@@ -54,9 +54,12 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
+      # No `version:` — pnpm/action-setup@v4 then reads the
+      # `packageManager` field from package.json so CI uses the exact
+      # same pnpm as `just dev` on a contributor's machine. Pinning
+      # a different `version:` here would cause pnpm 10+ to refuse to
+      # run with "current pnpm version does not match packageManager".
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - uses: actions/setup-node@v4
         with:
