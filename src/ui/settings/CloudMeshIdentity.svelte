@@ -190,9 +190,11 @@
           </button>
         </div>
         <div class="field-hint">
-          Permanent identifier for this MyOwnLLM instance, derived from a keypair
-          under <code class="path">~/.myownllm/.secrets/</code>. Shared with other
-          peers when you join a mesh.
+          Internal identifier for this MyOwnLLM instance, derived from a
+          keypair under <code class="path">~/.myownllm/.secrets/</code>.
+          You don't share this with anyone — peers learn each other's
+          Device IDs automatically at connection time. Shown here for
+          your reference (and for the Connections list on other peers).
         </div>
       </div>
 
@@ -260,10 +262,12 @@
           <div class="inline-error">{inlineError}</div>
         {:else if savedNetworkId === ""}
           <div class="field-hint">
-            The shared rendezvous handle for your mesh. Type one in to join an
-            existing network, or generate a fresh one to start your own. All
-            devices using the same Network ID can discover each other through
-            the signaling server.
+            The one thing you share with other devices to bring them
+            into your mesh. Paste a Network ID someone gave you to
+            join their network, or generate a fresh one to start your
+            own. All devices using the same Network ID find each other
+            through the signaling broker; peer identities are exchanged
+            automatically once connected.
           </div>
         {:else if !locked && dirty}
           <div class="field-hint warn">
