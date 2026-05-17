@@ -54,9 +54,14 @@
       : { body: "", suffix: "" },
   );
 
-  function shortPubkey(pk: string): string {
+  /** Truncated body of a pubkey for the secondary identifier line
+   *  on each peer row. Deliberately drops the trailing chars so it
+   *  doesn't visually compete with the `-SUFFIX` tag on the
+   *  primary label — the suffix is the eyeball-friendly identifier,
+   *  this is the underlying key fingerprint for reference. */
+  function shortPubkeyBody(pk: string): string {
     if (pk.length <= 14) return pk;
-    return `${pk.slice(0, 8)}…${pk.slice(-5)}`;
+    return `${pk.slice(0, 12)}…`;
   }
 
   /** Split a `pubkey-SUFFIX` display ID into its two parts. Falls
@@ -79,13 +84,13 @@
       case "handshaking":
         return "authenticating";
       case "pending_remote":
-        // Guest waiting for host's first approve vs. either side
-        // waiting for peer's reciprocal approve.
         if (p.local_approved) return "awaiting confirmation";
         if (!p.approver_role && !p.remote_approved) return "awaiting peer approval";
         return "awaiting peer";
       case "active":
         return "live";
+      case "offline":
+        return "offline";
       case "denied":
         return "denied";
       case "failed":
@@ -400,12 +405,15 @@
             <div class="peer-row request">
               <div class="peer-main">
                 <div class="peer-label">
-                  {p.label || shortPubkey(p.device_pubkey)}
+                  <span class="peer-name">{p.label || "Unnamed device"}</span>
+                  {#if p.device_suffix}
+                    <span class="peer-suffix" title="Stable display tag derived from this peer's pubkey">-{p.device_suffix}</span>
+                  {/if}
                   <span class="badge pending">
                     {p.approver_role ? "wants to connect" : "authorized you — confirm?"}
                   </span>
                 </div>
-                <code class="peer-id">{shortPubkey(p.device_pubkey)}</code>
+                <code class="peer-pubkey" title={p.device_pubkey}>{shortPubkeyBody(p.device_pubkey)}</code>
                 <div class="confirm-row">
                   {#if p.device_suffix}
                     <div class="confirm-tile suffix-tile" title="Stable per-device tag — should match the suffix the peer sees in their own Identity tab.">
@@ -449,16 +457,20 @@
       {:else}
         <div class="peer-list">
           {#each connections as p (p.peer_id)}
-            <div class="peer-row" class:awaiting={p.status === "pending_remote"}>
+            <div
+              class="peer-row"
+              class:awaiting={p.status === "pending_remote"}
+              class:offline={p.status === "offline"}
+            >
               <div class="peer-main">
                 <div class="peer-label">
-                  {p.label || shortPubkey(p.device_pubkey)}
+                  <span class="peer-name">{p.label || "Unnamed device"}</span>
                   {#if p.device_suffix}
-                    <span class="suffix-chip" title="Peer's stable display tag">{p.device_suffix}</span>
+                    <span class="peer-suffix" title="Stable display tag derived from this peer's pubkey">-{p.device_suffix}</span>
                   {/if}
-                  {#if p.authorized}<span class="badge ok">approved</span>{/if}
+                  {#if p.authorized && p.status !== "offline"}<span class="badge ok">approved</span>{/if}
                 </div>
-                <code class="peer-id">{shortPubkey(p.device_pubkey)}</code>
+                <code class="peer-pubkey" title={p.device_pubkey}>{shortPubkeyBody(p.device_pubkey)}</code>
                 {#if p.status === "pending_remote" && p.local_approved && p.verification_code}
                   <div class="verify-line">
                     Your code: <code class="code-pill">{p.verification_code}</code>
@@ -467,8 +479,8 @@
                 {/if}
               </div>
               <span class="peer-status" data-status={p.status}>{statusLabel(p)}</span>
-              <button class="btn-small ghost" onclick={() => meshClient.removePeer(p.peer_id)} title="Disconnect and revoke approval">
-                Remove
+              <button class="btn-small ghost" onclick={() => meshClient.removePeer(p.peer_id)} title={p.status === "offline" ? "Forget this peer (removes from roster)" : "Disconnect and revoke approval"}>
+                {p.status === "offline" ? "Forget" : "Remove"}
               </button>
             </div>
           {/each}
@@ -811,6 +823,43 @@
     border-color: #3a3a55;
     background: #161624;
   }
+  /* Rostered peers we currently can't see — visually de-emphasized
+     but still in the list, so the mesh feels persistent rather
+     than ephemeral. Trystero auto-reconnects whenever the peer
+     comes back into the room. */
+  .peer-row.offline {
+    background: #0f0f0f;
+    border-color: #1a1a1a;
+    opacity: 0.7;
+  }
+  .peer-row.offline .peer-name,
+  .peer-row.offline .peer-suffix { color: #888; }
+  .peer-row.offline .peer-pubkey { color: #555; }
+
+  .peer-name {
+    font-size: 0.85rem;
+    color: #e8e8e8;
+  }
+  /* `-SUFFIX` segment appended to each peer's name. The single
+     visible "suffix" anywhere on the row — keeps the user's
+     mental model of "the suffix is the part after the dash"
+     intact and avoids confusion with the truncated pubkey body
+     below. */
+  .peer-suffix {
+    font-family: monospace;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: #b9c9ee;
+    letter-spacing: 0.06em;
+    user-select: all;
+  }
+  .peer-pubkey {
+    font-family: monospace;
+    font-size: 0.68rem;
+    color: #555;
+    margin-top: 0.1rem;
+    user-select: all;
+  }
   .verify-line {
     font-size: 0.74rem;
     color: #aaa;
@@ -870,21 +919,6 @@
     font-weight: 700;
     color: #b9c9ee;
     letter-spacing: 0.08em;
-    user-select: all;
-  }
-
-  /* Inline suffix chip on each peer row (smaller version of the
-     pill above, lives next to the label). */
-  .suffix-chip {
-    font-family: monospace;
-    font-size: 0.72rem;
-    font-weight: 700;
-    color: #b9c9ee;
-    background: #131820;
-    border: 1px solid #2a3a55;
-    padding: 0.05rem 0.4rem;
-    border-radius: 3px;
-    letter-spacing: 0.06em;
     user-select: all;
   }
 
@@ -952,11 +986,6 @@
     display: flex;
     align-items: center;
     gap: 0.4rem;
-  }
-  .peer-id {
-    font-family: monospace;
-    font-size: 0.7rem;
-    color: #666;
   }
   .peer-status {
     font-size: 0.72rem;

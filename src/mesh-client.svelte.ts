@@ -79,6 +79,7 @@ export type PeerStatus =
   | "pending_approval" // local user needs to act (approve or confirm, see approver_role)
   | "pending_remote" // we've acted, OR we're waiting for the host's first move
   | "active" // both sides have approved and exchanged approve messages
+  | "offline" // rostered peer not currently present in the Trystero room
   | "denied" // user denied; close imminent
   | "failed"; // protocol error; close imminent
 
@@ -116,7 +117,6 @@ export interface PeerEntry {
 interface ConnectionState {
   peer_id: string;
   device_pubkey: string;
-  device_suffix: string;
   label: string;
   our_nonce: string;
   their_nonce: string | null;
@@ -161,6 +161,16 @@ class MeshClient {
   private network_handle = "";
   private connections = new Map<string, ConnectionState>();
   private roster_pubkeys = new Set<string>();
+  /** Pubkey → friendly label, sourced from the roster file. Used to
+   *  render offline-but-rostered peers in the Connections list so
+   *  the user sees their mesh persisting across sessions instead
+   *  of peers vanishing whenever a device goes to sleep. */
+  private roster_labels = new Map<string, string>();
+  /** Pubkey → 5-char uppercase hex display tag. Hashing happens
+   *  asynchronously via SubtleCrypto so we cache the result to
+   *  keep `computePeers()` synchronous. Populated on roster load
+   *  and on every incoming `hello`. */
+  private suffix_cache = new Map<string, string>();
   private stopping = false;
   private pending_moves_out = new Map<
     string,
@@ -351,6 +361,7 @@ class MeshClient {
         label: conn.label,
       });
       this.roster_pubkeys.add(conn.device_pubkey);
+      this.roster_labels.set(conn.device_pubkey, conn.label);
     } catch (e) {
       this.logDiag("warn", `roster add failed: ${String(e)}`);
     }
@@ -367,19 +378,29 @@ class MeshClient {
 
   async removePeer(peer_id: string): Promise<void> {
     const c = this.connections.get(peer_id);
-    if (c?.device_pubkey) {
+    const pubkey = c?.device_pubkey ?? this.offlinePubkeyFromPeerId(peer_id);
+    if (pubkey) {
       try {
         await invoke("mesh_roster_remove", {
           networkId: this.network_id,
-          deviceId: c.device_pubkey,
+          deviceId: pubkey,
         });
-        this.roster_pubkeys.delete(c.device_pubkey);
+        this.roster_pubkeys.delete(pubkey);
+        this.roster_labels.delete(pubkey);
       } catch (e) {
         this.logDiag("warn", `roster remove failed: ${String(e)}`);
       }
     }
     if (c) this.dropConnection(peer_id);
     else this.republishPeers();
+  }
+
+  /** Synthetic peer ids we use for offline rostered entries are
+   *  prefixed `offline:<pubkey>`. Strip the prefix to recover the
+   *  pubkey for roster operations. */
+  private offlinePubkeyFromPeerId(peer_id: string): string | null {
+    if (peer_id.startsWith("offline:")) return peer_id.slice("offline:".length);
+    return null;
   }
 
   async moveConversation(guid: string, target_peer_id: string): Promise<void> {
@@ -443,7 +464,6 @@ class MeshClient {
     return {
       peer_id,
       device_pubkey: "",
-      device_suffix: "",
       label: "",
       our_nonce: generateNonce(),
       their_nonce: null,
@@ -559,10 +579,12 @@ class MeshClient {
     conn.their_nonce = msg.nonce;
     conn.label = msg.label || "";
     conn.their_verification_code = (msg.verification_code || "").slice(0, 16);
-    try {
-      conn.device_suffix = await pubkeySuffix(msg.device_id);
-    } catch {
-      conn.device_suffix = "";
+    // Cache the display suffix and label for this peer so we can
+    // render them even when the peer goes offline later (rostered
+    // entries still show in the Connections list).
+    void this.hydrateSuffix(msg.device_id);
+    if (this.roster_pubkeys.has(msg.device_id)) {
+      this.roster_labels.set(msg.device_id, conn.label);
     }
     // Decide approver role: the lex-lesser pubkey side prompts /
     // auto-allows. Symmetric tie-break means both sides agree on
@@ -814,21 +836,50 @@ class MeshClient {
   }
 
   private computePeers(): PeerEntry[] {
-    return Array.from(this.connections.values()).map((c) => ({
-      peer_id: c.peer_id,
-      device_pubkey: c.device_pubkey,
-      device_suffix: c.device_suffix,
-      device_id_display: c.device_suffix && c.device_pubkey
-        ? `${c.device_pubkey}-${c.device_suffix}`
-        : c.device_pubkey || c.peer_id,
-      label: c.label,
-      status: this.peerStatus(c),
-      authorized: c.device_pubkey ? this.roster_pubkeys.has(c.device_pubkey) : false,
-      approver_role: c.approver_role,
-      local_approved: c.local_approved,
-      remote_approved: c.remote_approved,
-      verification_code: c.approver_role ? c.their_verification_code : c.our_verification_code,
-    }));
+    const active: PeerEntry[] = Array.from(this.connections.values()).map((c) => {
+      const suffix = c.device_pubkey ? this.suffix_cache.get(c.device_pubkey) ?? "" : "";
+      return {
+        peer_id: c.peer_id,
+        device_pubkey: c.device_pubkey,
+        device_suffix: suffix,
+        device_id_display: suffix && c.device_pubkey ? `${c.device_pubkey}-${suffix}` : c.device_pubkey || c.peer_id,
+        label: c.label,
+        status: this.peerStatus(c),
+        authorized: c.device_pubkey ? this.roster_pubkeys.has(c.device_pubkey) : false,
+        approver_role: c.approver_role,
+        local_approved: c.local_approved,
+        remote_approved: c.remote_approved,
+        verification_code: c.approver_role ? c.their_verification_code : c.our_verification_code,
+      };
+    });
+
+    // Synthesize offline entries for rostered peers we don't have
+    // an active connection to. Surfaces the "this peer was here
+    // before and should auto-reconnect" expectation visually —
+    // the mesh stops feeling ephemeral and starts feeling like a
+    // configured set of devices that comes and goes.
+    const active_pubkeys = new Set(
+      active.filter((p) => p.device_pubkey !== "").map((p) => p.device_pubkey),
+    );
+    const offline: PeerEntry[] = [];
+    for (const pubkey of this.roster_pubkeys) {
+      if (active_pubkeys.has(pubkey)) continue;
+      const suffix = this.suffix_cache.get(pubkey) ?? "";
+      offline.push({
+        peer_id: `offline:${pubkey}`,
+        device_pubkey: pubkey,
+        device_suffix: suffix,
+        device_id_display: suffix ? `${pubkey}-${suffix}` : pubkey,
+        label: this.roster_labels.get(pubkey) ?? "",
+        status: "offline",
+        authorized: true,
+        approver_role: false,
+        local_approved: false,
+        remote_approved: false,
+        verification_code: "",
+      });
+    }
+    return [...active, ...offline];
   }
 
   private republishPeers(): void {
@@ -842,9 +893,30 @@ class MeshClient {
         authorized_devices: Array<{ device_id: string; label: string; approved_at: number }>;
       }>("mesh_roster_get", { networkId: this.network_id });
       this.roster_pubkeys = new Set(r.authorized_devices.map((d) => d.device_id));
+      this.roster_labels.clear();
+      for (const d of r.authorized_devices) {
+        this.roster_labels.set(d.device_id, d.label);
+        // Pre-hydrate the suffix cache so the offline rows render
+        // their tag immediately rather than after the first
+        // async tick.
+        void this.hydrateSuffix(d.device_id);
+      }
     } catch (e) {
       this.logDiag("warn", `roster load failed: ${String(e)}`);
       this.roster_pubkeys = new Set();
+      this.roster_labels.clear();
+    }
+  }
+
+  private async hydrateSuffix(pubkey: string): Promise<void> {
+    if (this.suffix_cache.has(pubkey)) return;
+    try {
+      const s = await pubkeySuffix(pubkey);
+      this.suffix_cache.set(pubkey, s);
+      this.republishPeers();
+    } catch {
+      // Suffix is cosmetic — log nothing, leave cache empty,
+      // UI will fall back to label-only.
     }
   }
 }
