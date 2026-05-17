@@ -280,6 +280,7 @@ export function pubkeyPart(device_id: string): string {
  *  truncation isn't a footgun for impersonation. */
 const NETWORK_TAG_LEN = 8;
 const PUBKEY_TAG_LEN = 8;
+const SESSION_TAG_LEN = 4;
 
 export function networkTag(network_handle: string): string {
   return network_handle.slice(0, NETWORK_TAG_LEN);
@@ -289,25 +290,51 @@ export function pubkeyTag(pubkey: string): string {
   return pubkey.slice(0, PUBKEY_TAG_LEN);
 }
 
-export function peerJsId(network_handle: string, device_pubkey: string): string {
-  return `mol-${networkTag(network_handle)}-${pubkeyTag(device_pubkey)}`;
+/** Generate a per-session random tag. Re-runs of the same MyOwnLLM
+ *  instance (or two instances of the same identity, e.g. for
+ *  local testing on one machine) end up with different Peer IDs
+ *  on the broker, avoiding "id-taken" / "server-error" rejections
+ *  that fire when the broker hasn't yet GC'd the previous
+ *  registration. 4 chars from `[a-z0-9]` = 36^4 ≈ 1.7M — plenty
+ *  for cross-session uniqueness. */
+export function generateSessionTag(): string {
+  const ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = new Uint8Array(SESSION_TAG_LEN);
+  crypto.getRandomValues(bytes);
+  let out = "";
+  for (const b of bytes) out += ALPHABET[b % ALPHABET.length];
+  return out;
+}
+
+export function peerJsId(
+  network_handle: string,
+  device_pubkey: string,
+  session_tag: string,
+): string {
+  return `mol-${networkTag(network_handle)}-${pubkeyTag(device_pubkey)}-${session_tag}`;
 }
 
 /** Inverse of `peerJsId`. Returns null if the input isn't one of
  *  ours — used to filter the broker's peer list down to MyOwnLLM
  *  instances on our network. The pubkey returned here is a TAG
  *  (prefix), not a full pubkey; the auth handshake exchanges full
- *  pubkeys via `hello` and verifies they match. */
+ *  pubkeys via `hello` and verifies they match. The session tag
+ *  is exposed for completeness but no caller currently needs it
+ *  beyond bookkeeping. */
 export function parsePeerJsId(
   id: string,
-): { network_tag: string; pubkey_tag: string } | null {
+): { network_tag: string; pubkey_tag: string; session_tag: string } | null {
   if (!id.startsWith("mol-")) return null;
   const rest = id.slice("mol-".length);
-  const expected_len = NETWORK_TAG_LEN + 1 + PUBKEY_TAG_LEN;
-  if (rest.length !== expected_len || rest[NETWORK_TAG_LEN] !== "-") return null;
+  // `<8>-<8>-<4>` = 22 chars (+ 2 dashes = 22 in `rest`).
+  const expected_len = NETWORK_TAG_LEN + 1 + PUBKEY_TAG_LEN + 1 + SESSION_TAG_LEN;
+  if (rest.length !== expected_len) return null;
+  if (rest[NETWORK_TAG_LEN] !== "-") return null;
+  if (rest[NETWORK_TAG_LEN + 1 + PUBKEY_TAG_LEN] !== "-") return null;
   return {
     network_tag: rest.slice(0, NETWORK_TAG_LEN),
-    pubkey_tag: rest.slice(NETWORK_TAG_LEN + 1),
+    pubkey_tag: rest.slice(NETWORK_TAG_LEN + 1, NETWORK_TAG_LEN + 1 + PUBKEY_TAG_LEN),
+    session_tag: rest.slice(NETWORK_TAG_LEN + 1 + PUBKEY_TAG_LEN + 1),
   };
 }
 

@@ -42,6 +42,7 @@ import {
   authPayload,
   deriveNetworkHandle,
   generateNonce,
+  generateSessionTag,
   generateVerificationCode,
   networkTag,
   parsePeerJsId,
@@ -246,7 +247,8 @@ class MeshClient {
     await this.refreshRoster();
 
     const pubkey = pubkeyPart(opts.identity.device_id);
-    const id = peerJsId(this.network_handle, pubkey);
+    const session_tag = generateSessionTag();
+    const id = peerJsId(this.network_handle, pubkey, session_tag);
     this.my_peer_id = id;
 
     const parsed = parseSignalingUrl(opts.signalingUrl);
@@ -266,10 +268,12 @@ class MeshClient {
         path: parsed.path,
         secure: parsed.secure,
         config: { iceServers: ice_servers },
-        // Verbose during early Cloud Mesh rollout — the dev console
-        // is the cheapest place to debug broker connectivity. Tighten
-        // to 1 (errors only) once the failure modes stabilise.
-        debug: 2,
+        // Maximum verbosity until broker connectivity stops being
+        // a regular source of mystery — every WS frame ends up in
+        // the dev console, which is invaluable when the only
+        // visible failure is `server-error:` with an empty
+        // payload.
+        debug: 3,
       });
     } catch (e) {
       this.status = "error";
@@ -562,7 +566,10 @@ class MeshClient {
     const our_pubkey_tag = pubkeyTag(my_pubkey);
     const matches = all.filter((id) => {
       const p = parsePeerJsId(id);
-      return p && p.network_tag === our_network_tag && p.pubkey_tag !== our_pubkey_tag;
+      // Exclude ourselves by full Peer ID (not just pubkey tag) so
+      // two MyOwnLLM instances of the same identity — common when
+      // testing on a single machine — can still find each other.
+      return p && p.network_tag === our_network_tag && id !== this.my_peer_id;
     });
     this.logDiag(
       "info",
@@ -572,14 +579,15 @@ class MeshClient {
       const parsed = parsePeerJsId(id);
       if (!parsed) continue;
       if (parsed.network_tag !== our_network_tag) continue;
-      if (parsed.pubkey_tag === our_pubkey_tag) continue;
+      if (id === this.my_peer_id) continue;
       if (this.connections.has(parsed.pubkey_tag)) continue;
       // Tie-break who initiates so we don't double-connect: the
-      // lexically-lesser pubkey-tag is the initiator. Without this
-      // both sides would try simultaneously and we'd get two
-      // redundant channels.
-      if (our_pubkey_tag > parsed.pubkey_tag) continue;
-      this.logDiag("info", `initiating connection to ${parsed.pubkey_tag}…`);
+      // lexically-lesser Peer ID is the initiator. Using the full
+      // Peer ID (which includes the session tag) handles the
+      // edge case of two same-identity instances on one machine
+      // — different session tags break the tie deterministically.
+      if (this.my_peer_id > id) continue;
+      this.logDiag("info", `initiating connection to ${parsed.pubkey_tag} (${id.slice(-4)})`);
       this.initiateConnection(id, parsed.pubkey_tag);
     }
   }
