@@ -18,6 +18,53 @@ if (-not (Have "rustup")) {
     $env:Path = "$env:Path;$env:USERPROFILE\.cargo\bin"
 }
 
+# Rust on Windows targets `x86_64-pc-windows-msvc` by default, which links
+# via Microsoft's `link.exe` from Visual Studio Build Tools. rustup-init
+# normally prompts to install Build Tools when it's missing, but running
+# via winget with --silent suppresses that prompt — so a fresh box gets
+# rustup happily installed and then every `cargo install` blows up with:
+#   error: linker `link.exe` not found
+# Probe for the linker; install BuildTools + the C++ workload only if it
+# isn't there. The install is large (~5 GB) so we don't want to re-run
+# it on every bootstrap.
+#
+# `--override` passes the args verbatim to the Visual Studio Installer:
+#   Microsoft.VisualStudio.Workload.VCTools  — the actual C++ toolchain
+#   Microsoft.VisualStudio.Component.Windows11SDK.22621 — Windows headers
+#   --includeRecommended                     — pulls in matching MSBuild +
+#                                              ATL/MFC bits Tauri needs at
+#                                              bundle time
+function Have-MsvcLinker {
+    if (Have "link.exe") { return $true }
+    # `link.exe` only appears on PATH inside a Developer Command Prompt;
+    # check the canonical install paths too.
+    foreach ($base in @(
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC",
+        "${env:ProgramFiles}\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC",
+        "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC",
+        "${env:ProgramFiles}\Microsoft Visual Studio\2022\Professional\VC\Tools\MSVC",
+        "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC"
+    )) {
+        if (Test-Path $base) {
+            $found = Get-ChildItem -Path $base -Recurse -Filter "link.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { return $true }
+        }
+    }
+    return $false
+}
+
+if (-not (Have-MsvcLinker)) {
+    Log "Installing Visual Studio Build Tools (C++ workload, ~5 GB — first run only)…"
+    winget install --id Microsoft.VisualStudio.2022.BuildTools --silent `
+        --accept-source-agreements --accept-package-agreements `
+        --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --includeRecommended"
+    if ($LASTEXITCODE -ne 0) {
+        Warn "Build Tools install returned exit $LASTEXITCODE. If `cargo install` later fails with 'link.exe not found', install manually:"
+        Warn "  https://visualstudio.microsoft.com/downloads/  →  'Build Tools for Visual Studio 2022'  →  check 'Desktop development with C++'"
+        Warn "…then re-run scripts/bootstrap.ps1."
+    }
+}
+
 Log "Installing Rust 1.88.0 toolchain (no-op if present)…"
 rustup toolchain install 1.88.0 -c clippy,rustfmt --profile minimal | Out-Null
 
@@ -54,17 +101,31 @@ if (-not $webView2) {
     winget install --id Microsoft.EdgeWebView2Runtime --silent --accept-source-agreements --accept-package-agreements
 }
 
-# cmake is required by whisper-rs's build.rs (it builds whisper.cpp from
-# source for local transcription). Visual Studio Build Tools provide the
-# C++ toolchain whisper.cpp needs at link time.
+# cmake is kept around for any C/C++ build.rs in the dep tree. The
+# previous whisper-rs ASR backend has been replaced by `ort`
+# (load-dynamic onnxruntime) so cmake is no longer strictly required —
+# but installing it is cheap and several smaller crates still reach for
+# it, so we leave it in.
 if (-not (Have "cmake")) {
-    Log "Installing CMake (needed by whisper-rs)…"
+    Log "Installing CMake…"
     winget install --id Kitware.CMake --silent --accept-source-agreements --accept-package-agreements
     $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
 }
 
+# `$ErrorActionPreference = "Stop"` at the top only catches PowerShell-
+# native errors — external commands like `cargo` signal failure through
+# `$LASTEXITCODE`, which Stop never sees. Without the explicit check
+# below, a `cargo install` that died on a missing linker prints
+# "==> Done. Try: just dev …" and leaves the user staring at a "command
+# not found" the next time they try to build. Check after every external
+# invocation that's expected to succeed.
 Log "Installing tauri-cli@^2…"
 cargo install tauri-cli --version "^2" --locked
+if ($LASTEXITCODE -ne 0) {
+    Warn "tauri-cli install failed (cargo exit $LASTEXITCODE)."
+    Warn "If the error mentions 'link.exe not found', open a NEW PowerShell window so the Build Tools PATH refreshes, then re-run scripts/bootstrap.ps1."
+    exit $LASTEXITCODE
+}
 
 if (-not (Have "just")) {
     Log "Installing just…"
