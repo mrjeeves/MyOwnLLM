@@ -43,35 +43,28 @@ const DEFAULT_REMOTE_UI: RemoteUiConfig = {
   port: 1474,
 };
 
-// Signaling rendezvous defaults to the public PeerJS broker
-// (0.peerjs.com) so the mesh has no MyOwnLLM-operated infrastructure
-// to depend on. Anyone who wants to self-host can swap in their own
-// peerjs-server URL via this field; custom MyOwnLLM distributions can
-// ship their own default. STUN servers default to Google's public
-// pool, which is the de-facto baseline.
+// Signaling is handled by Trystero over Nostr relays. The default
+// `signaling_servers` list is empty so Trystero falls back to its
+// built-in public-relay pool — anyone who wants to point at a
+// self-hosted Nostr relay (or a private one for office/LAN use)
+// adds entries here from the Cloud Mesh → Addresses tab. STUN
+// servers default to Google's public pool, which is the de-facto
+// baseline.
 //
-// URL contract: the path is the peerjs-server *mount point*. For the
-// public broker that's `/`; PeerJS internally appends `/peerjs` to
-// reach the WebSocket endpoint. Don't include `/peerjs` in the URL
-// here — that pushes PeerJS to build `…/peerjspeerjs/id` which 404s
-// and leaves the client stuck on "Connecting…" forever.
-//
-// Exported so the Addresses UI can use it as a fallback when the
-// user removes every entry — signaling_servers is never allowed to
-// persist as empty.
-export const DEFAULT_PEERJS_SIGNALING_URL = "wss://0.peerjs.com:443/";
-/** URLs we've shipped as default in earlier commits on this branch
- *  that were broken (path included `/peerjs`, see note above).
- *  Migrated to the current default on load so testers who locked
- *  their Network ID against the broken URL come back up cleanly
- *  without having to manually edit Addresses. */
-const LEGACY_BROKEN_SIGNALING_URLS = ["wss://0.peerjs.com:443/peerjs"];
+// Legacy entries from earlier PeerJS-based commits get stripped
+// on load so testers don't end up pointing Trystero at a
+// peerjs-server URL it can't speak to.
+const LEGACY_PEERJS_SIGNALING_URLS = [
+  "wss://0.peerjs.com:443/",
+  "wss://0.peerjs.com:443/peerjs",
+  "wss://mesh.myownllm.net/signal",
+];
 
 const DEFAULT_CLOUD_MESH: CloudMeshConfig = {
   enabled: false,
   network_id: "",
   locked: false,
-  signaling_servers: [DEFAULT_PEERJS_SIGNALING_URL],
+  signaling_servers: [],
   stun_servers: [
     "stun:stun.l.google.com:19302",
     "stun:stun1.l.google.com:19302",
@@ -213,13 +206,12 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
 }
 
 /** Merge a partial cloud_mesh config from a saved file with defaults,
- *  preserving array fields the user has customised. STUN and TURN
- *  arrays default only when the saved value is missing entirely — an
- *  empty array is a valid user choice (e.g. "I want no TURN servers"),
- *  so we don't overwrite it. Signaling is different: a peer needs
- *  somewhere to rendezvous, so an empty saved value is treated as
- *  missing and the PeerJS default is restored. This is what makes the
- *  default reappear after a user removes every entry and restarts. */
+ *  preserving array fields the user has customised. Empty arrays are
+ *  legitimate user choices for all of signaling, STUN, and TURN —
+ *  empty signaling means "let Trystero use its built-in default
+ *  Nostr relays," empty STUN/TURN means "I don't want any of those."
+ *  Legacy PeerJS URLs from earlier branch commits get stripped on
+ *  load. */
 function mergeCloudMesh(raw: Partial<CloudMeshConfig> | undefined): CloudMeshConfig {
   if (!raw) {
     return {
@@ -229,15 +221,9 @@ function mergeCloudMesh(raw: Partial<CloudMeshConfig> | undefined): CloudMeshCon
       turn_servers: [...DEFAULT_CLOUD_MESH.turn_servers],
     };
   }
-  // Replace any legacy-broken default we previously shipped with
-  // the corrected URL so users who locked against the old value
-  // don't sit on "Connecting…" forever.
-  const signaling =
-    raw.signaling_servers && raw.signaling_servers.length > 0
-      ? raw.signaling_servers.map((s) =>
-          LEGACY_BROKEN_SIGNALING_URLS.includes(s) ? DEFAULT_PEERJS_SIGNALING_URL : s,
-        )
-      : [...DEFAULT_CLOUD_MESH.signaling_servers];
+  const signaling = (raw.signaling_servers ?? []).filter(
+    (s) => !LEGACY_PEERJS_SIGNALING_URLS.includes(s),
+  );
   return {
     enabled: raw.enabled ?? DEFAULT_CLOUD_MESH.enabled,
     network_id: raw.network_id ?? DEFAULT_CLOUD_MESH.network_id,

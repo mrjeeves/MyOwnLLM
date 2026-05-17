@@ -35,7 +35,7 @@ That's what we thought AI was going to be before it turned into a host of separa
 
 **What's landing next — Cloud Mesh:**
 
-Every MyOwnLLM instance becomes a window into the same mesh. Devices share a Network ID, find each other through a signaling broker (the public PeerJS server by default — no MyOwnLLM-operated infrastructure to depend on; swap in your own with one config field), and connect peer-to-peer over WebRTC. A second laptop joins your mesh and now its idle CPU is your transcription pool. Phone audio in, desktop transcription out, talking-points summary on the tablet you left in the kitchen. Conversations are *hosted* on one device with explicit Move-to-another-device transfers — your data still lives on disks you own, but the mesh routes capability where you need it. The substrate (identity keypair, Network ID rendezvous, settings UI) ships in this release; the WebRTC transport and routing follow in the next. See **Settings → Cloud Mesh** in the GUI.
+Every MyOwnLLM instance becomes a window into the same mesh. Devices share a Network ID (a short human name like `office-mesh`, hashed for namespace cleanliness), find each other through [Trystero](https://trystero.dev) over public Nostr relays — no MyOwnLLM-operated signaling server, no API key to register, no single point of failure — and connect peer-to-peer over WebRTC. A second laptop joins your mesh and now its idle CPU is your transcription pool. Phone audio in, desktop transcription out, talking-points summary on the tablet you left in the kitchen. Conversations are *hosted* on one device with explicit Move-to-another-device transfers — your data still lives on disks you own, but the mesh routes capability where you need it. Self-host a Nostr relay for an air-gapped office/LAN mesh; one-line Docker command in the Addresses tab. See **Settings → Cloud Mesh** in the GUI.
 
 ## Install
 
@@ -78,7 +78,7 @@ Both paths — chat and transcription — are designed to be available on the GU
 |   |   |
 |---|---|
 | **Multi-speaker diarized transcription** | Speaker IDs that stay stable across the whole session, not just a single window. `pyannote-segmentation-3.0` + a speaker embedder, online clustering on the Rust side. The part the rest of the ecosystem hand-waves. |
-| **Cloud Mesh** *(in progress)* | Devices on the same Network ID find each other via signaling + WebRTC and pool compute. Conversations hosted on one device with explicit Move transfers. Identity is a long-lived ed25519 keypair under `~/.myownllm/.secrets/`. |
+| **Cloud Mesh** | Devices on the same Network ID find each other via Trystero (Nostr relays, no central broker) and connect peer-to-peer over WebRTC. Mutual ed25519 auth handshake with per-request verification code; identity is a long-lived keypair under `~/.myownllm/.secrets/`. Conversations hosted on one device with explicit Move-to-peer transfers from the sidebar right-click. Self-host a Nostr relay for an air-gapped mesh. |
 | **Three wire formats, one server** | OpenAI on `:1473`, plus Ollama and Anthropic. Point Cursor, Continue, Aider, Cline, Zed, Open WebUI, opencode, OpenClaw, OpenClaude or your own scripts at it and it just works. |
 | **Virtual model IDs** | `myownllm` and `myownllm-transcribe`. Stable names; the right tag for your hardware auto-resolves. |
 | **Manifests, not config** | A JSON file at a URL is the source of truth. `imports` compose merged catalogs across publishers — no coordination required. |

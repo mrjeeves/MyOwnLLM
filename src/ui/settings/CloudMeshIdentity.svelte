@@ -432,7 +432,7 @@
         </div>
       {:else}
         <div class="peer-list">
-          {#each connections as p (p.device_pubkey_tag)}
+          {#each connections as p (p.peer_id)}
             <div class="peer-row" class:awaiting={p.status === "pending_remote_approval"}>
               <div class="peer-main">
                 <div class="peer-label">
@@ -451,7 +451,7 @@
                 {/if}
               </div>
               <span class="peer-status" data-status={p.status}>{statusLabel(p.status)}</span>
-              <button class="btn-small ghost" onclick={() => meshClient.removePeer(p.device_pubkey_tag)} title="Disconnect and revoke approval">
+              <button class="btn-small ghost" onclick={() => meshClient.removePeer(p.peer_id)} title="Disconnect and revoke approval">
                 Remove
               </button>
             </div>
@@ -470,7 +470,7 @@
         </div>
       {:else}
         <div class="peer-list">
-          {#each pendingRequests as p (p.device_pubkey_tag)}
+          {#each pendingRequests as p (p.peer_id)}
             <div class="peer-row request">
               <div class="peer-main">
                 <div class="peer-label">
@@ -496,10 +496,10 @@
                   </div>
                 </div>
               </div>
-              <button class="btn-small primary" onclick={() => meshClient.approveRequest(p.device_pubkey_tag)}>
+              <button class="btn-small primary" onclick={() => meshClient.approveRequest(p.peer_id)}>
                 Approve
               </button>
-              <button class="btn-small ghost" onclick={() => meshClient.denyRequest(p.device_pubkey_tag)}>
+              <button class="btn-small ghost" onclick={() => meshClient.denyRequest(p.peer_id)}>
                 Deny
               </button>
             </div>

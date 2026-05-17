@@ -201,8 +201,8 @@
       }
       // Bring up the Cloud Mesh client if the user has a locked
       // Network ID from a previous session. Fire-and-forget — the
-      // PeerJS broker connection runs entirely off the startup path
-      // and the user sees its status in Settings → Cloud Mesh →
+      // Trystero room-join runs entirely off the startup path and
+      // the user sees its status in Settings → Cloud Mesh →
       // Identity.
       meshClient.reconcile().catch(() => {});
 

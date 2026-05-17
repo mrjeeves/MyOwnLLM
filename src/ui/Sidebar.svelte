@@ -830,9 +830,9 @@
       {#if moveTargets.length > 0}
         <div class="menu-divider"></div>
         <div class="menu-section-label">Move to device</div>
-        {#each moveTargets as peer (peer.device_pubkey_tag)}
+        {#each moveTargets as peer (peer.peer_id)}
           <button
-            onclick={() => startMove(targetId, peer.device_pubkey_tag, shortPeerLabel(peer.device_pubkey, peer.label))}
+            onclick={() => startMove(targetId, peer.peer_id, shortPeerLabel(peer.device_pubkey, peer.label))}
             title="Transfer this conversation to {peer.label || peer.device_pubkey.slice(0, 12)}"
           >
             → {shortPeerLabel(peer.device_pubkey, peer.label)}

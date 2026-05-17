@@ -1,15 +1,19 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { loadConfig, updateConfig, DEFAULT_PEERJS_SIGNALING_URL } from "../../config";
+  import { loadConfig, updateConfig } from "../../config";
   import type { TurnServer } from "../../types";
 
-  let signalingServers = $state<string[]>([]);
+  /** Trystero signaling relays (Nostr WebSocket URLs). Empty list
+   *  = use Trystero's built-in defaults; populated = override
+   *  with the user's own relays, typically self-hosted. */
+  let signalingRelays = $state<string[]>([]);
   let stunServers = $state<string[]>([]);
   let turnServers = $state<TurnServer[]>([]);
 
   let loading = $state(true);
   let saving = $state(false);
   let error = $state("");
+  let selfHostExpanded = $state(false);
 
   /** Local draft for "add a new TURN server" — we keep credentials
    *  staged here until the user clicks Add so a partial entry can't
@@ -19,7 +23,7 @@
   onMount(async () => {
     try {
       const cfg = await loadConfig();
-      signalingServers = [...cfg.cloud_mesh.signaling_servers];
+      signalingRelays = [...cfg.cloud_mesh.signaling_servers];
       stunServers = [...cfg.cloud_mesh.stun_servers];
       turnServers = cfg.cloud_mesh.turn_servers.map((t) => ({ ...t }));
     } catch (e) {
@@ -34,17 +38,10 @@
     error = "";
     try {
       const cfg = await loadConfig();
-      // Signaling must never persist as empty — a peer needs somewhere to
-      // rendezvous. If the user has cleared every entry we restore the
-      // PeerJS default so the next load (or reopened settings panel)
-      // shows it again. STUN and TURN can legitimately be empty.
-      const filteredSignaling = signalingServers.filter((s) => s.trim() !== "");
-      const persistedSignaling =
-        filteredSignaling.length > 0 ? filteredSignaling : [DEFAULT_PEERJS_SIGNALING_URL];
       await updateConfig({
         cloud_mesh: {
           ...cfg.cloud_mesh,
-          signaling_servers: persistedSignaling,
+          signaling_servers: signalingRelays.filter((s) => s.trim() !== ""),
           stun_servers: stunServers.filter((s) => s.trim() !== ""),
           turn_servers: turnServers.filter((t) => t.url.trim() !== ""),
         },
@@ -56,19 +53,14 @@
     }
   }
 
-  function updateSignaling(i: number, value: string) {
-    signalingServers[i] = value;
+  function updateRelay(i: number, value: string) {
+    signalingRelays[i] = value;
   }
-  function addSignaling() {
-    // Pre-fill with the PeerJS default when the list is empty so the
-    // user gets back to a working state with one click after clearing
-    // everything. Subsequent adds give an empty row to fill in manually.
-    const next = signalingServers.length === 0 ? DEFAULT_PEERJS_SIGNALING_URL : "";
-    signalingServers = [...signalingServers, next];
-    if (next !== "") void persist();
+  function addRelay() {
+    signalingRelays = [...signalingRelays, ""];
   }
-  function removeSignaling(i: number) {
-    signalingServers = signalingServers.filter((_, idx) => idx !== i);
+  function removeRelay(i: number) {
+    signalingRelays = signalingRelays.filter((_, idx) => idx !== i);
     void persist();
   }
 
@@ -107,33 +99,96 @@
     <div class="loading">Loading addresses…</div>
   {:else}
     <section class="block">
-      <h3>Signaling servers</h3>
+      <h3>Signaling relays</h3>
       <div class="block-hint">
-        WebSocket rendezvous used to introduce peers to each other.
-        Tried in order; the first reachable one wins. Default points at
-        the public PeerJS broker (<code>0.peerjs.com</code>) so MyOwnLLM
-        doesn't operate any required mesh infrastructure — swap in
-        your own peerjs-server or other compatible signaler to
-        decouple from it entirely.
+        Cloud Mesh uses <a href="https://trystero.dev" target="_blank" rel="noopener">Trystero</a>
+        for peer discovery — currently over Nostr relays. By default
+        Trystero picks from a built-in pool of public relays
+        maintained by the Nostr community, so MyOwnLLM operates no
+        signaling infrastructure of its own. Add your own relay
+        URLs below to use specific or self-hosted relays instead;
+        leave the list empty to keep the defaults.
       </div>
       <div class="list">
-        {#each signalingServers as _, i (i)}
+        {#each signalingRelays as _, i (i)}
           <div class="addr-row">
             <input
               class="text-input mono"
               type="text"
-              value={signalingServers[i]}
-              oninput={(e) => updateSignaling(i, (e.target as HTMLInputElement).value)}
+              value={signalingRelays[i]}
+              oninput={(e) => updateRelay(i, (e.target as HTMLInputElement).value)}
               onblur={persist}
               spellcheck="false"
               autocomplete="off"
-              placeholder="wss://example.com/signal"
+              placeholder="wss://relay.example.com"
             />
-            <button class="btn-small ghost" onclick={() => removeSignaling(i)}>Remove</button>
+            <button class="btn-small ghost" onclick={() => removeRelay(i)}>Remove</button>
           </div>
         {/each}
-        <button class="btn-small" onclick={addSignaling}>Add signaling server</button>
+        <button class="btn-small" onclick={addRelay}>Add relay</button>
       </div>
+
+      <button
+        class="disclosure"
+        onclick={() => (selfHostExpanded = !selfHostExpanded)}
+        aria-expanded={selfHostExpanded}
+      >
+        <span class="disclosure-chevron">{selfHostExpanded ? "▾" : "▸"}</span>
+        Self-host a Nostr relay
+      </button>
+      {#if selfHostExpanded}
+        <div class="self-host">
+          <p>
+            A Nostr relay is a tiny WebSocket service that proxies
+            signed messages between subscribed clients — Trystero
+            piggybacks on this to relay WebRTC offers/answers
+            between MyOwnLLM peers. The relay never sees mesh
+            content, only the small offer/answer envelopes during
+            connection setup.
+          </p>
+
+          <div class="self-host-option">
+            <div class="self-host-title">
+              <strong>strfry</strong> — high-performance C++, single binary, ~10 MB RAM
+            </div>
+            <p>
+              Lightweight option, recommended for home/office use.
+            </p>
+            <code class="self-host-cmd">
+              docker run -d -p 7777:7777 dockurr/strfry
+            </code>
+            <p class="self-host-add">
+              Then add <code>ws://your-host:7777</code> (or
+              <code>wss://</code> if you're behind a TLS terminator)
+              to the relay list above.
+            </p>
+          </div>
+
+          <div class="self-host-option">
+            <div class="self-host-title">
+              <strong>nostr-rs-relay</strong> — Rust, persistent SQLite store
+            </div>
+            <p>
+              More featureful, persists messages across restarts
+              (which Trystero doesn't need but doesn't hurt).
+            </p>
+            <code class="self-host-cmd">
+              docker run -d -p 8080:8080 scsibug/nostr-rs-relay
+            </code>
+            <p class="self-host-add">
+              Then add <code>ws://your-host:8080</code> to the list.
+            </p>
+          </div>
+
+          <p class="self-host-note">
+            Two devices both pointed at the same private relay will
+            find each other through it without ever hitting the
+            public Nostr network — useful for office/LAN setups or
+            for keeping your mesh connections off third-party
+            infrastructure entirely.
+          </p>
+        </div>
+      {/if}
     </section>
 
     <section class="block">
@@ -325,6 +380,74 @@
   }
   .saving-hint {
     color: #888;
+    font-size: 0.72rem;
+    font-style: italic;
+  }
+
+  .disclosure {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    background: none;
+    border: none;
+    color: #888;
+    font-size: 0.78rem;
+    cursor: pointer;
+    padding: 0.35rem 0.1rem;
+    align-self: flex-start;
+  }
+  .disclosure:hover { color: #ccc; }
+  .disclosure-chevron {
+    font-size: 0.7rem;
+    width: 0.8rem;
+    display: inline-block;
+    text-align: center;
+  }
+  .self-host {
+    border-left: 2px solid #2a2a3a;
+    padding: 0.4rem 0 0.4rem 0.9rem;
+    margin: 0.1rem 0 0 0.3rem;
+    color: #aaa;
+    font-size: 0.78rem;
+    line-height: 1.55;
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+  }
+  .self-host p { margin: 0; }
+  .self-host-option {
+    background: #131313;
+    border: 1px solid #1e1e1e;
+    border-radius: 6px;
+    padding: 0.55rem 0.7rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .self-host-title { color: #ddd; font-size: 0.82rem; }
+  .self-host-cmd {
+    display: block;
+    font-family: monospace;
+    font-size: 0.78rem;
+    color: #cfeacf;
+    background: #0d0d0d;
+    padding: 0.4rem 0.6rem;
+    border-radius: 5px;
+    border: 1px solid #1e1e1e;
+    word-break: break-all;
+    user-select: all;
+  }
+  .self-host-add { color: #888; font-size: 0.74rem; }
+  .self-host-add code {
+    font-family: monospace;
+    font-size: 0.74rem;
+    color: #b9b9ee;
+    background: #1a1a2a;
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+  }
+  .self-host-note {
+    color: #666;
     font-size: 0.72rem;
     font-style: italic;
   }

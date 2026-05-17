@@ -187,12 +187,12 @@ export interface CloudMeshConfig {
    *  icon and warning popup so a misclick can't silently swap mesh
    *  membership. */
   locked: boolean;
-  /** WebSocket URLs of signaling servers, in fallback order. The
-   *  first reachable one is used for SDP exchange. Default points at
-   *  the public PeerJS broker (`0.peerjs.com`) so MyOwnLLM doesn't
-   *  operate any required mesh infrastructure; users who want a
-   *  different broker — self-hosted peerjs-server, a private
-   *  WebSocket signaler, etc. — substitute their own URL here. */
+  /** WebSocket URLs of Nostr signaling relays Trystero should use.
+   *  Empty array = use Trystero's built-in public-relay pool (the
+   *  default). Populated = override with the user's own relays
+   *  (typically self-hosted strfry / nostr-rs-relay). MyOwnLLM
+   *  operates none of these — the public defaults are
+   *  community-run Nostr relays. */
   signaling_servers: string[];
   /** STUN server URLs for NAT traversal. Defaults cover Google's
    *  public stun pool; replace or extend per deployment. */

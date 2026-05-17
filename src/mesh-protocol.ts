@@ -1,8 +1,10 @@
 /**
  * Wire protocol for Cloud Mesh peer connections.
  *
- * All peer-to-peer traffic over a PeerJS data channel is framed as
- * JSON messages with a discriminated `kind` field. The two
+ * All peer-to-peer traffic over the mesh transport (Trystero room
+ * action channel; previously a PeerJS DataConnection — the protocol
+ * is transport-agnostic) is framed as JSON messages with a
+ * discriminated `kind` field. The two
  * pre-active phases are:
  *
  *   1. `hello` — each side announces its claimed Device ID and a
@@ -264,86 +266,14 @@ export function pubkeyPart(device_id: string): string {
   return device_id;
 }
 
-/** PeerJS peer-id format. Includes a brand prefix so we can filter
- *  for our own peers on a shared public broker, an 8-char
- *  network tag (prefix of sha256(network_id)) so peers on the same
- *  network find each other and peers on different networks ignore
- *  each other, and an 8-char pubkey tag (prefix of the device's
- *  ed25519 pubkey).
- *
- *  Stays under the public 0.peerjs.com broker's ~50-char Peer ID
- *  limit (full hashes / pubkeys ran 109 chars and silently got
- *  rejected as `server-error`). Discrimination space: 2^80 across
- *  the combined tags, plenty for any realistic deployment. The
- *  auth handshake verifies that the peer's claimed full pubkey in
- *  `hello` starts with the pubkey tag in their Peer ID, so the
- *  truncation isn't a footgun for impersonation. */
-const NETWORK_TAG_LEN = 8;
-const PUBKEY_TAG_LEN = 8;
-const SESSION_TAG_LEN = 4;
-
-export function networkTag(network_handle: string): string {
-  return network_handle.slice(0, NETWORK_TAG_LEN);
-}
-
-export function pubkeyTag(pubkey: string): string {
-  return pubkey.slice(0, PUBKEY_TAG_LEN);
-}
-
-/** Generate a per-session random tag. Re-runs of the same MyOwnLLM
- *  instance (or two instances of the same identity, e.g. for
- *  local testing on one machine) end up with different Peer IDs
- *  on the broker, avoiding "id-taken" / "server-error" rejections
- *  that fire when the broker hasn't yet GC'd the previous
- *  registration. 4 chars from `[a-z0-9]` = 36^4 ≈ 1.7M — plenty
- *  for cross-session uniqueness. */
-export function generateSessionTag(): string {
-  const ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
-  const bytes = new Uint8Array(SESSION_TAG_LEN);
-  crypto.getRandomValues(bytes);
-  let out = "";
-  for (const b of bytes) out += ALPHABET[b % ALPHABET.length];
-  return out;
-}
-
-export function peerJsId(
-  network_handle: string,
-  device_pubkey: string,
-  session_tag: string,
-): string {
-  return `mol-${networkTag(network_handle)}-${pubkeyTag(device_pubkey)}-${session_tag}`;
-}
-
-/** Inverse of `peerJsId`. Returns null if the input isn't one of
- *  ours — used to filter the broker's peer list down to MyOwnLLM
- *  instances on our network. The pubkey returned here is a TAG
- *  (prefix), not a full pubkey; the auth handshake exchanges full
- *  pubkeys via `hello` and verifies they match. The session tag
- *  is exposed for completeness but no caller currently needs it
- *  beyond bookkeeping. */
-export function parsePeerJsId(
-  id: string,
-): { network_tag: string; pubkey_tag: string; session_tag: string } | null {
-  if (!id.startsWith("mol-")) return null;
-  const rest = id.slice("mol-".length);
-  // `<8>-<8>-<4>` = 22 chars (+ 2 dashes = 22 in `rest`).
-  const expected_len = NETWORK_TAG_LEN + 1 + PUBKEY_TAG_LEN + 1 + SESSION_TAG_LEN;
-  if (rest.length !== expected_len) return null;
-  if (rest[NETWORK_TAG_LEN] !== "-") return null;
-  if (rest[NETWORK_TAG_LEN + 1 + PUBKEY_TAG_LEN] !== "-") return null;
-  return {
-    network_tag: rest.slice(0, NETWORK_TAG_LEN),
-    pubkey_tag: rest.slice(NETWORK_TAG_LEN + 1, NETWORK_TAG_LEN + 1 + PUBKEY_TAG_LEN),
-    session_tag: rest.slice(NETWORK_TAG_LEN + 1 + PUBKEY_TAG_LEN + 1),
-  };
-}
-
-/** Derive the broker-side discovery handle from a user-typed Network
- *  ID. Hashes under a domain-separation tag so the same string used
- *  elsewhere can't collide, then base32-encodes to 52 chars. The
- *  full handle is what `deriveNetworkHandle` returns; the broker
- *  Peer ID only embeds the first NETWORK_TAG_LEN chars of it via
- *  `networkTag()`. Async because SubtleCrypto is — callers cache
+/** Derive a Trystero room id from a user-typed Network ID. Hashes
+ *  under a domain-separation tag so the same string used elsewhere
+ *  can't collide, then base32-encodes to a fixed 52 chars. Trystero
+ *  doesn't care about the format, but the hash means two devices
+ *  who type the exact same human Network ID end up in the same
+ *  room without leaking the user's chosen name to anyone scraping
+ *  the underlying signaling substrate (BitTorrent trackers, Nostr
+ *  relays, etc.). Async because SubtleCrypto is — callers cache
  *  the result for the session. */
 export async function deriveNetworkHandle(network_id: string): Promise<string> {
   const tagged = `myownllm-network-v1:${network_id}`;

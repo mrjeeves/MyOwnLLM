@@ -1,32 +1,33 @@
 /**
- * Cloud Mesh runtime client.
+ * Cloud Mesh runtime client (Trystero transport).
  *
- * Manages the lifetime of the PeerJS connection, peer discovery, the
- * mutual auth handshake, and the in-memory state the Cloud Mesh
- * settings tab renders against. Persistence lives in Rust (identity,
- * roster); this class is the live, reactive view of what's happening
- * right now.
+ * Trystero handles peer discovery and WebRTC connection setup via
+ * existing decentralized infrastructure (BitTorrent trackers, Nostr
+ * relays, etc., with auto-fallback). No MyOwnLLM-operated signaling
+ * server, no broker key to register, no single point of failure.
+ *
+ * Identity, the auth handshake, the roster, Move, and the
+ * Connections / Network Requests UI are unchanged from the previous
+ * peerjs-backed client — the protocol rides on top of Trystero's
+ * `makeAction` data channel and is transport-agnostic by design.
  *
  * Lifecycle:
- *   - `start()` is called when the user has a locked Network ID. It
- *     connects to the PeerJS broker, registers under a deterministic
- *     Peer ID (`mol-<networkId>-<devicePubkey>`), and listens for
- *     incoming connections.
- *   - On a periodic tick the client polls the broker's peer list,
- *     filters to peers on the same Network ID, and initiates
- *     connections to ones it isn't already talking to.
- *   - Inbound and outbound connections both run the same mutual-auth
- *     handshake. The receiver side either auto-allows (peer in
- *     roster) or queues for user approval. Once the receiver sends
- *     `approve`, both sides flip to ACTIVE.
- *   - `stop()` tears everything down. Re-runnable.
- *
- * What's intentionally not here yet (slots reserved in the protocol
- * for future commits): catalog gossip, Move RPC, capability
- * advertisement, mic / file routing.
+ *   - `start()` joins a Trystero room keyed by the network handle.
+ *     Trystero takes care of discovery + WebRTC; we get
+ *     `onPeerJoin` / `onPeerLeave` callbacks and a typed action
+ *     channel for our protocol messages.
+ *   - On every `onPeerJoin`, both sides start the bidirectional
+ *     auth handshake. The lex-lesser pubkey side acts as the
+ *     "approver" (auto-allows if peer is in roster, prompts the
+ *     user otherwise); the other side waits for the approver's
+ *     `approve` message and flips to ACTIVE on receipt. This
+ *     preserves the asymmetric one-prompt UX the prior code had
+ *     without needing an initiator/receiver distinction in the
+ *     transport layer.
+ *   - `stop()` leaves the room and tears down all connections.
  */
 
-import Peer, { type DataConnection } from "peerjs";
+import { joinRoom, type Room } from "trystero";
 import { invoke } from "@tauri-apps/api/core";
 import type { MeshIdentity } from "./mesh";
 import type { TurnServer } from "./types";
@@ -42,31 +43,22 @@ import {
   authPayload,
   deriveNetworkHandle,
   generateNonce,
-  generateSessionTag,
   generateVerificationCode,
-  networkTag,
-  parsePeerJsId,
-  peerJsId,
   pubkeyPart,
   pubkeySuffix,
-  pubkeyTag,
   signMessage,
   verifySignature,
   PROTOCOL_VERSION,
   type MeshMessage,
 } from "./mesh-protocol";
 
-const DISCOVERY_INTERVAL_MS = 15_000;
 const HANDSHAKE_TIMEOUT_MS = 20_000;
-/** If the broker's `open` event doesn't arrive within this window
- *  we flip to error rather than sit on "Connecting…" indefinitely.
- *  Surfaces the most common failure modes (broker down, URL path
- *  wrong, network blocked) with an actionable message instead of
- *  hanging silently. */
-const BROKER_OPEN_TIMEOUT_MS = 15_000;
-/** Cap on in-UI diagnostic log entries. Old entries fall off so the
- *  log doesn't grow unbounded during long sessions. */
 const DIAG_MAX = 80;
+/** Globally-unique app identifier passed to Trystero so MyOwnLLM
+ *  peers don't accidentally match peers from unrelated apps that
+ *  happen to use the same `roomId`. Bump the suffix if we ever
+ *  ship a wire-incompatible protocol change. */
+const TRYSTERO_APP_ID = "myownllm-cloud-mesh-v1";
 
 export type DiagLevel = "info" | "warn" | "error";
 export interface DiagEntry {
@@ -76,148 +68,145 @@ export interface DiagEntry {
 }
 
 export type PeerStatus =
-  | "connecting" // DC opening, no hello exchanged yet
   | "handshaking" // hello sent / received; awaiting auth_response or verifying
-  | "pending_approval" // receiver: waiting on the local user to approve
-  | "pending_remote_approval" // initiator: waiting on the remote user to approve
+  | "pending_approval" // approver side, waiting on local user to approve
+  | "pending_remote_approval" // non-approver side, waiting on remote's approve
   | "active" // both sides cleared; channel usable
   | "denied" // user denied; close imminent
   | "failed"; // protocol error; close imminent
 
 export interface PeerEntry {
-  /** Full pubkey when handshake has completed; pubkey-tag during
-   *  early handshake. The UI uses this for display only — for
-   *  action callbacks pass `device_pubkey_tag` instead, since it's
-   *  always defined. */
+  /** Trystero-assigned peer id — unique per session, used as the
+   *  callback handle for action methods (approve/deny/remove). */
+  peer_id: string;
+  /** Full pubkey once handshake has completed; empty string during
+   *  early handshake. */
   device_pubkey: string;
-  /** 8-char tag — the always-defined handle used as the
-   *  connections-map key. Pass this back into approve/deny/remove
-   *  callbacks. */
-  device_pubkey_tag: string;
   /** 5-char uppercase-hex display suffix derived from the peer's
-   *  pubkey, matching what they show in their own Identity tab.
-   *  Empty string until handshake completes. */
+   *  pubkey, matching what they show in their own Identity tab. */
   device_suffix: string;
-  /** Display form including the 5-char suffix. Derived from the
-   *  pubkey using the same algorithm Rust uses, so the suffix
-   *  matches what the peer themselves would show. */
   device_id_display: string;
   label: string;
   status: PeerStatus;
   /** True when this peer is in our local roster (we'd auto-allow on
    *  reconnect). */
   authorized: boolean;
-  /** True when we were the side that initiated this connection. */
-  initiated_by_us: boolean;
-  connected_at: number;
+  /** True when our side is the one responsible for prompting the
+   *  user (we have the lex-lesser pubkey of the pair). */
+  approver_role: boolean;
   /** Six-char verification code the user reads to confirm the
-   *  request is the one they expect. On the initiator side this is
-   *  the code we sent (so the local user can read it to the
-   *  remote); on the receiver side this is the code we received
-   *  from the peer (so the local user can confirm it matches what
-   *  the remote person quoted them). Both sides see the same
-   *  string. */
+   *  request is the one they expect. */
   verification_code: string;
 }
 
 interface ConnectionState {
-  dc: DataConnection;
-  /** 8-char tag derived from the peer's full pubkey. Stable for
-   *  the lifetime of the connection — known immediately from the
-   *  Peer ID, used as the connections-map key. */
-  device_pubkey_tag: string;
-  /** Full 52-char pubkey. Empty string until `hello` arrives and
-   *  we've verified `pubkeyTag(device_pubkey) === device_pubkey_tag`.
-   *  Used for roster lookups, signature verification, and anything
-   *  cryptographic. */
+  peer_id: string;
   device_pubkey: string;
-  /** 5-char uppercase-hex display suffix. Computed once when the
-   *  full pubkey arrives in `hello`; the same algorithm Rust uses
-   *  so a peer's suffix here matches what they show in their own
-   *  Identity tab. */
   device_suffix: string;
   label: string;
-  initiated_by_us: boolean;
   our_nonce: string;
-  /** Their nonce — populated after we receive their `hello`. */
   their_nonce: string | null;
-  /** Verification code WE generated and sent in our `hello`. The
-   *  initiator's UI shows this — the local user reads it to the
-   *  remote to confirm. */
   our_verification_code: string;
-  /** Verification code we RECEIVED from the peer's `hello`. The
-   *  receiver's UI shows this in Network Requests — the local user
-   *  confirms it matches what the remote person quoted. */
   their_verification_code: string;
-  /** True after we've verified the auth_response signature. */
   peer_authenticated: boolean;
-  /** True after they've sent us `approve`. Always true on the
-   *  initiator side once `approve` arrives, and on the receiver
-   *  side when we auto-allow (in roster) without sending anything. */
+  /** Set after we've received `approve` from the peer. */
   remote_approved: boolean;
-  /** True after we've decided to allow this peer (auto-allowed or
+  /** Set when we've decided to allow this peer (auto-allowed or
    *  user clicked Approve). */
   local_approved: boolean;
+  /** True when WE are the lex-lesser side — we're the one who
+   *  prompts the user / auto-approves and sends `approve`. */
+  approver_role: boolean;
   handshake_timer: number | null;
 }
 
 class MeshClient {
-  // ---- reactive state, observed by the Cloud Mesh tab -----------------
+  // ---- reactive state ---------------------------------------------------
 
   status = $state<"off" | "starting" | "online" | "error">("off");
   error = $state("");
-  /** Our own Peer-JS-side identifier on the broker, for debugging. */
+  /** Mostly informational — Trystero peer ids are short hex strings,
+   *  surfaced for the Activity panel. */
   my_peer_id = $state("");
   peers = $state<PeerEntry[]>([]);
-
-  /** Ring-buffered diagnostic log surfaced inside the Cloud Mesh
-   *  tab. Same content the dev console gets, but reachable without
-   *  opening DevTools — important on Tauri where the WebView's
-   *  console is platform-dependent and often hidden in shipped
-   *  builds. */
   diag = $state<DiagEntry[]>([]);
+
   private logDiag(level: DiagLevel, msg: string): void {
     const entry: DiagEntry = { ts: Date.now(), level, msg };
     this.diag = [...this.diag, entry].slice(-DIAG_MAX);
-    // Mirror to the dev console so a reproduction transcript exists
-    // in both places.
     const fn = level === "error" ? console.error : level === "warn" ? console.warn : console.info;
     fn(`[mesh] ${msg}`);
   }
 
   // ---- internal --------------------------------------------------------
 
-  private peer_js: Peer | null = null;
+  private room: Room | null = null;
+  private sendMesh: ((data: unknown, target?: string | string[] | null) => Promise<unknown>) | null = null;
   private identity: MeshIdentity | null = null;
-  /** Human-readable Network ID — what the user sees and shares. */
   private network_id = "";
-  /** sha256 of `network_id` framed under our domain tag. Used as
-   *  the broker discovery handle in `peerJsId()` / filtering. */
   private network_handle = "";
   private connections = new Map<string, ConnectionState>();
   private roster_pubkeys = new Set<string>();
-  private discovery_timer: number | null = null;
-  private broker_open_timer: number | null = null;
   private stopping = false;
-  /** Outgoing Move state. Keyed by conversation GUID — only one
-   *  in-flight Move per conversation is allowed. Holds the full
-   *  payload so move_accept can immediately ship it without
-   *  re-reading from disk. */
   private pending_moves_out = new Map<
     string,
-    { target_tag: string; conversation: Conversation; on_complete?: (ok: boolean, err?: string) => void }
+    { target_peer_id: string; conversation: Conversation; on_complete?: (ok: boolean, err?: string) => void }
   >();
+
+  // ---- lifecycle -------------------------------------------------------
+
+  async reconcile(): Promise<void> {
+    let cfg;
+    let identity: MeshIdentity;
+    try {
+      cfg = await loadConfig();
+      identity = await invoke<MeshIdentity>("mesh_identity_get");
+    } catch (e) {
+      this.logDiag("warn", `reconcile preflight failed: ${String(e)}`);
+      return;
+    }
+
+    const should_run = cfg.cloud_mesh.locked && cfg.cloud_mesh.network_id !== "";
+    if (!should_run) {
+      if (this.room) {
+        this.logDiag("info", "reconcile: should_run=false → stopping");
+        await this.stop();
+      }
+      return;
+    }
+
+    // Already running on the right network with the right identity?
+    // No-op.
+    if (
+      this.room &&
+      this.network_id === cfg.cloud_mesh.network_id &&
+      this.identity?.device_id === identity.device_id
+    ) {
+      return;
+    }
+
+    if (this.room) {
+      this.logDiag("info", "reconcile: config changed → restarting");
+      await this.stop();
+    }
+    this.logDiag("info", `reconcile: joining mesh for "${cfg.cloud_mesh.network_id}"`);
+    await this.start({
+      identity,
+      networkId: cfg.cloud_mesh.network_id,
+      relayUrls: cfg.cloud_mesh.signaling_servers,
+      stunServers: cfg.cloud_mesh.stun_servers,
+      turnServers: cfg.cloud_mesh.turn_servers,
+    });
+  }
 
   async start(opts: {
     identity: MeshIdentity;
     networkId: string;
-    signalingUrl: string;
+    relayUrls: string[];
     stunServers: string[];
     turnServers: TurnServer[];
   }): Promise<void> {
-    // Defensive idempotency — calling start while already running
-    // is a no-op rather than a double-init.
-    if (this.peer_js) return;
+    if (this.room) return;
 
     this.stopping = false;
     this.status = "starting";
@@ -227,222 +216,106 @@ class MeshClient {
     this.peers = [];
     this.connections.clear();
 
-    // Derive the broker-side handle once per session. Hashing the
-    // human Network ID gives us a fixed-length, parseable identifier
-    // for the PeerJS ID without leaking the user's chosen name to
-    // anyone scraping the broker. The act of joining the right
-    // handle on the broker is itself proof-of-knowledge of the
-    // Network ID, which is one half of the bidirectional auth model
-    // — the other half is the per-peer signature handshake below.
     try {
       this.network_handle = await deriveNetworkHandle(opts.networkId);
     } catch (e) {
       this.status = "error";
       this.error = `network-handle derivation: ${String(e)}`;
+      this.logDiag("error", `handle derivation failed: ${String(e)}`);
       return;
     }
 
-    // Hydrate the roster so auto-allow works on the very first
-    // incoming connection of this session.
     await this.refreshRoster();
 
-    const pubkey = pubkeyPart(opts.identity.device_id);
-    const session_tag = generateSessionTag();
-    const id = peerJsId(this.network_handle, pubkey, session_tag);
-    this.my_peer_id = id;
-
-    const parsed = parseSignalingUrl(opts.signalingUrl);
     const ice_servers = buildIceServers(opts.stunServers, opts.turnServers);
+    const room_id = this.network_handle;
+    const custom_relays = opts.relayUrls.filter((r) => r.trim() !== "");
 
     this.logDiag(
       "info",
-      `connecting → ${parsed.secure ? "wss" : "ws"}://${parsed.host}:${parsed.port}${parsed.path}`,
+      `joining mesh room ${room_id.slice(0, 12)}… (trystero, app=${TRYSTERO_APP_ID}` +
+        (custom_relays.length > 0
+          ? `, ${custom_relays.length} custom relay${custom_relays.length === 1 ? "" : "s"})`
+          : `, default relays)`),
     );
-    this.logDiag("info", `my peer id: ${id}`);
-    this.logDiag("info", `network handle: ${this.network_handle.slice(0, 12)}…`);
 
     try {
-      this.peer_js = new Peer(id, {
-        host: parsed.host,
-        port: parsed.port,
-        path: parsed.path,
-        secure: parsed.secure,
-        config: { iceServers: ice_servers },
-        // Maximum verbosity until broker connectivity stops being
-        // a regular source of mystery — every WS frame ends up in
-        // the dev console, which is invaluable when the only
-        // visible failure is `server-error:` with an empty
-        // payload.
-        debug: 3,
-      });
+      const room_config: Parameters<typeof joinRoom>[0] = {
+        appId: TRYSTERO_APP_ID,
+        rtcConfig: { iceServers: ice_servers },
+      };
+      if (custom_relays.length > 0) {
+        // Trystero accepts a `relayUrls` override for the current
+        // strategy. When set, only these relays are used; when not,
+        // the strategy's built-in defaults apply.
+        (room_config as Record<string, unknown>).relayUrls = custom_relays;
+      }
+      this.room = joinRoom(room_config, room_id);
     } catch (e) {
       this.status = "error";
-      this.error = `peerjs init: ${String(e)}`;
-      this.logDiag("error", `peerjs init failed: ${String(e)}`);
+      this.error = `trystero init: ${String(e)}`;
+      this.logDiag("error", `trystero init failed: ${String(e)}`);
       return;
     }
 
-    // Bail out of "Connecting…" if the broker never responds with
-    // `open`. The most common cause is a wrong path component in
-    // the signaling URL (e.g. `…/peerjs` instead of `…/`) where
-    // PeerJS dutifully tries to talk to a 404 endpoint and never
-    // surfaces an error. 15s is generous for a healthy broker over
-    // any reasonable network.
-    this.broker_open_timer = window.setTimeout(() => {
-      if (this.status === "starting") {
-        const detail = `${parsed.secure ? "wss" : "ws"}://${parsed.host}:${parsed.port}${parsed.path}`;
-        const msg =
-          `signaling broker did not respond within ${BROKER_OPEN_TIMEOUT_MS / 1000}s ` +
-          `(${detail}). Check that the URL is reachable and the path is the ` +
-          `peerjs-server mount point — for the public broker that's just '/' ` +
-          `(PeerJS adds '/peerjs' itself).`;
-        this.status = "error";
-        this.error = msg;
-        this.logDiag("error", `broker open timeout — ${detail}`);
-      }
-    }, BROKER_OPEN_TIMEOUT_MS);
+    // Trystero exposes a single typed `action` channel per name.
+    // We carry our entire MeshMessage envelope through one action;
+    // discriminating on `kind` keeps the existing handlers as-is.
+    const [send, recv] = this.room.makeAction("mesh");
+    this.sendMesh = send as typeof this.sendMesh extends infer T
+      ? T extends null
+        ? never
+        : T
+      : never;
 
-    this.peer_js.on("open", () => {
-      if (this.broker_open_timer !== null) {
-        clearTimeout(this.broker_open_timer);
-        this.broker_open_timer = null;
-      }
-      this.status = "online";
-      this.logDiag("info", `broker open — listening as ${this.my_peer_id}`);
-      this.kickDiscovery();
+    recv((data, peerId) => {
+      // Trystero's typed payload covers binary too; we only send
+      // JSON objects via `send`, so the cast through `unknown` is
+      // safe and matches what arrives at runtime.
+      void this.handleMessage(peerId, data as unknown as MeshMessage);
     });
-    this.peer_js.on("error", (err) => {
-      // PeerJS surfaces both fatal and recoverable errors here.
-      // "peer-unavailable" happens routinely when listAllPeers races
-      // a peer leaving — log but ignore. Everything else flips the
-      // visible status so the user gets feedback rather than a
-      // silent hang.
-      const type = (err as { type?: string }).type ?? "unknown";
-      const message = String((err as Error).message ?? err);
-      if (type === "peer-unavailable") {
-        this.logDiag("warn", `${type}: ${message}`);
-        return;
-      }
-      this.logDiag("error", `${type}: ${message}`);
-      this.status = "error";
-      this.error = `${type}: ${message}`;
-      if (this.broker_open_timer !== null) {
-        clearTimeout(this.broker_open_timer);
-        this.broker_open_timer = null;
-      }
-    });
-    this.peer_js.on("disconnected", () => {
-      this.logDiag("warn", "broker disconnected — peerjs will retry");
-      if (!this.stopping) this.status = "starting";
-    });
-    this.peer_js.on("close", () => {
-      this.logDiag("info", "broker connection closed");
-    });
-    this.peer_js.on("connection", (dc) => {
-      this.logDiag("info", `inbound connection from ${dc.peer.slice(0, 20)}…`);
-      this.handleInboundConnection(dc);
-    });
-  }
 
-  /** Read current config + identity and reconcile the client state
-   *  with what the user asked for. Idempotent: called at app start
-   *  and again after any setting that affects the mesh (locking the
-   *  Network ID, changing signaling addresses, etc.). Restarts the
-   *  client only when the config has actually changed; otherwise
-   *  it's a cheap no-op. */
-  async reconcile(): Promise<void> {
-    let cfg;
-    let identity: MeshIdentity;
-    try {
-      cfg = await loadConfig();
-      identity = await invoke<MeshIdentity>("mesh_identity_get");
-    } catch (e) {
-      // No identity yet (anchor failed to generate?) — leave the
-      // mesh in whatever state it's in. The user will see the
-      // problem when they open the Cloud Mesh tab.
-      // eslint-disable-next-line no-console
-      console.warn("[mesh] reconcile preflight failed", e);
-      return;
-    }
-
-    const should_run = cfg.cloud_mesh.locked && cfg.cloud_mesh.network_id !== "";
-    if (!should_run) {
-      if (this.peer_js) {
-        this.logDiag("info", "reconcile: should_run=false → stopping");
-        await this.stop();
-      }
-      return;
-    }
-
-    const signaling = cfg.cloud_mesh.signaling_servers[0];
-    if (!signaling || signaling.trim() === "") {
-      this.logDiag("error", "reconcile: no signaling URL configured");
-      return;
-    }
-
-    // If we're already running on the right network with the right
-    // identity, leave it alone. Detecting STUN/TURN drift here is
-    // overkill for v1 — the user can stop and re-lock the Network
-    // ID to force a restart.
-    if (
-      this.peer_js &&
-      this.network_id === cfg.cloud_mesh.network_id &&
-      this.identity?.device_id === identity.device_id
-    ) {
-      return;
-    }
-
-    if (this.peer_js) {
-      this.logDiag("info", "reconcile: config changed → restarting");
-      await this.stop();
-    }
-    this.logDiag("info", `reconcile: starting mesh for network "${cfg.cloud_mesh.network_id}"`);
-    await this.start({
-      identity,
-      networkId: cfg.cloud_mesh.network_id,
-      signalingUrl: signaling,
-      stunServers: cfg.cloud_mesh.stun_servers,
-      turnServers: cfg.cloud_mesh.turn_servers,
+    this.room.onPeerJoin((peerId) => {
+      this.handlePeerJoin(peerId);
     });
+
+    this.room.onPeerLeave((peerId) => {
+      this.handlePeerLeave(peerId);
+    });
+
+    // Trystero joins the room synchronously — discovery happens in
+    // the background and `onPeerJoin` fires as peers turn up. No
+    // open/connect handshake to wait for like with peerjs.
+    this.status = "online";
+    this.my_peer_id = `trystero/${room_id.slice(0, 8)}`;
+    this.logDiag("info", `online — listening for peers in room ${room_id.slice(0, 12)}…`);
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
-    if (this.discovery_timer !== null) {
-      clearInterval(this.discovery_timer);
-      this.discovery_timer = null;
-    }
-    if (this.broker_open_timer !== null) {
-      clearTimeout(this.broker_open_timer);
-      this.broker_open_timer = null;
-    }
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
-      try {
-        c.dc.close();
-      } catch {}
     }
     this.connections.clear();
-    if (this.peer_js) {
+    if (this.room) {
       try {
-        this.peer_js.destroy();
+        this.room.leave();
       } catch {}
-      this.peer_js = null;
+      this.room = null;
     }
+    this.sendMesh = null;
     this.peers = [];
     this.my_peer_id = "";
     this.status = "off";
     this.error = "";
     settingsAttention.set("cloud-mesh", null);
+    this.logDiag("info", "stopped");
   }
 
-  /** Approve a peer waiting in the pending_approval state. Adds them
-   *  to the roster (so reconnects auto-allow) and sends an `approve`
-   *  message so the other side flips to ACTIVE. Takes the peer's
-   *  pubkey tag (PeerEntry.device_pubkey_tag) since that's the
-   *  always-defined handle the UI knows about. */
-  async approveRequest(device_pubkey_tag: string): Promise<void> {
-    const c = this.connections.get(device_pubkey_tag);
+  // ---- action callbacks (UI) -------------------------------------------
+
+  async approveRequest(peer_id: string): Promise<void> {
+    const c = this.connections.get(peer_id);
     if (!c || !c.device_pubkey) return;
     c.local_approved = true;
     try {
@@ -453,10 +326,6 @@ class MeshClient {
       });
       this.roster_pubkeys.add(c.device_pubkey);
     } catch (e) {
-      // Persistence failure shouldn't block the active connection
-      // — the peer is still authenticated, the user has approved
-      // them — but it does mean they won't auto-allow on
-      // reconnect. Log and continue.
       this.logDiag("warn", `roster add failed: ${String(e)}`);
     }
     this.sendApprove(c);
@@ -464,24 +333,32 @@ class MeshClient {
     this.republishPeers();
   }
 
-  /** Deny a pending peer. Closes the data channel and removes them
-   *  from the peers list. Does not blacklist — they can try again,
-   *  and they may succeed if circumstances change (e.g. roster
-   *  populated by a different peer). */
-  async denyRequest(device_pubkey_tag: string): Promise<void> {
-    const c = this.connections.get(device_pubkey_tag);
+  async denyRequest(peer_id: string): Promise<void> {
+    const c = this.connections.get(peer_id);
     if (!c) return;
     this.sendDeny(c, "user denied");
-    this.dropConnection(device_pubkey_tag);
+    this.dropConnection(peer_id);
   }
 
-  /** Initiate a Move of conversation `guid` to peer `target_tag`.
-   *  The target must be in the active peer list. Resolves when the
-   *  receiver has acknowledged write completion (and we've deleted
-   *  the local copy); rejects on protocol error, peer-decline, or
-   *  disconnect mid-flight. */
-  async moveConversation(guid: string, target_tag: string): Promise<void> {
-    const conn = this.connections.get(target_tag);
+  async removePeer(peer_id: string): Promise<void> {
+    const c = this.connections.get(peer_id);
+    if (c?.device_pubkey) {
+      try {
+        await invoke("mesh_roster_remove", {
+          networkId: this.network_id,
+          deviceId: c.device_pubkey,
+        });
+        this.roster_pubkeys.delete(c.device_pubkey);
+      } catch (e) {
+        this.logDiag("warn", `roster remove failed: ${String(e)}`);
+      }
+    }
+    if (c) this.dropConnection(peer_id);
+    else this.republishPeers();
+  }
+
+  async moveConversation(guid: string, target_peer_id: string): Promise<void> {
+    const conn = this.connections.get(target_peer_id);
     if (!conn || this.peerStatus(conn) !== "active") {
       throw new Error("target peer is not active");
     }
@@ -494,7 +371,7 @@ class MeshClient {
     }
     return await new Promise<void>((resolve, reject) => {
       this.pending_moves_out.set(guid, {
-        target_tag,
+        target_peer_id,
         conversation,
         on_complete: (ok, err) => {
           if (ok) resolve();
@@ -509,129 +386,33 @@ class MeshClient {
     });
   }
 
-  /** Remove an already-active peer from the roster and close the
-   *  current connection. The peer can reconnect, but will require
-   *  fresh approval. */
-  async removePeer(device_pubkey_tag: string): Promise<void> {
-    const c = this.connections.get(device_pubkey_tag);
-    const full_pubkey = c?.device_pubkey;
-    if (full_pubkey) {
-      try {
-        await invoke("mesh_roster_remove", {
-          networkId: this.network_id,
-          deviceId: full_pubkey,
-        });
-        this.roster_pubkeys.delete(full_pubkey);
-      } catch (e) {
-        this.logDiag("warn", `roster remove failed: ${String(e)}`);
-      }
-    }
-    if (c) this.dropConnection(device_pubkey_tag);
-    else this.republishPeers();
-  }
+  // ---- peer lifecycle --------------------------------------------------
 
-  // ---- discovery ------------------------------------------------------
-
-  private kickDiscovery(): void {
-    void this.runDiscoveryTick();
-    this.discovery_timer = window.setInterval(() => {
-      void this.runDiscoveryTick();
-    }, DISCOVERY_INTERVAL_MS);
-  }
-
-  private async runDiscoveryTick(): Promise<void> {
-    if (!this.peer_js || !this.identity) return;
-    const my_pubkey = pubkeyPart(this.identity.device_id);
-    // Wrap listAllPeers in a promise — PeerJS's signature is
-    // callback-based even though it logically returns a list.
-    let all: string[];
-    try {
-      all = await new Promise<string[]>((resolve, reject) => {
-        this.peer_js!.listAllPeers((ids) => resolve(ids));
-        // Belt-and-braces timeout in case the broker doesn't respond.
-        setTimeout(() => reject(new Error("listAllPeers timed out")), 10_000);
-      });
-    } catch (e) {
-      // Some peerjs-server deployments disable discovery. We surface
-      // this once and stop polling — the user can still connect by
-      // having a peer initiate to us, just not the reverse.
-      this.logDiag("warn", `discovery unavailable: ${String(e)}`);
-      if (this.discovery_timer !== null) {
-        clearInterval(this.discovery_timer);
-        this.discovery_timer = null;
-      }
-      return;
-    }
-    const our_network_tag = networkTag(this.network_handle);
-    const our_pubkey_tag = pubkeyTag(my_pubkey);
-    const matches = all.filter((id) => {
-      const p = parsePeerJsId(id);
-      // Exclude ourselves by full Peer ID (not just pubkey tag) so
-      // two MyOwnLLM instances of the same identity — common when
-      // testing on a single machine — can still find each other.
-      return p && p.network_tag === our_network_tag && id !== this.my_peer_id;
-    });
-    this.logDiag(
-      "info",
-      `discovery: ${all.length} peers on broker, ${matches.length} on our network`,
-    );
-    for (const id of all) {
-      const parsed = parsePeerJsId(id);
-      if (!parsed) continue;
-      if (parsed.network_tag !== our_network_tag) continue;
-      if (id === this.my_peer_id) continue;
-      if (this.connections.has(parsed.pubkey_tag)) continue;
-      // Tie-break who initiates so we don't double-connect: the
-      // lexically-lesser Peer ID is the initiator. Using the full
-      // Peer ID (which includes the session tag) handles the
-      // edge case of two same-identity instances on one machine
-      // — different session tags break the tie deterministically.
-      if (this.my_peer_id > id) continue;
-      this.logDiag("info", `initiating connection to ${parsed.pubkey_tag} (${id.slice(-4)})`);
-      this.initiateConnection(id, parsed.pubkey_tag);
-    }
-  }
-
-  private initiateConnection(peer_id: string, device_pubkey_tag: string): void {
-    if (!this.peer_js) return;
-    const dc = this.peer_js.connect(peer_id, { reliable: true });
-    const conn = this.createConnState(dc, device_pubkey_tag, /* initiator */ true);
-    this.connections.set(device_pubkey_tag, conn);
-    this.wireDataChannel(conn);
+  private handlePeerJoin(peer_id: string): void {
+    if (this.connections.has(peer_id)) return;
+    this.logDiag("info", `peer joined: ${peer_id.slice(0, 8)}…`);
+    const conn = this.createConnState(peer_id);
+    this.connections.set(peer_id, conn);
+    this.sendHello(conn);
+    conn.handshake_timer = window.setTimeout(() => {
+      if (this.peerStatus(conn) === "active") return;
+      this.logDiag("warn", `handshake timeout for ${peer_id.slice(0, 8)}…`);
+      this.dropConnection(peer_id);
+    }, HANDSHAKE_TIMEOUT_MS);
     this.republishPeers();
   }
 
-  private handleInboundConnection(dc: DataConnection): void {
-    const parsed = parsePeerJsId(dc.peer);
-    if (!parsed || parsed.network_tag !== networkTag(this.network_handle)) {
-      // Foreign peer (different network or non-MyOwnLLM client).
-      try { dc.close(); } catch {}
-      return;
-    }
-    // If a connection in either direction is already in flight,
-    // prefer the one we initiated and drop this inbound one.
-    if (this.connections.has(parsed.pubkey_tag)) {
-      try { dc.close(); } catch {}
-      return;
-    }
-    const conn = this.createConnState(dc, parsed.pubkey_tag, /* initiator */ false);
-    this.connections.set(parsed.pubkey_tag, conn);
-    this.wireDataChannel(conn);
-    this.republishPeers();
+  private handlePeerLeave(peer_id: string): void {
+    this.logDiag("info", `peer left: ${peer_id.slice(0, 8)}…`);
+    this.dropConnection(peer_id);
   }
 
-  private createConnState(
-    dc: DataConnection,
-    device_pubkey_tag: string,
-    initiator: boolean,
-  ): ConnectionState {
+  private createConnState(peer_id: string): ConnectionState {
     return {
-      dc,
-      device_pubkey_tag,
+      peer_id,
       device_pubkey: "",
       device_suffix: "",
       label: "",
-      initiated_by_us: initiator,
       our_nonce: generateNonce(),
       their_nonce: null,
       our_verification_code: generateVerificationCode(),
@@ -639,29 +420,12 @@ class MeshClient {
       peer_authenticated: false,
       remote_approved: false,
       local_approved: false,
+      approver_role: false, // set in handleHello once we know both pubkeys
       handshake_timer: null,
     };
   }
 
-  private wireDataChannel(conn: ConnectionState): void {
-    conn.dc.on("open", () => {
-      // Send our hello as soon as the data channel opens.
-      this.sendHello(conn);
-      conn.handshake_timer = window.setTimeout(() => {
-        if (this.peerStatus(conn) === "active") return;
-        this.dropConnection(conn.device_pubkey_tag);
-      }, HANDSHAKE_TIMEOUT_MS);
-    });
-    conn.dc.on("data", (raw) => {
-      this.handleMessage(conn, raw);
-    });
-    conn.dc.on("close", () => {
-      this.dropConnection(conn.device_pubkey_tag);
-    });
-    conn.dc.on("error", () => {
-      this.dropConnection(conn.device_pubkey_tag);
-    });
-  }
+  // ---- protocol --------------------------------------------------------
 
   private sendHello(conn: ConnectionState): void {
     if (!this.identity) return;
@@ -685,21 +449,32 @@ class MeshClient {
   }
 
   private send(conn: ConnectionState, msg: MeshMessage): void {
+    if (!this.sendMesh) return;
     try {
-      conn.dc.send(JSON.stringify(msg));
+      void this.sendMesh(msg, conn.peer_id);
     } catch (e) {
-      // eslint-disable-next-line no-console
-      console.warn("[mesh] send failed", e);
+      this.logDiag("warn", `send failed: ${String(e)}`);
     }
   }
 
-  private async handleMessage(conn: ConnectionState, raw: unknown): Promise<void> {
-    let msg: MeshMessage;
-    try {
-      msg = typeof raw === "string" ? JSON.parse(raw) : (raw as MeshMessage);
-    } catch {
+  private async handleMessage(peer_id: string, msg: MeshMessage): Promise<void> {
+    const conn = this.connections.get(peer_id);
+    if (!conn) {
+      // Message from a peer we don't have state for — possible if
+      // trystero delivers a message before onPeerJoin fires, or
+      // after we've dropped the connection. Spin up state on
+      // demand for the former case.
+      if (msg.kind === "hello") {
+        this.handlePeerJoin(peer_id);
+        const fresh = this.connections.get(peer_id);
+        if (fresh) await this.handleMessageOn(fresh, msg);
+      }
       return;
     }
+    await this.handleMessageOn(conn, msg);
+  }
+
+  private async handleMessageOn(conn: ConnectionState, msg: MeshMessage): Promise<void> {
     switch (msg.kind) {
       case "hello":
         await this.handleHello(conn, msg);
@@ -713,20 +488,15 @@ class MeshClient {
         this.republishPeers();
         break;
       case "deny":
-        this.dropConnection(conn.device_pubkey);
+        this.logDiag("warn", `peer denied: ${msg.reason ?? "(no reason)"}`);
+        this.dropConnection(conn.peer_id);
         break;
       case "ping":
         this.send(conn, { kind: "pong", t: msg.t });
         break;
       case "pong":
-        // No-op for v1 — latency tracking will land with capability
-        // advertisement.
         break;
       case "catalog_announce":
-        // No-op for v1. Catalog state is held by the source of
-        // each conversation; this message just isn't actioned yet.
-        // The "Network" view that consumes it will land in a
-        // follow-up commit.
         break;
       case "move_offer":
         await this.handleMoveOffer(conn, msg);
@@ -746,12 +516,108 @@ class MeshClient {
     }
   }
 
+  private async handleHello(
+    conn: ConnectionState,
+    msg: MeshMessage & { kind: "hello" },
+  ): Promise<void> {
+    if (msg.protocol !== PROTOCOL_VERSION) {
+      this.sendDeny(conn, "protocol mismatch");
+      this.dropConnection(conn.peer_id);
+      return;
+    }
+    conn.device_pubkey = msg.device_id;
+    conn.their_nonce = msg.nonce;
+    conn.label = msg.label || "";
+    conn.their_verification_code = (msg.verification_code || "").slice(0, 16);
+    try {
+      conn.device_suffix = await pubkeySuffix(msg.device_id);
+    } catch {
+      conn.device_suffix = "";
+    }
+    // Decide approver role: the lex-lesser pubkey side prompts /
+    // auto-allows. Symmetric tie-break means both sides agree on
+    // who's in charge without needing extra coordination.
+    const my_pubkey = pubkeyPart(this.identity!.device_id);
+    conn.approver_role = my_pubkey < msg.device_id;
+    this.republishPeers();
+
+    // Sign the payload they expect to verify against us.
+    const payload = authPayload({
+      nonce: msg.nonce,
+      my_device_id: my_pubkey,
+      their_device_id: conn.device_pubkey,
+    });
+    try {
+      const signature = await signMessage(payload);
+      this.send(conn, { kind: "auth_response", signature });
+    } catch (e) {
+      this.logDiag("error", `signing failed: ${String(e)}`);
+      this.dropConnection(conn.peer_id);
+    }
+  }
+
+  private async handleAuthResponse(
+    conn: ConnectionState,
+    msg: MeshMessage & { kind: "auth_response" },
+  ): Promise<void> {
+    if (!conn.our_nonce || !conn.device_pubkey) {
+      this.sendDeny(conn, "auth_response before hello");
+      this.dropConnection(conn.peer_id);
+      return;
+    }
+    const payload = authPayload({
+      nonce: conn.our_nonce,
+      my_device_id: conn.device_pubkey,
+      their_device_id: pubkeyPart(this.identity!.device_id),
+    });
+    let ok: boolean;
+    try {
+      ok = await verifySignature(conn.device_pubkey, payload, msg.signature);
+    } catch (e) {
+      this.logDiag("error", `verify failed: ${String(e)}`);
+      ok = false;
+    }
+    if (!ok) {
+      this.sendDeny(conn, "signature invalid");
+      this.dropConnection(conn.peer_id);
+      return;
+    }
+    conn.peer_authenticated = true;
+    this.logDiag(
+      "info",
+      `auth ok with ${conn.device_pubkey.slice(0, 8)}… (approver=${conn.approver_role})`,
+    );
+
+    if (conn.approver_role) {
+      // Our side does the approving. Auto-allow if in roster;
+      // otherwise queue for user approval (settings attention
+      // dot lights up).
+      const authorized = this.roster_pubkeys.has(conn.device_pubkey);
+      if (authorized) {
+        conn.local_approved = true;
+        this.sendApprove(conn);
+      } else {
+        settingsAttention.set("cloud-mesh", {
+          reason: `${shortLabel(conn.label, conn.device_pubkey)} wants to connect`,
+        });
+      }
+    } else {
+      // Non-approver side: we wait for `approve` from the other
+      // side to flip to ACTIVE. Locally we treat ourselves as
+      // approved — the act of locking the Network ID was our
+      // user's consent to join.
+      conn.local_approved = true;
+    }
+    this.maybePromoteToActive(conn);
+    this.republishPeers();
+  }
+
+  // ---- move ------------------------------------------------------------
+
   private async handleMoveOffer(
     conn: ConnectionState,
     msg: MeshMessage & { kind: "move_offer" },
   ): Promise<void> {
-    // Defensively refuse offers from un-approved peers — the auth
-    // gates should already block this but cheap to be sure.
     if (this.peerStatus(conn) !== "active") {
       this.send(conn, { kind: "move_decline", guid: msg.guid, reason: "channel not active" });
       return;
@@ -778,7 +644,7 @@ class MeshClient {
     msg: MeshMessage & { kind: "move_accept" },
   ): Promise<void> {
     const pending = this.pending_moves_out.get(msg.guid);
-    if (!pending || pending.target_tag !== conn.device_pubkey_tag) return;
+    if (!pending || pending.target_peer_id !== conn.peer_id) return;
     this.send(conn, {
       kind: "move_payload",
       guid: msg.guid,
@@ -792,12 +658,7 @@ class MeshClient {
   ): Promise<void> {
     const incoming = msg.conversation as Conversation | undefined;
     if (!incoming || typeof incoming !== "object" || incoming.id !== msg.guid) {
-      // Malformed payload — decline rather than write garbage.
-      this.send(conn, {
-        kind: "move_decline",
-        guid: msg.guid,
-        reason: "malformed payload",
-      });
+      this.send(conn, { kind: "move_decline", guid: msg.guid, reason: "malformed payload" });
       return;
     }
     try {
@@ -817,13 +678,10 @@ class MeshClient {
     msg: MeshMessage & { kind: "move_complete" },
   ): Promise<void> {
     const pending = this.pending_moves_out.get(msg.guid);
-    if (!pending || pending.target_tag !== conn.device_pubkey_tag) return;
+    if (!pending || pending.target_peer_id !== conn.peer_id) return;
     try {
       await deleteConversation(msg.guid);
     } catch (e) {
-      // The receiver successfully wrote and we couldn't delete our
-      // local — the user now has the conversation on both devices.
-      // Inconvenient but not destructive. Surface to the caller.
       this.resolveMoveOut(msg.guid, false, `local delete failed: ${String(e)}`);
       return;
     }
@@ -837,126 +695,7 @@ class MeshClient {
     pending.on_complete?.(ok, err);
   }
 
-  private async handleHello(
-    conn: ConnectionState,
-    msg: MeshMessage & { kind: "hello" },
-  ): Promise<void> {
-    if (msg.protocol !== PROTOCOL_VERSION) {
-      this.sendDeny(conn, "protocol mismatch");
-      this.dropConnection(conn.device_pubkey_tag);
-      return;
-    }
-    // The peer's Peer ID embeds only an 8-char prefix (tag) of their
-    // pubkey — `hello` carries the full pubkey, and we verify it
-    // matches the tag we know from the broker. Without this, a peer
-    // could register under one tag and claim a totally different
-    // identity in `hello`, then sign with whichever key matches the
-    // claim. Anchoring the claim to the registered tag closes that
-    // gap.
-    if (pubkeyTag(msg.device_id) !== conn.device_pubkey_tag) {
-      this.sendDeny(conn, "device_id / peerjs_id tag mismatch");
-      this.dropConnection(conn.device_pubkey_tag);
-      return;
-    }
-    conn.device_pubkey = msg.device_id;
-    conn.their_nonce = msg.nonce;
-    conn.label = msg.label || "";
-    // Stash the peer's verification code so the receiver UI can
-    // surface it for confirmation. Length-clamp defensively — the
-    // sender controls this field and we don't want a runaway string
-    // breaking the layout.
-    conn.their_verification_code = (msg.verification_code || "").slice(0, 16);
-    // Compute the peer's display suffix locally from their pubkey —
-    // never trust a suffix the peer sends, but they don't send one
-    // either: the suffix is purely derived. Mirrors the algorithm
-    // Rust uses for our own device.
-    try {
-      conn.device_suffix = await pubkeySuffix(msg.device_id);
-    } catch {
-      conn.device_suffix = "";
-    }
-    this.republishPeers();
-
-    // Sign the payload they expect to verify against us.
-    const my_pubkey = pubkeyPart(this.identity!.device_id);
-    const payload = authPayload({
-      nonce: msg.nonce,
-      my_device_id: my_pubkey,
-      their_device_id: conn.device_pubkey,
-    });
-    try {
-      const signature = await signMessage(payload);
-      this.send(conn, { kind: "auth_response", signature });
-    } catch (e) {
-      this.logDiag("error", `signing failed: ${String(e)}`);
-      this.dropConnection(conn.device_pubkey_tag);
-    }
-  }
-
-  private async handleAuthResponse(
-    conn: ConnectionState,
-    msg: MeshMessage & { kind: "auth_response" },
-  ): Promise<void> {
-    if (!conn.our_nonce) return;
-    if (!conn.device_pubkey) {
-      // Peer sent auth_response before hello — protocol error.
-      this.sendDeny(conn, "auth_response before hello");
-      this.dropConnection(conn.device_pubkey_tag);
-      return;
-    }
-    const payload = authPayload({
-      nonce: conn.our_nonce,
-      my_device_id: conn.device_pubkey,
-      their_device_id: pubkeyPart(this.identity!.device_id),
-    });
-    let ok: boolean;
-    try {
-      ok = await verifySignature(conn.device_pubkey, payload, msg.signature);
-    } catch (e) {
-      this.logDiag("error", `verify failed: ${String(e)}`);
-      ok = false;
-    }
-    if (!ok) {
-      this.sendDeny(conn, "signature invalid");
-      this.dropConnection(conn.device_pubkey_tag);
-      return;
-    }
-    conn.peer_authenticated = true;
-
-    // Authentication clear. Decide local-approval policy.
-    const authorized = this.roster_pubkeys.has(conn.device_pubkey);
-    if (authorized) {
-      conn.local_approved = true;
-      this.sendApprove(conn);
-    } else {
-      // The initiator's identity is the user that just locked a
-      // Network ID — they've already consented to joining. Treat the
-      // initiator side as auto-approving so the user only sees one
-      // approval prompt (on the receiver). Roster gets populated on
-      // both sides as soon as the approve flows complete.
-      if (conn.initiated_by_us) {
-        conn.local_approved = true;
-        try {
-          await invoke("mesh_roster_add", {
-            networkId: this.network_id,
-            deviceId: conn.device_pubkey,
-            label: conn.label,
-          });
-          this.roster_pubkeys.add(conn.device_pubkey);
-        } catch {}
-        this.sendApprove(conn);
-      } else {
-        // Receiver side: surface for user approval. Settings tab
-        // dot lights up so the user knows there's something
-        // waiting even if they're elsewhere in the app.
-        settingsAttention.set("cloud-mesh", {
-          reason: `${shortLabel(conn.label, conn.device_pubkey)} wants to connect`,
-        });
-      }
-    }
-    this.maybePromoteToActive(conn);
-    this.republishPeers();
-  }
+  // ---- helpers ---------------------------------------------------------
 
   private maybePromoteToActive(conn: ConnectionState): void {
     if (
@@ -967,24 +706,20 @@ class MeshClient {
     ) {
       clearTimeout(conn.handshake_timer);
       conn.handshake_timer = null;
+      this.logDiag("info", `peer active: ${conn.device_pubkey.slice(0, 8)}…`);
     }
-    // If we just transitioned to active and there are no more
-    // pending requests, clear the attention dot. Otherwise leave it.
     if (this.computePeers().every((p) => p.status !== "pending_approval")) {
       settingsAttention.set("cloud-mesh", null);
     }
   }
 
-  private dropConnection(device_pubkey_tag: string): void {
-    const c = this.connections.get(device_pubkey_tag);
+  private dropConnection(peer_id: string): void {
+    const c = this.connections.get(peer_id);
     if (!c) return;
     if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
-    try { c.dc.close(); } catch {}
-    this.connections.delete(device_pubkey_tag);
-    // Reject any in-flight outgoing moves to this peer so the
-    // caller's promise settles rather than hanging forever.
+    this.connections.delete(peer_id);
     for (const [guid, pending] of this.pending_moves_out) {
-      if (pending.target_tag === device_pubkey_tag) {
+      if (pending.target_peer_id === peer_id) {
         this.pending_moves_out.delete(guid);
         pending.on_complete?.(false, "peer disconnected mid-move");
       }
@@ -995,34 +730,26 @@ class MeshClient {
     }
   }
 
-  // ---- derived views --------------------------------------------------
-
   private peerStatus(conn: ConnectionState): PeerStatus {
-    if (!conn.peer_authenticated) {
-      if (conn.their_nonce === null) return "connecting";
-      return "handshaking";
-    }
+    if (!conn.peer_authenticated) return "handshaking";
     if (conn.local_approved && conn.remote_approved) return "active";
-    if (!conn.local_approved) return "pending_approval";
+    if (conn.approver_role && !conn.local_approved) return "pending_approval";
     return "pending_remote_approval";
   }
 
   private computePeers(): PeerEntry[] {
     return Array.from(this.connections.values()).map((c) => ({
-      device_pubkey: c.device_pubkey || c.device_pubkey_tag,
-      device_pubkey_tag: c.device_pubkey_tag,
+      peer_id: c.peer_id,
+      device_pubkey: c.device_pubkey,
       device_suffix: c.device_suffix,
-      device_id_display: c.device_suffix
+      device_id_display: c.device_suffix && c.device_pubkey
         ? `${c.device_pubkey}-${c.device_suffix}`
-        : c.device_pubkey || c.device_pubkey_tag,
+        : c.device_pubkey || c.peer_id,
       label: c.label,
       status: this.peerStatus(c),
       authorized: c.device_pubkey ? this.roster_pubkeys.has(c.device_pubkey) : false,
-      initiated_by_us: c.initiated_by_us,
-      connected_at: 0,
-      verification_code: c.initiated_by_us
-        ? c.our_verification_code
-        : c.their_verification_code,
+      approver_role: c.approver_role,
+      verification_code: c.approver_role ? c.their_verification_code : c.our_verification_code,
     }));
   }
 
@@ -1038,24 +765,10 @@ class MeshClient {
       }>("mesh_roster_get", { networkId: this.network_id });
       this.roster_pubkeys = new Set(r.authorized_devices.map((d) => d.device_id));
     } catch (e) {
-      // eslint-disable-next-line no-console
-      console.warn("[mesh] roster load failed", e);
+      this.logDiag("warn", `roster load failed: ${String(e)}`);
       this.roster_pubkeys = new Set();
     }
   }
-}
-
-function parseSignalingUrl(url: string): {
-  host: string;
-  port: number;
-  path: string;
-  secure: boolean;
-} {
-  const u = new URL(url);
-  const secure = u.protocol === "wss:" || u.protocol === "https:";
-  const port = u.port ? parseInt(u.port, 10) : secure ? 443 : 80;
-  const path = u.pathname || "/";
-  return { host: u.hostname, port, path, secure };
 }
 
 function buildIceServers(
