@@ -100,9 +100,11 @@ jobs:
           # gives each runner image its own cache namespace.
           key: ${{ matrix.platform.os }}
 
+      # No `version:` — pnpm/action-setup@v4 reads the version from
+      # package.json's `packageManager` field. Pinning a different
+      # `version:` here causes pnpm 10+ to refuse to run with
+      # ERR_PNPM_BAD_PM_VERSION.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - uses: actions/setup-node@v4
         with:
