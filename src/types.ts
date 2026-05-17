@@ -188,9 +188,11 @@ export interface CloudMeshConfig {
    *  membership. */
   locked: boolean;
   /** WebSocket URLs of signaling servers, in fallback order. The
-   *  first reachable one is used for SDP exchange. Default ships a
-   *  known public server; custom MyOwnLLM distributions can override
-   *  via this config field. */
+   *  first reachable one is used for SDP exchange. Default points at
+   *  the public PeerJS broker (`0.peerjs.com`) so MyOwnLLM doesn't
+   *  operate any required mesh infrastructure; users who want a
+   *  different broker — self-hosted peerjs-server, a private
+   *  WebSocket signaler, etc. — substitute their own URL here. */
   signaling_servers: string[];
   /** STUN server URLs for NAT traversal. Defaults cover Google's
    *  public stun pool; replace or extend per deployment. */

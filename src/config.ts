@@ -43,15 +43,17 @@ const DEFAULT_REMOTE_UI: RemoteUiConfig = {
   port: 1474,
 };
 
-// Default signaling server is a placeholder until the public server is
-// stood up; custom MyOwnLLM distributions can ship their own default via
-// `cloud_mesh.signaling_servers` in the bundled config. STUN servers
-// default to Google's public pool, which is the de-facto baseline.
+// Signaling rendezvous defaults to the public PeerJS broker
+// (0.peerjs.com) so the mesh has no MyOwnLLM-operated infrastructure
+// to depend on. Anyone who wants to self-host can swap in their own
+// peerjs-server URL via this field; custom MyOwnLLM distributions can
+// ship their own default. STUN servers default to Google's public
+// pool, which is the de-facto baseline.
 const DEFAULT_CLOUD_MESH: CloudMeshConfig = {
   enabled: false,
   network_id: "",
   locked: false,
-  signaling_servers: ["wss://mesh.myownllm.net/signal"],
+  signaling_servers: ["wss://0.peerjs.com:443/peerjs"],
   stun_servers: [
     "stun:stun.l.google.com:19302",
     "stun:stun1.l.google.com:19302",

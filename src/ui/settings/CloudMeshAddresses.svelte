@@ -98,8 +98,11 @@
       <h3>Signaling servers</h3>
       <div class="block-hint">
         WebSocket rendezvous used to introduce peers to each other.
-        Tried in order; the first reachable one wins. Custom MyOwnLLM
-        distributions ship their own default.
+        Tried in order; the first reachable one wins. Default points at
+        the public PeerJS broker (<code>0.peerjs.com</code>) so MyOwnLLM
+        doesn't operate any required mesh infrastructure — swap in
+        your own peerjs-server or other compatible signaler to
+        decouple from it entirely.
       </div>
       <div class="list">
         {#each signalingServers as _, i (i)}
