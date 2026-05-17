@@ -45,12 +45,3 @@ export async function generateNetworkId(): Promise<string> {
 export async function normalizeNetworkId(input: string): Promise<string> {
   return await invoke<string>("mesh_network_id_normalize", { input });
 }
-
-/** Render a Device ID for compact display. Keeps the leading and
- *  trailing chunks so the user can spot-check copy-paste, drops the
- *  middle for screen real estate. The full ID is always selectable
- *  in a code element next to this. */
-export function shortenId(id: string, head = 6, tail = 6): string {
-  if (id.length <= head + tail + 1) return id;
-  return `${id.slice(0, head)}…${id.slice(-tail)}`;
-}

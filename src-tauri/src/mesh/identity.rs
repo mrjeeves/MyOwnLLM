@@ -51,10 +51,23 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// Base32-lowercase encoding of the public key. This is the Device
-    /// ID surfaced in the UI and the value other peers will know us by.
+    /// Base32-lowercase encoding of the public key. This is the
+    /// cryptographic identifier used on the wire — peers compare
+    /// pubkeys by this value. Stable across launches.
     pub fn public_id(&self) -> &str {
         &self.public_id
+    }
+
+    /// Display form of the Device ID surfaced in the UI: the
+    /// public-key body, a dash, and a deterministic 5-char
+    /// alphanumeric tag. The tag (sha256 of the pubkey, first 5
+    /// bytes mapped into `[a-z0-9]`) makes instances easier to pick
+    /// out at a glance in a peers list — the same device always
+    /// shows the same tail. Display-only; the protocol still talks
+    /// `public_id()`.
+    pub fn display_id(&self) -> String {
+        let suffix = display_suffix(self.signing_key.verifying_key().as_bytes());
+        format!("{}-{}", self.public_id, suffix)
     }
 
     pub fn label(&self) -> &str {
@@ -70,6 +83,24 @@ impl Identity {
     pub fn signing_key(&self) -> &SigningKey {
         &self.signing_key
     }
+}
+
+/// Derive a 5-char human-recognizable tag from a public key. Maps
+/// 5 bytes of the pubkey's sha256 into `[a-z0-9]` — 36^5 = 60M
+/// distinct tags is plenty for eyeball-disambiguation in a peers
+/// list. Modulo-bias is irrelevant here (this is a display tag, not
+/// a security primitive).
+fn display_suffix(pubkey_bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut hasher = Sha256::new();
+    hasher.update(pubkey_bytes);
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .take(5)
+        .map(|&b| ALPHABET[(b as usize) % ALPHABET.len()] as char)
+        .collect()
 }
 
 /// Path of the anchor file. The directory `~/.myownllm/.secrets/` is
@@ -290,5 +321,31 @@ mod tests {
         assert!(normalize_network_id("not base32!").is_err());
         // Too few bytes
         assert!(normalize_network_id("aaaa").is_err());
+    }
+
+    #[test]
+    fn display_suffix_is_5_alphanumeric() {
+        let bytes = [42u8; 32];
+        let suffix = display_suffix(&bytes);
+        assert_eq!(suffix.len(), 5);
+        assert!(suffix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn display_suffix_is_deterministic() {
+        let bytes = [7u8; 32];
+        assert_eq!(display_suffix(&bytes), display_suffix(&bytes));
+    }
+
+    #[test]
+    fn display_suffix_differs_across_pubkeys() {
+        // Astronomically unlikely to collide on 5 chars of sha256
+        // output, but assert so a future refactor that breaks the
+        // determinism (or accidentally returns a constant) fails loud.
+        let a = display_suffix(&[1u8; 32]);
+        let b = display_suffix(&[2u8; 32]);
+        assert_ne!(a, b);
     }
 }

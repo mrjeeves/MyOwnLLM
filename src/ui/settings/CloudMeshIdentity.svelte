@@ -6,7 +6,6 @@
     generateNetworkId,
     normalizeNetworkId,
     setMeshIdentityLabel,
-    shortenId,
   } from "../../mesh";
 
   /** Persisted Network ID (canonical form). Mirrors `cloud_mesh.network_id`. */
@@ -140,10 +139,13 @@
     confirm = null;
   }
 
-  async function copyDeviceId() {
-    if (!meshUi.identity) return;
+  async function copyNetworkId() {
+    // Copy whatever's currently in the field — the user's intent is "copy
+    // what I see," whether that's the saved value or an in-progress edit.
+    const value = draftNetworkId.trim();
+    if (!value) return;
     try {
-      await navigator.clipboard.writeText(meshUi.identity.device_id);
+      await navigator.clipboard.writeText(value);
     } catch {
       // Clipboard unavailable in some Tauri webview contexts; ignore.
     }
@@ -182,19 +184,25 @@
       <div class="row">
         <label class="field-label" for="device-id">Device ID</label>
         <div class="field-row">
-          <code id="device-id" class="id-display" title={meshUi.identity.device_id}>
-            {meshUi.identity.device_id}
-          </code>
-          <button class="btn-small" onclick={copyDeviceId} title="Copy full Device ID">
-            Copy
-          </button>
+          <input
+            id="device-id"
+            class="text-input mono"
+            type="text"
+            value={meshUi.identity.device_id}
+            disabled
+            spellcheck="false"
+            autocomplete="off"
+            title={meshUi.identity.device_id}
+          />
         </div>
         <div class="field-hint">
           Internal identifier for this MyOwnLLM instance, derived from a
           keypair under <code class="path">~/.myownllm/.secrets/</code>.
-          You don't share this with anyone — peers learn each other's
-          Device IDs automatically at connection time. Shown here for
-          your reference (and for the Connections list on other peers).
+          The five characters after the dash are a stable tag derived
+          from the same key, so you can spot this device in a peers
+          list at a glance. You don't share this with anyone — peers
+          learn each other's Device IDs automatically at connection
+          time.
         </div>
       </div>
 
@@ -205,7 +213,7 @@
             id="device-label"
             class="text-input"
             type="text"
-            placeholder={shortenId(meshUi.identity.device_id)}
+            placeholder="e.g. Laptop, Pi, Office, Home Office"
             bind:value={labelDraft}
             onblur={onLabelBlur}
             disabled={labelSaving}
@@ -213,8 +221,9 @@
           />
         </div>
         <div class="field-hint">
-          Friendly name shown in other peers' Connections list. Cosmetic — peers
-          identify each other by Device ID.
+          Friendly name for this device inside your own little virtual
+          network — what it's called in other peers' Connections list.
+          Cosmetic; peers still identify each other by Device ID.
         </div>
       </div>
     </section>
@@ -256,6 +265,14 @@
             title="Generate a fresh 256-bit Network ID"
           >
             Generate
+          </button>
+          <button
+            class="btn-small"
+            onclick={copyNetworkId}
+            disabled={draftNetworkId.trim() === ""}
+            title="Copy Network ID to share with another device"
+          >
+            Copy
           </button>
         </div>
         {#if inlineError}
@@ -394,21 +411,6 @@
     color: #d6b25a;
   }
 
-  .id-display {
-    flex: 1;
-    font-family: monospace;
-    font-size: 0.78rem;
-    color: #cfeacf;
-    background: #0d0d0d;
-    padding: 0.4rem 0.6rem;
-    border-radius: 5px;
-    border: 1px solid #1e1e1e;
-    user-select: all;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    min-width: 0;
-  }
   .path {
     font-family: monospace;
     font-size: 0.73rem;
@@ -438,6 +440,15 @@
     color: #888;
     background: #161616;
     border-color: #1c1c1c;
+  }
+  /* Device ID is disabled-but-meant-to-be-read. Override the default
+     dimmed disabled palette so it stays legible at a glance while
+     remaining text-selectable for copy/paste. */
+  #device-id:disabled {
+    color: #cfeacf;
+    background: #0d0d0d;
+    border-color: #1e1e1e;
+    cursor: text;
   }
 
   .lock-btn {

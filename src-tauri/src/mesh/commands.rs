@@ -12,7 +12,9 @@ use super::identity;
 
 #[derive(Serialize)]
 pub struct MeshIdentity {
-    /// Base32-lowercase pubkey — the user-facing Device ID.
+    /// Display form of the Device ID: pubkey-suffix. The protocol
+    /// uses the pubkey part directly; the 5-char suffix is a UI
+    /// nicety to tell instances apart in a peers list.
     pub device_id: String,
     /// User-editable label. Empty string when unset; the UI shows a
     /// truncated Device ID in that case.
@@ -20,13 +22,14 @@ pub struct MeshIdentity {
 }
 
 /// Load (or generate on first call) this device's mesh identity.
-/// Returns the Device ID and current label. Safe to call repeatedly
-/// — the keypair is generated exactly once, on first invocation.
+/// Returns the Device ID (display form, pubkey-suffix) and current
+/// label. Safe to call repeatedly — the keypair is generated exactly
+/// once, on first invocation.
 #[tauri::command]
 pub fn mesh_identity_get() -> Result<MeshIdentity, String> {
     identity::load_or_create()
         .map(|id| MeshIdentity {
-            device_id: id.public_id().to_string(),
+            device_id: id.display_id(),
             label: id.label().to_string(),
         })
         .map_err(|e| format!("{e:#}"))
