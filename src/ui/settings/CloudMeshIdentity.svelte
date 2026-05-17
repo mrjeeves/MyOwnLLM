@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { loadConfig, updateConfig } from "../../config";
   import { meshUi } from "../../mesh-state.svelte";
+  import { meshClient } from "../../mesh-client.svelte";
   import {
     generateNetworkId,
     normalizeNetworkId,
@@ -31,6 +32,41 @@
 
   let labelDraft = $state("");
   let labelSaving = $state(false);
+
+  /** Split the live peer list into active connections (anything that
+   *  isn't waiting on our approval) vs. pending requests (waiting on
+   *  us). Receiver side surfaces requests; everyone else just sees
+   *  the connection state. */
+  let connections = $derived(
+    meshClient.peers.filter((p) => p.status !== "pending_approval"),
+  );
+  let pendingRequests = $derived(
+    meshClient.peers.filter((p) => p.status === "pending_approval"),
+  );
+
+  function shortPubkey(pk: string): string {
+    if (pk.length <= 14) return pk;
+    return `${pk.slice(0, 8)}…${pk.slice(-5)}`;
+  }
+
+  function statusLabel(s: string): string {
+    switch (s) {
+      case "connecting":
+        return "connecting";
+      case "handshaking":
+        return "authenticating";
+      case "pending_remote_approval":
+        return "awaiting peer";
+      case "active":
+        return "live";
+      case "denied":
+        return "denied";
+      case "failed":
+        return "failed";
+      default:
+        return s;
+    }
+  }
 
   onMount(async () => {
     await meshUi.ensureLoaded();
@@ -130,6 +166,10 @@
       });
       savedNetworkId = networkId;
       locked = lockedAfter;
+      // Bring the mesh client in line with what the user just
+      // committed: start it on lock, stop it on unlock, restart it
+      // when the Network ID changes.
+      meshClient.reconcile().catch(() => {});
     } finally {
       saving = false;
     }
@@ -304,21 +344,82 @@
     </section>
 
     <section class="block">
-      <h3>Connections</h3>
-      <div class="empty-state">
-        Not connected to any peers yet. Once the mesh transport ships in the
-        next release, joining a network will populate this list with direct
-        and indirect peers.
+      <h3>Status</h3>
+      <div class="status-row">
+        <span class="status-dot" class:online={meshClient.status === "online"} class:starting={meshClient.status === "starting"} class:error-dot={meshClient.status === "error"}></span>
+        <span class="status-text">
+          {#if meshClient.status === "off"}
+            Offline. Lock a Network ID to connect.
+          {:else if meshClient.status === "starting"}
+            Connecting to signaling broker…
+          {:else if meshClient.status === "online"}
+            Online — {meshClient.peers.length} {meshClient.peers.length === 1 ? "peer" : "peers"} ·
+            {#if connections.length > 1}router-eligible{:else}leaf{/if}
+          {:else}
+            Error: {meshClient.error}
+          {/if}
+        </span>
       </div>
     </section>
 
     <section class="block">
+      <h3>Connections</h3>
+      {#if connections.length === 0}
+        <div class="empty-state">
+          Not connected to any peers yet. Once another device joins the same
+          Network ID, peers find each other through the signaling broker and
+          establish direct WebRTC connections.
+        </div>
+      {:else}
+        <div class="peer-list">
+          {#each connections as p (p.device_pubkey)}
+            <div class="peer-row">
+              <div class="peer-main">
+                <div class="peer-label">
+                  {p.label || shortPubkey(p.device_pubkey)}
+                  {#if p.authorized}<span class="badge ok">approved</span>{/if}
+                </div>
+                <code class="peer-id">{shortPubkey(p.device_pubkey)}</code>
+              </div>
+              <span class="peer-status" data-status={p.status}>{statusLabel(p.status)}</span>
+              <button class="btn-small ghost" onclick={() => meshClient.removePeer(p.device_pubkey)} title="Disconnect and revoke approval">
+                Remove
+              </button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
+
+    <section class="block">
       <h3>Network requests</h3>
-      <div class="empty-state">
-        No pending requests. When another device asks to join your mesh and
-        isn't already vouched for by a peer you trust, the request will show
-        up here.
-      </div>
+      {#if pendingRequests.length === 0}
+        <div class="empty-state">
+          No pending requests. When another device asks to join your mesh and
+          isn't already vouched for, the request will show up here for your
+          approval.
+        </div>
+      {:else}
+        <div class="peer-list">
+          {#each pendingRequests as p (p.device_pubkey)}
+            <div class="peer-row request">
+              <div class="peer-main">
+                <div class="peer-label">
+                  {p.label || shortPubkey(p.device_pubkey)}
+                  <span class="badge pending">wants to connect</span>
+                </div>
+                <code class="peer-id">{shortPubkey(p.device_pubkey)}</code>
+              </div>
+              <button class="btn-small primary" onclick={() => meshClient.approveRequest(p.device_pubkey)}>
+                Approve
+              </button>
+              <button class="btn-small ghost" onclick={() => meshClient.denyRequest(p.device_pubkey)}>
+                Deny
+              </button>
+            </div>
+          {/each}
+        </div>
+      {/if}
     </section>
   {/if}
 
@@ -505,6 +606,128 @@
     padding: 0.35rem 0.55rem;
     border-radius: 5px;
     max-width: 32rem;
+  }
+
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.55rem 0.7rem;
+    background: #131313;
+    border: 1px solid #1e1e1e;
+    border-radius: 6px;
+  }
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #555;
+    flex-shrink: 0;
+  }
+  .status-dot.online {
+    background: #6c6;
+    box-shadow: 0 0 6px rgba(102, 204, 102, 0.6);
+  }
+  .status-dot.starting {
+    background: #d6b25a;
+    box-shadow: 0 0 6px rgba(214, 178, 90, 0.6);
+  }
+  .status-dot.error-dot {
+    background: #d66;
+    box-shadow: 0 0 6px rgba(214, 102, 102, 0.6);
+  }
+  .status-text {
+    font-size: 0.78rem;
+    color: #aaa;
+  }
+
+  .peer-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  .peer-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.65rem;
+    background: #131313;
+    border: 1px solid #1e1e1e;
+    border-radius: 6px;
+  }
+  .peer-row.request {
+    border-color: #4a3a18;
+    background: #1f1a0d;
+  }
+  .peer-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+  }
+  .peer-label {
+    font-size: 0.85rem;
+    color: #e8e8e8;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .peer-id {
+    font-family: monospace;
+    font-size: 0.7rem;
+    color: #666;
+  }
+  .peer-status {
+    font-size: 0.72rem;
+    color: #888;
+    padding: 0.15rem 0.45rem;
+    border-radius: 3px;
+    background: #1a1a22;
+    text-transform: lowercase;
+    font-family: monospace;
+  }
+  .peer-status[data-status="active"] {
+    color: #6c6;
+    background: #122212;
+  }
+  .peer-status[data-status="connecting"],
+  .peer-status[data-status="handshaking"],
+  .peer-status[data-status="pending_remote_approval"] {
+    color: #d6b25a;
+    background: #2a220e;
+  }
+  .badge {
+    font-size: 0.65rem;
+    padding: 0.05rem 0.35rem;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .badge.ok {
+    color: #6c6;
+    background: #122212;
+  }
+  .badge.pending {
+    color: #ffd166;
+    background: #2a2210;
+  }
+  .btn-small.primary {
+    background: #2a3a55;
+    color: #cdeaff;
+    border-color: #3a4a6a;
+  }
+  .btn-small.primary:hover {
+    background: #344566;
+  }
+  .btn-small.ghost {
+    background: none;
+    border: 1px solid #222;
+    color: #888;
+  }
+  .btn-small.ghost:hover {
+    background: #1c1c1c;
+    color: #ccc;
   }
 
   .empty-state {

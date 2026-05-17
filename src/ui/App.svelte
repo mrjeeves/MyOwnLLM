@@ -27,6 +27,7 @@
     type FolderMeta,
   } from "../conversations";
   import { updateUi } from "../update-state.svelte";
+  import { meshClient } from "../mesh-client.svelte";
   import {
     transcribeUi,
     stopRecording,
@@ -198,6 +199,13 @@
       if (config.auto_cleanup?.legacy !== false) {
         invoke<number>("legacy_models_remove_all").catch(() => {});
       }
+      // Bring up the Cloud Mesh client if the user has a locked
+      // Network ID from a previous session. Fire-and-forget — the
+      // PeerJS broker connection runs entirely off the startup path
+      // and the user sees its status in Settings → Cloud Mesh →
+      // Identity.
+      meshClient.reconcile().catch(() => {});
+
       if (config.auto_cleanup?.conversations !== false) {
         clearConversationOrphans().catch(() => {});
       }
