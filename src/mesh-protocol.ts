@@ -255,12 +255,16 @@ export function base32Encode(bytes: Uint8Array): string {
 
 /** Strip the `-XXXXX` display suffix from a Device ID, returning
  *  just the pubkey portion. Mirrors `signing::pubkey_part` on the
- *  Rust side. */
+ *  Rust side (which uses `is_ascii_alphanumeric()` — case-
+ *  insensitive). The current suffix format is 5 uppercase-hex
+ *  chars (sha256 → first-5-hex-uppercased), but we accept any
+ *  alphanumeric 5-char tail so legacy IDs from earlier commits
+ *  on this branch (lowercase-alphanumeric) also strip cleanly. */
 export function pubkeyPart(device_id: string): string {
   const idx = device_id.lastIndexOf("-");
   if (idx === -1) return device_id;
   const suffix = device_id.slice(idx + 1);
-  if (suffix.length === 5 && /^[a-z0-9]+$/.test(suffix)) {
+  if (suffix.length === 5 && /^[a-zA-Z0-9]{5}$/.test(suffix)) {
     return device_id.slice(0, idx);
   }
   return device_id;
