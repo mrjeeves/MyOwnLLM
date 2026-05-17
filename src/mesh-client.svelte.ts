@@ -145,6 +145,14 @@ interface ConnectionState {
    *  prompts the user / auto-approves and sends `approve`. */
   approver_role: boolean;
   handshake_timer: number | null;
+  /** Last time we received ANY message from this peer (ping,
+   *  pong, protocol envelope). Used by the heartbeat tick to
+   *  decide if the connection is still alive — catches the
+   *  "laptop suspended, WebRTC layer didn't notice" case. */
+  last_recv_at: number;
+  /** setInterval handle for the keepalive ping. Active from the
+   *  moment the connection state is created until it's dropped. */
+  heartbeat_timer: number | null;
 }
 
 class MeshClient {
@@ -466,7 +474,28 @@ class MeshClient {
       );
       this.dropConnection(peer_id);
     }, HANDSHAKE_TIMEOUT_MS);
+    // Keepalive: every HEARTBEAT_INTERVAL_MS we ping and check
+    // staleness. If the peer's gone (e.g. their device sleeping)
+    // Trystero may not notice via WebRTC alone — this app-level
+    // tick is the source of truth for "did we hear from them
+    // recently."
+    conn.heartbeat_timer = window.setInterval(() => {
+      this.heartbeatTick(conn);
+    }, HEARTBEAT_INTERVAL_MS);
     this.republishPeers();
+  }
+
+  private heartbeatTick(conn: ConnectionState): void {
+    const now = Date.now();
+    if (now - conn.last_recv_at > HEARTBEAT_TIMEOUT_MS) {
+      this.logDiag(
+        "warn",
+        `peer ${conn.peer_id.slice(0, 8)}… silent for ${Math.round((now - conn.last_recv_at) / 1000)}s — dropping`,
+      );
+      this.dropConnection(conn.peer_id);
+      return;
+    }
+    this.send(conn, { kind: "ping", t: now });
   }
 
   private handlePeerLeave(peer_id: string): void {
@@ -486,6 +515,8 @@ class MeshClient {
       peer_authenticated: false,
       remote_approved: false,
       local_approved: false,
+      last_recv_at: Date.now(),
+      heartbeat_timer: null,
       approver_role: false, // set in handleHello once we know both pubkeys
       handshake_timer: null,
     };
