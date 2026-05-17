@@ -8,7 +8,7 @@
 
 use serde::Serialize;
 
-use super::identity;
+use super::{identity, roster, signing};
 
 #[derive(Serialize)]
 pub struct MeshIdentity {
@@ -60,4 +60,86 @@ pub fn mesh_network_id_generate() -> String {
 #[tauri::command]
 pub fn mesh_network_id_normalize(input: String) -> Result<String, String> {
     identity::normalize_network_id(&input).map_err(|e| format!("{e:#}"))
+}
+
+// ---- signing / verification --------------------------------------------
+
+/// Sign a message with this device's private key. The frontend uses
+/// this for the auth handshake (challenge/response) and for any
+/// future signed-gossip operations. Message bytes are passed as
+/// base32-lowercase to avoid byte-array marshaling issues across the
+/// Tauri bridge; returned signature is also base32-lowercase.
+#[tauri::command]
+pub fn mesh_sign(message_b32: String) -> Result<String, String> {
+    let bytes = data_encoding::BASE32_NOPAD
+        .decode(message_b32.to_uppercase().as_bytes())
+        .map_err(|e| format!("decode message: {e}"))?;
+    signing::sign(&bytes).map_err(|e| format!("{e:#}"))
+}
+
+/// Verify a signature claim from another peer. Returns true iff
+/// `signature_b32` is a valid ed25519 signature of `message_b32` under
+/// the pubkey portion of `device_id`. Accepts Device IDs in either
+/// the bare-pubkey or pubkey-suffix display form.
+#[tauri::command]
+pub fn mesh_verify(
+    device_id: String,
+    message_b32: String,
+    signature_b32: String,
+) -> Result<bool, String> {
+    let bytes = data_encoding::BASE32_NOPAD
+        .decode(message_b32.to_uppercase().as_bytes())
+        .map_err(|e| format!("decode message: {e}"))?;
+    signing::verify(&device_id, &bytes, &signature_b32).map_err(|e| format!("{e:#}"))
+}
+
+// ---- roster ------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct RosterView {
+    pub network_id: String,
+    pub authorized_devices: Vec<roster::AuthorizedPeer>,
+}
+
+impl From<roster::Roster> for RosterView {
+    fn from(r: roster::Roster) -> Self {
+        RosterView {
+            network_id: r.network_id,
+            authorized_devices: r.authorized_devices,
+        }
+    }
+}
+
+/// Load the roster scoped to a Network ID. Returns an empty roster
+/// for a never-seen network or after a network change (old approvals
+/// don't carry across networks).
+#[tauri::command]
+pub fn mesh_roster_get(network_id: String) -> Result<RosterView, String> {
+    roster::load(&network_id)
+        .map(RosterView::from)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Approve a peer by adding them to the roster under the given
+/// Network ID. Idempotent — re-approving an existing peer refreshes
+/// their label but preserves the original `approved_at`.
+#[tauri::command]
+pub fn mesh_roster_add(
+    network_id: String,
+    device_id: String,
+    label: String,
+) -> Result<RosterView, String> {
+    roster::add_peer(&network_id, &device_id, &label)
+        .map(RosterView::from)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Remove a peer from the roster. Used both by the user manually
+/// revoking access and (in future) by automated kicks via signed
+/// threshold ops.
+#[tauri::command]
+pub fn mesh_roster_remove(network_id: String, device_id: String) -> Result<RosterView, String> {
+    roster::remove_peer(&network_id, &device_id)
+        .map(RosterView::from)
+        .map_err(|e| format!("{e:#}"))
 }

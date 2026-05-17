@@ -67,7 +67,7 @@ impl Identity {
     /// `public_id()`.
     pub fn display_id(&self) -> String {
         let suffix = display_suffix(self.signing_key.verifying_key().as_bytes());
-        format!("{}-{}", self.public_id, suffix)
+        format!("{}-{}", self.public_id(), suffix)
     }
 
     pub fn label(&self) -> &str {

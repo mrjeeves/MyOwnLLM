@@ -19,3 +19,5 @@
 
 pub mod commands;
 pub mod identity;
+pub mod roster;
+pub mod signing;
