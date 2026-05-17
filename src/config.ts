@@ -49,11 +49,17 @@ const DEFAULT_REMOTE_UI: RemoteUiConfig = {
 // peerjs-server URL via this field; custom MyOwnLLM distributions can
 // ship their own default. STUN servers default to Google's public
 // pool, which is the de-facto baseline.
+//
+// Exported so the Addresses UI can use it as a fallback when the
+// user removes every entry — signaling_servers is never allowed to
+// persist as empty.
+export const DEFAULT_PEERJS_SIGNALING_URL = "wss://0.peerjs.com:443/peerjs";
+
 const DEFAULT_CLOUD_MESH: CloudMeshConfig = {
   enabled: false,
   network_id: "",
   locked: false,
-  signaling_servers: ["wss://0.peerjs.com:443/peerjs"],
+  signaling_servers: [DEFAULT_PEERJS_SIGNALING_URL],
   stun_servers: [
     "stun:stun.l.google.com:19302",
     "stun:stun1.l.google.com:19302",
@@ -195,10 +201,13 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
 }
 
 /** Merge a partial cloud_mesh config from a saved file with defaults,
- *  preserving array fields the user has customised. Arrays default
- *  only when the saved value is missing entirely — an empty array is
- *  a valid user choice (e.g. "I want no TURN servers"), so we don't
- *  overwrite it. */
+ *  preserving array fields the user has customised. STUN and TURN
+ *  arrays default only when the saved value is missing entirely — an
+ *  empty array is a valid user choice (e.g. "I want no TURN servers"),
+ *  so we don't overwrite it. Signaling is different: a peer needs
+ *  somewhere to rendezvous, so an empty saved value is treated as
+ *  missing and the PeerJS default is restored. This is what makes the
+ *  default reappear after a user removes every entry and restarts. */
 function mergeCloudMesh(raw: Partial<CloudMeshConfig> | undefined): CloudMeshConfig {
   if (!raw) {
     return {
@@ -213,7 +222,9 @@ function mergeCloudMesh(raw: Partial<CloudMeshConfig> | undefined): CloudMeshCon
     network_id: raw.network_id ?? DEFAULT_CLOUD_MESH.network_id,
     locked: raw.locked ?? DEFAULT_CLOUD_MESH.locked,
     signaling_servers:
-      raw.signaling_servers ?? [...DEFAULT_CLOUD_MESH.signaling_servers],
+      raw.signaling_servers && raw.signaling_servers.length > 0
+        ? raw.signaling_servers
+        : [...DEFAULT_CLOUD_MESH.signaling_servers],
     stun_servers: raw.stun_servers ?? [...DEFAULT_CLOUD_MESH.stun_servers],
     turn_servers: raw.turn_servers ?? [...DEFAULT_CLOUD_MESH.turn_servers],
   };

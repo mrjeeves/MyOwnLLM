@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { loadConfig, updateConfig } from "../../config";
+  import { loadConfig, updateConfig, DEFAULT_PEERJS_SIGNALING_URL } from "../../config";
   import type { TurnServer } from "../../types";
 
   let signalingServers = $state<string[]>([]);
@@ -34,10 +34,17 @@
     error = "";
     try {
       const cfg = await loadConfig();
+      // Signaling must never persist as empty — a peer needs somewhere to
+      // rendezvous. If the user has cleared every entry we restore the
+      // PeerJS default so the next load (or reopened settings panel)
+      // shows it again. STUN and TURN can legitimately be empty.
+      const filteredSignaling = signalingServers.filter((s) => s.trim() !== "");
+      const persistedSignaling =
+        filteredSignaling.length > 0 ? filteredSignaling : [DEFAULT_PEERJS_SIGNALING_URL];
       await updateConfig({
         cloud_mesh: {
           ...cfg.cloud_mesh,
-          signaling_servers: signalingServers.filter((s) => s.trim() !== ""),
+          signaling_servers: persistedSignaling,
           stun_servers: stunServers.filter((s) => s.trim() !== ""),
           turn_servers: turnServers.filter((t) => t.url.trim() !== ""),
         },
@@ -53,7 +60,12 @@
     signalingServers[i] = value;
   }
   function addSignaling() {
-    signalingServers = [...signalingServers, ""];
+    // Pre-fill with the PeerJS default when the list is empty so the
+    // user gets back to a working state with one click after clearing
+    // everything. Subsequent adds give an empty row to fill in manually.
+    const next = signalingServers.length === 0 ? DEFAULT_PEERJS_SIGNALING_URL : "";
+    signalingServers = [...signalingServers, next];
+    if (next !== "") void persist();
   }
   function removeSignaling(i: number) {
     signalingServers = signalingServers.filter((_, idx) => idx !== i);
