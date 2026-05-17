@@ -42,6 +42,7 @@ import {
   authPayload,
   deriveNetworkHandle,
   generateNonce,
+  generateVerificationCode,
   parsePeerJsId,
   peerJsId,
   pubkeyPart,
@@ -77,6 +78,14 @@ export interface PeerEntry {
   /** True when we were the side that initiated this connection. */
   initiated_by_us: boolean;
   connected_at: number;
+  /** Six-char verification code the user reads to confirm the
+   *  request is the one they expect. On the initiator side this is
+   *  the code we sent (so the local user can read it to the
+   *  remote); on the receiver side this is the code we received
+   *  from the peer (so the local user can confirm it matches what
+   *  the remote person quoted them). Both sides see the same
+   *  string. */
+  verification_code: string;
 }
 
 interface ConnectionState {
@@ -87,6 +96,14 @@ interface ConnectionState {
   our_nonce: string;
   /** Their nonce — populated after we receive their `hello`. */
   their_nonce: string | null;
+  /** Verification code WE generated and sent in our `hello`. The
+   *  initiator's UI shows this — the local user reads it to the
+   *  remote to confirm. */
+  our_verification_code: string;
+  /** Verification code we RECEIVED from the peer's `hello`. The
+   *  receiver's UI shows this in Network Requests — the local user
+   *  confirms it matches what the remote person quoted. */
+  their_verification_code: string;
   /** True after we've verified the auth_response signature. */
   peer_authenticated: boolean;
   /** True after they've sent us `approve`. Always true on the
@@ -476,6 +493,8 @@ class MeshClient {
       initiated_by_us: initiator,
       our_nonce: generateNonce(),
       their_nonce: null,
+      our_verification_code: generateVerificationCode(),
+      their_verification_code: "",
       peer_authenticated: false,
       remote_approved: false,
       local_approved: false,
@@ -511,6 +530,7 @@ class MeshClient {
       device_id: pubkeyPart(this.identity.device_id),
       label: this.identity.label,
       nonce: conn.our_nonce,
+      verification_code: conn.our_verification_code,
     };
     this.send(conn, msg);
   }
@@ -698,6 +718,11 @@ class MeshClient {
     }
     conn.their_nonce = msg.nonce;
     conn.label = msg.label || "";
+    // Stash the peer's verification code so the receiver UI can
+    // surface it for confirmation. Length-clamp defensively — the
+    // sender controls this field and we don't want a runaway string
+    // breaking the layout.
+    conn.their_verification_code = (msg.verification_code || "").slice(0, 16);
     this.republishPeers();
 
     // Sign the payload they expect to verify against us.
@@ -835,6 +860,12 @@ class MeshClient {
       authorized: this.roster_pubkeys.has(c.device_pubkey),
       initiated_by_us: c.initiated_by_us,
       connected_at: 0, // set on first transition to handshaking; v1 is fine without
+      // Initiator surfaces what they sent (so the local user can
+      // read it aloud); receiver surfaces what they received (so
+      // the local user confirms it matches what the remote quoted).
+      verification_code: c.initiated_by_us
+        ? c.our_verification_code
+        : c.their_verification_code,
     }));
   }
 

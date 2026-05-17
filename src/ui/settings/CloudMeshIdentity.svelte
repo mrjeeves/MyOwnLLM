@@ -374,13 +374,19 @@
       {:else}
         <div class="peer-list">
           {#each connections as p (p.device_pubkey)}
-            <div class="peer-row">
+            <div class="peer-row" class:awaiting={p.status === "pending_remote_approval"}>
               <div class="peer-main">
                 <div class="peer-label">
                   {p.label || shortPubkey(p.device_pubkey)}
                   {#if p.authorized}<span class="badge ok">approved</span>{/if}
                 </div>
                 <code class="peer-id">{shortPubkey(p.device_pubkey)}</code>
+                {#if p.status === "pending_remote_approval" && p.verification_code}
+                  <div class="verify-line">
+                    Your code: <code class="code-pill">{p.verification_code}</code>
+                    <span class="verify-hint">tell the other side to confirm this</span>
+                  </div>
+                {/if}
               </div>
               <span class="peer-status" data-status={p.status}>{statusLabel(p.status)}</span>
               <button class="btn-small ghost" onclick={() => meshClient.removePeer(p.device_pubkey)} title="Disconnect and revoke approval">
@@ -410,6 +416,14 @@
                   <span class="badge pending">wants to connect</span>
                 </div>
                 <code class="peer-id">{shortPubkey(p.device_pubkey)}</code>
+                {#if p.verification_code}
+                  <div class="verify-line">
+                    Their code: <code class="code-pill">{p.verification_code}</code>
+                    <span class="verify-hint">
+                      confirm this matches what they read out before you approve
+                    </span>
+                  </div>
+                {/if}
               </div>
               <button class="btn-small primary" onclick={() => meshClient.approveRequest(p.device_pubkey)}>
                 Approve
@@ -659,6 +673,34 @@
   .peer-row.request {
     border-color: #4a3a18;
     background: #1f1a0d;
+  }
+  .peer-row.awaiting {
+    border-color: #3a3a55;
+    background: #161624;
+  }
+  .verify-line {
+    font-size: 0.74rem;
+    color: #aaa;
+    margin-top: 0.25rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .verify-hint {
+    color: #666;
+    font-size: 0.7rem;
+  }
+  .code-pill {
+    font-family: monospace;
+    font-size: 0.95rem;
+    letter-spacing: 0.08em;
+    color: #ffd166;
+    background: #2a2210;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    border: 1px solid #4a3a18;
+    user-select: all;
   }
   .peer-main {
     flex: 1;
