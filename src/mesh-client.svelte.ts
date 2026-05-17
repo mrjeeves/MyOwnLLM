@@ -52,7 +52,14 @@ import {
   type MeshMessage,
 } from "./mesh-protocol";
 
-const HANDSHAKE_TIMEOUT_MS = 20_000;
+/** Watchdog for the cryptographic handshake only. If a peer doesn't
+ *  send a valid `auth_response` within this window we assume the
+ *  channel is broken and drop. Once `peer_authenticated` flips true
+ *  we clear the timer — the subsequent waits (for the local user to
+ *  click Approve, or for the remote side's `approve`) have no
+ *  timeout, because verifying a code with a peer out-of-band can
+ *  easily take more than 30s. */
+const HANDSHAKE_TIMEOUT_MS = 30_000;
 const DIAG_MAX = 80;
 /** Globally-unique app identifier passed to Trystero so MyOwnLLM
  *  peers don't accidentally match peers from unrelated apps that
@@ -395,8 +402,15 @@ class MeshClient {
     this.connections.set(peer_id, conn);
     this.sendHello(conn);
     conn.handshake_timer = window.setTimeout(() => {
-      if (this.peerStatus(conn) === "active") return;
-      this.logDiag("warn", `handshake timeout for ${peer_id.slice(0, 8)}…`);
+      // Only fire if we never made it past the cryptographic
+      // handshake. Once `peer_authenticated` is set the watchdog
+      // is cleared explicitly in handleAuthResponse, so this
+      // callback firing means the peer genuinely never replied.
+      if (conn.peer_authenticated) return;
+      this.logDiag(
+        "warn",
+        `handshake timeout for ${peer_id.slice(0, 8)}… — peer never sent auth_response`,
+      );
       this.dropConnection(peer_id);
     }, HANDSHAKE_TIMEOUT_MS);
     this.republishPeers();
@@ -583,6 +597,13 @@ class MeshClient {
       return;
     }
     conn.peer_authenticated = true;
+    // Cryptographic handshake is complete — kill the watchdog. The
+    // peer is now genuinely waiting on user approval (locally or
+    // remotely) and that can take as long as it takes.
+    if (conn.handshake_timer !== null) {
+      clearTimeout(conn.handshake_timer);
+      conn.handshake_timer = null;
+    }
     this.logDiag(
       "info",
       `auth ok with ${conn.device_pubkey.slice(0, 8)}… (approver=${conn.approver_role})`,
@@ -701,11 +722,15 @@ class MeshClient {
     if (
       conn.peer_authenticated &&
       conn.local_approved &&
-      conn.remote_approved &&
-      conn.handshake_timer !== null
+      conn.remote_approved
     ) {
-      clearTimeout(conn.handshake_timer);
-      conn.handshake_timer = null;
+      // Defensive: watchdog should already be cleared at this
+      // point (cleared on `peer_authenticated`). Re-clear just
+      // in case some future code path leaves it dangling.
+      if (conn.handshake_timer !== null) {
+        clearTimeout(conn.handshake_timer);
+        conn.handshake_timer = null;
+      }
       this.logDiag("info", `peer active: ${conn.device_pubkey.slice(0, 8)}…`);
     }
     if (this.computePeers().every((p) => p.status !== "pending_approval")) {
