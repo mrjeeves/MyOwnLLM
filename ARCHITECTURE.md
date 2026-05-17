@@ -89,6 +89,7 @@ A tier carries three RAM/VRAM thresholds because Apple Silicon and discrete GPUs
 | `hardware.rs` | nvidia-smi / rocm-smi / sysctl / /proc detection. |
 | `ollama.rs` | spawn/stop `ollama serve`, pull, list, delete, warm, has_model. |
 | `purge.rs` | Danger-zone resets: `purge_models` / `purge_conversations` / `purge_all`. Shared between the Storage tab's "Danger zone" Tauri commands and `myownllm purge` in the CLI. |
+| `mesh/` | Cloud Mesh substrate. `identity.rs` owns the long-lived ed25519 keypair persisted to `~/.myownllm/.secrets/identity.json` (0600 on Unix), generated lazily on first mesh-tab visit. `commands.rs` exposes `mesh_identity_get` / `mesh_identity_set_label` / `mesh_network_id_generate` / `mesh_network_id_normalize` to the GUI. Wire transport (signaling, WebRTC, gossip, roster CRDT, Move) lives in upcoming submodules; identity + Network ID handling is the shipped surface. |
 
 ## Modules (TypeScript)
 
@@ -102,6 +103,8 @@ The TS layer is the GUI's source of truth. The Rust layer reads the same on-disk
 | `model-lifecycle.ts` | `recomputeRecommendedSet`, `runCleanup`, `pruneNow`, `markEvictedNow`. |
 | `import-export.ts` | Bundle config to/from `myownllm:import:…` URLs. |
 | `preload.ts`, `watcher.ts` | Thin Tauri-invoke wrappers for the Rust counterparts. |
+| `mesh.ts`, `mesh-state.svelte.ts` | Cloud Mesh bindings + reactive UI state. `mesh.ts` wraps the four Rust commands; `mesh-state.svelte.ts` caches the identity readout for the session and exposes an `ensureLoaded()` for the Cloud Mesh settings tab. |
+| `settings-attention.svelte.ts` | Generic per-tab attention indicator registry. `SettingsPanel` renders dots from this store; the legacy `updateUi.available` signal is mirrored into it so the existing Updates dot keeps working through the unified path. New tabs that need a dot just call `settingsAttention.set(tabId, …)`. |
 | `ui/*.svelte` | Svelte 5 UI. |
 
 ## Live update lifecycle

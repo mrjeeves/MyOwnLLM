@@ -41,6 +41,18 @@ sha2 = "0.10"
 hex = "0.4"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
+# Cloud Mesh identity layer. Each instance generates a long-lived
+# ed25519 keypair on first use of the mesh feature, stored under
+# `~/.myownllm/.secrets/identity.json`. The public key is encoded as
+# base32-lowercase (RFC 4648) and surfaced as the Device ID; Network IDs
+# use the same encoding for 256-bit shared rendezvous handles. The
+# `rand_core/getrandom` feature pulls OS randomness for keypair and
+# Network ID generation. Wire protocol / signaling / WebRTC live in
+# follow-up PRs; this dep set covers identity + the anchor file only.
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+data-encoding = "2"
+
 # Local transcription stack. ASR + diarization run as ONNX models via
 # the `ort` crate (onnxruntime). Loading is `load-dynamic` so the
 # onnxruntime dylib is resolved at runtime rather than statically

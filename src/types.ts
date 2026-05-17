@@ -163,6 +163,43 @@ export interface RemoteUiConfig {
   port: number;
 }
 
+/** TURN relay server. URL plus optional credentials — TURN servers
+ *  typically require auth because they consume bandwidth. */
+export interface TurnServer {
+  url: string;
+  username?: string;
+  credential?: string;
+}
+
+/** Cloud Mesh — peer-to-peer substrate that lets multiple MyOwnLLM instances
+ *  share identities, conversations, and (later) sensors / compute. Off by
+ *  default. The Device ID is derived from the ed25519 keypair stored under
+ *  `~/.myownllm/.secrets/identity.json` and lives outside this config — only
+ *  the network membership and address configuration lives here. */
+export interface CloudMeshConfig {
+  enabled: boolean;
+  /** Shared rendezvous handle for the mesh. Empty string when no
+   *  network is configured. Persisted in canonical base32-lowercase
+   *  form (256-bit, 52 chars). */
+  network_id: string;
+  /** True when the user has committed the current `network_id`. The
+   *  Cloud Mesh settings tab uses this to gate edits behind a lock
+   *  icon and warning popup so a misclick can't silently swap mesh
+   *  membership. */
+  locked: boolean;
+  /** WebSocket URLs of signaling servers, in fallback order. The
+   *  first reachable one is used for SDP exchange. Default ships a
+   *  known public server; custom MyOwnLLM distributions can override
+   *  via this config field. */
+  signaling_servers: string[];
+  /** STUN server URLs for NAT traversal. Defaults cover Google's
+   *  public stun pool; replace or extend per deployment. */
+  stun_servers: string[];
+  /** TURN relay servers — optional fallback when STUN can't punch
+   *  through. Empty by default; users add their own credentials. */
+  turn_servers: TurnServer[];
+}
+
 /** Microphone capture settings used by transcribe mode. Audio capture
  *  runs through cpal on the Rust side; `device_name` is matched against
  *  `cpal::Device::name()`. Empty string = system default. The ASR
@@ -229,6 +266,7 @@ export interface Config {
   api: ApiConfig;
   auto_update: AutoUpdateConfig;
   remote_ui: RemoteUiConfig;
+  cloud_mesh: CloudMeshConfig;
   mic: MicConfig;
   providers: Provider[];
 }

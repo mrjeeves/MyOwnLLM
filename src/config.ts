@@ -6,6 +6,7 @@ import type {
   AutoUpdateConfig,
   AutoCleanupConfig,
   RemoteUiConfig,
+  CloudMeshConfig,
   MicConfig,
 } from "./types";
 
@@ -42,6 +43,22 @@ const DEFAULT_REMOTE_UI: RemoteUiConfig = {
   port: 1474,
 };
 
+// Default signaling server is a placeholder until the public server is
+// stood up; custom MyOwnLLM distributions can ship their own default via
+// `cloud_mesh.signaling_servers` in the bundled config. STUN servers
+// default to Google's public pool, which is the de-facto baseline.
+const DEFAULT_CLOUD_MESH: CloudMeshConfig = {
+  enabled: false,
+  network_id: "",
+  locked: false,
+  signaling_servers: ["wss://mesh.myownllm.net/signal"],
+  stun_servers: [
+    "stun:stun.l.google.com:19302",
+    "stun:stun1.l.google.com:19302",
+  ],
+  turn_servers: [],
+};
+
 const DEFAULT_AUTO_CLEANUP: AutoCleanupConfig = {
   models: true,
   transcribe_buffer: true,
@@ -76,6 +93,12 @@ const DEFAULT_CONFIG: Config = {
   api: { ...DEFAULT_API },
   auto_update: { ...DEFAULT_AUTO_UPDATE },
   remote_ui: { ...DEFAULT_REMOTE_UI },
+  cloud_mesh: {
+    ...DEFAULT_CLOUD_MESH,
+    signaling_servers: [...DEFAULT_CLOUD_MESH.signaling_servers],
+    stun_servers: [...DEFAULT_CLOUD_MESH.stun_servers],
+    turn_servers: [...DEFAULT_CLOUD_MESH.turn_servers],
+  },
   mic: { ...DEFAULT_MIC },
   providers: [
     {
@@ -127,6 +150,9 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
       ...DEFAULT_REMOTE_UI,
       ...((raw as { remote_ui?: Partial<RemoteUiConfig> }).remote_ui ?? {}),
     },
+    cloud_mesh: mergeCloudMesh(
+      (raw as { cloud_mesh?: Partial<CloudMeshConfig> }).cloud_mesh,
+    ),
     mic: {
       ...DEFAULT_MIC,
       ...((raw as { mic?: Partial<MicConfig> & { whisper_model?: string } }).mic ?? {}),
@@ -164,6 +190,31 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
     merged.active_family = DEFAULT_CONFIG.active_family;
   }
   return merged;
+}
+
+/** Merge a partial cloud_mesh config from a saved file with defaults,
+ *  preserving array fields the user has customised. Arrays default
+ *  only when the saved value is missing entirely — an empty array is
+ *  a valid user choice (e.g. "I want no TURN servers"), so we don't
+ *  overwrite it. */
+function mergeCloudMesh(raw: Partial<CloudMeshConfig> | undefined): CloudMeshConfig {
+  if (!raw) {
+    return {
+      ...DEFAULT_CLOUD_MESH,
+      signaling_servers: [...DEFAULT_CLOUD_MESH.signaling_servers],
+      stun_servers: [...DEFAULT_CLOUD_MESH.stun_servers],
+      turn_servers: [...DEFAULT_CLOUD_MESH.turn_servers],
+    };
+  }
+  return {
+    enabled: raw.enabled ?? DEFAULT_CLOUD_MESH.enabled,
+    network_id: raw.network_id ?? DEFAULT_CLOUD_MESH.network_id,
+    locked: raw.locked ?? DEFAULT_CLOUD_MESH.locked,
+    signaling_servers:
+      raw.signaling_servers ?? [...DEFAULT_CLOUD_MESH.signaling_servers],
+    stun_servers: raw.stun_servers ?? [...DEFAULT_CLOUD_MESH.stun_servers],
+    turn_servers: raw.turn_servers ?? [...DEFAULT_CLOUD_MESH.turn_servers],
+  };
 }
 
 export async function saveConfig(config: Config): Promise<void> {

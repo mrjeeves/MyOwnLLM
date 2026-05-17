@@ -2,7 +2,7 @@
 
 # MyOwnLLM
 
-### Local LLMs and real-time transcription, on your machine.<br>The piece every &ldquo;bring your own LLM&rdquo; agent assumes you've already built.
+### Multi-speaker diarized transcription. A local LLM endpoint. A peer mesh that turns every device you own into more capacity.<br>The AI everyone thought was in the box.
 
 [**myownllm.net**](https://myownllm.net) — installers, screenshots, the pitch
 
@@ -20,18 +20,22 @@
 
 ## Why this exists
 
-You starred OpenClaw, or Continue, or Cline, or opencode, or Aider. You imagined a local AI that just works on your laptop. Then you got to the part that says *"point it at an LLM."* Which one? Where from? On what hardware? Bring your own.
+The local-LLM piece *is* a solved problem now. Ollama installs in one command. LMStudio gives you a model picker with backend choice. We use both of those ourselves, because they work. So this isn't another local-LLM installer dressed up in different copy.
 
-In practice, "bring your own" quietly turns into "bring your own paid API key," and the bills add up faster than anyone budgeted for — every agent loop, every autocomplete burst, every transcript summary, charged by the token to a different vendor. The local-AI dream was supposed to cut that line, not refactor it.
+What *isn't* free and easy is everything else that was supposed to come with the AI revolution. Multi-speaker diarized transcription that doesn't ship your meetings to a vendor. A speaker timeline that stays stable for two hours instead of resetting every window. A talking-points summary that grows with the conversation in real time. *Mesh* — every device you own contributing to a shared pool of compute and capability, so plugging in a second laptop *adds* capacity instead of consuming a separate subscription.
 
-MyOwnLLM is what people thought was in the box. A `myownllm` CLI that resolves *the right model for this machine* against a JSON manifest, serves it on OpenAI / Ollama / Anthropic ports, and ships the on-device real-time transcription pipeline that the rest of the ecosystem hand-waves as a solved problem. After 20 years writing AI software it still took a week of yak-shaving to wire all this up by hand — so if that's the floor for someone who does this for a living, nobody else stands a chance. Hence this.
+That's what we thought AI was going to be before it turned into a host of separate metered APIs. MyOwnLLM is the pieces that didn't get built — packaged as a desktop app, scriptable from the CLI, with a local OpenAI-compatible endpoint thrown in because if we're already on your machine, we may as well serve a model too.
 
-**Two solved paths:**
+**What ships today:**
 
 |   |   |
 |---|---|
+| **Multi-speaker diarized transcription** | Mic-to-text in ~1 s on a Pi 5 (English) or 80–200 ms on capable hardware (25 languages), with `pyannote-segmentation-3.0` + an embedder driving speaker IDs that stay stable across the whole session — not just a single window. Click a speaker pill to rename them; labels persist with the session. A live Talking-Points summary grows alongside the transcript. In-process — no Python venv, no whisper-server sidecar, no cloud round-trip. |
 | **A local LLM endpoint that just works** | OpenAI-compatible HTTP on `127.0.0.1:1473` (also Ollama, also Anthropic), serving whichever model fits the machine — picked by a JSON manifest you, your team, or someone you trust controls. Cursor, Continue, Aider, Cline, Zed, Open WebUI, opencode, **OpenClaw**, OpenClaude, and your own scripts target it on day one. No metered tokens, no vendor lock-in. |
-| **Real-time transcription that just works** | Mic-to-text in ~1 s on a Pi 5 (English) or 80–200 ms on capable hardware (25 languages), with optional speaker diarization that stays stable across the whole session and a Talking-Points summary that grows alongside the live transcript. In-process — no Python venv, no whisper-server sidecar, no cloud round-trip. |
+
+**What's landing next — Cloud Mesh:**
+
+Every MyOwnLLM instance becomes a window into the same mesh. Devices share a Network ID, find each other through a signaling server, and connect peer-to-peer over WebRTC. A second laptop joins your mesh and now its idle CPU is your transcription pool. Phone audio in, desktop transcription out, talking-points summary on the tablet you left in the kitchen. Conversations are *hosted* on one device with explicit Move-to-another-device transfers — your data still lives on disks you own, but the mesh routes capability where you need it. The substrate (identity keypair, Network ID rendezvous, settings UI) ships in this release; the WebRTC transport and routing follow in the next. See **Settings → Cloud Mesh** in the GUI.
 
 ## Install
 
@@ -73,12 +77,14 @@ Both paths — chat and transcription — are designed to be available on the GU
 
 |   |   |
 |---|---|
+| **Multi-speaker diarized transcription** | Speaker IDs that stay stable across the whole session, not just a single window. `pyannote-segmentation-3.0` + a speaker embedder, online clustering on the Rust side. The part the rest of the ecosystem hand-waves. |
+| **Cloud Mesh** *(in progress)* | Devices on the same Network ID find each other via signaling + WebRTC and pool compute. Conversations hosted on one device with explicit Move transfers. Identity is a long-lived ed25519 keypair under `~/.myownllm/.secrets/`. |
 | **Three wire formats, one server** | OpenAI on `:1473`, plus Ollama and Anthropic. Point Cursor, Continue, Aider, Cline, Zed, Open WebUI, opencode, OpenClaw, OpenClaude or your own scripts at it and it just works. |
 | **Virtual model IDs** | `myownllm` and `myownllm-transcribe`. Stable names; the right tag for your hardware auto-resolves. |
 | **Manifests, not config** | A JSON file at a URL is the source of truth. `imports` compose merged catalogs across publishers — no coordination required. |
 | **Runs on a Pi 5** | Default manifest ships Gemma 4 edge variants (`e2b` / `e4b`), Apache-2.0, ~7.6 tok/s on a Pi 5. Same manifest gives a 4090 the 4090 tag. |
 | **Desktop GUI** | Tauri + Svelte 5. Two singleton slots (chat-model, transcription) with conversation folders, in-place rename, crash-recoverable state. |
-| **LAN remote** | Open the GUI from your phone on the same network. Single-user lock with kick-and-hide. |
+| **LAN remote** | Open the GUI from your phone on the same network. Single-user lock with kick-and-hide. (Tab now lives under **Cloud Mesh → LAN**.) |
 | **Self-updating** | Stages quietly on launch, applies on next start. Last good manifest stays cached for offline runs. |
 | **Scriptable end-to-end** | Every CLI subcommand returns parseable text or `--json`. |
 

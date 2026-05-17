@@ -6,8 +6,9 @@
   import HardwareSection from "./settings/HardwareSection.svelte";
   import UsageSection from "./settings/UsageSection.svelte";
   import UpdatesSection from "./settings/UpdatesSection.svelte";
-  import RemoteSection from "./settings/RemoteSection.svelte";
+  import CloudMeshSection from "./settings/CloudMeshSection.svelte";
   import { updateUi } from "../update-state.svelte";
+  import { settingsAttention } from "../settings-attention.svelte";
 
   type Tab =
     | "providers"
@@ -16,12 +17,13 @@
     | "storage"
     | "hardware"
     | "usage"
-    | "remote"
+    | "cloud-mesh"
     | "updates"
     // Legacy values that still appear in old `initialTab` deep-links
-    // from earlier code paths. We map them to `models` on entry so a
+    // from earlier code paths. We map them to current ids on entry so a
     // stale callsite doesn't render an empty tab.
-    | "transcription";
+    | "transcription"
+    | "remote";
 
   let {
     initialTab = "families",
@@ -40,16 +42,22 @@
   }>();
 
   // svelte-ignore state_referenced_locally
-  let active = $state<Tab>(initialTab === "transcription" ? "models" : initialTab);
+  let active = $state<Tab>(
+    initialTab === "transcription"
+      ? "models"
+      : initialTab === "remote"
+        ? "cloud-mesh"
+        : initialTab,
+  );
 
-  const tabs: Array<{ id: Exclude<Tab, "transcription">; label: string }> = [
+  const tabs: Array<{ id: Exclude<Tab, "transcription" | "remote">; label: string }> = [
     { id: "families", label: "Family" },
     { id: "providers", label: "Providers" },
     { id: "models", label: "Models" },
     { id: "storage", label: "Storage" },
     { id: "hardware", label: "Hardware" },
     { id: "usage", label: "Usage" },
-    { id: "remote", label: "Remote" },
+    { id: "cloud-mesh", label: "Cloud Mesh" },
     { id: "updates", label: "Updates" },
   ];
 
@@ -58,6 +66,19 @@
   // version will re-set it.
   $effect(() => {
     if (active === "updates") updateUi.available = null;
+  });
+
+  // Mirror the legacy `updateUi.available` signal into the generic
+  // attention registry so all tabs (Updates, Cloud Mesh, future) render
+  // dots through one path. Updates keeps the typed `available` field
+  // because the version string is consumed directly by the Updates tab.
+  $effect(() => {
+    settingsAttention.set(
+      "updates",
+      updateUi.available
+        ? { reason: `Update ${updateUi.available.version} available` }
+        : null,
+    );
   });
 </script>
 
@@ -71,13 +92,14 @@
   <div class="body">
     <nav class="v-tabs" aria-label="Settings sections">
       {#each tabs as t}
+        {@const attention = settingsAttention.get(t.id)}
         <button class="v-tab" class:active={active === t.id} onclick={() => (active = t.id)}>
           <span class="tab-label">{t.label}</span>
-          {#if t.id === "updates" && updateUi.available}
+          {#if attention}
             <span
               class="attention-dot"
-              aria-label="Update available"
-              title="Update {updateUi.available.version} available"
+              aria-label={attention.reason}
+              title={attention.reason}
             ></span>
           {/if}
         </button>
@@ -97,8 +119,8 @@
         <HardwareSection setActive={(t) => (active = t)} />
       {:else if active === "usage"}
         <UsageSection />
-      {:else if active === "remote"}
-        <RemoteSection />
+      {:else if active === "cloud-mesh"}
+        <CloudMeshSection />
       {:else if active === "updates"}
         <UpdatesSection />
       {/if}
