@@ -175,6 +175,22 @@ export function generateNonce(): string {
   return base32Encode(bytes);
 }
 
+/** Derive the 5-char uppercase-hex display suffix from a peer's
+ *  base32 pubkey string. Mirrors the Rust `display_suffix` exactly
+ *  (sha256 of the string bytes → first 5 hex chars, uppercased) so
+ *  the same device shows the same tail in our UI as it does in its
+ *  own. Async because SubtleCrypto.digest is. */
+export async function pubkeySuffix(pubkey: string): Promise<string> {
+  const bytes = new TextEncoder().encode(pubkey);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const view = new Uint8Array(digest);
+  let hex = "";
+  for (let i = 0; i < 3 && hex.length < 5; i++) {
+    hex += view[i].toString(16).padStart(2, "0").toUpperCase();
+  }
+  return hex.slice(0, 5);
+}
+
 /** Generate a short human-readable verification code. 6 chars from
  *  `[a-z0-9]` = 36^6 ≈ 2 billion possibilities — vastly more than
  *  needed for a "did the right request just arrive?" eyeball check,
@@ -249,42 +265,59 @@ export function pubkeyPart(device_id: string): string {
 }
 
 /** PeerJS peer-id format. Includes a brand prefix so we can filter
- *  for our own peers on a shared public broker, and the broker-side
- *  network handle (a sha256 of the human Network ID, base32-encoded
- *  to a fixed 52 chars) so peers on the same network find each other
- *  while peers on different networks ignore each other.
+ *  for our own peers on a shared public broker, an 8-char
+ *  network tag (prefix of sha256(network_id)) so peers on the same
+ *  network find each other and peers on different networks ignore
+ *  each other, and an 8-char pubkey tag (prefix of the device's
+ *  ed25519 pubkey).
  *
- *  We use the hashed handle rather than the raw Network ID for three
- *  reasons: (1) the user's chosen ID may contain `-` which would
- *  confuse the parser, (2) human IDs are short and bias toward
- *  collisions/scanning on a shared broker, and (3) it lets the
- *  visible Network ID stay friendly without leaking it to anyone
- *  who scrapes the broker. */
+ *  Stays under the public 0.peerjs.com broker's ~50-char Peer ID
+ *  limit (full hashes / pubkeys ran 109 chars and silently got
+ *  rejected as `server-error`). Discrimination space: 2^80 across
+ *  the combined tags, plenty for any realistic deployment. The
+ *  auth handshake verifies that the peer's claimed full pubkey in
+ *  `hello` starts with the pubkey tag in their Peer ID, so the
+ *  truncation isn't a footgun for impersonation. */
+const NETWORK_TAG_LEN = 8;
+const PUBKEY_TAG_LEN = 8;
+
+export function networkTag(network_handle: string): string {
+  return network_handle.slice(0, NETWORK_TAG_LEN);
+}
+
+export function pubkeyTag(pubkey: string): string {
+  return pubkey.slice(0, PUBKEY_TAG_LEN);
+}
+
 export function peerJsId(network_handle: string, device_pubkey: string): string {
-  return `mol-${network_handle}-${device_pubkey}`;
+  return `mol-${networkTag(network_handle)}-${pubkeyTag(device_pubkey)}`;
 }
 
 /** Inverse of `peerJsId`. Returns null if the input isn't one of
  *  ours — used to filter the broker's peer list down to MyOwnLLM
- *  instances on our network. */
+ *  instances on our network. The pubkey returned here is a TAG
+ *  (prefix), not a full pubkey; the auth handshake exchanges full
+ *  pubkeys via `hello` and verifies they match. */
 export function parsePeerJsId(
   id: string,
-): { network_handle: string; device_pubkey: string } | null {
+): { network_tag: string; pubkey_tag: string } | null {
   if (!id.startsWith("mol-")) return null;
   const rest = id.slice("mol-".length);
-  // network_handle is exactly 52 chars (sha256 base32, no padding).
-  if (rest.length < 53 || rest[52] !== "-") return null;
+  const expected_len = NETWORK_TAG_LEN + 1 + PUBKEY_TAG_LEN;
+  if (rest.length !== expected_len || rest[NETWORK_TAG_LEN] !== "-") return null;
   return {
-    network_handle: rest.slice(0, 52),
-    device_pubkey: rest.slice(53),
+    network_tag: rest.slice(0, NETWORK_TAG_LEN),
+    pubkey_tag: rest.slice(NETWORK_TAG_LEN + 1),
   };
 }
 
 /** Derive the broker-side discovery handle from a user-typed Network
  *  ID. Hashes under a domain-separation tag so the same string used
- *  elsewhere can't collide, then base32-encodes to 52 chars (the
- *  format `parsePeerJsId` expects). Async because SubtleCrypto is —
- *  callers cache the result for the session. */
+ *  elsewhere can't collide, then base32-encodes to 52 chars. The
+ *  full handle is what `deriveNetworkHandle` returns; the broker
+ *  Peer ID only embeds the first NETWORK_TAG_LEN chars of it via
+ *  `networkTag()`. Async because SubtleCrypto is — callers cache
+ *  the result for the session. */
 export async function deriveNetworkHandle(network_id: string): Promise<string> {
   const tagged = `myownllm-network-v1:${network_id}`;
   const bytes = new TextEncoder().encode(tagged);

@@ -17,12 +17,12 @@
   let moveInFlight = $state<{ guid: string; label: string } | null>(null);
   let moveError = $state<string>("");
 
-  async function startMove(guid: string, target_pubkey: string, target_label: string) {
+  async function startMove(guid: string, target_tag: string, target_label: string) {
     moveInFlight = { guid, label: target_label };
     moveError = "";
     closeMenu();
     try {
-      await meshClient.moveConversation(guid, target_pubkey);
+      await meshClient.moveConversation(guid, target_tag);
     } catch (e) {
       moveError = String(e);
     } finally {
@@ -830,9 +830,9 @@
       {#if moveTargets.length > 0}
         <div class="menu-divider"></div>
         <div class="menu-section-label">Move to device</div>
-        {#each moveTargets as peer (peer.device_pubkey)}
+        {#each moveTargets as peer (peer.device_pubkey_tag)}
           <button
-            onclick={() => startMove(targetId, peer.device_pubkey, shortPeerLabel(peer.device_pubkey, peer.label))}
+            onclick={() => startMove(targetId, peer.device_pubkey_tag, shortPeerLabel(peer.device_pubkey, peer.label))}
             title="Transfer this conversation to {peer.label || peer.device_pubkey.slice(0, 12)}"
           >
             → {shortPeerLabel(peer.device_pubkey, peer.label)}

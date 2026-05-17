@@ -60,13 +60,16 @@ impl Identity {
 
     /// Display form of the Device ID surfaced in the UI: the
     /// public-key body, a dash, and a deterministic 5-char
-    /// alphanumeric tag. The tag (sha256 of the pubkey, first 5
-    /// bytes mapped into `[a-z0-9]`) makes instances easier to pick
+    /// UPPERCASE HEX tag. The tag (sha256 of the base32 pubkey
+    /// string, first 5 hex chars) makes instances easier to pick
     /// out at a glance in a peers list — the same device always
     /// shows the same tail. Display-only; the protocol still talks
-    /// `public_id()`.
+    /// `public_id()`. Hashing the base32 string (rather than the
+    /// raw 32 pubkey bytes) lets the TypeScript side derive the
+    /// same suffix from the string it already has, without
+    /// base32-decoding.
     pub fn display_id(&self) -> String {
-        let suffix = display_suffix(self.signing_key.verifying_key().as_bytes());
+        let suffix = display_suffix(self.public_id().as_bytes());
         format!("{}-{}", self.public_id(), suffix)
     }
 
@@ -85,22 +88,24 @@ impl Identity {
     }
 }
 
-/// Derive a 5-char human-recognizable tag from a public key. Maps
-/// 5 bytes of the pubkey's sha256 into `[a-z0-9]` — 36^5 = 60M
-/// distinct tags is plenty for eyeball-disambiguation in a peers
-/// list. Modulo-bias is irrelevant here (this is a display tag, not
-/// a security primitive).
-fn display_suffix(pubkey_bytes: &[u8]) -> String {
+/// Derive a 5-char UPPERCASE-HEX display tag from a pubkey string.
+/// Input is the base32-encoded pubkey (as bytes of that string), not
+/// the raw 32-byte pubkey, so the TypeScript side can mirror this
+/// exactly by hashing the same string it already has — no
+/// base32-decoding required in the browser.
+///
+/// 5 hex chars = 20 bits ≈ 1M distinct tags. Plenty for
+/// eyeball-disambiguation in a peers list, and the all-caps hex
+/// rendering reads unambiguously over voice ("seven C four A
+/// one").
+fn display_suffix(pubkey_string_bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let mut hasher = Sha256::new();
-    hasher.update(pubkey_bytes);
+    hasher.update(pubkey_string_bytes);
     let digest = hasher.finalize();
-    digest
-        .iter()
-        .take(5)
-        .map(|&b| ALPHABET[(b as usize) % ALPHABET.len()] as char)
-        .collect()
+    // 3 bytes → 6 hex chars; take the first 5.
+    let hex: String = digest.iter().take(3).map(|b| format!("{b:02X}")).collect();
+    hex.chars().take(5).collect()
 }
 
 /// Path of the anchor file. The directory `~/.myownllm/.secrets/` is
@@ -343,13 +348,14 @@ mod tests {
     }
 
     #[test]
-    fn display_suffix_is_5_alphanumeric() {
-        let bytes = [42u8; 32];
-        let suffix = display_suffix(&bytes);
+    fn display_suffix_is_5_uppercase_hex() {
+        let bytes = b"some-base32-pubkey-string";
+        let suffix = display_suffix(bytes);
         assert_eq!(suffix.len(), 5);
+        // Uppercase hex only: [0-9A-F]
         assert!(suffix
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+            .all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c)));
     }
 
     #[test]

@@ -45,9 +45,31 @@
     meshClient.peers.filter((p) => p.status === "pending_approval"),
   );
 
+  /** Split our own Device ID into greyed-out body + prominent
+   *  suffix pill. Recomputes whenever the identity loads or
+   *  updates. */
+  let identitySplit = $derived(
+    meshUi.identity
+      ? splitDisplayId(meshUi.identity.device_id)
+      : { body: "", suffix: "" },
+  );
+
   function shortPubkey(pk: string): string {
     if (pk.length <= 14) return pk;
     return `${pk.slice(0, 8)}…${pk.slice(-5)}`;
+  }
+
+  /** Split a `pubkey-SUFFIX` display ID into its two parts. Falls
+   *  back gracefully when the ID has no suffix (early handshake,
+   *  before `hello`). */
+  function splitDisplayId(id: string): { body: string; suffix: string } {
+    const dash = id.lastIndexOf("-");
+    if (dash === -1) return { body: id, suffix: "" };
+    const tail = id.slice(dash + 1);
+    if (tail.length === 5 && /^[0-9A-F]+$/.test(tail)) {
+      return { body: id.slice(0, dash), suffix: tail };
+    }
+    return { body: id, suffix: "" };
   }
 
   function statusLabel(s: string): string {
@@ -231,26 +253,31 @@
       <h3>This device</h3>
       <div class="row">
         <label class="field-label" for="device-id">Device ID</label>
-        <div class="field-row">
+        <div class="field-row id-row">
           <input
             id="device-id"
-            class="text-input mono"
+            class="text-input mono id-body"
             type="text"
-            value={meshUi.identity.device_id}
+            value={identitySplit.body}
             disabled
             spellcheck="false"
             autocomplete="off"
             title={meshUi.identity.device_id}
           />
+          {#if identitySplit.suffix}
+            <div class="suffix-pill" title="Stable display tag for this device — read this aloud to a peer to identify yourself.">
+              <span class="suffix-label">suffix</span>
+              <span class="suffix-value">{identitySplit.suffix}</span>
+            </div>
+          {/if}
         </div>
         <div class="field-hint">
           Internal identifier for this MyOwnLLM instance, derived from a
           keypair under <code class="path">~/.myownllm/.secrets/</code>.
-          The five characters after the dash are a stable tag derived
-          from the same key, so you can spot this device in a peers
-          list at a glance. You don't share this with anyone — peers
-          learn each other's Device IDs automatically at connection
-          time.
+          The greyed-out body uniquely identifies the keypair; the
+          5-char <strong>suffix</strong> alongside is the eyeball-friendly
+          tag — that's what you'd quote to confirm "yes, that's me" when
+          a peer is approving your join request.
         </div>
       </div>
 
@@ -405,11 +432,14 @@
         </div>
       {:else}
         <div class="peer-list">
-          {#each connections as p (p.device_pubkey)}
+          {#each connections as p (p.device_pubkey_tag)}
             <div class="peer-row" class:awaiting={p.status === "pending_remote_approval"}>
               <div class="peer-main">
                 <div class="peer-label">
                   {p.label || shortPubkey(p.device_pubkey)}
+                  {#if p.device_suffix}
+                    <span class="suffix-chip" title="Peer's stable display tag">{p.device_suffix}</span>
+                  {/if}
                   {#if p.authorized}<span class="badge ok">approved</span>{/if}
                 </div>
                 <code class="peer-id">{shortPubkey(p.device_pubkey)}</code>
@@ -421,7 +451,7 @@
                 {/if}
               </div>
               <span class="peer-status" data-status={p.status}>{statusLabel(p.status)}</span>
-              <button class="btn-small ghost" onclick={() => meshClient.removePeer(p.device_pubkey)} title="Disconnect and revoke approval">
+              <button class="btn-small ghost" onclick={() => meshClient.removePeer(p.device_pubkey_tag)} title="Disconnect and revoke approval">
                 Remove
               </button>
             </div>
@@ -440,7 +470,7 @@
         </div>
       {:else}
         <div class="peer-list">
-          {#each pendingRequests as p (p.device_pubkey)}
+          {#each pendingRequests as p (p.device_pubkey_tag)}
             <div class="peer-row request">
               <div class="peer-main">
                 <div class="peer-label">
@@ -448,19 +478,28 @@
                   <span class="badge pending">wants to connect</span>
                 </div>
                 <code class="peer-id">{shortPubkey(p.device_pubkey)}</code>
-                {#if p.verification_code}
-                  <div class="verify-line">
-                    Their code: <code class="code-pill">{p.verification_code}</code>
-                    <span class="verify-hint">
-                      confirm this matches what they read out before you approve
-                    </span>
+                <div class="confirm-row">
+                  {#if p.device_suffix}
+                    <div class="confirm-tile suffix-tile" title="Stable per-device tag — should match the suffix the peer sees in their own Identity tab.">
+                      <span class="confirm-label">suffix</span>
+                      <span class="confirm-value">{p.device_suffix}</span>
+                    </div>
+                  {/if}
+                  {#if p.verification_code}
+                    <div class="confirm-tile code-tile" title="Per-request code generated by the peer this session. Confirm out-of-band before approving.">
+                      <span class="confirm-label">code</span>
+                      <span class="confirm-value">{p.verification_code}</span>
+                    </div>
+                  {/if}
+                  <div class="confirm-help">
+                    Both should match what the peer reads to you before you approve.
                   </div>
-                {/if}
+                </div>
               </div>
-              <button class="btn-small primary" onclick={() => meshClient.approveRequest(p.device_pubkey)}>
+              <button class="btn-small primary" onclick={() => meshClient.approveRequest(p.device_pubkey_tag)}>
                 Approve
               </button>
-              <button class="btn-small ghost" onclick={() => meshClient.denyRequest(p.device_pubkey)}>
+              <button class="btn-small ghost" onclick={() => meshClient.denyRequest(p.device_pubkey_tag)}>
                 Deny
               </button>
             </div>
@@ -780,6 +819,110 @@
     border-radius: 4px;
     border: 1px solid #4a3a18;
     user-select: all;
+  }
+
+  /* Device ID body greyed-out vs the suffix pill, which is the
+     thing the user actually quotes when confirming with a peer. */
+  .id-row { align-items: stretch; }
+  .id-body:disabled {
+    color: #555 !important;
+    background: #0d0d0d;
+    border-color: #1c1c1c;
+    cursor: text;
+    letter-spacing: 0;
+  }
+  .suffix-pill {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: #131820;
+    border: 1px solid #2a3a55;
+    border-radius: 6px;
+    padding: 0.25rem 0.7rem;
+    min-width: 5.5rem;
+    flex-shrink: 0;
+  }
+  .suffix-label {
+    font-size: 0.58rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #6a7a99;
+  }
+  .suffix-value {
+    font-family: monospace;
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: #b9c9ee;
+    letter-spacing: 0.08em;
+    user-select: all;
+  }
+
+  /* Inline suffix chip on each peer row (smaller version of the
+     pill above, lives next to the label). */
+  .suffix-chip {
+    font-family: monospace;
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: #b9c9ee;
+    background: #131820;
+    border: 1px solid #2a3a55;
+    padding: 0.05rem 0.4rem;
+    border-radius: 3px;
+    letter-spacing: 0.06em;
+    user-select: all;
+  }
+
+  /* Pending-request confirm row: suffix + verification code shown
+     side by side so the user can verify both at a glance. */
+  .confirm-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.4rem;
+    flex-wrap: wrap;
+  }
+  .confirm-tile {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    padding: 0.3rem 0.75rem;
+    min-width: 5.5rem;
+  }
+  .confirm-tile.suffix-tile {
+    background: #131820;
+    border: 1px solid #2a3a55;
+  }
+  .confirm-tile.code-tile {
+    background: #2a2210;
+    border: 1px solid #4a3a18;
+  }
+  .confirm-label {
+    font-size: 0.58rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: inherit;
+    opacity: 0.55;
+  }
+  .confirm-tile.suffix-tile .confirm-label { color: #6a7a99; }
+  .confirm-tile.code-tile .confirm-label { color: #a88d4a; }
+  .confirm-value {
+    font-family: monospace;
+    font-size: 1.05rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    user-select: all;
+  }
+  .confirm-tile.suffix-tile .confirm-value { color: #b9c9ee; }
+  .confirm-tile.code-tile .confirm-value { color: #ffd166; }
+  .confirm-help {
+    font-size: 0.7rem;
+    color: #777;
+    flex: 1;
+    min-width: 12rem;
+    font-style: italic;
   }
   .peer-main {
     flex: 1;

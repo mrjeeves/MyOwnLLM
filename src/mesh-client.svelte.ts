@@ -43,9 +43,12 @@ import {
   deriveNetworkHandle,
   generateNonce,
   generateVerificationCode,
+  networkTag,
   parsePeerJsId,
   peerJsId,
   pubkeyPart,
+  pubkeySuffix,
+  pubkeyTag,
   signMessage,
   verifySignature,
   PROTOCOL_VERSION,
@@ -81,7 +84,19 @@ export type PeerStatus =
   | "failed"; // protocol error; close imminent
 
 export interface PeerEntry {
+  /** Full pubkey when handshake has completed; pubkey-tag during
+   *  early handshake. The UI uses this for display only — for
+   *  action callbacks pass `device_pubkey_tag` instead, since it's
+   *  always defined. */
   device_pubkey: string;
+  /** 8-char tag — the always-defined handle used as the
+   *  connections-map key. Pass this back into approve/deny/remove
+   *  callbacks. */
+  device_pubkey_tag: string;
+  /** 5-char uppercase-hex display suffix derived from the peer's
+   *  pubkey, matching what they show in their own Identity tab.
+   *  Empty string until handshake completes. */
+  device_suffix: string;
   /** Display form including the 5-char suffix. Derived from the
    *  pubkey using the same algorithm Rust uses, so the suffix
    *  matches what the peer themselves would show. */
@@ -106,7 +121,20 @@ export interface PeerEntry {
 
 interface ConnectionState {
   dc: DataConnection;
+  /** 8-char tag derived from the peer's full pubkey. Stable for
+   *  the lifetime of the connection — known immediately from the
+   *  Peer ID, used as the connections-map key. */
+  device_pubkey_tag: string;
+  /** Full 52-char pubkey. Empty string until `hello` arrives and
+   *  we've verified `pubkeyTag(device_pubkey) === device_pubkey_tag`.
+   *  Used for roster lookups, signature verification, and anything
+   *  cryptographic. */
   device_pubkey: string;
+  /** 5-char uppercase-hex display suffix. Computed once when the
+   *  full pubkey arrives in `hello`; the same algorithm Rust uses
+   *  so a peer's suffix here matches what they show in their own
+   *  Identity tab. */
+  device_suffix: string;
   label: string;
   initiated_by_us: boolean;
   our_nonce: string;
@@ -176,7 +204,7 @@ class MeshClient {
    *  re-reading from disk. */
   private pending_moves_out = new Map<
     string,
-    { target_pubkey: string; conversation: Conversation; on_complete?: (ok: boolean, err?: string) => void }
+    { target_tag: string; conversation: Conversation; on_complete?: (ok: boolean, err?: string) => void }
   >();
 
   async start(opts: {
@@ -406,10 +434,12 @@ class MeshClient {
 
   /** Approve a peer waiting in the pending_approval state. Adds them
    *  to the roster (so reconnects auto-allow) and sends an `approve`
-   *  message so the other side flips to ACTIVE. */
-  async approveRequest(device_pubkey: string): Promise<void> {
-    const c = this.connections.get(device_pubkey);
-    if (!c) return;
+   *  message so the other side flips to ACTIVE. Takes the peer's
+   *  pubkey tag (PeerEntry.device_pubkey_tag) since that's the
+   *  always-defined handle the UI knows about. */
+  async approveRequest(device_pubkey_tag: string): Promise<void> {
+    const c = this.connections.get(device_pubkey_tag);
+    if (!c || !c.device_pubkey) return;
     c.local_approved = true;
     try {
       await invoke("mesh_roster_add", {
@@ -423,8 +453,7 @@ class MeshClient {
       // — the peer is still authenticated, the user has approved
       // them — but it does mean they won't auto-allow on
       // reconnect. Log and continue.
-      // eslint-disable-next-line no-console
-      console.warn("[mesh] roster add failed", e);
+      this.logDiag("warn", `roster add failed: ${String(e)}`);
     }
     this.sendApprove(c);
     this.maybePromoteToActive(c);
@@ -435,20 +464,20 @@ class MeshClient {
    *  from the peers list. Does not blacklist — they can try again,
    *  and they may succeed if circumstances change (e.g. roster
    *  populated by a different peer). */
-  async denyRequest(device_pubkey: string): Promise<void> {
-    const c = this.connections.get(device_pubkey);
+  async denyRequest(device_pubkey_tag: string): Promise<void> {
+    const c = this.connections.get(device_pubkey_tag);
     if (!c) return;
     this.sendDeny(c, "user denied");
-    this.dropConnection(device_pubkey);
+    this.dropConnection(device_pubkey_tag);
   }
 
-  /** Initiate a Move of conversation `guid` to peer `target_pubkey`.
+  /** Initiate a Move of conversation `guid` to peer `target_tag`.
    *  The target must be in the active peer list. Resolves when the
    *  receiver has acknowledged write completion (and we've deleted
    *  the local copy); rejects on protocol error, peer-decline, or
    *  disconnect mid-flight. */
-  async moveConversation(guid: string, target_pubkey: string): Promise<void> {
-    const conn = this.connections.get(target_pubkey);
+  async moveConversation(guid: string, target_tag: string): Promise<void> {
+    const conn = this.connections.get(target_tag);
     if (!conn || this.peerStatus(conn) !== "active") {
       throw new Error("target peer is not active");
     }
@@ -461,7 +490,7 @@ class MeshClient {
     }
     return await new Promise<void>((resolve, reject) => {
       this.pending_moves_out.set(guid, {
-        target_pubkey,
+        target_tag,
         conversation,
         on_complete: (ok, err) => {
           if (ok) resolve();
@@ -479,19 +508,21 @@ class MeshClient {
   /** Remove an already-active peer from the roster and close the
    *  current connection. The peer can reconnect, but will require
    *  fresh approval. */
-  async removePeer(device_pubkey: string): Promise<void> {
-    const c = this.connections.get(device_pubkey);
-    try {
-      await invoke("mesh_roster_remove", {
-        networkId: this.network_id,
-        deviceId: device_pubkey,
-      });
-      this.roster_pubkeys.delete(device_pubkey);
-    } catch (e) {
-      // eslint-disable-next-line no-console
-      console.warn("[mesh] roster remove failed", e);
+  async removePeer(device_pubkey_tag: string): Promise<void> {
+    const c = this.connections.get(device_pubkey_tag);
+    const full_pubkey = c?.device_pubkey;
+    if (full_pubkey) {
+      try {
+        await invoke("mesh_roster_remove", {
+          networkId: this.network_id,
+          deviceId: full_pubkey,
+        });
+        this.roster_pubkeys.delete(full_pubkey);
+      } catch (e) {
+        this.logDiag("warn", `roster remove failed: ${String(e)}`);
+      }
     }
-    if (c) this.dropConnection(device_pubkey);
+    if (c) this.dropConnection(device_pubkey_tag);
     else this.republishPeers();
   }
 
@@ -527,9 +558,11 @@ class MeshClient {
       }
       return;
     }
+    const our_network_tag = networkTag(this.network_handle);
+    const our_pubkey_tag = pubkeyTag(my_pubkey);
     const matches = all.filter((id) => {
       const p = parsePeerJsId(id);
-      return p && p.network_handle === this.network_handle && p.device_pubkey !== my_pubkey;
+      return p && p.network_tag === our_network_tag && p.pubkey_tag !== our_pubkey_tag;
     });
     this.logDiag(
       "info",
@@ -538,55 +571,57 @@ class MeshClient {
     for (const id of all) {
       const parsed = parsePeerJsId(id);
       if (!parsed) continue;
-      if (parsed.network_handle !== this.network_handle) continue;
-      if (parsed.device_pubkey === my_pubkey) continue;
-      if (this.connections.has(parsed.device_pubkey)) continue;
+      if (parsed.network_tag !== our_network_tag) continue;
+      if (parsed.pubkey_tag === our_pubkey_tag) continue;
+      if (this.connections.has(parsed.pubkey_tag)) continue;
       // Tie-break who initiates so we don't double-connect: the
-      // lexically-lesser pubkey is the initiator. Without this both
-      // sides would try simultaneously and we'd get two redundant
-      // channels.
-      if (my_pubkey > parsed.device_pubkey) continue;
-      this.logDiag("info", `initiating connection to ${parsed.device_pubkey.slice(0, 12)}…`);
-      this.initiateConnection(id, parsed.device_pubkey);
+      // lexically-lesser pubkey-tag is the initiator. Without this
+      // both sides would try simultaneously and we'd get two
+      // redundant channels.
+      if (our_pubkey_tag > parsed.pubkey_tag) continue;
+      this.logDiag("info", `initiating connection to ${parsed.pubkey_tag}…`);
+      this.initiateConnection(id, parsed.pubkey_tag);
     }
   }
 
-  private initiateConnection(peer_id: string, device_pubkey: string): void {
+  private initiateConnection(peer_id: string, device_pubkey_tag: string): void {
     if (!this.peer_js) return;
     const dc = this.peer_js.connect(peer_id, { reliable: true });
-    const conn = this.createConnState(dc, device_pubkey, /* initiator */ true);
-    this.connections.set(device_pubkey, conn);
+    const conn = this.createConnState(dc, device_pubkey_tag, /* initiator */ true);
+    this.connections.set(device_pubkey_tag, conn);
     this.wireDataChannel(conn);
     this.republishPeers();
   }
 
   private handleInboundConnection(dc: DataConnection): void {
     const parsed = parsePeerJsId(dc.peer);
-    if (!parsed || parsed.network_handle !== this.network_handle) {
+    if (!parsed || parsed.network_tag !== networkTag(this.network_handle)) {
       // Foreign peer (different network or non-MyOwnLLM client).
       try { dc.close(); } catch {}
       return;
     }
     // If a connection in either direction is already in flight,
     // prefer the one we initiated and drop this inbound one.
-    if (this.connections.has(parsed.device_pubkey)) {
+    if (this.connections.has(parsed.pubkey_tag)) {
       try { dc.close(); } catch {}
       return;
     }
-    const conn = this.createConnState(dc, parsed.device_pubkey, /* initiator */ false);
-    this.connections.set(parsed.device_pubkey, conn);
+    const conn = this.createConnState(dc, parsed.pubkey_tag, /* initiator */ false);
+    this.connections.set(parsed.pubkey_tag, conn);
     this.wireDataChannel(conn);
     this.republishPeers();
   }
 
   private createConnState(
     dc: DataConnection,
-    device_pubkey: string,
+    device_pubkey_tag: string,
     initiator: boolean,
   ): ConnectionState {
     return {
       dc,
-      device_pubkey,
+      device_pubkey_tag,
+      device_pubkey: "",
+      device_suffix: "",
       label: "",
       initiated_by_us: initiator,
       our_nonce: generateNonce(),
@@ -606,17 +641,17 @@ class MeshClient {
       this.sendHello(conn);
       conn.handshake_timer = window.setTimeout(() => {
         if (this.peerStatus(conn) === "active") return;
-        this.dropConnection(conn.device_pubkey);
+        this.dropConnection(conn.device_pubkey_tag);
       }, HANDSHAKE_TIMEOUT_MS);
     });
     conn.dc.on("data", (raw) => {
       this.handleMessage(conn, raw);
     });
     conn.dc.on("close", () => {
-      this.dropConnection(conn.device_pubkey);
+      this.dropConnection(conn.device_pubkey_tag);
     });
     conn.dc.on("error", () => {
-      this.dropConnection(conn.device_pubkey);
+      this.dropConnection(conn.device_pubkey_tag);
     });
   }
 
@@ -717,8 +752,6 @@ class MeshClient {
     try {
       existing = await loadConversation(msg.guid);
     } catch {
-      // Treat read failure as "we don't have it" so a corrupt file
-      // doesn't block a fresh copy arriving.
       existing = null;
     }
     if (existing) {
@@ -737,7 +770,7 @@ class MeshClient {
     msg: MeshMessage & { kind: "move_accept" },
   ): Promise<void> {
     const pending = this.pending_moves_out.get(msg.guid);
-    if (!pending || pending.target_pubkey !== conn.device_pubkey) return;
+    if (!pending || pending.target_tag !== conn.device_pubkey_tag) return;
     this.send(conn, {
       kind: "move_payload",
       guid: msg.guid,
@@ -776,7 +809,7 @@ class MeshClient {
     msg: MeshMessage & { kind: "move_complete" },
   ): Promise<void> {
     const pending = this.pending_moves_out.get(msg.guid);
-    if (!pending || pending.target_pubkey !== conn.device_pubkey) return;
+    if (!pending || pending.target_tag !== conn.device_pubkey_tag) return;
     try {
       await deleteConversation(msg.guid);
     } catch (e) {
@@ -802,18 +835,22 @@ class MeshClient {
   ): Promise<void> {
     if (msg.protocol !== PROTOCOL_VERSION) {
       this.sendDeny(conn, "protocol mismatch");
-      this.dropConnection(conn.device_pubkey);
+      this.dropConnection(conn.device_pubkey_tag);
       return;
     }
-    // Bind the peer to the pubkey embedded in their PeerJS ID, not
-    // the one they claim in `hello`. Anything else lets a peer
-    // impersonate by lying about device_id, since the auth signature
-    // is over the claimed value.
-    if (msg.device_id !== conn.device_pubkey) {
-      this.sendDeny(conn, "device_id / peerjs_id mismatch");
-      this.dropConnection(conn.device_pubkey);
+    // The peer's Peer ID embeds only an 8-char prefix (tag) of their
+    // pubkey — `hello` carries the full pubkey, and we verify it
+    // matches the tag we know from the broker. Without this, a peer
+    // could register under one tag and claim a totally different
+    // identity in `hello`, then sign with whichever key matches the
+    // claim. Anchoring the claim to the registered tag closes that
+    // gap.
+    if (pubkeyTag(msg.device_id) !== conn.device_pubkey_tag) {
+      this.sendDeny(conn, "device_id / peerjs_id tag mismatch");
+      this.dropConnection(conn.device_pubkey_tag);
       return;
     }
+    conn.device_pubkey = msg.device_id;
     conn.their_nonce = msg.nonce;
     conn.label = msg.label || "";
     // Stash the peer's verification code so the receiver UI can
@@ -821,6 +858,15 @@ class MeshClient {
     // sender controls this field and we don't want a runaway string
     // breaking the layout.
     conn.their_verification_code = (msg.verification_code || "").slice(0, 16);
+    // Compute the peer's display suffix locally from their pubkey —
+    // never trust a suffix the peer sends, but they don't send one
+    // either: the suffix is purely derived. Mirrors the algorithm
+    // Rust uses for our own device.
+    try {
+      conn.device_suffix = await pubkeySuffix(msg.device_id);
+    } catch {
+      conn.device_suffix = "";
+    }
     this.republishPeers();
 
     // Sign the payload they expect to verify against us.
@@ -834,9 +880,8 @@ class MeshClient {
       const signature = await signMessage(payload);
       this.send(conn, { kind: "auth_response", signature });
     } catch (e) {
-      // eslint-disable-next-line no-console
-      console.warn("[mesh] signing failed", e);
-      this.dropConnection(conn.device_pubkey);
+      this.logDiag("error", `signing failed: ${String(e)}`);
+      this.dropConnection(conn.device_pubkey_tag);
     }
   }
 
@@ -845,6 +890,12 @@ class MeshClient {
     msg: MeshMessage & { kind: "auth_response" },
   ): Promise<void> {
     if (!conn.our_nonce) return;
+    if (!conn.device_pubkey) {
+      // Peer sent auth_response before hello — protocol error.
+      this.sendDeny(conn, "auth_response before hello");
+      this.dropConnection(conn.device_pubkey_tag);
+      return;
+    }
     const payload = authPayload({
       nonce: conn.our_nonce,
       my_device_id: conn.device_pubkey,
@@ -854,13 +905,12 @@ class MeshClient {
     try {
       ok = await verifySignature(conn.device_pubkey, payload, msg.signature);
     } catch (e) {
-      // eslint-disable-next-line no-console
-      console.warn("[mesh] verify failed", e);
+      this.logDiag("error", `verify failed: ${String(e)}`);
       ok = false;
     }
     if (!ok) {
       this.sendDeny(conn, "signature invalid");
-      this.dropConnection(conn.device_pubkey);
+      this.dropConnection(conn.device_pubkey_tag);
       return;
     }
     conn.peer_authenticated = true;
@@ -917,16 +967,16 @@ class MeshClient {
     }
   }
 
-  private dropConnection(device_pubkey: string): void {
-    const c = this.connections.get(device_pubkey);
+  private dropConnection(device_pubkey_tag: string): void {
+    const c = this.connections.get(device_pubkey_tag);
     if (!c) return;
     if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
     try { c.dc.close(); } catch {}
-    this.connections.delete(device_pubkey);
+    this.connections.delete(device_pubkey_tag);
     // Reject any in-flight outgoing moves to this peer so the
     // caller's promise settles rather than hanging forever.
     for (const [guid, pending] of this.pending_moves_out) {
-      if (pending.target_pubkey === device_pubkey) {
+      if (pending.target_tag === device_pubkey_tag) {
         this.pending_moves_out.delete(guid);
         pending.on_complete?.(false, "peer disconnected mid-move");
       }
@@ -951,16 +1001,17 @@ class MeshClient {
 
   private computePeers(): PeerEntry[] {
     return Array.from(this.connections.values()).map((c) => ({
-      device_pubkey: c.device_pubkey,
-      device_id_display: c.device_pubkey, // suffix is appended by the UI layer
+      device_pubkey: c.device_pubkey || c.device_pubkey_tag,
+      device_pubkey_tag: c.device_pubkey_tag,
+      device_suffix: c.device_suffix,
+      device_id_display: c.device_suffix
+        ? `${c.device_pubkey}-${c.device_suffix}`
+        : c.device_pubkey || c.device_pubkey_tag,
       label: c.label,
       status: this.peerStatus(c),
-      authorized: this.roster_pubkeys.has(c.device_pubkey),
+      authorized: c.device_pubkey ? this.roster_pubkeys.has(c.device_pubkey) : false,
       initiated_by_us: c.initiated_by_us,
-      connected_at: 0, // set on first transition to handshaking; v1 is fine without
-      // Initiator surfaces what they sent (so the local user can
-      // read it aloud); receiver surfaces what they received (so
-      // the local user confirms it matches what the remote quoted).
+      connected_at: 0,
       verification_code: c.initiated_by_us
         ? c.our_verification_code
         : c.their_verification_code,
