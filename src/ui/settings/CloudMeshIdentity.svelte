@@ -72,13 +72,17 @@
     return { body: id, suffix: "" };
   }
 
-  function statusLabel(s: string): string {
-    switch (s) {
+  function statusLabel(p: { status: string; local_approved: boolean; remote_approved: boolean; approver_role: boolean }): string {
+    switch (p.status) {
       case "connecting":
         return "connecting";
       case "handshaking":
         return "authenticating";
-      case "pending_remote_approval":
+      case "pending_remote":
+        // Guest waiting for host's first approve vs. either side
+        // waiting for peer's reciprocal approve.
+        if (p.local_approved) return "awaiting confirmation";
+        if (!p.approver_role && !p.remote_approved) return "awaiting peer approval";
         return "awaiting peer";
       case "active":
         return "live";
@@ -87,7 +91,7 @@
       case "failed":
         return "failed";
       default:
-        return s;
+        return p.status;
     }
   }
 
@@ -370,6 +374,12 @@
         {:else if locked}
           <div class="field-hint">
             Locked. Click the lock to change — you'll see a warning first.
+            Unlocking and re-locking the same Network ID is also the
+            way to <strong>reset the mesh connection</strong>: the
+            client tears down everything, rejoins the room from
+            scratch, and re-runs handshakes with peers — useful if
+            a connection seems stuck or you want to force a
+            re-authentication.
           </div>
         {:else}
           <div class="field-hint">
@@ -433,7 +443,7 @@
       {:else}
         <div class="peer-list">
           {#each connections as p (p.peer_id)}
-            <div class="peer-row" class:awaiting={p.status === "pending_remote_approval"}>
+            <div class="peer-row" class:awaiting={p.status === "pending_remote"}>
               <div class="peer-main">
                 <div class="peer-label">
                   {p.label || shortPubkey(p.device_pubkey)}
@@ -443,14 +453,14 @@
                   {#if p.authorized}<span class="badge ok">approved</span>{/if}
                 </div>
                 <code class="peer-id">{shortPubkey(p.device_pubkey)}</code>
-                {#if p.status === "pending_remote_approval" && p.verification_code}
+                {#if p.status === "pending_remote" && p.verification_code}
                   <div class="verify-line">
                     Your code: <code class="code-pill">{p.verification_code}</code>
                     <span class="verify-hint">tell the other side to confirm this</span>
                   </div>
                 {/if}
               </div>
-              <span class="peer-status" data-status={p.status}>{statusLabel(p.status)}</span>
+              <span class="peer-status" data-status={p.status}>{statusLabel(p)}</span>
               <button class="btn-small ghost" onclick={() => meshClient.removePeer(p.peer_id)} title="Disconnect and revoke approval">
                 Remove
               </button>
@@ -475,7 +485,9 @@
               <div class="peer-main">
                 <div class="peer-label">
                   {p.label || shortPubkey(p.device_pubkey)}
-                  <span class="badge pending">wants to connect</span>
+                  <span class="badge pending">
+                    {p.approver_role ? "wants to connect" : "authorized you — confirm?"}
+                  </span>
                 </div>
                 <code class="peer-id">{shortPubkey(p.device_pubkey)}</code>
                 <div class="confirm-row">
@@ -492,15 +504,17 @@
                     </div>
                   {/if}
                   <div class="confirm-help">
-                    Both should match what the peer reads to you before you approve.
+                    {p.approver_role
+                      ? "Both should match what the peer reads to you before you approve."
+                      : "The peer just approved your join. Confirm to complete the handshake."}
                   </div>
                 </div>
               </div>
               <button class="btn-small primary" onclick={() => meshClient.approveRequest(p.peer_id)}>
-                Approve
+                {p.approver_role ? "Approve" : "Confirm"}
               </button>
               <button class="btn-small ghost" onclick={() => meshClient.denyRequest(p.peer_id)}>
-                Deny
+                {p.approver_role ? "Deny" : "Cancel"}
               </button>
             </div>
           {/each}
@@ -958,7 +972,7 @@
   }
   .peer-status[data-status="connecting"],
   .peer-status[data-status="handshaking"],
-  .peer-status[data-status="pending_remote_approval"] {
+  .peer-status[data-status="pending_remote"] {
     color: #d6b25a;
     background: #2a220e;
   }

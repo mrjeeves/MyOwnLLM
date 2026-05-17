@@ -76,9 +76,9 @@ export interface DiagEntry {
 
 export type PeerStatus =
   | "handshaking" // hello sent / received; awaiting auth_response or verifying
-  | "pending_approval" // approver side, waiting on local user to approve
-  | "pending_remote_approval" // non-approver side, waiting on remote's approve
-  | "active" // both sides cleared; channel usable
+  | "pending_approval" // local user needs to act (approve or confirm, see approver_role)
+  | "pending_remote" // we've acted, OR we're waiting for the host's first move
+  | "active" // both sides have approved and exchanged approve messages
   | "denied" // user denied; close imminent
   | "failed"; // protocol error; close imminent
 
@@ -98,9 +98,16 @@ export interface PeerEntry {
   /** True when this peer is in our local roster (we'd auto-allow on
    *  reconnect). */
   authorized: boolean;
-  /** True when our side is the one responsible for prompting the
-   *  user (we have the lex-lesser pubkey of the pair). */
+  /** True when our side is the "host" (lex-lesser pubkey) — we
+   *  prompt first ("X wants to connect"). False = "guest" (we
+   *  prompt second, "X authorized you. Confirm?"). */
   approver_role: boolean;
+  /** True after we've sent our own `approve`. UI uses this to
+   *  pick "awaiting peer approval" (false) vs "awaiting peer
+   *  confirmation" (true) labels. */
+  local_approved: boolean;
+  /** True after we've received `approve` from the peer. */
+  remote_approved: boolean;
   /** Six-char verification code the user reads to confirm the
    *  request is the one they expect. */
   verification_code: string;
@@ -321,23 +328,34 @@ class MeshClient {
 
   // ---- action callbacks (UI) -------------------------------------------
 
+  /** User clicked Approve (host first prompt) or Confirm (guest
+   *  second prompt). Both flows route here — what the button reads
+   *  is purely a UI decision based on `approver_role`. */
   async approveRequest(peer_id: string): Promise<void> {
     const c = this.connections.get(peer_id);
     if (!c || !c.device_pubkey) return;
-    c.local_approved = true;
+    await this.acceptPeer(c);
+    this.republishPeers();
+  }
+
+  /** Common path for "this side has approved this peer." Sets
+   *  local_approved, adds the peer to the roster (so the next
+   *  reconnect is silent on our side), and sends the `approve`
+   *  message so the other side can flip to active. */
+  private async acceptPeer(conn: ConnectionState): Promise<void> {
+    conn.local_approved = true;
     try {
       await invoke("mesh_roster_add", {
         networkId: this.network_id,
-        deviceId: c.device_pubkey,
-        label: c.label,
+        deviceId: conn.device_pubkey,
+        label: conn.label,
       });
-      this.roster_pubkeys.add(c.device_pubkey);
+      this.roster_pubkeys.add(conn.device_pubkey);
     } catch (e) {
       this.logDiag("warn", `roster add failed: ${String(e)}`);
     }
-    this.sendApprove(c);
-    this.maybePromoteToActive(c);
-    this.republishPeers();
+    this.sendApprove(conn);
+    this.maybePromoteToActive(conn);
   }
 
   async denyRequest(peer_id: string): Promise<void> {
@@ -497,9 +515,7 @@ class MeshClient {
         await this.handleAuthResponse(conn, msg);
         break;
       case "approve":
-        conn.remote_approved = true;
-        this.maybePromoteToActive(conn);
-        this.republishPeers();
+        await this.handleApproveMessage(conn);
         break;
       case "deny":
         this.logDiag("warn", `peer denied: ${msg.reason ?? "(no reason)"}`);
@@ -610,26 +626,52 @@ class MeshClient {
     );
 
     if (conn.approver_role) {
-      // Our side does the approving. Auto-allow if in roster;
-      // otherwise queue for user approval (settings attention
-      // dot lights up).
+      // Host side: prompt the local user first (or auto-allow
+      // from roster, in which case `acceptPeer` sends our
+      // `approve` immediately).
       const authorized = this.roster_pubkeys.has(conn.device_pubkey);
       if (authorized) {
-        conn.local_approved = true;
-        this.sendApprove(conn);
+        await this.acceptPeer(conn);
       } else {
         settingsAttention.set("cloud-mesh", {
           reason: `${shortLabel(conn.label, conn.device_pubkey)} wants to connect`,
         });
       }
-    } else {
-      // Non-approver side: we wait for `approve` from the other
-      // side to flip to ACTIVE. Locally we treat ourselves as
-      // approved — the act of locking the Network ID was our
-      // user's consent to join.
-      conn.local_approved = true;
     }
-    this.maybePromoteToActive(conn);
+    // Guest side: just wait. The host either auto-allows us (in
+    // which case their `approve` will arrive almost immediately
+    // and the guest path in `handleApprove` runs) or prompts
+    // their user. Until then we sit in `pending_remote` with
+    // "awaiting peer approval" in the UI.
+    this.republishPeers();
+  }
+
+  private async handleApproveMessage(conn: ConnectionState): Promise<void> {
+    conn.remote_approved = true;
+    if (conn.approver_role) {
+      // Host side: receiving guest's `approve` is the final step.
+      // We sent our own already; both sides now have both flags
+      // set and the connection flips to ACTIVE.
+      this.maybePromoteToActive(conn);
+    } else {
+      // Guest side: this is the host's authorization arriving.
+      // Either auto-confirm (peer already in our roster from a
+      // previous session) or surface a confirm prompt to the
+      // user — same UI surface as the host's first prompt, but
+      // the label reads "X authorized you. Confirm?".
+      if (!conn.local_approved) {
+        const authorized = this.roster_pubkeys.has(conn.device_pubkey);
+        if (authorized) {
+          await this.acceptPeer(conn);
+        } else {
+          settingsAttention.set("cloud-mesh", {
+            reason: `${shortLabel(conn.label, conn.device_pubkey)} authorized you`,
+          });
+        }
+      } else {
+        this.maybePromoteToActive(conn);
+      }
+    }
     this.republishPeers();
   }
 
@@ -758,8 +800,17 @@ class MeshClient {
   private peerStatus(conn: ConnectionState): PeerStatus {
     if (!conn.peer_authenticated) return "handshaking";
     if (conn.local_approved && conn.remote_approved) return "active";
-    if (conn.approver_role && !conn.local_approved) return "pending_approval";
-    return "pending_remote_approval";
+    // Needs local user action when:
+    //   - We're the host AND haven't approved yet (first prompt)
+    //   - We're the guest AND the host has already approved
+    //     (second prompt: "Confirm?")
+    if (!conn.local_approved && (conn.approver_role || conn.remote_approved)) {
+      return "pending_approval";
+    }
+    // Otherwise we're waiting on the peer — either guest waiting
+    // for host's first approve, or either side having already
+    // sent approve and waiting for the reciprocal.
+    return "pending_remote";
   }
 
   private computePeers(): PeerEntry[] {
@@ -774,6 +825,8 @@ class MeshClient {
       status: this.peerStatus(c),
       authorized: c.device_pubkey ? this.roster_pubkeys.has(c.device_pubkey) : false,
       approver_role: c.approver_role,
+      local_approved: c.local_approved,
+      remote_approved: c.remote_approved,
       verification_code: c.approver_role ? c.their_verification_code : c.our_verification_code,
     }));
   }
