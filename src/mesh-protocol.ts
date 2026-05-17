@@ -33,7 +33,13 @@ export type MeshMessage =
   | ApproveMessage
   | DenyMessage
   | PingMessage
-  | PongMessage;
+  | PongMessage
+  | CatalogAnnounceMessage
+  | MoveOfferMessage
+  | MoveAcceptMessage
+  | MoveDeclineMessage
+  | MovePayloadMessage
+  | MoveCompleteMessage;
 
 export interface HelloMessage {
   kind: "hello";
@@ -77,6 +83,64 @@ export interface PingMessage {
 export interface PongMessage {
   kind: "pong";
   t: number;
+}
+
+// ---- catalog + move -----------------------------------------------------
+
+/** Lightweight metadata for a conversation hosted on the announcer.
+ *  Catalog entries propagate freely between peers so any peer can
+ *  render a list of "what's where" without forcing content
+ *  replication. The hosting peer is whoever sent the announcement. */
+export interface CatalogEntry {
+  guid: string;
+  title: string;
+  mode: string;
+  updated_at: string;
+}
+
+export interface CatalogAnnounceMessage {
+  kind: "catalog_announce";
+  /** Replaces the announcer's previous catalog wholesale rather
+   *  than mutating per-entry. v1 catalogs are small (hundreds of
+   *  entries), so the simplicity-vs-bandwidth trade is the right
+   *  call. Incremental gossip can land alongside the OR-set
+   *  roster when we add that. */
+  conversations: CatalogEntry[];
+}
+
+/** Initiator offers a Move of conversation `guid` to the recipient.
+ *  Includes the title so the receiver can show a friendlier "X is
+ *  about to send you 'Standup notes'" if we later add an opt-in
+ *  confirmation prompt. */
+export interface MoveOfferMessage {
+  kind: "move_offer";
+  guid: string;
+  title: string;
+}
+
+export interface MoveAcceptMessage {
+  kind: "move_accept";
+  guid: string;
+}
+
+export interface MoveDeclineMessage {
+  kind: "move_decline";
+  guid: string;
+  reason: string;
+}
+
+/** The full conversation payload, sent as a JSON-encoded object. The
+ *  receiver writes it to local storage before sending `move_complete`,
+ *  at which point the initiator deletes its local copy. */
+export interface MovePayloadMessage {
+  kind: "move_payload";
+  guid: string;
+  conversation: unknown;
+}
+
+export interface MoveCompleteMessage {
+  kind: "move_complete";
+  guid: string;
 }
 
 /** Compose the payload that a peer signs in response to a `hello`.

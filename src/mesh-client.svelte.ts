@@ -33,6 +33,12 @@ import type { TurnServer } from "./types";
 import { loadConfig } from "./config";
 import { settingsAttention } from "./settings-attention.svelte";
 import {
+  loadConversation,
+  saveConversation,
+  deleteConversation,
+  type Conversation,
+} from "./conversations";
+import {
   authPayload,
   generateNonce,
   parsePeerJsId,
@@ -110,6 +116,14 @@ class MeshClient {
   private roster_pubkeys = new Set<string>();
   private discovery_timer: number | null = null;
   private stopping = false;
+  /** Outgoing Move state. Keyed by conversation GUID — only one
+   *  in-flight Move per conversation is allowed. Holds the full
+   *  payload so move_accept can immediately ship it without
+   *  re-reading from disk. */
+  private pending_moves_out = new Map<
+    string,
+    { target_pubkey: string; conversation: Conversation; on_complete?: (ok: boolean, err?: string) => void }
+  >();
 
   async start(opts: {
     identity: MeshIdentity;
@@ -299,6 +313,40 @@ class MeshClient {
     if (!c) return;
     this.sendDeny(c, "user denied");
     this.dropConnection(device_pubkey);
+  }
+
+  /** Initiate a Move of conversation `guid` to peer `target_pubkey`.
+   *  The target must be in the active peer list. Resolves when the
+   *  receiver has acknowledged write completion (and we've deleted
+   *  the local copy); rejects on protocol error, peer-decline, or
+   *  disconnect mid-flight. */
+  async moveConversation(guid: string, target_pubkey: string): Promise<void> {
+    const conn = this.connections.get(target_pubkey);
+    if (!conn || this.peerStatus(conn) !== "active") {
+      throw new Error("target peer is not active");
+    }
+    if (this.pending_moves_out.has(guid)) {
+      throw new Error("a move for this conversation is already in flight");
+    }
+    const conversation = await loadConversation(guid);
+    if (!conversation) {
+      throw new Error("conversation not found locally");
+    }
+    return await new Promise<void>((resolve, reject) => {
+      this.pending_moves_out.set(guid, {
+        target_pubkey,
+        conversation,
+        on_complete: (ok, err) => {
+          if (ok) resolve();
+          else reject(new Error(err ?? "move failed"));
+        },
+      });
+      this.send(conn, {
+        kind: "move_offer",
+        guid,
+        title: conversation.title,
+      });
+    });
   }
 
   /** Remove an already-active peer from the roster and close the
@@ -493,7 +541,121 @@ class MeshClient {
         // No-op for v1 — latency tracking will land with capability
         // advertisement.
         break;
+      case "catalog_announce":
+        // No-op for v1. Catalog state is held by the source of
+        // each conversation; this message just isn't actioned yet.
+        // The "Network" view that consumes it will land in a
+        // follow-up commit.
+        break;
+      case "move_offer":
+        await this.handleMoveOffer(conn, msg);
+        break;
+      case "move_accept":
+        await this.handleMoveAccept(conn, msg);
+        break;
+      case "move_decline":
+        this.resolveMoveOut(msg.guid, false, msg.reason);
+        break;
+      case "move_payload":
+        await this.handleMovePayload(conn, msg);
+        break;
+      case "move_complete":
+        await this.handleMoveComplete(conn, msg);
+        break;
     }
+  }
+
+  private async handleMoveOffer(
+    conn: ConnectionState,
+    msg: MeshMessage & { kind: "move_offer" },
+  ): Promise<void> {
+    // Defensively refuse offers from un-approved peers — the auth
+    // gates should already block this but cheap to be sure.
+    if (this.peerStatus(conn) !== "active") {
+      this.send(conn, { kind: "move_decline", guid: msg.guid, reason: "channel not active" });
+      return;
+    }
+    let existing: Conversation | null = null;
+    try {
+      existing = await loadConversation(msg.guid);
+    } catch {
+      // Treat read failure as "we don't have it" so a corrupt file
+      // doesn't block a fresh copy arriving.
+      existing = null;
+    }
+    if (existing) {
+      this.send(conn, {
+        kind: "move_decline",
+        guid: msg.guid,
+        reason: "already have this conversation",
+      });
+      return;
+    }
+    this.send(conn, { kind: "move_accept", guid: msg.guid });
+  }
+
+  private async handleMoveAccept(
+    conn: ConnectionState,
+    msg: MeshMessage & { kind: "move_accept" },
+  ): Promise<void> {
+    const pending = this.pending_moves_out.get(msg.guid);
+    if (!pending || pending.target_pubkey !== conn.device_pubkey) return;
+    this.send(conn, {
+      kind: "move_payload",
+      guid: msg.guid,
+      conversation: pending.conversation,
+    });
+  }
+
+  private async handleMovePayload(
+    conn: ConnectionState,
+    msg: MeshMessage & { kind: "move_payload" },
+  ): Promise<void> {
+    const incoming = msg.conversation as Conversation | undefined;
+    if (!incoming || typeof incoming !== "object" || incoming.id !== msg.guid) {
+      // Malformed payload — decline rather than write garbage.
+      this.send(conn, {
+        kind: "move_decline",
+        guid: msg.guid,
+        reason: "malformed payload",
+      });
+      return;
+    }
+    try {
+      await saveConversation(incoming);
+      this.send(conn, { kind: "move_complete", guid: msg.guid });
+    } catch (e) {
+      this.send(conn, {
+        kind: "move_decline",
+        guid: msg.guid,
+        reason: `write failed: ${String(e)}`,
+      });
+    }
+  }
+
+  private async handleMoveComplete(
+    conn: ConnectionState,
+    msg: MeshMessage & { kind: "move_complete" },
+  ): Promise<void> {
+    const pending = this.pending_moves_out.get(msg.guid);
+    if (!pending || pending.target_pubkey !== conn.device_pubkey) return;
+    try {
+      await deleteConversation(msg.guid);
+    } catch (e) {
+      // The receiver successfully wrote and we couldn't delete our
+      // local — the user now has the conversation on both devices.
+      // Inconvenient but not destructive. Surface to the caller.
+      this.resolveMoveOut(msg.guid, false, `local delete failed: ${String(e)}`);
+      return;
+    }
+    this.resolveMoveOut(msg.guid, true);
+  }
+
+  private resolveMoveOut(guid: string, ok: boolean, err?: string): void {
+    const pending = this.pending_moves_out.get(guid);
+    if (!pending) return;
+    this.pending_moves_out.delete(guid);
+    pending.on_complete?.(ok, err);
   }
 
   private async handleHello(
@@ -618,6 +780,14 @@ class MeshClient {
     if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
     try { c.dc.close(); } catch {}
     this.connections.delete(device_pubkey);
+    // Reject any in-flight outgoing moves to this peer so the
+    // caller's promise settles rather than hanging forever.
+    for (const [guid, pending] of this.pending_moves_out) {
+      if (pending.target_pubkey === device_pubkey) {
+        this.pending_moves_out.delete(guid);
+        pending.on_complete?.(false, "peer disconnected mid-move");
+      }
+    }
     this.republishPeers();
     if (this.computePeers().every((p) => p.status !== "pending_approval")) {
       settingsAttention.set("cloud-mesh", null);
