@@ -625,9 +625,17 @@ fn main() {
     // picked and surface a clear error if the lib is missing instead
     // of leaving the user staring at "Loading Moonshine encoder…"
     // while ort hangs inside an FFI trampoline.
-    ort_setup::initialize();
-
+    //
+    // GUI mode defers this to the Tauri setup hook (on a worker
+    // thread) so a slow `LoadLibrary` — Windows Defender real-time
+    // scanning an unsigned `onnxruntime.dll` in `~/.myownllm/runtime/`
+    // is the documented offender — can't wedge the main thread before
+    // Tauri opens the window. Repro: `just dev` on Windows hangs on
+    // `Running target\debug\myownllm.exe` with the process alive but
+    // no window. CLI mode keeps the eager init because `cli::run()`
+    // can drop straight into a transcribe path that needs ort ready.
     if cli_mode {
+        ort_setup::initialize();
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
             // Race the subcommand against Ctrl-C so we always reach the
@@ -766,69 +774,66 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 let _ = ensure_config_dir(&app_handle);
 
-                // Auto-fetch the onnxruntime dylib if the eager
-                // `ort_setup::initialize()` above couldn't find one on
-                // disk. This is the safety net for users who installed
-                // via the Tauri `.msi` / `.dmg` / `.deb` bundles (which
-                // never run our install scripts) or whose system copy
-                // was AV-quarantined. Skipped silently when ort already
+                // Resolve + commit the onnxruntime dylib path. Runs on
+                // a worker thread so a slow `LoadLibrary` (Windows
+                // Defender scanning an unsigned dylib in
+                // `~/.myownllm/runtime/`) can't wedge the GUI startup.
+                // If `initialize()` finds nothing on disk, fall through
+                // to the bundled-install fallback that downloads the
+                // pinned runtime into `~/.myownllm/runtime/` and emits
+                // progress on `myownllm://ort-install-progress` for a
+                // one-time toast. Skipped silently when ort already
                 // loaded — the common case after a future relaunch.
-                // Emits progress on `myownllm://ort-install-progress`
-                // so the frontend can surface a one-time toast; the
-                // user can keep using non-transcription features in
-                // the meantime.
-                if !ort_setup::status().initialized {
-                    let ah = app_handle.clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        use tauri::Emitter;
-                        let emit_progress =
-                            |stage: &str, bytes: u64, total: u64, error: Option<&str>| {
-                                let _ = ah.emit(
-                                    "myownllm://ort-install-progress",
-                                    serde_json::json!({
-                                        "stage": stage,
-                                        "bytes": bytes,
-                                        "total": total,
-                                        "error": error,
-                                    }),
-                                );
-                            };
-                        emit_progress("downloading", 0, 0, None);
-                        let ah_for_cb = ah.clone();
-                        let progress_cb: Box<ort_install::ProgressFn> =
-                            Box::new(move |bytes, total| {
-                                use tauri::Emitter;
-                                let _ = ah_for_cb.emit(
-                                    "myownllm://ort-install-progress",
-                                    serde_json::json!({
-                                        "stage": "downloading",
-                                        "bytes": bytes,
-                                        "total": total,
-                                        "error": null,
-                                    }),
-                                );
-                            });
-                        match ort_install::ensure_runtime_dylib(progress_cb) {
-                            Ok(path) => {
-                                eprintln!(
-                                    "[ort_install] dylib ready at {}; re-initializing ort_setup",
-                                    path.display()
-                                );
-                                // Re-run search so STATUS flips to
-                                // `initialized: true` and the next
-                                // record click no longer hits the
-                                // pre-flight error.
-                                ort_setup::initialize();
-                                emit_progress("ready", 0, 0, None);
-                            }
-                            Err(e) => {
-                                let msg = format!("{e:#}");
-                                eprintln!("[ort_install] failed: {msg}");
-                                emit_progress("error", 0, 0, Some(&msg));
-                            }
+                let ah = app_handle.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    use tauri::Emitter;
+                    ort_setup::initialize();
+                    if ort_setup::status().initialized {
+                        return;
+                    }
+                    let emit_progress =
+                        |stage: &str, bytes: u64, total: u64, error: Option<&str>| {
+                            let _ = ah.emit(
+                                "myownllm://ort-install-progress",
+                                serde_json::json!({
+                                    "stage": stage,
+                                    "bytes": bytes,
+                                    "total": total,
+                                    "error": error,
+                                }),
+                            );
+                        };
+                    emit_progress("downloading", 0, 0, None);
+                    let ah_for_cb = ah.clone();
+                    let progress_cb: Box<ort_install::ProgressFn> =
+                        Box::new(move |bytes, total| {
+                            use tauri::Emitter;
+                            let _ = ah_for_cb.emit(
+                                "myownllm://ort-install-progress",
+                                serde_json::json!({
+                                    "stage": "downloading",
+                                    "bytes": bytes,
+                                    "total": total,
+                                    "error": null,
+                                }),
+                            );
+                        });
+                    match ort_install::ensure_runtime_dylib(progress_cb) {
+                        Ok(path) => {
+                            eprintln!(
+                                "[ort_install] dylib ready at {}; re-initializing ort_setup",
+                                path.display()
+                            );
+                            ort_setup::initialize();
+                            emit_progress("ready", 0, 0, None);
                         }
-                    });
-                }
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            eprintln!("[ort_install] failed: {msg}");
+                            emit_progress("error", 0, 0, Some(&msg));
+                        }
+                    }
+                });
 
                 // Start watcher so tracked modes stay current in the GUI session.
                 watcher::spawn_background();
