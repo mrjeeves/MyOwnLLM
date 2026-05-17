@@ -3,6 +3,7 @@
   import { loadConfig, updateConfig } from "../../config";
   import { meshUi } from "../../mesh-state.svelte";
   import { meshClient } from "../../mesh-client.svelte";
+  import { scrollAffordance } from "../scroll-affordance";
   import {
     generateNetworkId,
     normalizeNetworkId,
@@ -66,6 +67,12 @@
       default:
         return s;
     }
+  }
+
+  function diagTime(ts: number): string {
+    const d = new Date(ts);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
 
   onMount(async () => {
@@ -213,7 +220,8 @@
   }
 </script>
 
-<div class="root">
+<div class="scroll-affordance-wrap">
+<div class="root scroll-fade" use:scrollAffordance>
   {#if loading || meshUi.loading}
     <div class="loading">Loading mesh identity…</div>
   {:else if meshUi.error}
@@ -364,6 +372,30 @@
     </section>
 
     <section class="block">
+      <h3>Activity</h3>
+      {#if meshClient.diag.length === 0}
+        <div class="empty-state">
+          Nothing yet. Mesh activity (broker handshake, peer discovery,
+          connection attempts, errors) will stream here as it happens.
+        </div>
+      {:else}
+        <div class="diag-log" role="log" aria-live="polite">
+          {#each meshClient.diag.slice(-30).reverse() as e (e.ts + ":" + e.msg)}
+            <div class="diag-row" data-level={e.level}>
+              <span class="diag-time">{diagTime(e.ts)}</span>
+              <span class="diag-level">{e.level}</span>
+              <span class="diag-msg">{e.msg}</span>
+            </div>
+          {/each}
+        </div>
+        <div class="diag-hint">
+          Newest events at top. Full log also available in the WebView dev console
+          (right-click → Inspect on platforms that allow it).
+        </div>
+      {/if}
+    </section>
+
+    <section class="block">
       <h3>Connections</h3>
       {#if connections.length === 0}
         <div class="empty-state">
@@ -437,6 +469,12 @@
       {/if}
     </section>
   {/if}
+</div>
+<div class="scroll-more-hint" aria-hidden="true">
+  <span class="scroll-more-chevron">⌄</span>
+  <span>more below</span>
+</div>
+</div>
 
   {#if confirm}
     <div class="modal-overlay" onclick={dismissConfirm} role="presentation"></div>
@@ -469,7 +507,6 @@
       {/if}
     </div>
   {/if}
-</div>
 
 <style>
   .root {
@@ -654,6 +691,48 @@
   .status-text {
     font-size: 0.78rem;
     color: #aaa;
+  }
+
+  .diag-log {
+    display: flex;
+    flex-direction: column;
+    max-height: 220px;
+    overflow-y: auto;
+    background: #0d0d0d;
+    border: 1px solid #1e1e1e;
+    border-radius: 6px;
+    padding: 0.3rem 0.4rem;
+    gap: 0.05rem;
+  }
+  .diag-row {
+    display: grid;
+    grid-template-columns: 4.5rem 3rem 1fr;
+    gap: 0.5rem;
+    align-items: baseline;
+    font-family: monospace;
+    font-size: 0.7rem;
+    color: #aaa;
+    padding: 0.15rem 0.3rem;
+    border-radius: 3px;
+  }
+  .diag-row:hover { background: #131313; }
+  .diag-row[data-level="warn"] { color: #d6b25a; }
+  .diag-row[data-level="error"] { color: #f88; }
+  .diag-time { color: #555; }
+  .diag-level {
+    text-transform: uppercase;
+    font-size: 0.62rem;
+    color: #666;
+    letter-spacing: 0.05em;
+  }
+  .diag-row[data-level="warn"] .diag-level { color: #a88d4a; }
+  .diag-row[data-level="error"] .diag-level { color: #c66; }
+  .diag-msg { word-break: break-word; }
+  .diag-hint {
+    font-size: 0.7rem;
+    color: #555;
+    margin-top: 0.35rem;
+    font-style: italic;
   }
 
   .peer-list {

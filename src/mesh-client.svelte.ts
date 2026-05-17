@@ -60,6 +60,16 @@ const HANDSHAKE_TIMEOUT_MS = 20_000;
  *  wrong, network blocked) with an actionable message instead of
  *  hanging silently. */
 const BROKER_OPEN_TIMEOUT_MS = 15_000;
+/** Cap on in-UI diagnostic log entries. Old entries fall off so the
+ *  log doesn't grow unbounded during long sessions. */
+const DIAG_MAX = 80;
+
+export type DiagLevel = "info" | "warn" | "error";
+export interface DiagEntry {
+  ts: number;
+  level: DiagLevel;
+  msg: string;
+}
 
 export type PeerStatus =
   | "connecting" // DC opening, no hello exchanged yet
@@ -131,6 +141,21 @@ class MeshClient {
   my_peer_id = $state("");
   peers = $state<PeerEntry[]>([]);
 
+  /** Ring-buffered diagnostic log surfaced inside the Cloud Mesh
+   *  tab. Same content the dev console gets, but reachable without
+   *  opening DevTools — important on Tauri where the WebView's
+   *  console is platform-dependent and often hidden in shipped
+   *  builds. */
+  diag = $state<DiagEntry[]>([]);
+  private logDiag(level: DiagLevel, msg: string): void {
+    const entry: DiagEntry = { ts: Date.now(), level, msg };
+    this.diag = [...this.diag, entry].slice(-DIAG_MAX);
+    // Mirror to the dev console so a reproduction transcript exists
+    // in both places.
+    const fn = level === "error" ? console.error : level === "warn" ? console.warn : console.info;
+    fn(`[mesh] ${msg}`);
+  }
+
   // ---- internal --------------------------------------------------------
 
   private peer_js: Peer | null = null;
@@ -199,6 +224,13 @@ class MeshClient {
     const parsed = parseSignalingUrl(opts.signalingUrl);
     const ice_servers = buildIceServers(opts.stunServers, opts.turnServers);
 
+    this.logDiag(
+      "info",
+      `connecting → ${parsed.secure ? "wss" : "ws"}://${parsed.host}:${parsed.port}${parsed.path}`,
+    );
+    this.logDiag("info", `my peer id: ${id}`);
+    this.logDiag("info", `network handle: ${this.network_handle.slice(0, 12)}…`);
+
     try {
       this.peer_js = new Peer(id, {
         host: parsed.host,
@@ -211,14 +243,10 @@ class MeshClient {
         // to 1 (errors only) once the failure modes stabilise.
         debug: 2,
       });
-      // eslint-disable-next-line no-console
-      console.info(
-        "[mesh] connecting to broker",
-        { host: parsed.host, port: parsed.port, path: parsed.path, secure: parsed.secure, peer_id: id },
-      );
     } catch (e) {
       this.status = "error";
       this.error = `peerjs init: ${String(e)}`;
+      this.logDiag("error", `peerjs init failed: ${String(e)}`);
       return;
     }
 
@@ -230,12 +258,15 @@ class MeshClient {
     // any reasonable network.
     this.broker_open_timer = window.setTimeout(() => {
       if (this.status === "starting") {
-        this.status = "error";
-        this.error =
+        const detail = `${parsed.secure ? "wss" : "ws"}://${parsed.host}:${parsed.port}${parsed.path}`;
+        const msg =
           `signaling broker did not respond within ${BROKER_OPEN_TIMEOUT_MS / 1000}s ` +
-          `(${parsed.secure ? "wss" : "ws"}://${parsed.host}:${parsed.port}${parsed.path}). ` +
-          `Check that the URL is reachable and the path is the peerjs-server mount point — ` +
-          `for the public broker that's just '/' (PeerJS adds '/peerjs' itself).`;
+          `(${detail}). Check that the URL is reachable and the path is the ` +
+          `peerjs-server mount point — for the public broker that's just '/' ` +
+          `(PeerJS adds '/peerjs' itself).`;
+        this.status = "error";
+        this.error = msg;
+        this.logDiag("error", `broker open timeout — ${detail}`);
       }
     }, BROKER_OPEN_TIMEOUT_MS);
 
@@ -245,8 +276,7 @@ class MeshClient {
         this.broker_open_timer = null;
       }
       this.status = "online";
-      // eslint-disable-next-line no-console
-      console.info("[mesh] broker open — my peer id is", id);
+      this.logDiag("info", `broker open — listening as ${this.my_peer_id}`);
       this.kickDiscovery();
     });
     this.peer_js.on("error", (err) => {
@@ -257,9 +287,11 @@ class MeshClient {
       // silent hang.
       const type = (err as { type?: string }).type ?? "unknown";
       const message = String((err as Error).message ?? err);
-      // eslint-disable-next-line no-console
-      console.warn("[mesh] peerjs error", type, message, err);
-      if (type === "peer-unavailable") return;
+      if (type === "peer-unavailable") {
+        this.logDiag("warn", `${type}: ${message}`);
+        return;
+      }
+      this.logDiag("error", `${type}: ${message}`);
       this.status = "error";
       this.error = `${type}: ${message}`;
       if (this.broker_open_timer !== null) {
@@ -268,12 +300,14 @@ class MeshClient {
       }
     });
     this.peer_js.on("disconnected", () => {
-      // Broker connection dropped; PeerJS auto-reconnects by default.
-      // Surface this so the UI can show a transient state without us
-      // tearing down the whole client.
+      this.logDiag("warn", "broker disconnected — peerjs will retry");
       if (!this.stopping) this.status = "starting";
     });
+    this.peer_js.on("close", () => {
+      this.logDiag("info", "broker connection closed");
+    });
     this.peer_js.on("connection", (dc) => {
+      this.logDiag("info", `inbound connection from ${dc.peer.slice(0, 20)}…`);
       this.handleInboundConnection(dc);
     });
   }
@@ -301,12 +335,18 @@ class MeshClient {
 
     const should_run = cfg.cloud_mesh.locked && cfg.cloud_mesh.network_id !== "";
     if (!should_run) {
-      if (this.peer_js) await this.stop();
+      if (this.peer_js) {
+        this.logDiag("info", "reconcile: should_run=false → stopping");
+        await this.stop();
+      }
       return;
     }
 
     const signaling = cfg.cloud_mesh.signaling_servers[0];
-    if (!signaling || signaling.trim() === "") return;
+    if (!signaling || signaling.trim() === "") {
+      this.logDiag("error", "reconcile: no signaling URL configured");
+      return;
+    }
 
     // If we're already running on the right network with the right
     // identity, leave it alone. Detecting STUN/TURN drift here is
@@ -320,7 +360,11 @@ class MeshClient {
       return;
     }
 
-    if (this.peer_js) await this.stop();
+    if (this.peer_js) {
+      this.logDiag("info", "reconcile: config changed → restarting");
+      await this.stop();
+    }
+    this.logDiag("info", `reconcile: starting mesh for network "${cfg.cloud_mesh.network_id}"`);
     await this.start({
       identity,
       networkId: cfg.cloud_mesh.network_id,
@@ -476,14 +520,21 @@ class MeshClient {
       // Some peerjs-server deployments disable discovery. We surface
       // this once and stop polling — the user can still connect by
       // having a peer initiate to us, just not the reverse.
-      // eslint-disable-next-line no-console
-      console.warn("[mesh] discovery unavailable", e);
+      this.logDiag("warn", `discovery unavailable: ${String(e)}`);
       if (this.discovery_timer !== null) {
         clearInterval(this.discovery_timer);
         this.discovery_timer = null;
       }
       return;
     }
+    const matches = all.filter((id) => {
+      const p = parsePeerJsId(id);
+      return p && p.network_handle === this.network_handle && p.device_pubkey !== my_pubkey;
+    });
+    this.logDiag(
+      "info",
+      `discovery: ${all.length} peers on broker, ${matches.length} on our network`,
+    );
     for (const id of all) {
       const parsed = parsePeerJsId(id);
       if (!parsed) continue;
@@ -495,6 +546,7 @@ class MeshClient {
       // sides would try simultaneously and we'd get two redundant
       // channels.
       if (my_pubkey > parsed.device_pubkey) continue;
+      this.logDiag("info", `initiating connection to ${parsed.device_pubkey.slice(0, 12)}…`);
       this.initiateConnection(id, parsed.device_pubkey);
     }
   }
