@@ -54,6 +54,12 @@ import {
 
 const DISCOVERY_INTERVAL_MS = 15_000;
 const HANDSHAKE_TIMEOUT_MS = 20_000;
+/** If the broker's `open` event doesn't arrive within this window
+ *  we flip to error rather than sit on "Connecting…" indefinitely.
+ *  Surfaces the most common failure modes (broker down, URL path
+ *  wrong, network blocked) with an actionable message instead of
+ *  hanging silently. */
+const BROKER_OPEN_TIMEOUT_MS = 15_000;
 
 export type PeerStatus =
   | "connecting" // DC opening, no hello exchanged yet
@@ -137,6 +143,7 @@ class MeshClient {
   private connections = new Map<string, ConnectionState>();
   private roster_pubkeys = new Set<string>();
   private discovery_timer: number | null = null;
+  private broker_open_timer: number | null = null;
   private stopping = false;
   /** Outgoing Move state. Keyed by conversation GUID — only one
    *  in-flight Move per conversation is allowed. Holds the full
@@ -199,31 +206,66 @@ class MeshClient {
         path: parsed.path,
         secure: parsed.secure,
         config: { iceServers: ice_servers },
-        // Quieter logs in production; bump for debugging.
-        debug: 1,
+        // Verbose during early Cloud Mesh rollout — the dev console
+        // is the cheapest place to debug broker connectivity. Tighten
+        // to 1 (errors only) once the failure modes stabilise.
+        debug: 2,
       });
+      // eslint-disable-next-line no-console
+      console.info(
+        "[mesh] connecting to broker",
+        { host: parsed.host, port: parsed.port, path: parsed.path, secure: parsed.secure, peer_id: id },
+      );
     } catch (e) {
       this.status = "error";
       this.error = `peerjs init: ${String(e)}`;
       return;
     }
 
+    // Bail out of "Connecting…" if the broker never responds with
+    // `open`. The most common cause is a wrong path component in
+    // the signaling URL (e.g. `…/peerjs` instead of `…/`) where
+    // PeerJS dutifully tries to talk to a 404 endpoint and never
+    // surfaces an error. 15s is generous for a healthy broker over
+    // any reasonable network.
+    this.broker_open_timer = window.setTimeout(() => {
+      if (this.status === "starting") {
+        this.status = "error";
+        this.error =
+          `signaling broker did not respond within ${BROKER_OPEN_TIMEOUT_MS / 1000}s ` +
+          `(${parsed.secure ? "wss" : "ws"}://${parsed.host}:${parsed.port}${parsed.path}). ` +
+          `Check that the URL is reachable and the path is the peerjs-server mount point — ` +
+          `for the public broker that's just '/' (PeerJS adds '/peerjs' itself).`;
+      }
+    }, BROKER_OPEN_TIMEOUT_MS);
+
     this.peer_js.on("open", () => {
+      if (this.broker_open_timer !== null) {
+        clearTimeout(this.broker_open_timer);
+        this.broker_open_timer = null;
+      }
       this.status = "online";
+      // eslint-disable-next-line no-console
+      console.info("[mesh] broker open — my peer id is", id);
       this.kickDiscovery();
     });
     this.peer_js.on("error", (err) => {
-      // PeerJS surfaces both fatal and recoverable errors here. We
-      // log them all but only flip status on fatal categories.
-      // "peer-unavailable" happens routinely when listAllPeers
-      // races a peer leaving, for example.
+      // PeerJS surfaces both fatal and recoverable errors here.
+      // "peer-unavailable" happens routinely when listAllPeers races
+      // a peer leaving — log but ignore. Everything else flips the
+      // visible status so the user gets feedback rather than a
+      // silent hang.
       const type = (err as { type?: string }).type ?? "unknown";
-      if (type === "network" || type === "server-error" || type === "socket-error") {
-        this.status = "error";
-        this.error = `${type}: ${String((err as Error).message ?? err)}`;
-      }
+      const message = String((err as Error).message ?? err);
       // eslint-disable-next-line no-console
-      console.warn("[mesh] peerjs error", type, err);
+      console.warn("[mesh] peerjs error", type, message, err);
+      if (type === "peer-unavailable") return;
+      this.status = "error";
+      this.error = `${type}: ${message}`;
+      if (this.broker_open_timer !== null) {
+        clearTimeout(this.broker_open_timer);
+        this.broker_open_timer = null;
+      }
     });
     this.peer_js.on("disconnected", () => {
       // Broker connection dropped; PeerJS auto-reconnects by default.
@@ -293,6 +335,10 @@ class MeshClient {
     if (this.discovery_timer !== null) {
       clearInterval(this.discovery_timer);
       this.discovery_timer = null;
+    }
+    if (this.broker_open_timer !== null) {
+      clearTimeout(this.broker_open_timer);
+      this.broker_open_timer = null;
     }
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);

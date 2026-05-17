@@ -50,10 +50,22 @@ const DEFAULT_REMOTE_UI: RemoteUiConfig = {
 // ship their own default. STUN servers default to Google's public
 // pool, which is the de-facto baseline.
 //
+// URL contract: the path is the peerjs-server *mount point*. For the
+// public broker that's `/`; PeerJS internally appends `/peerjs` to
+// reach the WebSocket endpoint. Don't include `/peerjs` in the URL
+// here — that pushes PeerJS to build `…/peerjspeerjs/id` which 404s
+// and leaves the client stuck on "Connecting…" forever.
+//
 // Exported so the Addresses UI can use it as a fallback when the
 // user removes every entry — signaling_servers is never allowed to
 // persist as empty.
-export const DEFAULT_PEERJS_SIGNALING_URL = "wss://0.peerjs.com:443/peerjs";
+export const DEFAULT_PEERJS_SIGNALING_URL = "wss://0.peerjs.com:443/";
+/** URLs we've shipped as default in earlier commits on this branch
+ *  that were broken (path included `/peerjs`, see note above).
+ *  Migrated to the current default on load so testers who locked
+ *  their Network ID against the broken URL come back up cleanly
+ *  without having to manually edit Addresses. */
+const LEGACY_BROKEN_SIGNALING_URLS = ["wss://0.peerjs.com:443/peerjs"];
 
 const DEFAULT_CLOUD_MESH: CloudMeshConfig = {
   enabled: false,
@@ -217,14 +229,20 @@ function mergeCloudMesh(raw: Partial<CloudMeshConfig> | undefined): CloudMeshCon
       turn_servers: [...DEFAULT_CLOUD_MESH.turn_servers],
     };
   }
+  // Replace any legacy-broken default we previously shipped with
+  // the corrected URL so users who locked against the old value
+  // don't sit on "Connecting…" forever.
+  const signaling =
+    raw.signaling_servers && raw.signaling_servers.length > 0
+      ? raw.signaling_servers.map((s) =>
+          LEGACY_BROKEN_SIGNALING_URLS.includes(s) ? DEFAULT_PEERJS_SIGNALING_URL : s,
+        )
+      : [...DEFAULT_CLOUD_MESH.signaling_servers];
   return {
     enabled: raw.enabled ?? DEFAULT_CLOUD_MESH.enabled,
     network_id: raw.network_id ?? DEFAULT_CLOUD_MESH.network_id,
     locked: raw.locked ?? DEFAULT_CLOUD_MESH.locked,
-    signaling_servers:
-      raw.signaling_servers && raw.signaling_servers.length > 0
-        ? raw.signaling_servers
-        : [...DEFAULT_CLOUD_MESH.signaling_servers],
+    signaling_servers: signaling,
     stun_servers: raw.stun_servers ?? [...DEFAULT_CLOUD_MESH.stun_servers],
     turn_servers: raw.turn_servers ?? [...DEFAULT_CLOUD_MESH.turn_servers],
   };
