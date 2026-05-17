@@ -60,6 +60,19 @@ import {
  *  timeout, because verifying a code with a peer out-of-band can
  *  easily take more than 30s. */
 const HANDSHAKE_TIMEOUT_MS = 30_000;
+/** App-level keepalive on each active connection. We send a ping
+ *  every interval and also use the tick to check whether we've
+ *  heard from the peer recently enough; if not, the connection
+ *  is dead and we drop it. Catches the case where the local
+ *  device suspended (laptop lid closed) — Trystero's WebRTC
+ *  layer doesn't always notice the peer's gone, so without an
+ *  app-level liveness check we'd sit on a stale connection
+ *  showing "live" indefinitely. */
+const HEARTBEAT_INTERVAL_MS = 10_000;
+/** Drop the connection if we haven't heard anything (ping, pong,
+ *  protocol message — anything) within this window. 25s gives us
+ *  two missed pings of grace before we consider the peer dead. */
+const HEARTBEAT_TIMEOUT_MS = 25_000;
 const DIAG_MAX = 80;
 /** Globally-unique app identifier passed to Trystero so MyOwnLLM
  *  peers don't accidentally match peers from unrelated apps that
@@ -319,6 +332,7 @@ class MeshClient {
     this.stopping = true;
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
+      if (c.heartbeat_timer !== null) clearInterval(c.heartbeat_timer);
     }
     this.connections.clear();
     if (this.room) {
@@ -511,6 +525,7 @@ class MeshClient {
 
   private async handleMessage(peer_id: string, msg: MeshMessage): Promise<void> {
     const conn = this.connections.get(peer_id);
+    if (conn) conn.last_recv_at = Date.now();
     if (!conn) {
       // Message from a peer we don't have state for — possible if
       // trystero delivers a message before onPeerJoin fires, or
@@ -806,6 +821,7 @@ class MeshClient {
     const c = this.connections.get(peer_id);
     if (!c) return;
     if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
+    if (c.heartbeat_timer !== null) clearInterval(c.heartbeat_timer);
     this.connections.delete(peer_id);
     for (const [guid, pending] of this.pending_moves_out) {
       if (pending.target_peer_id === peer_id) {
