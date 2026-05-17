@@ -253,11 +253,15 @@
   {:else if meshUi.error}
     <div class="error">Couldn't load identity: {meshUi.error}</div>
   {:else if meshUi.identity}
-    <section class="block">
-      <h3>This device</h3>
-      <div class="row">
-        <label class="field-label" for="device-id">Device ID</label>
-        <div class="field-row id-row">
+    <!-- Compact identity card: device + label inline, network ID + lock
+         below. Everything the user might want to read/edit about
+         "who am I and what mesh am I on" lives here in one tight
+         block so the rest of the page can be devoted to the live
+         connection-management surface below. -->
+    <div class="identity-card">
+      <div class="id-row">
+        <label class="micro-label" for="device-id">device</label>
+        <div class="id-row-content">
           <input
             id="device-id"
             class="text-input mono id-body"
@@ -269,49 +273,27 @@
             title={meshUi.identity.device_id}
           />
           {#if identitySplit.suffix}
-            <div class="suffix-pill" title="Stable display tag for this device — read this aloud to a peer to identify yourself.">
+            <div class="suffix-pill" title="Stable display tag — read this aloud to identify yourself to a peer.">
               <span class="suffix-label">suffix</span>
               <span class="suffix-value">{identitySplit.suffix}</span>
             </div>
           {/if}
-        </div>
-        <div class="field-hint">
-          Internal identifier for this MyOwnLLM instance, derived from a
-          keypair under <code class="path">~/.myownllm/.secrets/</code>.
-          The greyed-out body uniquely identifies the keypair; the
-          5-char <strong>suffix</strong> alongside is the eyeball-friendly
-          tag — that's what you'd quote to confirm "yes, that's me" when
-          a peer is approving your join request.
-        </div>
-      </div>
-
-      <div class="row">
-        <label class="field-label" for="device-label">Label</label>
-        <div class="field-row">
           <input
             id="device-label"
-            class="text-input"
+            class="text-input label-input"
             type="text"
-            placeholder="e.g. Laptop, Pi, Office, Home Office"
+            placeholder="Label (e.g. Laptop, Pi, Office)"
             bind:value={labelDraft}
             onblur={onLabelBlur}
             disabled={labelSaving}
             maxlength="64"
           />
         </div>
-        <div class="field-hint">
-          Friendly name for this device inside your own little virtual
-          network — what it's called in other peers' Connections list.
-          Cosmetic; peers still identify each other by Device ID.
-        </div>
       </div>
-    </section>
 
-    <section class="block">
-      <h3>Network</h3>
-      <div class="row">
-        <label class="field-label" for="net-id">Network ID</label>
-        <div class="field-row">
+      <div class="id-row">
+        <label class="micro-label" for="net-id">network</label>
+        <div class="id-row-content">
           <input
             id="net-id"
             class="text-input mono"
@@ -330,7 +312,7 @@
             onclick={onLockToggle}
             disabled={saving}
             title={locked
-              ? "Locked — click to unlock and change"
+              ? "Locked — click to unlock and change (also resets the mesh connection)"
               : dirty
                 ? "Lock to commit this Network ID"
                 : "Lock"}
@@ -355,130 +337,64 @@
             Copy
           </button>
         </div>
-        {#if inlineError}
-          <div class="inline-error">{inlineError}</div>
-        {:else if savedNetworkId === ""}
-          <div class="field-hint">
-            A short name for your mesh — pick anything memorable
-            (letters, digits, <code class="path">-</code> and
-            <code class="path">_</code>; 3–64 chars). Same name on
-            two devices = same mesh. Knowing the Network ID lets you
-            <em>knock</em>, not enter — every join still requires an
-            in-app approval from a peer that's already in.
-          </div>
-        {:else if !locked && dirty}
-          <div class="field-hint warn">
-            Pending change — lock to commit. The current network stays active
-            until you do.
-          </div>
-        {:else if locked}
-          <div class="field-hint">
-            Locked. Click the lock to change — you'll see a warning first.
-            Unlocking and re-locking the same Network ID is also the
-            way to <strong>reset the mesh connection</strong>: the
-            client tears down everything, rejoins the room from
-            scratch, and re-runs handshakes with peers — useful if
-            a connection seems stuck or you want to force a
-            re-authentication.
-          </div>
+      </div>
+
+      {#if inlineError}
+        <div class="card-hint error">{inlineError}</div>
+      {:else if savedNetworkId === ""}
+        <div class="card-hint">
+          A short name for your mesh. Same name on two devices = same
+          mesh. Knowing the Network ID lets you <em>knock</em>, not
+          enter — every join still requires an in-app approval.
+        </div>
+      {:else if !locked && dirty}
+        <div class="card-hint warn">
+          Pending change — lock to commit. The current network stays
+          active until you do.
+        </div>
+      {:else if locked}
+        <div class="card-hint">
+          Locked. Unlock and re-lock to <strong>reset</strong> the
+          mesh connection — tears down everything, rejoins the room,
+          and re-runs handshakes. The lock is the reset button.
+        </div>
+      {:else}
+        <div class="card-hint">Unlocked. Lock to commit.</div>
+      {/if}
+    </div>
+
+    <!-- Thin status bar — the live state of the mesh client at a
+         glance. Sits between the static identity card above and the
+         dynamic connection-management surface below. -->
+    <div
+      class="status-bar"
+      class:online={meshClient.status === "online"}
+      class:starting={meshClient.status === "starting"}
+      class:error-bar={meshClient.status === "error"}
+    >
+      <span
+        class="status-dot"
+        class:online={meshClient.status === "online"}
+        class:starting={meshClient.status === "starting"}
+        class:error-dot={meshClient.status === "error"}
+      ></span>
+      <span class="status-text">
+        {#if meshClient.status === "off"}
+          Offline — lock a Network ID to connect.
+        {:else if meshClient.status === "starting"}
+          Joining mesh room…
+        {:else if meshClient.status === "online"}
+          Online · {meshClient.peers.length} {meshClient.peers.length === 1 ? "peer" : "peers"} ·
+          {connections.length > 1 ? "router-eligible" : "leaf"}
         {:else}
-          <div class="field-hint">
-            Unlocked. Lock to commit.
-          </div>
+          Error: {meshClient.error}
         {/if}
-      </div>
-    </section>
+      </span>
+    </div>
 
-    <section class="block">
-      <h3>Status</h3>
-      <div class="status-row">
-        <span class="status-dot" class:online={meshClient.status === "online"} class:starting={meshClient.status === "starting"} class:error-dot={meshClient.status === "error"}></span>
-        <span class="status-text">
-          {#if meshClient.status === "off"}
-            Offline. Lock a Network ID to connect.
-          {:else if meshClient.status === "starting"}
-            Connecting to signaling broker…
-          {:else if meshClient.status === "online"}
-            Online — {meshClient.peers.length} {meshClient.peers.length === 1 ? "peer" : "peers"} ·
-            {#if connections.length > 1}router-eligible{:else}leaf{/if}
-          {:else}
-            Error: {meshClient.error}
-          {/if}
-        </span>
-      </div>
-    </section>
-
-    <section class="block">
-      <h3>Activity</h3>
-      {#if meshClient.diag.length === 0}
-        <div class="empty-state">
-          Nothing yet. Mesh activity (broker handshake, peer discovery,
-          connection attempts, errors) will stream here as it happens.
-        </div>
-      {:else}
-        <div class="diag-log" role="log" aria-live="polite">
-          {#each meshClient.diag.slice(-30).reverse() as e (e.ts + ":" + e.msg)}
-            <div class="diag-row" data-level={e.level}>
-              <span class="diag-time">{diagTime(e.ts)}</span>
-              <span class="diag-level">{e.level}</span>
-              <span class="diag-msg">{e.msg}</span>
-            </div>
-          {/each}
-        </div>
-        <div class="diag-hint">
-          Newest events at top. Full log also available in the WebView dev console
-          (right-click → Inspect on platforms that allow it).
-        </div>
-      {/if}
-    </section>
-
-    <section class="block">
-      <h3>Connections</h3>
-      {#if connections.length === 0}
-        <div class="empty-state">
-          Not connected to any peers yet. Once another device joins the same
-          Network ID, peers find each other through the signaling broker and
-          establish direct WebRTC connections.
-        </div>
-      {:else}
-        <div class="peer-list">
-          {#each connections as p (p.peer_id)}
-            <div class="peer-row" class:awaiting={p.status === "pending_remote"}>
-              <div class="peer-main">
-                <div class="peer-label">
-                  {p.label || shortPubkey(p.device_pubkey)}
-                  {#if p.device_suffix}
-                    <span class="suffix-chip" title="Peer's stable display tag">{p.device_suffix}</span>
-                  {/if}
-                  {#if p.authorized}<span class="badge ok">approved</span>{/if}
-                </div>
-                <code class="peer-id">{shortPubkey(p.device_pubkey)}</code>
-                {#if p.status === "pending_remote" && p.verification_code}
-                  <div class="verify-line">
-                    Your code: <code class="code-pill">{p.verification_code}</code>
-                    <span class="verify-hint">tell the other side to confirm this</span>
-                  </div>
-                {/if}
-              </div>
-              <span class="peer-status" data-status={p.status}>{statusLabel(p)}</span>
-              <button class="btn-small ghost" onclick={() => meshClient.removePeer(p.peer_id)} title="Disconnect and revoke approval">
-                Remove
-              </button>
-            </div>
-          {/each}
-        </div>
-      {/if}
-    </section>
-
-    <section class="block">
-      <h3>Network requests</h3>
-      {#if pendingRequests.length === 0}
-        <div class="empty-state">
-          No pending requests. When another device asks to join your mesh and
-          isn't already vouched for, the request will show up here for your
-          approval.
-        </div>
-      {:else}
+    {#if pendingRequests.length > 0}
+      <section class="block">
+        <h3>Network requests</h3>
         <div class="peer-list">
           {#each pendingRequests as p (p.peer_id)}
             <div class="peer-row request">
@@ -518,6 +434,68 @@
               </button>
             </div>
           {/each}
+        </div>
+      </section>
+    {/if}
+
+    <section class="block">
+      <h3>Connections</h3>
+      {#if connections.length === 0}
+        <div class="empty-state">
+          Not connected to any peers yet. Once another device joins
+          the same Network ID, peers find each other through the
+          signaling relay and establish direct WebRTC connections.
+        </div>
+      {:else}
+        <div class="peer-list">
+          {#each connections as p (p.peer_id)}
+            <div class="peer-row" class:awaiting={p.status === "pending_remote"}>
+              <div class="peer-main">
+                <div class="peer-label">
+                  {p.label || shortPubkey(p.device_pubkey)}
+                  {#if p.device_suffix}
+                    <span class="suffix-chip" title="Peer's stable display tag">{p.device_suffix}</span>
+                  {/if}
+                  {#if p.authorized}<span class="badge ok">approved</span>{/if}
+                </div>
+                <code class="peer-id">{shortPubkey(p.device_pubkey)}</code>
+                {#if p.status === "pending_remote" && p.local_approved && p.verification_code}
+                  <div class="verify-line">
+                    Your code: <code class="code-pill">{p.verification_code}</code>
+                    <span class="verify-hint">tell the other side to confirm this</span>
+                  </div>
+                {/if}
+              </div>
+              <span class="peer-status" data-status={p.status}>{statusLabel(p)}</span>
+              <button class="btn-small ghost" onclick={() => meshClient.removePeer(p.peer_id)} title="Disconnect and revoke approval">
+                Remove
+              </button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
+
+    <section class="block">
+      <h3>Activity</h3>
+      {#if meshClient.diag.length === 0}
+        <div class="empty-state">
+          Nothing yet. Mesh activity (broker handshake, peer discovery,
+          connection attempts, errors) will stream here as it happens.
+        </div>
+      {:else}
+        <div class="diag-log" role="log" aria-live="polite">
+          {#each meshClient.diag.slice(-30).reverse() as e (e.ts + ":" + e.msg)}
+            <div class="diag-row" data-level={e.level}>
+              <span class="diag-time">{diagTime(e.ts)}</span>
+              <span class="diag-level">{e.level}</span>
+              <span class="diag-msg">{e.msg}</span>
+            </div>
+          {/each}
+        </div>
+        <div class="diag-hint">
+          Newest events at top. Full log also available in the WebView dev console
+          (right-click → Inspect on platforms that allow it).
         </div>
       {/if}
     </section>
@@ -590,40 +568,6 @@
     letter-spacing: 0.06em;
     color: #888;
     margin: 0;
-  }
-
-  .row {
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-  }
-
-  .field-label {
-    font-size: 0.78rem;
-    color: #aaa;
-  }
-  .field-row {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-  .field-hint {
-    font-size: 0.73rem;
-    color: #666;
-    line-height: 1.5;
-    max-width: 32rem;
-  }
-  .field-hint.warn {
-    color: #d6b25a;
-  }
-
-  .path {
-    font-family: monospace;
-    font-size: 0.73rem;
-    background: #181818;
-    padding: 0.05rem 0.3rem;
-    border-radius: 3px;
-    color: #aaa;
   }
 
   .text-input {
@@ -704,23 +648,80 @@
   .btn-small:hover:not(:disabled) { background: #22223a; }
   .btn-small:disabled { opacity: 0.4; cursor: default; }
 
-  .inline-error {
-    font-size: 0.75rem;
-    color: #f88;
-    background: #2a1a1a;
-    padding: 0.35rem 0.55rem;
-    border-radius: 5px;
-    max-width: 32rem;
-  }
 
-  .status-row {
+  /* Compact identity card up top — replaces the previous "This
+     device" + "Network" sections. One block, two horizontal rows
+     (device + label inline, network + lock + actions inline),
+     contextual hint below. Goal: get all the static info/edit
+     surface out of the way so the live connection management
+     below has room to breathe. */
+  .identity-card {
+    background: #131313;
+    border: 1px solid #1e1e1e;
+    border-radius: 8px;
+    padding: 0.7rem 0.85rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+  .id-row {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+  }
+  .id-row-content {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-width: 0;
+  }
+  .micro-label {
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #666;
+    width: 3.5rem;
+    flex-shrink: 0;
+    text-align: right;
+  }
+  .label-input {
+    flex: 0 0 11rem;
+    font-size: 0.8rem;
+  }
+  .card-hint {
+    font-size: 0.72rem;
+    color: #888;
+    line-height: 1.5;
+    padding: 0 0.1rem;
+  }
+  .card-hint.warn { color: #d6b25a; }
+  .card-hint.error { color: #f88; }
+
+  /* Thin status bar between the static identity card and the
+     dynamic connection management surface. One line, full width,
+     left-aligned dot + text. Color shifts subtly with status so
+     it's scannable at a glance without dominating the layout. */
+  .status-bar {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    padding: 0.55rem 0.7rem;
+    padding: 0.4rem 0.7rem;
     background: #131313;
     border: 1px solid #1e1e1e;
     border-radius: 6px;
+  }
+  .status-bar.online {
+    background: #0f1812;
+    border-color: #1e2a1e;
+  }
+  .status-bar.starting {
+    background: #1a1612;
+    border-color: #2a221a;
+  }
+  .status-bar.error-bar {
+    background: #1f1212;
+    border-color: #3a1818;
   }
   .status-dot {
     width: 8px;
