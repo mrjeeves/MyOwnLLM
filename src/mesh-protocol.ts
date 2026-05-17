@@ -228,11 +228,19 @@ export function pubkeyPart(device_id: string): string {
 }
 
 /** PeerJS peer-id format. Includes a brand prefix so we can filter
- *  for our own peers on a shared public broker, and the Network ID
- *  so peers on the same network find each other while peers on
- *  different networks ignore each other. */
-export function peerJsId(network_id: string, device_pubkey: string): string {
-  return `mol-${network_id}-${device_pubkey}`;
+ *  for our own peers on a shared public broker, and the broker-side
+ *  network handle (a sha256 of the human Network ID, base32-encoded
+ *  to a fixed 52 chars) so peers on the same network find each other
+ *  while peers on different networks ignore each other.
+ *
+ *  We use the hashed handle rather than the raw Network ID for three
+ *  reasons: (1) the user's chosen ID may contain `-` which would
+ *  confuse the parser, (2) human IDs are short and bias toward
+ *  collisions/scanning on a shared broker, and (3) it lets the
+ *  visible Network ID stay friendly without leaking it to anyone
+ *  who scrapes the broker. */
+export function peerJsId(network_handle: string, device_pubkey: string): string {
+  return `mol-${network_handle}-${device_pubkey}`;
 }
 
 /** Inverse of `peerJsId`. Returns null if the input isn't one of
@@ -240,13 +248,25 @@ export function peerJsId(network_id: string, device_pubkey: string): string {
  *  instances on our network. */
 export function parsePeerJsId(
   id: string,
-): { network_id: string; device_pubkey: string } | null {
+): { network_handle: string; device_pubkey: string } | null {
   if (!id.startsWith("mol-")) return null;
   const rest = id.slice("mol-".length);
-  // network_id is exactly 52 chars (base32 of 32 bytes, no padding).
+  // network_handle is exactly 52 chars (sha256 base32, no padding).
   if (rest.length < 53 || rest[52] !== "-") return null;
   return {
-    network_id: rest.slice(0, 52),
+    network_handle: rest.slice(0, 52),
     device_pubkey: rest.slice(53),
   };
+}
+
+/** Derive the broker-side discovery handle from a user-typed Network
+ *  ID. Hashes under a domain-separation tag so the same string used
+ *  elsewhere can't collide, then base32-encodes to 52 chars (the
+ *  format `parsePeerJsId` expects). Async because SubtleCrypto is —
+ *  callers cache the result for the session. */
+export async function deriveNetworkHandle(network_id: string): Promise<string> {
+  const tagged = `myownllm-network-v1:${network_id}`;
+  const bytes = new TextEncoder().encode(tagged);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return base32Encode(new Uint8Array(digest));
 }

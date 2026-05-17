@@ -279,9 +279,10 @@
             type="text"
             bind:value={draftNetworkId}
             disabled={!editable || saving}
-            placeholder="Paste a Network ID, or click Generate to start a new mesh"
+            placeholder="e.g. office-mesh, or click Generate"
             spellcheck="false"
             autocomplete="off"
+            maxlength="64"
           />
           <button
             class="lock-btn"
@@ -302,7 +303,7 @@
             class="btn-small"
             onclick={onGenerate}
             disabled={!editable || saving}
-            title="Generate a fresh 256-bit Network ID"
+            title="Generate a short random Network ID"
           >
             Generate
           </button>
@@ -319,12 +320,12 @@
           <div class="inline-error">{inlineError}</div>
         {:else if savedNetworkId === ""}
           <div class="field-hint">
-            The one thing you share with other devices to bring them
-            into your mesh. Paste a Network ID someone gave you to
-            join their network, or generate a fresh one to start your
-            own. All devices using the same Network ID find each other
-            through the signaling broker; peer identities are exchanged
-            automatically once connected.
+            A short name for your mesh — pick anything memorable
+            (letters, digits, <code class="path">-</code> and
+            <code class="path">_</code>; 3–64 chars). Same name on
+            two devices = same mesh. Knowing the Network ID lets you
+            <em>knock</em>, not enter — every join still requires an
+            in-app approval from a peer that's already in.
           </div>
         {:else if !locked && dirty}
           <div class="field-hint warn">

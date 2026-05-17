@@ -191,41 +191,48 @@ fn decode_anchor(anchor: Anchor) -> Result<Identity> {
     })
 }
 
-/// Generate a fresh 256-bit Network ID, encoded as base32-lowercase
-/// without padding. This is the value users type in or hand off to
-/// other devices to join the same mesh — it's a random opaque handle,
-/// not derived from any key, so the same Network ID can be regenerated
-/// freely on any device without coordination.
+/// Generate a fresh memorable Network ID. Eight random chars from
+/// `[a-z0-9]` — short enough to read over the phone, long enough
+/// (36^8 ≈ 2.8 trillion) that accidental collisions don't happen.
+/// The Network ID itself doesn't gate access — the per-peer auth
+/// handshake does — so it doesn't need to be cryptographically
+/// strong. The frontend hashes whatever the user picks to derive
+/// the broker-side discovery handle.
 pub fn generate_network_id() -> String {
-    let mut bytes = [0u8; 32];
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut bytes = [0u8; 8];
     OsRng.fill_bytes(&mut bytes);
-    BASE32_NOPAD.encode(&bytes).to_lowercase()
+    bytes
+        .iter()
+        .map(|&b| ALPHABET[(b as usize) % ALPHABET.len()] as char)
+        .collect()
 }
 
-/// Validate a user-supplied Network ID. Accepts base32 in either case,
-/// strips internal whitespace and dashes (so users can copy-paste
-/// chunked IDs), and re-encodes to the canonical lowercase form. The
-/// canonical form is what gets persisted; we never store user
-/// formatting variations.
+/// Normalize a user-typed Network ID. Trims whitespace, lowercases,
+/// and validates that every character is alphanumeric, `-`, or `_`.
+/// Length is enforced to 3–64 chars — long enough to be unambiguous,
+/// short enough to share verbally. Returned string is the canonical
+/// form we persist and compare against; the broker discovery handle
+/// is derived on the frontend by hashing this value.
 pub fn normalize_network_id(input: &str) -> Result<String> {
-    let cleaned: String = input
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '-')
-        .collect();
-    if cleaned.is_empty() {
+    let trimmed = input.trim().to_lowercase();
+    if trimmed.is_empty() {
         anyhow::bail!("network id is empty");
     }
-    let upper = cleaned.to_uppercase();
-    let bytes = BASE32_NOPAD
-        .decode(upper.as_bytes())
-        .context("network id is not valid base32")?;
-    if bytes.len() != 32 {
-        anyhow::bail!(
-            "network id decodes to {} bytes; expected 32 (a 256-bit identifier)",
-            bytes.len()
-        );
+    if trimmed.len() < 3 {
+        anyhow::bail!("network id must be at least 3 characters");
     }
-    Ok(BASE32_NOPAD.encode(&bytes).to_lowercase())
+    if trimmed.len() > 64 {
+        anyhow::bail!("network id must be 64 characters or fewer");
+    }
+    for c in trimmed.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            anyhow::bail!(
+                "network id contains '{c}'; only letters, digits, '-', and '_' are allowed"
+            );
+        }
+    }
+    Ok(trimmed)
 }
 
 /// Update the stored label on the anchor file. Re-reads the anchor to
@@ -294,33 +301,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_round_trips() {
-        let raw = generate_network_id();
-        let normed = normalize_network_id(&raw).unwrap();
-        assert_eq!(raw, normed);
+    fn normalize_round_trips_simple_input() {
+        let normed = normalize_network_id("office-mesh").unwrap();
+        assert_eq!(normed, "office-mesh");
     }
 
     #[test]
-    fn normalize_accepts_uppercase_and_dashes() {
-        let raw = generate_network_id();
-        let chunked: String = raw
-            .to_uppercase()
-            .chars()
-            .collect::<Vec<_>>()
-            .chunks(4)
-            .map(|c| c.iter().collect::<String>())
-            .collect::<Vec<_>>()
-            .join("-");
-        let normed = normalize_network_id(&chunked).unwrap();
-        assert_eq!(raw, normed);
+    fn normalize_trims_and_lowercases() {
+        assert_eq!(
+            normalize_network_id("  Office-Mesh  ").unwrap(),
+            "office-mesh"
+        );
+    }
+
+    #[test]
+    fn normalize_accepts_letters_digits_dash_underscore() {
+        assert_eq!(normalize_network_id("my_net_1").unwrap(), "my_net_1");
+        assert_eq!(normalize_network_id("ab12").unwrap(), "ab12");
     }
 
     #[test]
     fn normalize_rejects_garbage() {
         assert!(normalize_network_id("").is_err());
-        assert!(normalize_network_id("not base32!").is_err());
-        // Too few bytes
-        assert!(normalize_network_id("aaaa").is_err());
+        // Too short
+        assert!(normalize_network_id("ab").is_err());
+        // Too long (65 chars)
+        assert!(normalize_network_id(&"a".repeat(65)).is_err());
+        // Disallowed character
+        assert!(normalize_network_id("not space!").is_err());
+        assert!(normalize_network_id("hello world").is_err());
+    }
+
+    #[test]
+    fn generate_produces_valid_id() {
+        for _ in 0..50 {
+            let id = generate_network_id();
+            assert_eq!(id.len(), 8);
+            // Round-trip: anything generate() emits must pass normalize().
+            assert_eq!(normalize_network_id(&id).unwrap(), id);
+        }
     }
 
     #[test]

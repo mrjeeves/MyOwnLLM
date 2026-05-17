@@ -40,6 +40,7 @@ import {
 } from "./conversations";
 import {
   authPayload,
+  deriveNetworkHandle,
   generateNonce,
   parsePeerJsId,
   peerJsId,
@@ -111,7 +112,11 @@ class MeshClient {
 
   private peer_js: Peer | null = null;
   private identity: MeshIdentity | null = null;
+  /** Human-readable Network ID — what the user sees and shares. */
   private network_id = "";
+  /** sha256 of `network_id` framed under our domain tag. Used as
+   *  the broker discovery handle in `peerJsId()` / filtering. */
+  private network_handle = "";
   private connections = new Map<string, ConnectionState>();
   private roster_pubkeys = new Set<string>();
   private discovery_timer: number | null = null;
@@ -144,12 +149,27 @@ class MeshClient {
     this.peers = [];
     this.connections.clear();
 
+    // Derive the broker-side handle once per session. Hashing the
+    // human Network ID gives us a fixed-length, parseable identifier
+    // for the PeerJS ID without leaking the user's chosen name to
+    // anyone scraping the broker. The act of joining the right
+    // handle on the broker is itself proof-of-knowledge of the
+    // Network ID, which is one half of the bidirectional auth model
+    // — the other half is the per-peer signature handshake below.
+    try {
+      this.network_handle = await deriveNetworkHandle(opts.networkId);
+    } catch (e) {
+      this.status = "error";
+      this.error = `network-handle derivation: ${String(e)}`;
+      return;
+    }
+
     // Hydrate the roster so auto-allow works on the very first
     // incoming connection of this session.
     await this.refreshRoster();
 
     const pubkey = pubkeyPart(opts.identity.device_id);
-    const id = peerJsId(opts.networkId, pubkey);
+    const id = peerJsId(this.network_handle, pubkey);
     this.my_peer_id = id;
 
     const parsed = parseSignalingUrl(opts.signalingUrl);
@@ -404,7 +424,7 @@ class MeshClient {
     for (const id of all) {
       const parsed = parsePeerJsId(id);
       if (!parsed) continue;
-      if (parsed.network_id !== this.network_id) continue;
+      if (parsed.network_handle !== this.network_handle) continue;
       if (parsed.device_pubkey === my_pubkey) continue;
       if (this.connections.has(parsed.device_pubkey)) continue;
       // Tie-break who initiates so we don't double-connect: the
@@ -427,7 +447,7 @@ class MeshClient {
 
   private handleInboundConnection(dc: DataConnection): void {
     const parsed = parsePeerJsId(dc.peer);
-    if (!parsed || parsed.network_id !== this.network_id) {
+    if (!parsed || parsed.network_handle !== this.network_handle) {
       // Foreign peer (different network or non-MyOwnLLM client).
       try { dc.close(); } catch {}
       return;
