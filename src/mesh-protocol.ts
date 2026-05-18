@@ -41,17 +41,175 @@ import { invoke } from "@tauri-apps/api/core";
 
 /** Wire-protocol version. Stays at 1 across Phase 2 because every
  *  Phase 2 change is additive: new optional fields on existing
- *  messages (capabilities, max_connections on hello) and brand-new
- *  message kinds (shelve, unshelve, capabilities_update, infer_*,
- *  move_prepare/commit/abort). A v1 receiver missing an optional
- *  field falls back to its default; a v1 receiver getting an
- *  unknown message kind silently drops it via the default switch
- *  arm. A 0.2.14 peer and a Phase 2 peer can share a mesh, with the
- *  v1 side simply not seeing the ring shelving / remote inference /
- *  catalog niceties. Bump this only when an existing message's
- *  wire shape changes incompatibly. */
+ *  messages (capabilities, max_connections, app_version, features on
+ *  hello) and brand-new message kinds (shelve, unshelve,
+ *  capabilities_update, infer_*, move_prepare/commit/abort, file_*).
+ *  A v1 receiver missing an optional field falls back to its
+ *  default; a v1 receiver getting an unknown message kind silently
+ *  drops it via the default switch arm. A 0.2.14 peer and a Phase 2
+ *  peer can share a mesh, with the v1 side simply not seeing the
+ *  ring shelving / remote inference / catalog / file-transfer
+ *  niceties. The feature matrix (see `FEATURES` below) is how Phase
+ *  2+ peers negotiate which optional message kinds are actually
+ *  safe to send between any specific pair of peers, so a v0.2.14
+ *  responder doesn't get bombarded with frames it'll silently
+ *  discard. Bump PROTOCOL_VERSION only when an existing message's
+ *  wire shape changes incompatibly — the feature matrix handles
+ *  additive change at finer granularity. */
 export const PROTOCOL_VERSION = 1;
 export const SIGN_DOMAIN_TAG = "myownllm-mesh-auth-v1:";
+
+/** This build's app version, baked in at compile time. Surfaced in
+ *  the Capabilities blob and in the Connections card so users can
+ *  see when a peer is running an older / newer release than them.
+ *  Resolved by vite via `define` from the package.json version; the
+ *  fallback string lets unit tests that don't run vite still import
+ *  this module. */
+declare const __APP_VERSION__: string | undefined;
+export const APP_VERSION: string =
+  typeof __APP_VERSION__ === "string" && __APP_VERSION__ ? __APP_VERSION__ : "dev";
+
+// ---- feature matrix -----------------------------------------------------
+//
+// Identifiers that peers advertise in `Capabilities.features` so the
+// sender can gate optional traffic per peer instead of broadcasting
+// blindly and trusting the receiver to ignore unknown kinds. Adding a
+// new optional message kind:
+//
+//   1. Add an entry to `FEATURES` below with a stable string id.
+//   2. Add it to `ADVERTISED_FEATURES` so we tell peers we support it.
+//   3. Gate `send` / `broadcast` calls behind
+//      `peerSupportsFeature(conn.capabilities, FEATURES.X)`.
+//   4. Verify the receive path is forward-compatible — older builds
+//      hit the `default` arm in `handleMessageOn` and drop unknown
+//      kinds, but a non-advertising peer shouldn't have been sent
+//      the frame in the first place.
+//
+// Feature ids are strings (not bitfields) so a forward-versioned
+// peer can advertise capabilities this build doesn't know about
+// without us needing to coordinate a registry update — we simply
+// don't gate on what we don't know.
+
+export const FEATURES = {
+  /** Sender can serve `infer_request` and the caller can stream
+   *  `infer_chunk` back. Phase 2.0. */
+  REMOTE_INFERENCE: "infer_request",
+  /** Sender can issue / respond to `move_request` (Pull). Phase 2.0. */
+  MOVE_REQUEST: "move_request",
+  /** Sender broadcasts and reads `move_prepare` / `move_commit` /
+   *  `move_abort` for catalog clarity during transfers. Phase 2.0. */
+  TWO_PHASE_MOVE: "two_phase_move",
+  /** Sender includes / honors `move_payload.target_folder` so a
+   *  Pulled or Pushed conversation lands in the source's folder.
+   *  Phase 2.0. */
+  FOLDER_PRESERVATION: "move_target_folder",
+  /** Sender publishes a `Capabilities` blob in hello + via
+   *  `capabilities_update`. Phase 2.0. */
+  CAPABILITIES: "capabilities_v1",
+  /** Sender publishes `catalog_announce` and reads peers' catalogs
+   *  for sidebar rendering. Phase 2.0. */
+  CATALOG_GOSSIP: "catalog_announce",
+  /** Sender participates in the ring topology — sends `shelve` /
+   *  `unshelve` and honors them inbound. Phase 2.0. */
+  RING_TOPOLOGY: "ring_shelve",
+  /** Sender supports the `file_*` RPCs for arbitrary file transfer.
+   *  Phase 2.1. */
+  FILE_TRANSFER: "file_transfer_v1",
+  /** Sender publishes `app_version` in capabilities so peers can
+   *  surface a version pill in the connections card. Phase 2.1. */
+  APP_VERSION: "app_version",
+} as const;
+
+/** The full set of feature ids this build advertises. Sent inside
+ *  `Capabilities.features` so peers know what optional message
+ *  kinds they can safely send us. Ordering doesn't matter — peers
+ *  match by string id. */
+export const ADVERTISED_FEATURES: string[] = [
+  FEATURES.REMOTE_INFERENCE,
+  FEATURES.MOVE_REQUEST,
+  FEATURES.TWO_PHASE_MOVE,
+  FEATURES.FOLDER_PRESERVATION,
+  FEATURES.CAPABILITIES,
+  FEATURES.CATALOG_GOSSIP,
+  FEATURES.RING_TOPOLOGY,
+  FEATURES.FILE_TRANSFER,
+  FEATURES.APP_VERSION,
+];
+
+/** Features a Phase 2.0 peer would have implicitly supported even
+ *  without advertising them — used as the assumed baseline when the
+ *  peer's `features` array is missing entirely (legacy v0.2.14
+ *  Phase 1 advertisement, or a parsing accident). If the peer's
+ *  `Capabilities` blob is present at all, we know it's at least
+ *  Phase 2.0 and these baseline features are safe to assume. */
+const BASELINE_PHASE_2_FEATURES = new Set<string>([
+  FEATURES.REMOTE_INFERENCE,
+  FEATURES.MOVE_REQUEST,
+  FEATURES.TWO_PHASE_MOVE,
+  FEATURES.FOLDER_PRESERVATION,
+  FEATURES.CAPABILITIES,
+  FEATURES.CATALOG_GOSSIP,
+  FEATURES.RING_TOPOLOGY,
+]);
+
+/** Does the peer's advertised capability set include `feature`?
+ *  Forward-compatible: a peer whose `features` array is missing
+ *  (e.g. a Phase 2.0 advertiser that predates the feature matrix)
+ *  is treated as having the Phase 2.0 baseline; a peer with empty
+ *  capabilities (Phase 1) is treated as supporting none of the
+ *  optional features.
+ *
+ *  Callers use this to decide whether sending an optional frame is
+ *  worthwhile. If it returns false, skip the send — the peer would
+ *  silently drop the frame anyway, but skipping saves bandwidth and
+ *  lets the UI surface "this peer doesn't support X" honestly. */
+export function peerSupportsFeature(
+  cap: Capabilities,
+  feature: string,
+): boolean {
+  if (Array.isArray(cap.features) && cap.features.length > 0) {
+    return cap.features.includes(feature);
+  }
+  // Capabilities blob present-and-non-empty in some other way: assume
+  // Phase 2.0 baseline. The cheapest "non-empty" proxy is the
+  // accepting policy, which is always written by snapshotCapabilities
+  // even when no LLMs / ASR are present.
+  if (cap.accepting !== undefined && cap.accepting !== null) {
+    return BASELINE_PHASE_2_FEATURES.has(feature);
+  }
+  // Fully blank — treat as a Phase 1 peer that just doesn't know
+  // about any optional surface.
+  return false;
+}
+
+/** Human-readable summary of how many features the peer supports
+ *  out of this build's `ADVERTISED_FEATURES`. Surfaced in the
+ *  Connections card so the user can see "this peer supports 7/9
+ *  features (missing: file_transfer, app_version)". Empty when
+ *  there's nothing notable to report. */
+export function summarizePeerCompat(cap: Capabilities): {
+  matched: number;
+  total: number;
+  missing: string[];
+} {
+  const peerFeatures = new Set<string>(
+    Array.isArray(cap.features) ? cap.features : [],
+  );
+  // Baseline expansion: a peer with capabilities but no features
+  // array gets the Phase 2.0 baseline for matching purposes too,
+  // otherwise the count would mis-report 0/N for a perfectly
+  // healthy Phase 2.0 peer.
+  if (peerFeatures.size === 0 && cap.accepting !== undefined) {
+    for (const f of BASELINE_PHASE_2_FEATURES) peerFeatures.add(f);
+  }
+  let matched = 0;
+  const missing: string[] = [];
+  for (const f of ADVERTISED_FEATURES) {
+    if (peerFeatures.has(f)) matched++;
+    else missing.push(f);
+  }
+  return { matched, total: ADVERTISED_FEATURES.length, missing };
+}
 
 export type MeshMessage =
   | HelloMessage
@@ -78,7 +236,13 @@ export type MeshMessage =
   | InferChunkMessage
   | InferDoneMessage
   | InferErrorMessage
-  | InferCancelMessage;
+  | InferCancelMessage
+  | FileOfferMessage
+  | FileAcceptMessage
+  | FileDeclineMessage
+  | FileChunkMessage
+  | FileCompleteMessage
+  | FileAbortMessage;
 
 // ---- capabilities --------------------------------------------------------
 
@@ -133,6 +297,22 @@ export interface Capabilities {
   outputs: { speaker: boolean; display: boolean };
   /** Willingness to accept jobs. Defaults to `available`. */
   accepting: AcceptingPolicy;
+  /** Build version (`package.json`'s `version`) of the peer's app.
+   *  Surfaced in the Connections card and used by the receiver to
+   *  log "running v0.2.14, you're on v0.3.0" for diagnostics.
+   *  Optional on the wire — Phase 1 / early Phase 2 peers omit it
+   *  and the receiver treats it as "unknown". */
+  app_version?: string;
+  /** Optional feature flags this peer advertises — see `FEATURES`
+   *  in this module. Senders gate optional message kinds behind
+   *  `peerSupportsFeature` so a peer that doesn't yet implement a
+   *  new RPC doesn't get spammed with frames it would silently
+   *  drop. Forward-compatible: unknown ids are kept verbatim so a
+   *  newer build can advertise something this build can't gate on
+   *  but the human-readable surface can still display. Omitted by
+   *  v1 / early Phase 2 peers; the receiver treats `undefined`
+   *  as the Phase 2.0 baseline (see `BASELINE_PHASE_2_FEATURES`). */
+  features?: string[];
 }
 
 export const EMPTY_CAPABILITIES: Capabilities = {
@@ -143,6 +323,8 @@ export const EMPTY_CAPABILITIES: Capabilities = {
   inputs: { mic: false, camera: false },
   outputs: { speaker: false, display: false },
   accepting: "available",
+  app_version: "",
+  features: [],
 };
 
 export interface HelloMessage {
@@ -433,6 +615,113 @@ export interface InferErrorMessage {
 export interface InferCancelMessage {
   kind: "infer_cancel";
   id: string;
+}
+
+// ---- file transfer (Phase 2.1) ------------------------------------------
+//
+// Arbitrary-byte file sharing between active peers. Modeled on the
+// Move RPC: offer → accept/decline → series of chunks → complete.
+// The wire frames stay JSON for simplicity; bytes are base64-encoded
+// inside `FileChunkMessage.bytes_b64`. The ~33% encoding overhead is
+// fine for v1 — small enough that the protocol stays trivial to map
+// to/from the existing JSON action channel, and the user-perceived
+// transfer time is dominated by network rather than encoding.
+//
+// Authorization: gated on `peerStatus(conn) === "active"` so a
+// stranger in the same Trystero room can't ship us files. The
+// sender additionally checks `peerSupportsFeature(cap,
+// FEATURES.FILE_TRANSFER)` so a Phase 2.0 peer that doesn't
+// implement the protocol doesn't get bombarded with unknown frames.
+
+/** Maximum payload bytes per `file_chunk` (post base64 — i.e. the
+ *  raw bytes count before encoding). Chosen to stay comfortably under
+ *  WebRTC's per-datachannel message budget (~16 KB on Chrome's SCTP
+ *  fallback path; some libraries set it as low as 64 KB) once the
+ *  ~33% base64 expansion is applied. 48 KB raw → 64 KB encoded,
+ *  which most browser stacks accept. Bumping this requires
+ *  benchmarking on a constrained NAT path. */
+export const FILE_CHUNK_BYTES = 48 * 1024;
+
+/** Top-bound on a single file transfer. Larger files would still
+ *  technically work but the receiver buffers in memory before
+ *  writing to disk, so a multi-GB transfer would OOM the WebView.
+ *  500 MB matches what feels reasonable for a chat-style "share
+ *  this thing" rather than a backup tool. Surfaced in the
+ *  Connections card if the user tries to send a bigger file so
+ *  they know why we declined. */
+export const FILE_MAX_BYTES = 500 * 1024 * 1024;
+
+/** Initiator offers a file to the recipient. The recipient runs a
+ *  save-as dialog (so they choose where it lands) and replies with
+ *  `file_accept` once the user picks a path, or `file_decline`
+ *  immediately on cancel / rejection. */
+export interface FileOfferMessage {
+  kind: "file_offer";
+  /** Caller-assigned id, echoed in every chunk and the terminal
+   *  frames so concurrent transfers on the same channel don't
+   *  cross. Base32 of 12 random bytes (`generateMeshId`). */
+  id: string;
+  /** Suggested filename including extension. The receiver's
+   *  save dialog defaults to this but the user can pick another. */
+  filename: string;
+  /** Total payload bytes (raw, before base64). Lets the receiver
+   *  show a progress bar and refuse oversized transfers ahead of
+   *  the chunk stream. */
+  size_bytes: number;
+  /** MIME type as the sender knows it (from `File.type` in the
+   *  browser; may be empty). Helps the receiver pick the right
+   *  default app to open with after save. */
+  mime_type?: string;
+  /** Negotiated chunk size in raw bytes. Echo of `FILE_CHUNK_BYTES`
+   *  for now — exposed on the wire so a future sender can pick a
+   *  smaller chunk for a low-bandwidth peer without breaking us. */
+  chunk_size: number;
+  /** SHA-256 of the full payload, base32-lowercase. The receiver
+   *  hashes the assembled bytes and aborts the transfer if they
+   *  don't match. Optional for back-compat with a future tighter
+   *  build that omits the hash to save bytes — v2.1 receivers
+   *  treat absence as "skip verification". */
+  sha256?: string;
+}
+
+export interface FileAcceptMessage {
+  kind: "file_accept";
+  id: string;
+}
+
+export interface FileDeclineMessage {
+  kind: "file_decline";
+  id: string;
+  reason: string;
+}
+
+/** One chunk of the file payload. `index` is the 0-based ordinal so
+ *  the receiver can detect drops and abort. `is_final` flips true
+ *  on the last chunk so the receiver doesn't need to compare
+ *  `bytes_received` against `size_bytes` to decide when to commit. */
+export interface FileChunkMessage {
+  kind: "file_chunk";
+  id: string;
+  index: number;
+  bytes_b64: string;
+  is_final: boolean;
+}
+
+/** Sender confirms it has shipped every chunk. Lets the receiver
+ *  do the SHA verification + filesystem write at a known point
+ *  rather than guessing from `is_final` alone. */
+export interface FileCompleteMessage {
+  kind: "file_complete";
+  id: string;
+}
+
+/** Either side aborts an in-flight transfer (sender failed to read,
+ *  receiver ran out of space, user cancelled, peer dropped). The
+ *  other side cleans up its in-memory buffer on receipt. */
+export interface FileAbortMessage {
+  kind: "file_abort";
+  id: string;
+  reason: string;
 }
 
 /** Compose the payload that a peer signs in response to a `hello`.

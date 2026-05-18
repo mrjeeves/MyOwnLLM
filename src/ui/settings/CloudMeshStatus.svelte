@@ -44,6 +44,7 @@
   import { scrollAffordance } from "../scroll-affordance";
   import { setMeshIdentityLabel } from "../../mesh";
   import AddNetworkModal from "./AddNetworkModal.svelte";
+import { APP_VERSION } from "../../mesh-capabilities";
 
   // ---- state ----------------------------------------------------------
 
@@ -104,6 +105,44 @@
       tone: "green",
       text: `Connected · ${active.network_id} · ${activePeers.length} peer${activePeers.length === 1 ? "" : "s"} · auto-healing ring`,
     };
+  });
+
+  /** "What to do next" coachmark — anchored visually under the
+   *  status pill. Derived from the same state machine as the pill
+   *  so the two never disagree about where the user is. Hidden once
+   *  the mesh is "connected with at least one peer" because at that
+   *  point the next move is up to the user (chat, transfer, etc.).
+   *
+   *  Re-introduced in Phase 2 after user testing showed the wizard
+   *  step-derivation was missed; the prior "wizard body" was
+   *  removed when the status pill became the single source of
+   *  truth. This is the lighter version: one inline tip rather
+   *  than a multi-step modal.  */
+  let coachmark = $derived.by<string>(() => {
+    if (loading) return "";
+    if (meshClient.status === "error") {
+      return "The mesh hit an error. Open the Activity tab for diagnostics, then unlock + re-lock the active network.";
+    }
+    if (!active) {
+      if (networks.length === 0) {
+        return "Add a network below to start sharing across devices.";
+      }
+      return "Pick a saved network below — click it to switch, then 🔒 to start joining.";
+    }
+    if (!active.locked) {
+      return `Click 🔒 next to "${active.network_id}" below to start joining the mesh.`;
+    }
+    if (meshClient.status === "starting" || meshClient.status === "off") {
+      return ""; // transient
+    }
+    const activePeers = meshClient.peers.filter(
+      (p) => p.status === "active" || p.status === "shelved",
+    );
+    if (activePeers.length === 0) {
+      const handle = active.network_id;
+      return `Open the same network "${handle}" on another device. Once they lock it too, you'll see an approval request appear below.`;
+    }
+    return ""; // happy path — nothing to suggest
   });
 
   // ---- helpers --------------------------------------------------------
@@ -266,6 +305,12 @@
         <code class="device-body" title={meshUi.identity.device_id}>
           {shortDeviceBody(identitySplit.body)}
         </code>
+        <span
+          class="version-pill"
+          title="Build version of this device. Peers compare this against their own and surface a 'different version' note in their Connections list when it doesn't match."
+        >
+          v{APP_VERSION}
+        </span>
       </div>
     </section>
 
@@ -302,6 +347,15 @@
           </select>
         </label>
       </div>
+      {#if coachmark}
+        <!-- Coachmark: "what to do next" derived from the same state
+             machine as the pill. Hidden once the user has a peer
+             connection going. -->
+        <div class="coachmark" role="status" aria-live="polite">
+          <span class="coachmark-arrow" aria-hidden="true">↓</span>
+          <span>{coachmark}</span>
+        </div>
+      {/if}
     </section>
 
     <!-- 3. Saved networks list. The active row gets a lock
@@ -618,6 +672,17 @@
     letter-spacing: 0.08em;
     user-select: all;
   }
+  .version-pill {
+    font-size: 0.65rem;
+    color: #6a7a99;
+    background: #131319;
+    border: 1px solid #1e1e2a;
+    border-radius: 4px;
+    padding: 0.1rem 0.4rem;
+    letter-spacing: 0.02em;
+    cursor: help;
+    flex-shrink: 0;
+  }
   .device-body {
     font-family: monospace;
     font-size: 0.72rem;
@@ -636,6 +701,34 @@
     align-items: center;
     gap: 0.55rem;
     flex-wrap: wrap;
+  }
+  /* Coachmark: the "what to do next" hint that anchors under the
+     status pill. Subtle background and a small arrow pointing
+     downward to direct the user toward the saved-networks list
+     where the action they need lives. Hidden via {#if} once the
+     mesh is healthy so it stops shouting on the happy path. */
+  .coachmark {
+    margin-top: 0.55rem;
+    padding: 0.45rem 0.7rem;
+    background: #131325;
+    border: 1px solid #2a2a4a;
+    border-radius: 7px;
+    color: #b9c9ee;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+  .coachmark-arrow {
+    color: #6e6ef7;
+    font-weight: bold;
+    line-height: 1.4;
+    animation: coachmark-bob 1.6s ease-in-out infinite;
+  }
+  @keyframes coachmark-bob {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(2px); }
   }
   .status-pill {
     display: inline-flex;

@@ -11,6 +11,11 @@
   } from "../config";
   import { settingsRoute } from "./settings-route.svelte";
   import type { CatalogEntry } from "../mesh-protocol";
+  import {
+    APP_VERSION,
+    describePeerMissingFeatures,
+    formatPeerCompat,
+  } from "../mesh-capabilities";
 
   /** Peers eligible as Move targets — active and authorized. The
    *  context-menu uses this directly; if the list is empty the
@@ -262,6 +267,67 @@
   function shortPeerLabel(pubkey: string, label: string): string {
     if (label.trim() !== "") return label;
     return pubkey.slice(0, 8);
+  }
+
+  // ---- file send (Phase 2.1) -------------------------------------------
+  //
+  // Lets the user right-click a connected peer → "Send file…" → pick a
+  // file from disk → ship it over the mesh via meshClient.sendFile.
+  // The hidden <input type="file"> lives at the bottom of the sidebar
+  // and we re-target it per send so the peer-id stays paired with the
+  // selected file.
+
+  let fileInput = $state<HTMLInputElement | null>(null);
+  let pendingFileTarget = $state<{
+    peer_id: string;
+    peer_label: string;
+  } | null>(null);
+  let fileSendError = $state<string>("");
+
+  function startFileSend(peer_id: string, peer_label: string) {
+    closeMenu();
+    pendingFileTarget = { peer_id, peer_label };
+    fileSendError = "";
+    // Reset the input value before opening so picking the same file
+    // twice in a row still fires `change`. Browsers de-duplicate
+    // identical selections otherwise.
+    if (fileInput) {
+      fileInput.value = "";
+      fileInput.click();
+    }
+  }
+
+  async function onFileChosen(e: Event) {
+    const target = pendingFileTarget;
+    pendingFileTarget = null;
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files && input.files.length > 0 ? input.files[0] : null;
+    input.value = "";
+    if (!target || !file) return;
+    try {
+      const buf = await file.arrayBuffer();
+      await meshClient.sendFile({
+        target_peer_id: target.peer_id,
+        filename: file.name,
+        mime_type: file.type || undefined,
+        bytes: new Uint8Array(buf),
+      });
+    } catch (err) {
+      fileSendError = `Send "${file.name}" to ${target.peer_label} failed: ${String(err)}`;
+    }
+  }
+
+  /** Inbound offers from the mesh client. Each one renders as a
+   *  toast at the bottom of the sidebar with Save / Decline buttons.
+   *  The list is mutated by the mesh client on `file_offer` arrival
+   *  and on the user's accept/decline action. */
+  let inboundOffers = $derived(meshClient.inbound_offers);
+
+  function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
   }
 
   let {
@@ -1105,6 +1171,19 @@
               {#if peer.status === "shelved"}
                 <span class="peer-standby-pill">standby</span>
               {/if}
+              {#if peer.capabilities.app_version && peer.capabilities.app_version !== APP_VERSION}
+                <!-- Version mismatch surfaced inline so the user
+                     sees it without going to settings. The
+                     hover-title carries the full missing-feature
+                     list so a mismatched-and-incompatible peer
+                     reads at a glance. -->
+                <span
+                  class="peer-version-pill"
+                  title={`Peer build v${peer.capabilities.app_version} differs from yours (v${APP_VERSION}). ${describePeerMissingFeatures(peer.capabilities)}`}
+                >
+                  v{peer.capabilities.app_version}
+                </span>
+              {/if}
             </div>
             {#if !isPeerCollapsed}
               {@const node = remoteTrees.get(peer.device_pubkey)}
@@ -1400,6 +1479,13 @@
     {:else if menu.target.kind === "peer"}
       {@const target = menu.target}
       <div class="menu-section-label">{target.peer_label}</div>
+      <button
+        onclick={() => startFileSend(target.peer_id, target.peer_label)}
+        title="Pick a file from your computer to ship to this peer over the mesh"
+      >
+        Send file…
+      </button>
+      <div class="menu-divider"></div>
       <button onclick={openMeshConnectionsSettings} title="Open Networks → Connections">
         Settings
       </button>
@@ -1459,6 +1545,99 @@
   <div class="move-toast error" role="alert">
     Pull failed: {pullError}
     <button onclick={() => (pullError = "")} class="dismiss">✕</button>
+  </div>
+{/if}
+
+<!-- Hidden file picker — opened by the per-peer "Send file…" menu
+     item. Routed through a single shared input so we don't render
+     N invisible inputs (one per connected peer). The target peer
+     is stashed in `pendingFileTarget` before `.click()` so the
+     change handler knows where to ship the bytes. -->
+<input
+  bind:this={fileInput}
+  type="file"
+  style="display:none"
+  onchange={onFileChosen}
+/>
+
+{#if fileSendError}
+  <div class="move-toast error" role="alert">
+    {fileSendError}
+    <button onclick={() => (fileSendError = "")} class="dismiss">✕</button>
+  </div>
+{/if}
+
+<!-- Outgoing file transfers from meshClient.files.outbound. Each
+     row shows the live byte count + progress bar so the user
+     knows how far along the transfer is. Cleared automatically
+     when the receiver acks `file_complete` or aborts. -->
+{#if meshClient.files.outbound.length > 0}
+  <div class="file-stack file-stack-out" role="status" aria-live="polite">
+    {#each meshClient.files.outbound as f (f.id)}
+      {@const pct = f.bytes_total > 0 ? Math.round((f.bytes_sent / f.bytes_total) * 100) : 0}
+      <div class="file-toast file-toast-out">
+        <div class="file-toast-head">
+          <span class="file-toast-arrow">→</span>
+          <span class="file-toast-name" title={f.filename}>{f.filename}</span>
+          <span class="file-toast-meta">{f.peer_label} · {formatBytes(f.bytes_sent)} / {formatBytes(f.bytes_total)}</span>
+        </div>
+        <div class="file-toast-bar"><div class="file-toast-fill" style="width:{pct}%"></div></div>
+        <div class="file-toast-status">{f.status === "offered" ? "awaiting accept…" : `${pct}%`}</div>
+      </div>
+    {/each}
+  </div>
+{/if}
+
+<!-- Incoming offers: a sender has shipped us a `file_offer`. Each
+     row mounts Save / Decline buttons; Save opens the OS save
+     dialog and then accepts the offer, Decline drops it. -->
+{#if inboundOffers.length > 0}
+  <div class="file-stack file-stack-in" role="status" aria-live="polite">
+    {#each inboundOffers as offer (offer.id)}
+      <div class="file-toast file-toast-offer">
+        <div class="file-toast-head">
+          <span class="file-toast-arrow in">←</span>
+          <span class="file-toast-name" title={offer.filename}>{offer.filename}</span>
+          <span class="file-toast-meta">from {offer.peer_label} · {formatBytes(offer.size_bytes)}</span>
+        </div>
+        <div class="file-toast-actions">
+          <button
+            class="file-toast-btn primary"
+            onclick={() => meshClient.acceptInboundFile(offer.id)}
+            title="Open save dialog and accept the transfer"
+          >
+            Save as…
+          </button>
+          <button
+            class="file-toast-btn ghost"
+            onclick={() => meshClient.declineInboundFile(offer.id)}
+            title="Tell the sender we're not accepting this file"
+          >
+            Decline
+          </button>
+        </div>
+      </div>
+    {/each}
+  </div>
+{/if}
+
+<!-- Inbound transfers currently streaming. Pure progress display;
+     declining or accepting happens via the inboundOffers stack
+     above. -->
+{#if meshClient.files.inbound.length > 0}
+  <div class="file-stack file-stack-in" role="status" aria-live="polite">
+    {#each meshClient.files.inbound as f (f.id)}
+      {@const pct = f.bytes_total > 0 ? Math.round((f.bytes_received / f.bytes_total) * 100) : 0}
+      <div class="file-toast file-toast-in">
+        <div class="file-toast-head">
+          <span class="file-toast-arrow in">←</span>
+          <span class="file-toast-name" title={f.filename}>{f.filename}</span>
+          <span class="file-toast-meta">{f.peer_label} · {formatBytes(f.bytes_received)} / {formatBytes(f.bytes_total)}</span>
+        </div>
+        <div class="file-toast-bar"><div class="file-toast-fill" style="width:{pct}%"></div></div>
+        <div class="file-toast-status">{pct}%</div>
+      </div>
+    {/each}
   </div>
 {/if}
 
@@ -1850,6 +2029,16 @@
     padding: .05rem .3rem;
     flex-shrink: 0;
   }
+  .peer-version-pill {
+    font-size: .55rem;
+    background: #221218;
+    color: #d6a09c;
+    border-radius: 3px;
+    padding: .05rem .3rem;
+    flex-shrink: 0;
+    cursor: help;
+    letter-spacing: .02em;
+  }
   .peer-empty {
     font-size: .72rem;
     color: #555;
@@ -2035,6 +2224,78 @@
     padding: 0 0.25rem;
   }
   .move-toast .dismiss:hover { opacity: 1; }
+
+  /* File transfer toasts — stacked at the bottom-right so they
+     don't collide with the move/pull toast at bottom-center. Each
+     file gets its own row so a multi-transfer batch reads
+     vertically. */
+  .file-stack {
+    position: fixed;
+    right: 1rem;
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+    gap: .35rem;
+    max-width: 320px;
+  }
+  .file-stack-out { bottom: 1rem; }
+  .file-stack-in { bottom: 1rem; right: auto; left: 1rem; }
+  .file-toast {
+    background: #15151f;
+    border: 1px solid #2a2a3a;
+    color: #d6d6ef;
+    padding: .55rem .7rem;
+    border-radius: 8px;
+    font-size: .78rem;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.55);
+    display: flex;
+    flex-direction: column;
+    gap: .35rem;
+  }
+  .file-toast-offer { border-color: #4a4a3a; background: #232a1f; }
+  .file-toast-in { border-color: #2a4a4a; background: #1a2a2a; color: #c8e8e8; }
+  .file-toast-out { border-color: #2a3a4a; background: #1a2030; color: #c8d6ee; }
+  .file-toast-head {
+    display: flex;
+    align-items: center;
+    gap: .35rem;
+    flex-wrap: wrap;
+  }
+  .file-toast-arrow { font-weight: bold; color: #b9c9ee; }
+  .file-toast-arrow.in { color: #b9eec9; }
+  .file-toast-name { font-weight: 600; word-break: break-all; flex: 1; min-width: 0; }
+  .file-toast-meta { color: #888; font-size: .72rem; }
+  .file-toast-status { color: #888; font-size: .72rem; text-align: right; }
+  .file-toast-bar {
+    height: 4px;
+    background: #2a2a3a;
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .file-toast-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #6e6ef7, #b96eef);
+    transition: width .14s linear;
+  }
+  .file-toast-actions {
+    display: flex;
+    gap: .35rem;
+    justify-content: flex-end;
+  }
+  .file-toast-btn {
+    background: none;
+    border: 1px solid #3a3a55;
+    color: #ccc;
+    padding: .25rem .55rem;
+    border-radius: 5px;
+    font-size: .76rem;
+    cursor: pointer;
+    transition: background .12s, border-color .12s;
+  }
+  .file-toast-btn:hover { background: #1a1a2a; border-color: #5a5a7a; color: #fff; }
+  .file-toast-btn.primary { background: #2a2a5a; border-color: #4a4a7a; color: #d8d8ff; }
+  .file-toast-btn.primary:hover { background: #3a3a7a; }
+  .file-toast-btn.ghost { color: #aaa; }
 
   /* Pointer-following ghost while dragging. Position is updated from the
    * pointermove handler; pointer-events:none keeps it from blocking

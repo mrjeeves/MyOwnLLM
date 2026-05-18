@@ -27,9 +27,16 @@
  *   - `stop()` leaves the room and tears down all connections.
  */
 
-import { joinRoom, type Room } from "trystero";
+import type { Room, joinRoom as JoinRoomType } from "trystero";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+// `save` from plugin-dialog opens the OS save dialog and returns the
+// chosen path (or null on cancel). The Rust side then writes via
+// `mesh_file_save_at` (or refuses if the path's outside the user's
+// home tree). The fs plugin's path-prefix allowlist is scoped to
+// ~/.myownllm/** so we have to go through a Rust command to write
+// anywhere else.
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import type { MeshIdentity } from "./mesh";
 import type { TurnServer } from "./types";
 import { loadConfig, updateConfig, activeNetwork, updateNetwork } from "./config";
@@ -43,24 +50,102 @@ import {
 } from "./conversations";
 import {
   authPayload,
+  base32Encode,
   deriveNetworkHandle,
   generateMeshId,
   generateNonce,
   generateVerificationCode,
+  peerSupportsFeature,
   pubkeyPart,
   pubkeySuffix,
   selectRingNeighbors,
   signMessage,
   verifySignature,
+  ADVERTISED_FEATURES,
+  APP_VERSION,
   EMPTY_CAPABILITIES,
+  FEATURES,
+  FILE_CHUNK_BYTES,
+  FILE_MAX_BYTES,
   PROTOCOL_VERSION,
   type AcceptingPolicy,
   type Capabilities,
   type CatalogEntry,
+  type FileOfferMessage,
   type InferRequestMessage,
   type MeshMessage,
 } from "./mesh-protocol";
 import { snapshotCapabilities } from "./mesh-capabilities";
+
+/** Build-time selected Trystero strategy. Defined in vite.config.ts
+ *  via `define`; defaults to "nostr" when running outside Vite
+ *  (tests, type-checks). Each strategy ships in its own subpath
+ *  export; we dynamic-import the chosen one so a non-default build
+ *  doesn't pull every signaling code path into the bundle.
+ *
+ *  The actual `joinRoom` function is loaded lazily by
+ *  `loadJoinRoom()` and cached for the session — `start()` awaits
+ *  it once at startup. */
+declare const __TRYSTERO_STRATEGY__: string | undefined;
+const TRYSTERO_STRATEGY: string =
+  typeof __TRYSTERO_STRATEGY__ === "string" && __TRYSTERO_STRATEGY__
+    ? __TRYSTERO_STRATEGY__
+    : "nostr";
+
+/** Cached `joinRoom` reference. The very first `start()` call awaits
+ *  the dynamic import; subsequent calls reuse the resolved value. */
+let cachedJoinRoom: typeof JoinRoomType | null = null;
+
+/** Resolve the strategy-specific Trystero `joinRoom`. In trystero
+ *  0.24+, only the Nostr submodule still ships with the main
+ *  package — the other strategy entry points (`trystero/torrent`,
+ *  `trystero/mqtt`, etc.) are deprecated empty stubs that direct
+ *  users to install the namespaced `@trystero-p2p/<strategy>`
+ *  package separately. The picker honors that: it tries the
+ *  namespaced package first for non-Nostr strategies and falls
+ *  back to Nostr (with a logged warning) when it's not present.
+ *
+ *  A maintainer who wants the torrent backend in their build runs
+ *  `pnpm add @trystero-p2p/torrent` and sets
+ *  `VITE_TRYSTERO_STRATEGY=torrent`; we resolve the import
+ *  dynamically so the package only ships in the bundle when it's
+ *  installed.
+ *
+ *  Vite needs the import specifier to be statically analysable to
+ *  pre-bundle the module — `import("@trystero-p2p/torrent")` is
+ *  literal here and matches what the bundler can see. */
+async function loadJoinRoom(): Promise<typeof JoinRoomType> {
+  if (cachedJoinRoom) return cachedJoinRoom;
+  let joinRoomFn: typeof JoinRoomType | null = null;
+  if (TRYSTERO_STRATEGY !== "nostr") {
+    try {
+      // @vite-ignore — non-Nostr strategies are opt-in installs;
+      // the bundler will inline only the ones present in
+      // node_modules. The variable-string import is intentional.
+      const path = `@trystero-p2p/${TRYSTERO_STRATEGY}`;
+      const mod = (await import(/* @vite-ignore */ path)) as {
+        joinRoom?: typeof JoinRoomType;
+      };
+      if (typeof mod.joinRoom === "function") {
+        joinRoomFn = mod.joinRoom;
+      } else {
+        console.warn(
+          `[mesh] @trystero-p2p/${TRYSTERO_STRATEGY} loaded but exposes no joinRoom — falling back to nostr`,
+        );
+      }
+    } catch (e) {
+      console.warn(
+        `[mesh] @trystero-p2p/${TRYSTERO_STRATEGY} not installed (${String(e)}) — falling back to nostr. Run \`pnpm add @trystero-p2p/${TRYSTERO_STRATEGY}\` to use this strategy.`,
+      );
+    }
+  }
+  if (!joinRoomFn) {
+    const mod = await import("trystero/nostr");
+    joinRoomFn = mod.joinRoom;
+  }
+  cachedJoinRoom = joinRoomFn;
+  return cachedJoinRoom;
+}
 
 /** Watchdog for the cryptographic handshake only. If a peer doesn't
  *  send a valid `auth_response` within this window we assume the
@@ -569,6 +654,101 @@ class MeshClient {
     { guid: string; peer_id: string; on_settle: (ok: boolean, err?: string) => void }
   >();
 
+  /** Outbound file transfers we've offered, keyed by file id. The
+   *  full bytes stay in memory on the sender so a chunked send can
+   *  walk the array without re-reading the source File object — the
+   *  user's File handle might already be revoked by the time the
+   *  receiver accepts. Cleared on `file_complete` from the receiver
+   *  or on `file_abort` / drop. */
+  private pending_files_out = new Map<
+    string,
+    {
+      target_peer_id: string;
+      filename: string;
+      mime_type: string;
+      bytes: Uint8Array;
+      /** Number of chunks the sender has shipped so far. Drives the
+       *  progress bar in the Connections card. */
+      chunks_sent: number;
+      /** Total chunks the receiver will see. Computed from bytes
+       *  length + FILE_CHUNK_BYTES at offer time. */
+      chunks_total: number;
+      /** True once the receiver has sent `file_accept` so the sender
+       *  knows the chunks below are safe to start streaming. */
+      accepted: boolean;
+      on_settle: (ok: boolean, err?: string) => void;
+    }
+  >();
+
+  /** Inbound file transfers we've accepted, keyed by file id. The
+   *  bytes accumulate in memory until the receiver acknowledges
+   *  `file_complete`, at which point they're written to the
+   *  user-chosen filesystem path via the `mesh_file_save_at`
+   *  command. Cleared on success, abort, or drop. */
+  private pending_files_in = new Map<
+    string,
+    {
+      peer_id: string;
+      peer_pubkey: string;
+      peer_label: string;
+      filename: string;
+      mime_type: string;
+      size_bytes: number;
+      chunk_size: number;
+      sha256_b32: string | null;
+      /** Filesystem path the user picked in the save dialog. The
+       *  receiver only displays the dialog AFTER the offer so the
+       *  user knows what they're saving. */
+      target_path: string;
+      /** Accumulated chunks, in order. We track the highest seen
+       *  index so a duplicate / out-of-order chunk is detected on
+       *  receipt instead of silently corrupting the file. */
+      chunks: Array<Uint8Array | null>;
+      next_expected_index: number;
+      bytes_received: number;
+      on_progress?: (received: number, total: number) => void;
+    }
+  >();
+
+  /** Reactive snapshot of in-flight file transfers for the
+   *  Connections tab + Sidebar toast. Same shape as `resources` but
+   *  separate so the existing infer/move surface stays untouched.
+   *  Each row carries enough state to render a progress percentage. */
+  files = $state<{
+    outbound: Array<{
+      id: string;
+      filename: string;
+      bytes_sent: number;
+      bytes_total: number;
+      peer_pubkey: string;
+      peer_label: string;
+      status: "offered" | "transferring" | "completed" | "failed";
+    }>;
+    inbound: Array<{
+      id: string;
+      filename: string;
+      bytes_received: number;
+      bytes_total: number;
+      peer_pubkey: string;
+      peer_label: string;
+      status: "offered" | "transferring" | "completed" | "failed";
+    }>;
+  }>({ outbound: [], inbound: [] });
+
+  /** Inbound offers awaiting the user's save-as dialog. Keyed by id
+   *  so accept/decline buttons map to the offer they originated
+   *  from. The Sidebar mounts a banner that lists these. */
+  inbound_offers = $state<
+    Array<{
+      id: string;
+      peer_id: string;
+      peer_label: string;
+      filename: string;
+      size_bytes: number;
+      mime_type: string;
+    }>
+  >([]);
+
   // ---- lifecycle -------------------------------------------------------
 
   async reconcile(): Promise<void> {
@@ -679,14 +859,27 @@ class MeshClient {
 
     this.logDiag(
       "info",
-      `joining mesh room ${room_id.slice(0, 12)}… (trystero, app=${TRYSTERO_APP_ID}` +
+      `joining mesh room ${room_id.slice(0, 12)}… (trystero/${TRYSTERO_STRATEGY}, app=${TRYSTERO_APP_ID}` +
         (custom_relays.length > 0
           ? `, ${custom_relays.length} custom relay${custom_relays.length === 1 ? "" : "s"})`
           : `, default relays)`),
     );
 
+    // Resolve the build-time-selected `joinRoom` once per session.
+    // Awaited here so a missing / failed strategy bundle surfaces
+    // as an init error rather than a silent stuck "starting" state.
+    let joinRoomFn: typeof JoinRoomType;
     try {
-      const room_config: Parameters<typeof joinRoom>[0] = {
+      joinRoomFn = await loadJoinRoom();
+    } catch (e) {
+      this.status = "error";
+      this.error = `trystero strategy load: ${String(e)}`;
+      this.logDiag("error", `trystero strategy load failed: ${String(e)}`);
+      return;
+    }
+
+    try {
+      const room_config: Parameters<typeof JoinRoomType>[0] = {
         appId: TRYSTERO_APP_ID,
         rtcConfig: { iceServers: ice_servers },
       };
@@ -696,7 +889,7 @@ class MeshClient {
         // the strategy's built-in defaults apply.
         (room_config as Record<string, unknown>).relayUrls = custom_relays;
       }
-      this.room = joinRoom(room_config, room_id);
+      this.room = joinRoomFn(room_config, room_id);
     } catch (e) {
       this.status = "error";
       this.error = `trystero init: ${String(e)}`;
@@ -784,6 +977,18 @@ class MeshClient {
       pending.on_settle(false, "mesh stopped");
     }
     this.pending_pulls_out.clear();
+    // File transfers: fail outbound senders so their promises unblock,
+    // then drop both directions. Inbound bytes accumulated in memory
+    // were ephemeral — losing them on stop is the right call (no
+    // partial files on disk).
+    for (const [, pending] of this.pending_files_out) {
+      pending.on_settle(false, "mesh stopped");
+    }
+    this.pending_files_out.clear();
+    this.pending_files_in.clear();
+    this.pending_offers.clear();
+    this.inbound_offers = [];
+    this.refreshFileResources();
     this.refreshResources();
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
@@ -964,6 +1169,11 @@ class MeshClient {
     const conn = this.connections.get(source_peer_id);
     if (!conn || this.peerStatus(conn) !== "active") {
       throw new Error("source peer is not active");
+    }
+    if (!peerSupportsFeature(conn.capabilities, FEATURES.MOVE_REQUEST)) {
+      throw new Error(
+        "source peer doesn't advertise pull support — try moving from their device, or update them to a newer build",
+      );
     }
     const id = generateMeshId();
     return await new Promise<void>((resolve, reject) => {
@@ -1565,6 +1775,34 @@ class MeshClient {
       case "infer_cancel":
         this.handleInferCancelInbound(conn, msg.id);
         break;
+      case "file_offer":
+        // Same active-peer gate as the move + infer surface: only
+        // mutually-authenticated rostered peers may ship us bytes.
+        if (this.peerStatus(conn) !== "active") {
+          this.send(conn, {
+            kind: "file_decline",
+            id: msg.id,
+            reason: "peer not authorized",
+          });
+          break;
+        }
+        this.handleFileOffer(conn, msg);
+        break;
+      case "file_accept":
+        this.handleFileAccept(conn, msg.id);
+        break;
+      case "file_decline":
+        this.handleFileDecline(msg.id, msg.reason);
+        break;
+      case "file_chunk":
+        this.handleFileChunk(conn, msg);
+        break;
+      case "file_complete":
+        void this.handleFileComplete(conn, msg.id);
+        break;
+      case "file_abort":
+        this.handleFileAbort(msg.id, msg.reason);
+        break;
     }
   }
 
@@ -2005,6 +2243,27 @@ class MeshClient {
         pending.on_settle(false, "peer disconnected");
       }
     }
+    // File transfers in either direction against this peer end
+    // here — drop staged bytes, fail outbound senders, clear any
+    // pending offer banners that pointed at this peer.
+    for (const [id, pending] of this.pending_files_out) {
+      if (pending.target_peer_id === peer_id) {
+        this.pending_files_out.delete(id);
+        pending.on_settle(false, "peer disconnected mid-transfer");
+      }
+    }
+    for (const [id, pending] of this.pending_files_in) {
+      if (pending.peer_id === peer_id) {
+        this.pending_files_in.delete(id);
+      }
+    }
+    for (const [id, offer] of this.pending_offers) {
+      if (offer.peer_id === peer_id) {
+        this.pending_offers.delete(id);
+      }
+    }
+    this.inbound_offers = this.inbound_offers.filter((o) => o.peer_id !== peer_id);
+    this.refreshFileResources();
     this.refreshResources();
     this.republishPeers();
     if (this.computePeers().every((p) => p.status !== "pending_approval")) {
@@ -2201,11 +2460,15 @@ class MeshClient {
       const cap = await snapshotCapabilities(this.accepting);
       this.my_capabilities = cap;
       // Tell every active peer the new shape — limited to peers that
-      // are at least authenticated so we don't waste a roundtrip on
-      // mid-handshake connections (they'll get the fresh value on
-      // their next hello-retry tick anyway).
+      // are at least authenticated AND that advertise the
+      // CAPABILITIES feature so we don't waste a roundtrip on
+      // mid-handshake or Phase 1 connections (they'll have got the
+      // shape via their initial hello capabilities anyway; if they
+      // can't parse capabilities_update there's no point sending
+      // them updates).
       for (const conn of this.connections.values()) {
         if (!conn.peer_authenticated) continue;
+        if (!peerSupportsFeature(conn.capabilities, FEATURES.CAPABILITIES)) continue;
         this.send(conn, { kind: "capabilities_update", capabilities: cap });
       }
     } catch (e) {
@@ -2256,20 +2519,34 @@ class MeshClient {
       });
       for (const conn of eligible) {
         const should_be_preferred = preferred.has(conn.device_pubkey);
+        // Skip the shelve/unshelve exchange for peers that don't
+        // implement it — those peers treat every connection as
+        // active by default, and our side carries the local_shelved
+        // bookkeeping silently. They'd drop the frame as unknown
+        // anyway, but skipping keeps the activity log honest about
+        // what's actually being signaled.
+        const supports_shelve = peerSupportsFeature(
+          conn.capabilities,
+          FEATURES.RING_TOPOLOGY,
+        );
         if (!should_be_preferred && !conn.local_shelved) {
           conn.local_shelved = true;
-          this.send(conn, { kind: "shelve", reason: "out-of-ring" });
-          this.logDiag(
-            "info",
-            `ring shelved ${conn.device_pubkey.slice(0, 8)}… (out-of-ring)`,
-          );
+          if (supports_shelve) {
+            this.send(conn, { kind: "shelve", reason: "out-of-ring" });
+            this.logDiag(
+              "info",
+              `ring shelved ${conn.device_pubkey.slice(0, 8)}… (out-of-ring)`,
+            );
+          }
         } else if (should_be_preferred && conn.local_shelved) {
           conn.local_shelved = false;
-          this.send(conn, { kind: "unshelve" });
-          this.logDiag(
-            "info",
-            `ring unshelved ${conn.device_pubkey.slice(0, 8)}… (ring-neighbor)`,
-          );
+          if (supports_shelve) {
+            this.send(conn, { kind: "unshelve" });
+            this.logDiag(
+              "info",
+              `ring unshelved ${conn.device_pubkey.slice(0, 8)}… (ring-neighbor)`,
+            );
+          }
         }
       }
       this.republishPeers();
@@ -2325,15 +2602,21 @@ class MeshClient {
 
   private broadcastCatalogDebounced(): void {
     // Send immediately if anyone's online; the debounce wrapper
-    // around `refreshLocalCatalog` is what gates the rate.
+    // around `refreshLocalCatalog` is what gates the rate. Peers
+    // that don't advertise the catalog gossip feature get skipped
+    // — Phase 1 receivers would drop the frame as an unknown kind
+    // anyway, but skipping saves the wire byte and surfaces the
+    // gap accurately in the Activity log.
     for (const conn of this.connections.values()) {
       if (!conn.peer_authenticated) continue;
       if (conn.local_shelved && conn.remote_shelved) continue; // dormant
+      if (!peerSupportsFeature(conn.capabilities, FEATURES.CATALOG_GOSSIP)) continue;
       this.sendCatalogTo(conn);
     }
   }
 
   private sendCatalogTo(conn: ConnectionState): void {
+    if (!peerSupportsFeature(conn.capabilities, FEATURES.CATALOG_GOSSIP)) return;
     this.send(conn, {
       kind: "catalog_announce",
       conversations: this.my_catalog,
@@ -2368,8 +2651,13 @@ class MeshClient {
   }
 
   private broadcastMovePrepare(guid: string, to_pubkey: string): void {
+    // The 2-phase move broadcast is purely advisory — a Phase 1 peer
+    // that doesn't see it falls back to seeing two copies briefly
+    // during the transfer window. Gate on the feature flag so we
+    // don't bother sending to peers that won't act on it.
     for (const conn of this.connections.values()) {
       if (!conn.peer_authenticated) continue;
+      if (!peerSupportsFeature(conn.capabilities, FEATURES.TWO_PHASE_MOVE)) continue;
       this.send(conn, { kind: "move_prepare", guid, to_pubkey });
     }
   }
@@ -2377,6 +2665,7 @@ class MeshClient {
   private broadcastMoveCommit(guid: string): void {
     for (const conn of this.connections.values()) {
       if (!conn.peer_authenticated) continue;
+      if (!peerSupportsFeature(conn.capabilities, FEATURES.TWO_PHASE_MOVE)) continue;
       this.send(conn, { kind: "move_commit", guid });
     }
   }
@@ -2384,6 +2673,7 @@ class MeshClient {
   private broadcastMoveAbort(guid: string, reason: string): void {
     for (const conn of this.connections.values()) {
       if (!conn.peer_authenticated) continue;
+      if (!peerSupportsFeature(conn.capabilities, FEATURES.TWO_PHASE_MOVE)) continue;
       this.send(conn, { kind: "move_abort", guid, reason });
     }
   }
@@ -2418,6 +2708,11 @@ class MeshClient {
     }
     if (conn.capabilities.accepting === "busy") {
       throw new Error("target peer is busy");
+    }
+    if (!peerSupportsFeature(conn.capabilities, FEATURES.REMOTE_INFERENCE)) {
+      throw new Error(
+        "target peer doesn't advertise remote inference support — they may be on an older build",
+      );
     }
     const id = generateMeshId();
     this.pending_infers_out.set(id, {
@@ -2598,6 +2893,487 @@ class MeshClient {
       unlisten?.();
     }
   }
+
+  // ---- file transfer (Phase 2.1) --------------------------------------
+  //
+  // Send arbitrary bytes to an active peer. The wire frames are
+  // file_offer → file_accept/decline → series of file_chunk →
+  // file_complete (or file_abort on either side). Sender stages the
+  // full payload in memory and walks the array; receiver assembles
+  // chunks in memory before writing to the user-chosen path. The ~33%
+  // base64 overhead is the cost of staying on the existing JSON
+  // action channel — see FILE_CHUNK_BYTES for the per-frame budget.
+  //
+  // Use cases this enables: ship the host a screenshot, drop a PDF
+  // onto the office mesh, attach a small dataset to a chat. Big
+  // multi-GB payloads aren't the target (the in-memory accumulation
+  // would OOM); for that, a future PR can add a streaming write path
+  // and remove the FILE_MAX_BYTES cap.
+
+  /** Send `bytes` to `target_peer_id` as `filename`. Resolves once
+   *  the receiver acks `file_complete`; rejects on decline / abort
+   *  / drop. The returned `cancel()` aborts the transfer in-flight
+   *  by emitting `file_abort` to the receiver.
+   *
+   *  Gating: the target must be in active state AND advertise the
+   *  `FILE_TRANSFER` feature in its capabilities. Peers that don't
+   *  yet implement the protocol see the offer arrive as an unknown
+   *  message kind and silently drop it — pre-flighting saves them
+   *  from a hanging "waiting for accept" state and surfaces a clear
+   *  error on our side. */
+  async sendFile(args: {
+    target_peer_id: string;
+    filename: string;
+    mime_type?: string;
+    bytes: Uint8Array;
+  }): Promise<{ id: string; cancel: () => void }> {
+    const conn = this.connections.get(args.target_peer_id);
+    if (!conn) throw new Error("target peer not connected");
+    if (this.peerStatus(conn) !== "active") {
+      throw new Error("target peer not in active state");
+    }
+    if (!peerSupportsFeature(conn.capabilities, FEATURES.FILE_TRANSFER)) {
+      throw new Error(
+        "target peer doesn't advertise file transfer support — they may be on an older build",
+      );
+    }
+    if (args.bytes.byteLength === 0) {
+      throw new Error("can't send an empty file");
+    }
+    if (args.bytes.byteLength > FILE_MAX_BYTES) {
+      throw new Error(
+        `file is ${formatBytes(args.bytes.byteLength)}; cap is ${formatBytes(FILE_MAX_BYTES)} per transfer`,
+      );
+    }
+    const id = generateMeshId();
+    const chunks_total = Math.ceil(args.bytes.byteLength / FILE_CHUNK_BYTES);
+    // SHA-256 the payload up front so the offer carries the hash —
+    // lets the receiver verify integrity end-to-end without a
+    // second round-trip after the bytes land.
+    const sha256_b32 = await sha256Base32(args.bytes);
+    return await new Promise<{ id: string; cancel: () => void }>(
+      (resolve, reject) => {
+        this.pending_files_out.set(id, {
+          target_peer_id: args.target_peer_id,
+          filename: sanitizeOfferFilename(args.filename),
+          mime_type: args.mime_type ?? "",
+          bytes: args.bytes,
+          chunks_sent: 0,
+          chunks_total,
+          accepted: false,
+          on_settle: (ok, err) => {
+            if (ok) {
+              this.refreshFileResources();
+              // already resolved synchronously below
+            } else {
+              this.refreshFileResources();
+              reject(new Error(err ?? "file transfer failed"));
+            }
+          },
+        });
+        this.refreshFileResources();
+        this.send(conn, {
+          kind: "file_offer",
+          id,
+          filename: sanitizeOfferFilename(args.filename),
+          size_bytes: args.bytes.byteLength,
+          mime_type: args.mime_type,
+          chunk_size: FILE_CHUNK_BYTES,
+          sha256: sha256_b32,
+        });
+        // Resolve the OUTER promise with the handle now — the caller
+        // gets back the id + cancel synchronously, and the receiver's
+        // accept/decline lands later via the message handler. The
+        // `on_settle` reject above is what surfaces a failure to the
+        // caller's await, via a separate listenable shape if needed
+        // (most call sites just rely on `meshClient.files.outbound`).
+        resolve({
+          id,
+          cancel: () => {
+            const p = this.pending_files_out.get(id);
+            if (!p) return;
+            this.send(conn, { kind: "file_abort", id, reason: "sender cancelled" });
+            this.pending_files_out.delete(id);
+            this.refreshFileResources();
+            p.on_settle(false, "cancelled");
+          },
+        });
+      },
+    );
+  }
+
+  /** Receiver responds to `file_accept` from the requester — start
+   *  streaming chunks. Walks the staged bytes in FILE_CHUNK_BYTES
+   *  windows, awaiting nothing between frames (Trystero handles
+   *  back-pressure at the data-channel level — we'd want to inject
+   *  explicit pacing only if we see chunk loss). */
+  private async handleFileAccept(conn: ConnectionState, id: string): Promise<void> {
+    const pending = this.pending_files_out.get(id);
+    if (!pending || pending.target_peer_id !== conn.peer_id) return;
+    pending.accepted = true;
+    this.refreshFileResources();
+    const total = pending.chunks_total;
+    for (let i = 0; i < total; i++) {
+      // Caller may have cancelled mid-stream — bail out without
+      // emitting more frames.
+      if (!this.pending_files_out.has(id)) return;
+      const start = i * FILE_CHUNK_BYTES;
+      const end = Math.min(start + FILE_CHUNK_BYTES, pending.bytes.byteLength);
+      const slice = pending.bytes.subarray(start, end);
+      const bytes_b64 = base64FromBytes(slice);
+      this.send(conn, {
+        kind: "file_chunk",
+        id,
+        index: i,
+        bytes_b64,
+        is_final: i === total - 1,
+      });
+      pending.chunks_sent = i + 1;
+      this.refreshFileResources();
+      // Yield to the event loop every 8 chunks so a multi-MB transfer
+      // doesn't block the UI thread for visible periods. Trystero's
+      // own send queue handles flow control under us.
+      if (i % 8 === 7) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      }
+    }
+    this.send(conn, { kind: "file_complete", id });
+  }
+
+  /** Receiver got an offer — open save-dialog, then accept/decline.
+   *  The dialog lives behind a Tauri command so the path that lands
+   *  in `target_path` is whatever the user picked (the fs plugin's
+   *  allowlist is scoped to ~/.myownllm/** so we can't write
+   *  anywhere else without the dialog handoff). */
+  private async handleFileOffer(
+    conn: ConnectionState,
+    msg: FileOfferMessage,
+  ): Promise<void> {
+    // Up-front sanity checks before we bother the user.
+    if (typeof msg.size_bytes !== "number" || msg.size_bytes <= 0) {
+      this.send(conn, { kind: "file_decline", id: msg.id, reason: "invalid size" });
+      return;
+    }
+    if (msg.size_bytes > FILE_MAX_BYTES) {
+      this.send(conn, {
+        kind: "file_decline",
+        id: msg.id,
+        reason: `file exceeds ${formatBytes(FILE_MAX_BYTES)} cap`,
+      });
+      return;
+    }
+    // Surface the offer to the UI. The user clicks Accept (→ save
+    // dialog → acceptInboundFile) or Decline (→ declineInboundFile).
+    const peer_label = shortLabel(conn.label, conn.device_pubkey);
+    this.inbound_offers = [
+      ...this.inbound_offers,
+      {
+        id: msg.id,
+        peer_id: conn.peer_id,
+        peer_label,
+        filename: sanitizeOfferFilename(msg.filename),
+        size_bytes: msg.size_bytes,
+        mime_type: msg.mime_type ?? "",
+      },
+    ];
+    // Stash the offer parameters so acceptInboundFile can wire them
+    // into pending_files_in once the user picks a path.
+    this.pending_offers.set(msg.id, {
+      peer_id: conn.peer_id,
+      peer_pubkey: conn.device_pubkey,
+      peer_label,
+      filename: sanitizeOfferFilename(msg.filename),
+      size_bytes: msg.size_bytes,
+      mime_type: msg.mime_type ?? "",
+      chunk_size:
+        typeof msg.chunk_size === "number" && msg.chunk_size > 0
+          ? Math.min(msg.chunk_size, FILE_CHUNK_BYTES * 2)
+          : FILE_CHUNK_BYTES,
+      sha256_b32: typeof msg.sha256 === "string" ? msg.sha256 : null,
+    });
+  }
+
+  /** User clicked Accept on an inbound offer (Sidebar UI). Opens
+   *  the OS save dialog with the sender-suggested filename as the
+   *  default; on a confirmed path replies `file_accept` so the
+   *  sender starts streaming chunks. If the dialog returns null
+   *  (user cancelled), we leave the offer in place so they can
+   *  re-Accept without losing the inbound — only an explicit
+   *  Decline tears it down. */
+  async acceptInboundFile(id: string): Promise<void> {
+    const offer = this.pending_offers.get(id);
+    if (!offer) return;
+    let target_path: string | null = null;
+    try {
+      const chosen = await saveDialog({
+        defaultPath: offer.filename,
+        title: `Save file from ${offer.peer_label}`,
+      });
+      // `saveDialog` returns either a string path (v2 plugin) or null
+      // on cancel. Older plugin shapes returned an object — coerce
+      // defensively.
+      if (typeof chosen === "string") {
+        target_path = chosen;
+      } else if (chosen && typeof (chosen as { path?: string }).path === "string") {
+        target_path = (chosen as { path: string }).path;
+      }
+    } catch (e) {
+      this.logDiag("info", `save dialog failed for ${offer.filename}: ${String(e)}`);
+      return;
+    }
+    if (!target_path || target_path.trim() === "") {
+      return;
+    }
+    const chunks_total = Math.ceil(offer.size_bytes / offer.chunk_size);
+    this.pending_files_in.set(id, {
+      peer_id: offer.peer_id,
+      peer_pubkey: offer.peer_pubkey,
+      peer_label: offer.peer_label,
+      filename: offer.filename,
+      mime_type: offer.mime_type,
+      size_bytes: offer.size_bytes,
+      chunk_size: offer.chunk_size,
+      sha256_b32: offer.sha256_b32,
+      target_path,
+      chunks: new Array(chunks_total).fill(null),
+      next_expected_index: 0,
+      bytes_received: 0,
+    });
+    this.pending_offers.delete(id);
+    this.inbound_offers = this.inbound_offers.filter((o) => o.id !== id);
+    this.refreshFileResources();
+    const conn = this.connections.get(offer.peer_id);
+    if (conn) this.send(conn, { kind: "file_accept", id });
+  }
+
+  /** User clicked Decline on an inbound offer. Tell the sender so
+   *  they can free their staged bytes. */
+  declineInboundFile(id: string, reason: string = "receiver declined"): void {
+    const offer = this.pending_offers.get(id);
+    if (!offer) return;
+    this.pending_offers.delete(id);
+    this.inbound_offers = this.inbound_offers.filter((o) => o.id !== id);
+    const conn = this.connections.get(offer.peer_id);
+    if (conn) this.send(conn, { kind: "file_decline", id, reason });
+  }
+
+  /** Sender's-side: receiver bounced the offer. Resolve the pending
+   *  sender's promise as failed and free the bytes. */
+  private handleFileDecline(id: string, reason: string): void {
+    const pending = this.pending_files_out.get(id);
+    if (!pending) return;
+    this.pending_files_out.delete(id);
+    this.refreshFileResources();
+    pending.on_settle(false, `peer declined: ${reason}`);
+  }
+
+  /** Receiver side: store the chunk in order. We tolerate out-of-
+   *  order arrival (slot into `chunks[index]` rather than appending)
+   *  because Trystero's WebRTC data channels don't guarantee
+   *  in-order delivery on every transport. The `next_expected_index`
+   *  is purely diagnostic — a duplicate / gap shows up as a
+   *  warning in the activity log but the transfer still
+   *  reassembles correctly. */
+  private handleFileChunk(
+    conn: ConnectionState,
+    msg: MeshMessage & { kind: "file_chunk" },
+  ): void {
+    const pending = this.pending_files_in.get(msg.id);
+    if (!pending || pending.peer_id !== conn.peer_id) return;
+    if (msg.index < 0 || msg.index >= pending.chunks.length) {
+      this.send(conn, {
+        kind: "file_abort",
+        id: msg.id,
+        reason: `chunk index ${msg.index} out of range (have ${pending.chunks.length})`,
+      });
+      this.pending_files_in.delete(msg.id);
+      this.refreshFileResources();
+      return;
+    }
+    if (pending.chunks[msg.index] !== null) {
+      // Duplicate — silently drop, the original write stands.
+      return;
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = bytesFromBase64(msg.bytes_b64);
+    } catch (e) {
+      this.send(conn, {
+        kind: "file_abort",
+        id: msg.id,
+        reason: `chunk decode failed: ${String(e)}`,
+      });
+      this.pending_files_in.delete(msg.id);
+      this.refreshFileResources();
+      return;
+    }
+    pending.chunks[msg.index] = bytes;
+    pending.bytes_received += bytes.byteLength;
+    if (msg.index === pending.next_expected_index) {
+      // Bump the watermark past any contiguous chunks we already have.
+      while (
+        pending.next_expected_index < pending.chunks.length &&
+        pending.chunks[pending.next_expected_index] !== null
+      ) {
+        pending.next_expected_index += 1;
+      }
+    }
+    pending.on_progress?.(pending.bytes_received, pending.size_bytes);
+    this.refreshFileResources();
+  }
+
+  /** Sender ack'd it shipped every chunk. Reassemble, verify the
+   *  SHA, and write to disk via the Tauri save command. */
+  private async handleFileComplete(conn: ConnectionState, id: string): Promise<void> {
+    const pending = this.pending_files_in.get(id);
+    if (!pending || pending.peer_id !== conn.peer_id) return;
+    // Confirm we got every chunk before writing.
+    let total_len = 0;
+    for (const c of pending.chunks) {
+      if (c === null) {
+        this.send(conn, {
+          kind: "file_abort",
+          id,
+          reason: "receiver missing one or more chunks",
+        });
+        this.pending_files_in.delete(id);
+        this.refreshFileResources();
+        return;
+      }
+      total_len += c.byteLength;
+    }
+    if (total_len !== pending.size_bytes) {
+      this.send(conn, {
+        kind: "file_abort",
+        id,
+        reason: `size mismatch: got ${total_len}, expected ${pending.size_bytes}`,
+      });
+      this.pending_files_in.delete(id);
+      this.refreshFileResources();
+      return;
+    }
+    const assembled = new Uint8Array(total_len);
+    {
+      let off = 0;
+      for (const c of pending.chunks) {
+        assembled.set(c!, off);
+        off += c!.byteLength;
+      }
+    }
+    if (pending.sha256_b32) {
+      const got = await sha256Base32(assembled);
+      if (got !== pending.sha256_b32) {
+        this.send(conn, {
+          kind: "file_abort",
+          id,
+          reason: "sha-256 mismatch",
+        });
+        this.pending_files_in.delete(id);
+        this.refreshFileResources();
+        this.logDiag(
+          "error",
+          `file ${pending.filename} from ${pending.peer_label} failed sha-256 check — discarded`,
+        );
+        return;
+      }
+    }
+    try {
+      await invoke("mesh_file_save_at", {
+        path: pending.target_path,
+        bytesB64: base64FromBytes(assembled),
+      });
+      this.logDiag(
+        "info",
+        `received file ${pending.filename} (${formatBytes(total_len)}) from ${pending.peer_label} → ${pending.target_path}`,
+      );
+    } catch (e) {
+      this.send(conn, {
+        kind: "file_abort",
+        id,
+        reason: `local write failed: ${String(e)}`,
+      });
+      this.pending_files_in.delete(id);
+      this.refreshFileResources();
+      this.logDiag("error", `file write failed for ${pending.filename}: ${String(e)}`);
+      return;
+    }
+    this.pending_files_in.delete(id);
+    this.refreshFileResources();
+  }
+
+  /** Either side received `file_abort` — clean up local state. The
+   *  reason flows to the activity log so the user can see why a
+   *  transfer didn't land. */
+  private handleFileAbort(id: string, reason: string): void {
+    const inbound = this.pending_files_in.get(id);
+    if (inbound) {
+      this.pending_files_in.delete(id);
+      this.refreshFileResources();
+      this.logDiag("warn", `inbound file ${inbound.filename} aborted: ${reason}`);
+    }
+    const outbound = this.pending_files_out.get(id);
+    if (outbound) {
+      this.pending_files_out.delete(id);
+      this.refreshFileResources();
+      outbound.on_settle(false, reason);
+      this.logDiag("warn", `outbound file ${outbound.filename} aborted: ${reason}`);
+    }
+    // Also drop any pending offer the user hasn't acted on yet.
+    if (this.pending_offers.has(id)) {
+      this.pending_offers.delete(id);
+      this.inbound_offers = this.inbound_offers.filter((o) => o.id !== id);
+    }
+  }
+
+  /** Push the latest file-transfer state into the reactive snapshot
+   *  the UI binds to. Cheap — runs whenever a pending map mutates. */
+  private refreshFileResources(): void {
+    const outbound: typeof this.files.outbound = [];
+    for (const [id, p] of this.pending_files_out) {
+      outbound.push({
+        id,
+        filename: p.filename,
+        bytes_sent: Math.min(p.bytes.byteLength, p.chunks_sent * FILE_CHUNK_BYTES),
+        bytes_total: p.bytes.byteLength,
+        peer_pubkey: this.connections.get(p.target_peer_id)?.device_pubkey ?? "",
+        peer_label:
+          this.connections.get(p.target_peer_id)?.label ||
+          p.target_peer_id.slice(0, 8),
+        status: p.accepted ? "transferring" : "offered",
+      });
+    }
+    const inbound: typeof this.files.inbound = [];
+    for (const [id, p] of this.pending_files_in) {
+      inbound.push({
+        id,
+        filename: p.filename,
+        bytes_received: p.bytes_received,
+        bytes_total: p.size_bytes,
+        peer_pubkey: p.peer_pubkey,
+        peer_label: p.peer_label,
+        status: "transferring",
+      });
+    }
+    this.files = { outbound, inbound };
+  }
+
+  /** Per-offer cache so `acceptInboundFile` knows how to materialize
+   *  the `pending_files_in` entry once the user picks a save path.
+   *  Separate from `pending_files_in` because we don't want to
+   *  reserve buffer space for a transfer the user might decline. */
+  private pending_offers = new Map<
+    string,
+    {
+      peer_id: string;
+      peer_pubkey: string;
+      peer_label: string;
+      filename: string;
+      size_bytes: number;
+      mime_type: string;
+      chunk_size: number;
+      sha256_b32: string | null;
+    }
+  >();
 }
 
 function buildIceServers(
@@ -2619,6 +3395,77 @@ function buildIceServers(
 function shortLabel(label: string, pubkey: string): string {
   if (label.trim() !== "") return label;
   return pubkey.slice(0, 8);
+}
+
+// ---- file transfer helpers ----------------------------------------------
+
+/** Format a byte count for the user — "2.4 MB" rather than 2400000. */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+/** Strip path components and limit length on a filename we just got
+ *  off the wire. Stops a malicious sender from suggesting
+ *  `../../passwords.txt` as the default save name. The Tauri save
+ *  dialog would also display the path before the user confirms,
+ *  but cleaning at receive-time is the right belt-and-braces. */
+function sanitizeOfferFilename(name: string): string {
+  let out = (name || "file").replace(/[/\\\x00-\x1f]/g, "_").trim();
+  // Drop any leading dots so the file isn't hidden by accident.
+  out = out.replace(/^\.+/, "");
+  if (out.length === 0) out = "file";
+  if (out.length > 200) out = out.slice(0, 200);
+  return out;
+}
+
+/** SHA-256 → base32-lowercase string. Matches the encoding the
+ *  protocol uses everywhere else (nonces, pubkeys), so a hash on
+ *  the wire reads the same as a key.
+ *
+ *  We pass the Uint8Array's underlying buffer to subtle.digest
+ *  rather than the view directly — TS's typing on SubtleCrypto
+ *  requires an ArrayBuffer (not SharedArrayBuffer), and copying
+ *  into a fresh ArrayBuffer is the cleanest way to satisfy that
+ *  without a cast. The copy is a one-shot O(n) hash input prep,
+ *  not a hot path. */
+async function sha256Base32(bytes: Uint8Array): Promise<string> {
+  const buf = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buf).set(bytes);
+  const digest = await crypto.subtle.digest("SHA-256", buf);
+  return base32Encode(new Uint8Array(digest));
+}
+
+/** Encode raw bytes as standard base64 (with `+/` and `=` padding —
+ *  the format `atob`/`btoa` and Rust's `base64::engine::standard`
+ *  both speak). The mesh's other binary fields use base32 because
+ *  the values are short (32-byte keys / hashes); file chunks are
+ *  much larger and the ~17% saving over base32 matters. */
+function base64FromBytes(bytes: Uint8Array): string {
+  // btoa accepts a binary string. We chunk to stay under the
+  // call-stack ceiling for String.fromCharCode.apply — modern
+  // browsers happily take ~100K args, but FILE_CHUNK_BYTES * 4/3
+  // ≈ 64K so a single apply is safe; we still chunk defensively
+  // for any future bump.
+  const CHUNK = 0x8000;
+  let s = "";
+  for (let i = 0; i < bytes.byteLength; i += CHUNK) {
+    s += String.fromCharCode.apply(
+      null,
+      Array.from(bytes.subarray(i, Math.min(i + CHUNK, bytes.byteLength))),
+    );
+  }
+  return btoa(s);
+}
+
+/** Inverse of `base64FromBytes`. Throws when `s` isn't valid base64. */
+function bytesFromBase64(s: string): Uint8Array {
+  const bin = atob(s);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
 }
 
 /** Coerce a peer's claimed capabilities into our local shape so
@@ -2667,6 +3514,22 @@ function mergeCapabilities(raw: Partial<Capabilities>): Capabilities {
   }
   if (raw.accepting === "available" || raw.accepting === "limited" || raw.accepting === "busy") {
     merged.accepting = raw.accepting;
+  }
+  // App version + feature matrix. Both optional on the wire — Phase 1
+  // / early Phase 2 peers omit them. We trim the version string and
+  // filter the features array to plain strings so a malformed
+  // advertisement can't pollute downstream UI / feature gates.
+  if (typeof raw.app_version === "string") {
+    merged.app_version = raw.app_version.trim().slice(0, 32);
+  }
+  if (Array.isArray(raw.features)) {
+    merged.features = raw.features
+      .filter((f): f is string => typeof f === "string" && f.length > 0 && f.length <= 64)
+      // Preserve unknown ids (forward-compat): a peer on a newer
+      // build can advertise features we haven't heard of, and the
+      // Connections card surfaces them verbatim. peerSupportsFeature
+      // only matches by exact id so unknown ids are harmless.
+      .slice(0, 64);
   }
   return merged;
 }

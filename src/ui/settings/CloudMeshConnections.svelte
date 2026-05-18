@@ -28,7 +28,13 @@
 
   import { onMount } from "svelte";
   import { meshClient } from "../../mesh-client.svelte";
-  import { capabilityBadges, summarizeCapabilities } from "../../mesh-capabilities";
+  import {
+    APP_VERSION,
+    capabilityBadges,
+    describePeerMissingFeatures,
+    formatPeerCompat,
+    summarizeCapabilities,
+  } from "../../mesh-capabilities";
 
   onMount(() => {
     // Trigger a fresh catalog walk on first visit so the resource
@@ -109,8 +115,17 @@
     meshClient.resources.outbound_infers.length > 0 ||
       meshClient.resources.inbound_infers.length > 0 ||
       meshClient.resources.outbound_moves.length > 0 ||
-      meshClient.resources.inbound_moves.length > 0,
+      meshClient.resources.inbound_moves.length > 0 ||
+      meshClient.files.outbound.length > 0 ||
+      meshClient.files.inbound.length > 0,
   );
+
+  function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
 </script>
 
 <div class="root">
@@ -140,6 +155,7 @@
           {#each ringPeers as p (p.peer_id)}
             {@const summary = summarizeCapabilities(p.capabilities)}
             {@const badges = capabilityBadges(p.capabilities)}
+            {@const compat = formatPeerCompat(p.capabilities, APP_VERSION)}
             <div class="peer-row ring">
               <div class="peer-main">
                 <div class="peer-label">
@@ -155,6 +171,11 @@
                     {#each badges as b}
                       <span class="cap-chip" data-kind={b}>{b}</span>
                     {/each}
+                  </div>
+                {/if}
+                {#if compat}
+                  <div class="compat-line" title={describePeerMissingFeatures(p.capabilities)}>
+                    {compat}
                   </div>
                 {/if}
               </div>
@@ -179,6 +200,7 @@
           {#each indirectPeers as p (p.peer_id)}
             {@const summary = summarizeCapabilities(p.capabilities)}
             {@const badges = capabilityBadges(p.capabilities)}
+            {@const compat = formatPeerCompat(p.capabilities, APP_VERSION)}
             <div
               class="peer-row indirect"
               class:offline={p.status === "offline"}
@@ -200,6 +222,11 @@
                     {#each badges as b}
                       <span class="cap-chip" data-kind={b}>{b}</span>
                     {/each}
+                  </div>
+                {/if}
+                {#if p.status !== "offline" && compat}
+                  <div class="compat-line" title={describePeerMissingFeatures(p.capabilities)}>
+                    {compat}
                   </div>
                 {/if}
               </div>
@@ -273,6 +300,27 @@
               <span class="resource-text">
                 <strong>receiving</strong> "{r.title}" from <code>{r.peer_label}</code>
               </span>
+            </div>
+          {/each}
+          {#each meshClient.files.outbound as r (r.id)}
+            {@const pct = r.bytes_total > 0 ? Math.round((r.bytes_sent / r.bytes_total) * 100) : 0}
+            <div class="resource-row">
+              <span class="resource-dir out">→</span>
+              <span class="resource-text">
+                <strong>{r.status === "offered" ? "offering" : "sending"} file</strong>
+                "{r.filename}" to <code>{r.peer_label}</code>
+              </span>
+              <span class="resource-meta">{formatBytes(r.bytes_sent)} / {formatBytes(r.bytes_total)} · {pct}%</span>
+            </div>
+          {/each}
+          {#each meshClient.files.inbound as r (r.id)}
+            {@const pct = r.bytes_total > 0 ? Math.round((r.bytes_received / r.bytes_total) * 100) : 0}
+            <div class="resource-row">
+              <span class="resource-dir in">←</span>
+              <span class="resource-text">
+                <strong>receiving file</strong> "{r.filename}" from <code>{r.peer_label}</code>
+              </span>
+              <span class="resource-meta">{formatBytes(r.bytes_received)} / {formatBytes(r.bytes_total)} · {pct}%</span>
             </div>
           {/each}
         </div>
@@ -447,6 +495,19 @@
   .cap-chip[data-kind="ASR"] { background: #1a2632; color: #aedde0; }
   .cap-chip[data-kind="busy"] { background: #2a1818; color: #f88; }
   .cap-chip[data-kind="limited"] { background: #2a220e; color: #d6b25a; }
+
+  /* Compat line: build version + feature-matrix match for the peer.
+     Cursor: help to nudge the user toward the hover-title with the
+     full missing-feature list. */
+  .compat-line {
+    font-size: 0.65rem;
+    color: #6a7a99;
+    margin-top: 0.15rem;
+    cursor: help;
+    text-overflow: ellipsis;
+    overflow: hidden;
+    white-space: nowrap;
+  }
 
   .btn-small {
     background: #1a1a2a;
