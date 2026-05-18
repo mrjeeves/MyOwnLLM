@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { transcribeUi } from "./transcribe-state.svelte";
+import { meshClient } from "../mesh-client.svelte";
 import {
   loadConversation,
   saveConversation,
@@ -16,7 +17,7 @@ export const chatSlot = $state({
   /** `null` when the slot is free. */
   kind: null as null | "chat" | "tp",
   /** Conversation that owns this occupancy. Lets the sidebar /
-   *  ModeBar resolve a human-readable label without a round-trip. */
+   *  TopBar resolve a human-readable label without a round-trip. */
   conversationId: null as string | null,
   conversationTitle: "" as string,
   /** `running` while inference is in flight or a TP cycle is summarising;
@@ -29,7 +30,7 @@ export const chatSlot = $state({
   /** Wall-clock seconds since `startedAt`, paused-time excluded. */
   elapsed: 0,
   /** Active ollama stream id when `kind === "chat"`, so a force-stop from
-   *  the ModeBar can call `ollama_chat_cancel` directly. */
+   *  the TopBar can call `ollama_chat_cancel` directly. */
   streamId: null as string | null,
 });
 
@@ -130,9 +131,24 @@ const TP_SILENCE_MS = 4_000;
 const TP_MAX_BULLETS = 50;
 
 let tpModel = "";
+/** Peer id to route TP cycles through, or null to run locally. Set
+ *  from `startTalkingPoints` and consumed by `runTpCycle` to pick
+ *  between the local ollama path and the mesh `infer_request` path.
+ *  TP gets the same "this device or a peer" affordance the user has
+ *  for chat — see TranscribeBar's ModelSelector. */
+let tpViaPeerId: string | null = null;
+/** The active family at TP start time, captured so mesh-routed
+ *  cycles can include it in `infer_request` for the peer's resolver
+ *  to match against its loaded models. */
+let tpFamily = "";
 let tpInterval: ReturnType<typeof setInterval> | null = null;
 let tpInFlightStreamId: string | null = null;
 let tpInFlightUnlisten: UnlistenFn | null = null;
+/** Cancel handle for an in-flight mesh-routed TP cycle. Distinct
+ *  from `tpInFlightStreamId` (which is the local ollama path's
+ *  cancel handle) so `stopTalkingPoints` can release whichever path
+ *  is mid-flight. */
+let tpInFlightMeshCancel: (() => void) | null = null;
 /** Index into `transcript` up to which we've already condensed into
  *  bullets. Each cycle takes `transcript.slice(tpProcessedLen)` and
  *  advances this on success — the model only ever sees the *new* slice,
@@ -157,8 +173,16 @@ interface ChatStreamFrame {
 }
 
 /** Activate Talking Points against the conversation currently in the
- *  transcribe slot. Caller has already checked the chat slot is free. */
-export function startTalkingPoints(args: { model: string }): void {
+ *  transcribe slot. Caller has already checked the chat slot is free.
+ *  `viaPeerId` routes cycles through a Cloud Mesh peer; `null` runs
+ *  locally against the in-process ollama. The peer's resolver picks
+ *  the exact tag, so `model` is mostly a no-op when routed (kept
+ *  on-call for the local path). */
+export function startTalkingPoints(args: {
+  model: string;
+  viaPeerId?: string | null;
+  family?: string;
+}): void {
   const convId = transcribeUi.conversationId;
   if (!convId) return;
   chatSlot.kind = "tp";
@@ -166,6 +190,8 @@ export function startTalkingPoints(args: { model: string }): void {
   chatSlot.conversationTitle = "Talking Points";
   chatSlot.status = "running";
   tpModel = args.model;
+  tpViaPeerId = args.viaPeerId ?? null;
+  tpFamily = args.family ?? "";
   tpProcessedLen = 0;
   tpObservedLen = 0;
   tpLastGrowthAt = Date.now();
@@ -216,7 +242,7 @@ export async function stopTalkingPoints(): Promise<void> {
   if (tpInterval) clearInterval(tpInterval);
   tpInterval = null;
   // Best-effort: cancel any in-flight TP inference so we don't keep the
-  // ollama daemon spinning after the user said stop.
+  // ollama daemon (local) or remote peer (mesh) spinning after stop.
   if (tpInFlightStreamId) {
     try {
       await invoke("ollama_chat_cancel", { streamId: tpInFlightStreamId });
@@ -225,6 +251,14 @@ export async function stopTalkingPoints(): Promise<void> {
     tpInFlightUnlisten = null;
     tpInFlightStreamId = null;
   }
+  if (tpInFlightMeshCancel) {
+    try {
+      tpInFlightMeshCancel();
+    } catch {}
+    tpInFlightMeshCancel = null;
+  }
+  tpViaPeerId = null;
+  tpFamily = "";
   resetSlot();
 }
 
@@ -300,38 +334,73 @@ async function runTpCycle(): Promise<void> {
   const streamId = crypto.randomUUID();
   tpInFlightStreamId = streamId;
   let collected = "";
+  // Shared message body — used by both the local ollama path and the
+  // mesh `infer_request` path so a routed TP behaves identically.
+  const messages = [
+    {
+      role: "system" as const,
+      content:
+        "You condense passages of a live meeting transcript into bullet notes. " +
+        "Reply with 1-3 bullets, one per line, prefixed with '- '. " +
+        "Each bullet < 12 words. No preamble, no commentary, just the bullets. " +
+        "If the passage is filler or small talk with no substance, reply with nothing.",
+    },
+    {
+      role: "user" as const,
+      content:
+        "Condense this passage into 1-3 bullet notes:\n\n" + newSlice,
+    },
+  ];
   try {
-    tpInFlightUnlisten = await listen<ChatStreamFrame>(
-      `myownllm://chat-stream/${streamId}`,
-      (e) => {
-        const f = e.payload;
-        if (f.delta) collected += f.delta;
-      },
-    );
-    await invoke("ollama_chat_stream", {
-      streamId,
-      model: tpModel,
-      // Reasoning models can spend thousands of tokens "thinking" before
-      // producing bullets — that compounds with whisper for memory and CPU
-      // and is the trigger for the transcription-repetition bug. Bullets
-      // don't need reasoning, so we skip it.
-      think: false,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You condense passages of a live meeting transcript into bullet notes. " +
-            "Reply with 1-3 bullets, one per line, prefixed with '- '. " +
-            "Each bullet < 12 words. No preamble, no commentary, just the bullets. " +
-            "If the passage is filler or small talk with no substance, reply with nothing.",
+    if (tpViaPeerId) {
+      // Mesh-routed cycle. The peer's resolver picks the actual tag —
+      // we just hand it the family/mode hint plus the messages. `think`
+      // stays false for the same reasoning-model memory rationale that
+      // governs the local path (see the system prompt comment above).
+      await new Promise<void>((resolve, reject) => {
+        meshClient
+          .sendInferRequest({
+            target_peer_id: tpViaPeerId!,
+            messages,
+            family: tpFamily,
+            mode: "text",
+            think: false,
+            on_chunk: (frame) => {
+              if (frame.delta) collected += frame.delta;
+            },
+            on_done: () => {
+              tpInFlightMeshCancel = null;
+              resolve();
+            },
+            on_error: (m) => {
+              tpInFlightMeshCancel = null;
+              reject(new Error(m));
+            },
+          })
+          .then((handle) => {
+            tpInFlightMeshCancel = handle.cancel;
+          })
+          .catch(reject);
+      });
+    } else {
+      tpInFlightUnlisten = await listen<ChatStreamFrame>(
+        `myownllm://chat-stream/${streamId}`,
+        (e) => {
+          const f = e.payload;
+          if (f.delta) collected += f.delta;
         },
-        {
-          role: "user",
-          content:
-            "Condense this passage into 1-3 bullet notes:\n\n" + newSlice,
-        },
-      ],
-    });
+      );
+      await invoke("ollama_chat_stream", {
+        streamId,
+        model: tpModel,
+        // Reasoning models can spend thousands of tokens "thinking"
+        // before producing bullets — compounds with whisper for memory
+        // and CPU and is the trigger for the transcription-repetition
+        // bug. Bullets don't need reasoning, so we skip it.
+        think: false,
+        messages,
+      });
+    }
     const newBullets = parseBullets(collected);
     if (newBullets.length > 0) {
       const fresh = await loadConversation(convId);

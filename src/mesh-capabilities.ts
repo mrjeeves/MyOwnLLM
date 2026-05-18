@@ -186,6 +186,16 @@ export function canServeInference(
   return true;
 }
 
+/** True when `cap` could serve a remote transcribe session — i.e. the
+ *  peer has at least one ASR backend on disk and isn't refusing work.
+ *  Used by the transcribe bar's ModelSelector to populate the peer
+ *  list. Feature gating (REMOTE_TRANSCRIBE) is applied at send time;
+ *  this helper just answers "does the peer have the right runtime". */
+export function canServeTranscribe(cap: Capabilities): boolean {
+  if (cap.accepting === "busy") return false;
+  return cap.asr.length > 0;
+}
+
 /** Quick summary string for the Connections card. Keeps the row
  *  scannable: "Pi 5 · 4 GB · LLM" rather than spelling out the
  *  whole capability set. */

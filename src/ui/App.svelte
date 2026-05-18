@@ -640,7 +640,7 @@
 
   // ---------------------------------------------------------------------
   // Persistent transcription — App-level confirm dialog + auto-resume.
-  // The StatusBar's stop button calls into here so the dialog is mounted
+  // The TopBar's stop button calls into here so the dialog is mounted
   // outside Chat / TranscribeView and survives mode switches.
   // ---------------------------------------------------------------------
 
@@ -748,14 +748,15 @@
   }
 
   /** Activate Talking Points against the active transcribe session.
-   *  Surfaces a conflict modal if the chat slot is already occupied. */
-  async function requestActivateTalkingPoints(): Promise<void> {
+   *  Surfaces a conflict modal if the chat slot is already occupied.
+   *  `viaPeerId` (optional) routes TP cycles through a Cloud Mesh peer
+   *  via the `infer_request` path; null/undefined runs locally. The
+   *  TranscribeBar's ModelSelector under the talking-points pane is
+   *  where that pin comes from. */
+  async function requestActivateTalkingPoints(
+    viaPeerId: string | null = null,
+  ): Promise<void> {
     if (!transcribeUi.active) return;
-    // TP always wants the text-mode model (the chat LLM), regardless of the
-    // current view. `activeModel` reflects the *active mode* — on the
-    // Transcribe view that's the whisper model name, which Ollama 404s on,
-    // which is why TP cycles silently failed for every user who clicked the
-    // button from Transcribe (i.e. every user).
     if (!hardware) {
       console.warn("TP: hardware not yet detected; aborting");
       return;
@@ -769,15 +770,22 @@
       activeFamilyName,
       config.family_overrides,
     );
-    if (resolved.runtime !== "ollama" || !resolved.model) {
-      // Talking Points needs an Ollama text-runtime model; the
-      // resolver picked an ASR / diarize runtime by mistake (or no
-      // chat family is configured).
+    // When TP is routed through a peer, the local resolver doesn't need
+    // to land on an Ollama model — the peer's own resolver picks the
+    // tag against ITS loaded LLMs. We still call resolveModelEx so the
+    // family hint we forward to the peer is consistent with what the
+    // user picked locally; just relax the "must be ollama" check.
+    if (!viaPeerId && (resolved.runtime !== "ollama" || !resolved.model)) {
       console.warn("TP: no chat model resolved for family", activeFamilyName);
       return;
     }
     const tpModel = resolved.model;
-    const startTp = () => startTalkingPoints({ model: tpModel });
+    const startTp = () =>
+      startTalkingPoints({
+        model: tpModel,
+        viaPeerId,
+        family: activeFamilyName,
+      });
     if (!chatSlot.kind) {
       startTp();
       return;
@@ -842,7 +850,7 @@
     await forceStopChat();
   }
 
-  /** Stop the chat-slot occupant — wired into ModeBar's stop button.
+  /** Stop the chat-slot occupant — wired into TopBar's stop button.
    *  No conflict modal needed; the user clicked stop and that's an
    *  explicit "release the slot" action. */
   function requestStopChat(): void {

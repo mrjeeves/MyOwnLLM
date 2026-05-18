@@ -1,8 +1,8 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import ModeBar from "./ModeBar.svelte";
-  import StatusBar from "./StatusBar.svelte";
+  import TopBar from "./TopBar.svelte";
+  import TextBar from "./TextBar.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import DownloadOverlay from "./DownloadOverlay.svelte";
   import {
@@ -23,7 +23,6 @@
   import { transcribeUi } from "./transcribe-state.svelte";
   import { stickToBottom } from "./stick-to-bottom";
   import { meshClient } from "../mesh-client.svelte";
-  import { canServeInference } from "../mesh-capabilities";
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
 
   let {
@@ -74,7 +73,7 @@
     /** Stop the active transcription. Wired by App so the
      *  pending-chunks confirm modal lives in one place. */
     onRequestStopTranscribe: () => void;
-    /** Stop the chat-slot occupant — used by ModeBar. */
+    /** Stop the chat-slot occupant — used by the TopBar's stop control. */
     onRequestStopChat: () => void;
     /** Singleton-checked send. App handles the conflict modal when
      *  another conversation already owns the chat slot. */
@@ -100,39 +99,19 @@
   let activeStreamId = $state<string | null>(null);
   /** When non-null, the next `send` routes the prompt to this peer
    *  via the mesh instead of running locally. Value is the peer's
-   *  Trystero peer_id. Cleared automatically if the peer drops or
-   *  shifts out of `active`. */
+   *  Trystero peer_id. Cleared automatically by the TextBar's
+   *  ModelSelector if the peer drops or shifts out of `active`. */
   let routeViaPeerId = $state<string | null>(null);
   /** Cancel handle returned by `meshClient.sendInferRequest`. Used
    *  by the Stop button while a mesh-routed response is streaming. */
   let routeCancel: (() => void) | null = null;
-
-  /** Peers that could plausibly serve this chat. Filtered to active
-   *  + authorized + non-busy + has at least one LLM advertised. */
-  let availableInferencePeers = $derived(
-    meshClient.peers.filter(
-      (p) =>
-        p.status === "active" &&
-        p.authorized &&
-        canServeInference(p.capabilities, activeFamily, activeMode),
-    ),
-  );
-
-  /** Drop a stale "via" pin if the picked peer is no longer
-   *  available (dropped, went busy, or shelved). Defensive — the
-   *  picker itself filters by `availableInferencePeers` so the
-   *  user can't intentionally pick a stale one. */
-  $effect(() => {
-    if (!routeViaPeerId) return;
-    const stillThere = availableInferencePeers.some((p) => p.peer_id === routeViaPeerId);
-    if (!stillThere) routeViaPeerId = null;
-  });
   let settingsTab = $state<SettingsTab | null>(null);
-  /** When the StatusBar's "{family} · {model}" button is clicked, this
-   *  carries the active family name so SettingsPanel opens the Family
-   *  tab straight into that family's tier ladder (per-tier Switch /
-   *  Un-switch) instead of the list. Cleared alongside `settingsTab`
-   *  whenever the panel closes. */
+  /** Deep-link state for the Settings panel's Families tab — carries
+   *  the active family name so SettingsPanel opens straight into that
+   *  family's tier ladder (per-tier Switch / Un-switch) instead of
+   *  the list. Currently unset on this surface (the family pill was
+   *  retired with the StatusBar → TopBar refactor); kept so other
+   *  callers can still deep-link via the same panel mount. */
   let settingsDetailFamily = $state<string | null>(null);
   /** Cloud Mesh sub-tab to open into. Carried alongside settingsTab
    *  so the per-peer "Settings" item in the Sidebar can land
@@ -157,7 +136,7 @@
    *  the chat panel doesn't display. */
   let activeConversation = $state<Conversation | null>(null);
   /** Model context window (tokens). Refreshed when the model changes. 0 =
-   *  not yet known — ModeBar hides the saturation block in that case. */
+   *  not yet known — TextBar hides the saturation block in that case. */
   let contextSize = $state(0);
   /** User-toggled "ask for reasoning tokens" preference for the active
    *  conversation. Hydrated from `activeConversation.thinking_enabled`
@@ -232,7 +211,7 @@
       activeConversation = null;
       messages = [];
       // Fresh chat: thinking defaults off. The brain toggle in the
-      // ModeBar surfaces this; the user's first toggle persists once
+      // TextBar surfaces this; the user's first toggle persists once
       // saveConversation runs after the first send.
       thinkingEnabled = false;
       return;
@@ -322,7 +301,7 @@
     return conv;
   }
 
-  /** Toggle handler wired from ModeBar's brain checkbox. Persists
+  /** Toggle handler wired from TextBar's brain checkbox. Persists
    *  on the next save (or right away if a conversation already
    *  exists on disk) so the flag survives a reload. */
   async function setThinkingEnabled(next: boolean) {
@@ -382,9 +361,9 @@
     const streamId = crypto.randomUUID();
     activeStreamId = streamId;
 
-    // Claim the chat slot for the duration of this stream so the ModeBar
+    // Claim the chat slot for the duration of this stream so the TopBar
     // shows a running indicator and any other conversation's send routes
-    // through the conflict modal. The streamId lets the ModeBar's force-
+    // through the conflict modal. The streamId lets the TopBar's force-
     // stop control cancel an in-flight generation.
     if (conv) claimChat({ conversationId: conv.id, conversationTitle: conv.title || "Chat", streamId });
     let unlisten: UnlistenFn | null = null;
@@ -595,16 +574,15 @@
 </script>
 
 <div class="chat-shell">
-  <StatusBar
-    model={activeModel}
-    mode={activeMode}
-    family={activeFamily}
+  <TopBar
+    current={activeMode}
+    supported={supportedModes}
     {sidebarOpen}
     {onToggleSidebar}
-    onOpenSettings={(tab, opts) => {
-      settingsTab = tab;
-      settingsDetailFamily = opts?.detailFamily ?? null;
-    }}
+    onChange={handleModeChange}
+    onOpenSettings={(tab) => (settingsTab = tab)}
+    onRequestStopTranscribe={() => onRequestStopTranscribe()}
+    onRequestStopChat={() => onRequestStopChat()}
   />
 
   <div class="chat-body">
@@ -685,56 +663,21 @@
   {/if}
   </div>
 
-  <ModeBar
-    current={activeMode}
-    supported={supportedModes}
+  <TextBar
+    activeModel={activeModel}
+    activeFamily={activeFamily}
+    activeMode={activeMode}
     {tokensUsed}
     {contextSize}
     {thinkingEnabled}
     thinkingAvailable={activeMode === "text"}
-    onChange={handleModeChange}
+    viaPeerId={routeViaPeerId}
+    onViaChange={(p) => (routeViaPeerId = p)}
     onThinkingChange={setThinkingEnabled}
-    onRequestStopTranscribe={() => onRequestStopTranscribe()}
-    onRequestStopChat={() => onRequestStopChat()}
+    {streaming}
   />
 
   {#if !tpHoldsSlot}
-    <!-- Compose tools row: left side reserved for upcoming
-         file-upload pills (input/manifests/screenshots/etc.); right
-         side hosts the Cloud Mesh "via:" picker. The row only
-         renders when there's something to show on either side, so
-         single-device users with no pending uploads never see an
-         empty bar. -->
-    {#if availableInferencePeers.length > 0 || routeViaPeerId}
-      <div class="compose-tools">
-        <div class="compose-tools-files" aria-label="File uploads">
-          <!-- Reserved bar for file-attachment pills. Hooked up in
-               a follow-up PR. Empty for now but holds the layout
-               slot so the "via:" picker sits visually to the
-               right consistently. -->
-        </div>
-        <div class="compose-tools-route">
-          <label class="route-label" for="route-picker">via:</label>
-          <select
-            id="route-picker"
-            class="route-picker"
-            bind:value={routeViaPeerId}
-            disabled={streaming}
-            title="Pick a peer to route this prompt through. The peer's LLM runs the request and streams tokens back over the mesh."
-          >
-            <option value={null}>this device (local)</option>
-            {#each availableInferencePeers as p (p.peer_id)}
-              <option value={p.peer_id}>
-                {p.label || `${p.device_pubkey.slice(0, 8)}…`}{p.device_suffix ? ` -${p.device_suffix}` : ""}
-              </option>
-            {/each}
-          </select>
-          {#if routeViaPeerId}
-            <span class="route-hint">remote inference active</span>
-          {/if}
-        </div>
-      </div>
-    {/if}
     <div class="input-row">
       <textarea
         bind:value={input}
@@ -767,6 +710,7 @@
   {/if}
 </div>
 
+
 <style>
   .chat-shell {
     flex: 1;
@@ -783,7 +727,7 @@
     position: relative;
   }
   /* Anchor for the DownloadOverlay — scoped to the messages area only so
-     the ModeBar below stays clickable (the user must always be able to
+     the TextBar below stays clickable (the user must always be able to
      swap to transcribe mode, even when the text model isn't on disk).
      The input-row is disabled separately while textModelMissing. */
   .chat-scroll {
@@ -886,76 +830,12 @@
   .dots span:nth-child(2) { animation-delay: .2s; }
   .dots span:nth-child(3) { animation-delay: .4s; }
   @keyframes blink { 0%,80%,100% { opacity: .3; } 40% { opacity: 1; } }
-  /* Compose tools row: left side reserved for upcoming file
-     upload pills, right side hosts the Cloud Mesh "via:" picker.
-     Same background as the input row below so the divider line
-     only renders once at the top of this row (see the adjacency
-     selector below). */
-  .compose-tools {
-    display: flex;
-    align-items: center;
-    gap: .5rem;
-    padding: 0.35rem 0.75rem 0 0.75rem;
-    background: #0f0f0f;
-    border-top: 1px solid #1e1e1e;
-    font-size: 0.72rem;
-    color: #888;
-  }
-  /* File-pills slot. Flexes to fill the left side regardless of
-     how many pills land here later. min-width: 0 so a long peer
-     label on the right side can shrink it freely. */
-  .compose-tools-files {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    align-items: center;
-    gap: .35rem;
-    /* Reserve enough height that a future file-pill row doesn't
-       resize the bar on first attach. Matches the picker's
-       intrinsic height. */
-    min-height: 1.3rem;
-  }
-  /* Route picker container — right-aligned. */
-  .compose-tools-route {
-    display: flex;
-    align-items: center;
-    gap: .4rem;
-    flex-shrink: 0;
-  }
-  .route-label {
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    font-size: 0.62rem;
-    color: #777;
-  }
-  .route-picker {
-    background: #131313;
-    border: 1px solid #2a2a2a;
-    color: #ccc;
-    border-radius: 5px;
-    padding: 0.15rem 0.4rem;
-    font-size: 0.74rem;
-    cursor: pointer;
-  }
-  .route-picker:focus { outline: none; border-color: #3a3a55; }
-  .route-picker:disabled { opacity: 0.5; cursor: default; }
-  .route-hint {
-    color: #b9c9ee;
-    font-style: italic;
-    font-size: 0.7rem;
-  }
   .input-row {
     display: flex;
     gap: .5rem;
     padding: .75rem;
     border-top: 1px solid #1e1e1e;
     background: #0f0f0f;
-  }
-  /* When compose-tools sits above input-row they share the same
-     background so the divider line only renders once at the top of
-     compose-tools. */
-  .compose-tools + .input-row {
-    border-top: none;
   }
   textarea {
     flex: 1;
