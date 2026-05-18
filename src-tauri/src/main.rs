@@ -642,9 +642,147 @@ fn workaround_pi_webkit_dmabuf() {
     }
 }
 
+/// Silence libasound's diagnostic spew on Linux. ALSA's plugin
+/// enumeration walks every entry in `asound.conf` (system + user)
+/// and prints to stderr whenever a plugin can't satisfy a given
+/// open — `dmix` rejects capture streams, `dsnoop` rejects playback
+/// streams, `route` complains when no channel map matches, etc.
+/// The opens still succeed via another plugin further down the
+/// list, so these are harmless, but on a typical Jetson / desktop
+/// Linux the user sees a wall of "ALSA lib pcm_*.c:NNN: [error.pcm]"
+/// lines on startup that looks like a real failure.
+///
+/// Two emission paths to suppress:
+///   1. In-process: cpal calls libasound directly for device
+///      enumeration, and our own threads can hit ALSA via the
+///      WebKitGTK media stack linked into this process.
+///   2. Out-of-process: WebKitGTK 2.38+ runs the WebContent /
+///      MediaProcessGStreamer subprocesses; once `set_enable_webrtc`
+///      flipped on (see #198), the WebRTC media stack in those
+///      subprocesses enumerates audio devices via ALSA and the
+///      same diagnostic prints come out — on the inherited stderr
+///      that ultimately flows to our terminal.
+///
+/// Installing `snd_lib_error_set_handler` only solves (1) — the
+/// subprocesses each have their own libasound instance, and the
+/// handler is process-local. The fd-level filter covers both:
+/// we replace fd 2 in our process (so children inherit the pipe
+/// end via execve) and a tiny background thread drops any line
+/// matching ALSA's well-known prefix. Everything else passes
+/// through to the real stderr that the shell handed us.
+///
+/// Honors `MYOWNLLM_ALSA_VERBOSE=1` for users debugging an actual
+/// audio problem who want the original prints back.
+#[cfg(target_os = "linux")]
+fn quiet_alsa_diagnostics() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::raw::c_int;
+
+    if std::env::var_os("MYOWNLLM_ALSA_VERBOSE").is_some() {
+        return;
+    }
+
+    // libc syscalls we need. Declared inline so we don't add libc
+    // as a direct dep; the symbols resolve through the C runtime
+    // every Rust binary on Linux already pulls in.
+    extern "C" {
+        fn dup(oldfd: c_int) -> c_int;
+        fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
+        fn pipe(pipefd: *mut c_int) -> c_int;
+        fn close(fd: c_int) -> c_int;
+    }
+
+    unsafe {
+        // Save the real stderr so the filter thread can forward the
+        // surviving lines back to wherever the shell pointed fd 2
+        // (terminal, log file, journald, …).
+        let saved_stderr = dup(2);
+        if saved_stderr < 0 {
+            return;
+        }
+
+        let mut pipe_fds: [c_int; 2] = [0; 2];
+        if pipe(pipe_fds.as_mut_ptr()) != 0 {
+            close(saved_stderr);
+            return;
+        }
+        let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+
+        // Point fd 2 at the pipe's write end. Subprocesses spawned
+        // after this inherit fd 2 → the pipe, so their stderr gets
+        // filtered too.
+        if dup2(write_fd, 2) < 0 {
+            close(read_fd);
+            close(write_fd);
+            close(saved_stderr);
+            return;
+        }
+        close(write_fd);
+
+        use std::os::unix::io::FromRawFd;
+        let pipe_reader = std::fs::File::from_raw_fd(read_fd);
+        let mut original_stderr = std::fs::File::from_raw_fd(saved_stderr);
+
+        std::thread::Builder::new()
+            .name("alsa-stderr-filter".into())
+            .spawn(move || {
+                let mut buf = BufReader::new(pipe_reader);
+                let mut line = Vec::new();
+                loop {
+                    line.clear();
+                    match buf.read_until(b'\n', &mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            // libasound prefixes every diagnostic
+                            // with "ALSA lib " — see
+                            // alsa-lib/src/error.c's default handler.
+                            // Match on raw bytes so a non-UTF-8 line
+                            // doesn't crash the filter thread.
+                            if !line.starts_with(b"ALSA lib ") {
+                                let _ = original_stderr.write_all(&line);
+                                let _ = original_stderr.flush();
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .ok();
+    }
+
+    // Belt-and-suspenders: also install a no-op libasound error
+    // handler for our own process. Cheap, and stops the formatting
+    // before the write happens for the cpal-driven enumeration in
+    // the same address space. The fd-level filter above catches
+    // anything that slips through (notably the WebKit subprocesses).
+    // libasound is linked unconditionally via cpal so the symbol
+    // resolves at startup.
+    use std::os::raw::{c_char, c_void};
+
+    extern "C" fn silent_handler(
+        _file: *const c_char,
+        _line: c_int,
+        _func: *const c_char,
+        _err: c_int,
+        _fmt: *const c_char,
+    ) {
+    }
+
+    extern "C" {
+        fn snd_lib_error_set_handler(handler: *const c_void) -> c_int;
+    }
+
+    unsafe {
+        snd_lib_error_set_handler(silent_handler as *const c_void);
+    }
+}
+
 fn main() {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     workaround_pi_webkit_dmabuf();
+
+    #[cfg(target_os = "linux")]
+    quiet_alsa_diagnostics();
 
     // If invoked from CLI with arguments, handle as CLI and exit before starting GUI.
     let args: Vec<String> = std::env::args().collect();
