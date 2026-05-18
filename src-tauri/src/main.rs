@@ -150,14 +150,17 @@ fn set_active_conversation(id: Option<String>) {
 /// Channel scheme: `myownllm://chat-stream/{stream_id}` — the frontend picks
 /// the id so it can subscribe before invoking, and so concurrent streams
 /// don't collide. Frames carry exactly one of `delta` (visible content),
-/// `thinking_delta` (reasoning from thinking models), or `done: true` with
-/// a `cancelled` flag set when the stream ended via `ollama_chat_cancel`.
+/// `thinking_delta` (reasoning from thinking models), `tool_call` (a
+/// `{function: {name, arguments}}` entry when the model invokes a tool from
+/// the `tools` list), or `done: true` with a `cancelled` flag set when the
+/// stream ended via `ollama_chat_cancel`.
 #[tauri::command]
 async fn ollama_chat_stream(
     stream_id: String,
     model: String,
     messages: serde_json::Value,
     think: Option<bool>,
+    tools: Option<serde_json::Value>,
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
     use tauri::Emitter;
@@ -166,6 +169,8 @@ async fn ollama_chat_stream(
     let content_event = event.clone();
     let thinking_window = window.clone();
     let thinking_event = event.clone();
+    let tool_window = window.clone();
+    let tool_event = event.clone();
     let done_window = window.clone();
     let done_event = event.clone();
     ollama::chat_stream(
@@ -173,6 +178,7 @@ async fn ollama_chat_stream(
         &model,
         messages,
         think,
+        tools,
         move |delta| {
             let _ = content_window.emit(&content_event, serde_json::json!({ "delta": delta }));
         },
@@ -181,6 +187,9 @@ async fn ollama_chat_stream(
                 &thinking_event,
                 serde_json::json!({ "thinking_delta": delta }),
             );
+        },
+        move |call| {
+            let _ = tool_window.emit(&tool_event, serde_json::json!({ "tool_call": call }));
         },
         move |outcome| {
             let cancelled = matches!(outcome, ollama::ChatStreamOutcome::Cancelled);

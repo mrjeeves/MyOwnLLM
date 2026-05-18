@@ -128,6 +128,13 @@ export const FEATURES = {
    *  through the host's local model) instead of having to Pull it
    *  onto local disk first. Phase 3. */
   SESSION_VIEW: "session_view_v1",
+  /** Sender can forward `infer_request.tools` to its local model and
+   *  emit `infer_chunk.tool_call` frames when the model invokes one.
+   *  The agent loop runs on the CALLER's device (so tool side-effects
+   *  always happen there); the peer is just a model-service. A peer
+   *  without this feature ignores the `tools` field, which gracefully
+   *  degrades to a tool-less chat. */
+  INFER_TOOLS: "infer_tools_v1",
 } as const;
 
 /** The full set of feature ids this build advertises. Sent inside
@@ -146,6 +153,7 @@ export const ADVERTISED_FEATURES: string[] = [
   FEATURES.APP_VERSION,
   FEATURES.REMOTE_TRANSCRIBE,
   FEATURES.SESSION_VIEW,
+  FEATURES.INFER_TOOLS,
 ];
 
 /** Features a Phase 2.0 peer would have implicitly supported even
@@ -597,8 +605,16 @@ export interface InferRequestMessage {
   id: string;
   /** Chat-completion-style message list. Mirrors the shape the
    *  local `ollama_chat_stream` command takes — keeps the protocol
-   *  trivial to map to/from the existing UI path. */
-  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+   *  trivial to map to/from the existing UI path. May include
+   *  `role: "tool"` entries when the caller is driving an agent
+   *  loop and feeding back tool results between turns. */
+  messages: Array<{
+    role: "system" | "user" | "assistant" | "tool";
+    content: string;
+    name?: string;
+    tool_call_id?: string;
+    tool_calls?: Array<{ function: { name: string; arguments: unknown } }>;
+  }>;
   /** Family/mode resolved by the caller. The peer uses its own
    *  resolver to pick the actual tag — sender doesn't care which
    *  exact variant runs, only that it's in the requested family. */
@@ -607,16 +623,27 @@ export interface InferRequestMessage {
   /** When true, request reasoning tokens via the peer's `think:true`
    *  path. Optional; defaults false. */
   think?: boolean;
+  /** OpenAI-style tool definitions the caller wants the peer's
+   *  model to be able to call. Gated by `FEATURES.INFER_TOOLS` —
+   *  peers without it silently ignore the field, and the model
+   *  just sees a plain chat. Tool side-effects always execute on
+   *  the caller's device; the peer's role is only to surface
+   *  tool_call frames back over `infer_chunk`. */
+  tools?: unknown[];
 }
 
 export interface InferChunkMessage {
   kind: "infer_chunk";
   id: string;
   /** Visible-content token delta. Mutually exclusive with
-   *  `thinking_delta`. */
+   *  `thinking_delta` / `tool_call`. */
   delta?: string;
   /** Reasoning-model thinking delta (e.g. Qwen reasoning). */
   thinking_delta?: string;
+  /** One `tool_call` per `{function: {name, arguments}}` entry the
+   *  model emitted. Forwarded verbatim from the peer's local Ollama
+   *  output. */
+  tool_call?: { function: { name: string; arguments: unknown } };
 }
 
 export interface InferDoneMessage {

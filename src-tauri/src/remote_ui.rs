@@ -563,6 +563,7 @@ async fn api_chat_stream(
             &resolved,
             messages,
             None,
+            None,
             move |delta| {
                 let _ = tx_content.send(Ok(
                     Event::default().data(json!({ "delta": delta }).to_string())
@@ -573,6 +574,11 @@ async fn api_chat_stream(
                     Event::default().data(json!({ "thinking": delta }).to_string())
                 ));
             },
+            // Remote UI doesn't drive the tool-calling loop today — the
+            // browser shell never sends `tools`, so this callback is
+            // unreachable in practice. Drop any stray tool_calls rather
+            // than smuggling them through as plain text.
+            move |_call| {},
             move |_outcome| {
                 let _ = tx_done.send(Ok(
                     Event::default().data(json!({ "done": true }).to_string())

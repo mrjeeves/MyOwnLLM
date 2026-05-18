@@ -684,7 +684,11 @@ class MeshClient {
     string,
     {
       target_peer_id: string;
-      on_chunk: (frame: { delta?: string; thinking_delta?: string }) => void;
+      on_chunk: (frame: {
+        delta?: string;
+        thinking_delta?: string;
+        tool_call?: { function: { name: string; arguments: unknown } };
+      }) => void;
       on_done: (cancelled: boolean) => void;
       on_error: (message: string) => void;
     }
@@ -2021,6 +2025,7 @@ class MeshClient {
         this.handleInferChunkInbound(msg.id, {
           delta: msg.delta,
           thinking_delta: msg.thinking_delta,
+          tool_call: msg.tool_call,
         });
         break;
       case "infer_done":
@@ -3103,11 +3108,26 @@ class MeshClient {
    *  approved the peer. */
   async sendInferRequest(args: {
     target_peer_id: string;
-    messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+    messages: Array<{
+      role: "system" | "user" | "assistant" | "tool";
+      content: string;
+      name?: string;
+      tool_call_id?: string;
+      tool_calls?: Array<{ function: { name: string; arguments: unknown } }>;
+    }>;
     family: string;
     mode: string;
     think?: boolean;
-    on_chunk: (frame: { delta?: string; thinking_delta?: string }) => void;
+    /** Optional OpenAI-style tool list. Sent only when the peer
+     *  advertises `FEATURES.INFER_TOOLS`; a peer without it gets a
+     *  plain (tool-less) chat so the agent loop degrades to a single
+     *  turn rather than failing. */
+    tools?: unknown[];
+    on_chunk: (frame: {
+      delta?: string;
+      thinking_delta?: string;
+      tool_call?: { function: { name: string; arguments: unknown } };
+    }) => void;
     on_done: (cancelled: boolean) => void;
     on_error: (message: string) => void;
   }): Promise<{ id: string; cancel: () => void }> {
@@ -3141,6 +3161,15 @@ class MeshClient {
     });
     this.remote_infer_in_flight = true;
     this.refreshResources();
+    // Only forward `tools` to peers that advertise INFER_TOOLS so
+    // older peers don't fail to parse the new field (most JSON
+    // decoders are tolerant, but skipping it is cheaper than
+    // explaining the silence to the user when a tool call doesn't
+    // come back).
+    const toolsForWire =
+      args.tools && peerSupportsFeature(conn.capabilities, FEATURES.INFER_TOOLS)
+        ? args.tools
+        : undefined;
     this.send(conn, {
       kind: "infer_request",
       id,
@@ -3148,6 +3177,7 @@ class MeshClient {
       family: args.family,
       mode: args.mode,
       think: args.think,
+      tools: toolsForWire,
     });
     const cancel = () => {
       // Best-effort: send `infer_cancel` and release the pending
@@ -3167,7 +3197,11 @@ class MeshClient {
 
   private handleInferChunkInbound(
     id: string,
-    frame: { delta?: string; thinking_delta?: string },
+    frame: {
+      delta?: string;
+      thinking_delta?: string;
+      tool_call?: { function: { name: string; arguments: unknown } };
+    },
   ): void {
     const pending = this.pending_infers_out.get(id);
     if (!pending) return;
@@ -3233,6 +3267,7 @@ class MeshClient {
     interface StreamFrame {
       delta?: string;
       thinking_delta?: string;
+      tool_call?: { function: { name: string; arguments: unknown } };
       done?: boolean;
       cancelled?: boolean;
       error?: string;
@@ -3251,6 +3286,16 @@ class MeshClient {
               kind: "infer_chunk",
               id: msg.id,
               thinking_delta: f.thinking_delta,
+            });
+          }
+          if (f.tool_call !== undefined) {
+            // The caller (not this peer) executes the tool — we just
+            // forward the model's request back so their agent loop
+            // can dispatch it against THEIR Networks state.
+            this.send(conn, {
+              kind: "infer_chunk",
+              id: msg.id,
+              tool_call: f.tool_call,
             });
           }
           if (f.done) {
@@ -3286,6 +3331,10 @@ class MeshClient {
         model,
         messages: msg.messages,
         think: msg.think ?? false,
+        // Forward the caller-supplied tools to our local Ollama so it
+        // can decide whether to invoke them. Optional — undefined for
+        // peers running an older build that doesn't ship `tools`.
+        tools: msg.tools,
       });
       // If the invoke resolves without a `done` frame having fired,
       // synthesise a terminal so the requester unblocks.

@@ -30,8 +30,16 @@ export const chatSlot = $state({
   /** Wall-clock seconds since `startedAt`, paused-time excluded. */
   elapsed: 0,
   /** Active ollama stream id when `kind === "chat"`, so a force-stop from
-   *  the TopBar can call `ollama_chat_cancel` directly. */
+   *  the TopBar can call `ollama_chat_cancel` directly. Only set for
+   *  single-turn (no-tools) chats; the agent loop manages its own per-turn
+   *  stream ids and surfaces cancellation via `abortController` below. */
   streamId: null as string | null,
+  /** Abort controller for an in-flight agent-loop run. Set by `claimChat`
+   *  when the chat enters the agent path; `forceStopChat` aborts it so
+   *  the loop unwinds at the next turn boundary (or sooner if it's
+   *  mid-stream, via the in-flight `ollama_chat_cancel` chained to the
+   *  abort). Null for non-agent chats (or when the slot is free). */
+  abortController: null as AbortController | null,
 });
 
 let elapsedTimer: ReturnType<typeof setInterval> | null = null;
@@ -53,16 +61,20 @@ function startTimer() {
 
 /** Claim the slot for a chat. Caller is responsible for having checked the
  *  slot was free (via `chatSlot.kind === null`); this function is a state
- *  transition, not an enforcement point. */
+ *  transition, not an enforcement point. Pass `abortController` when the
+ *  occupant is an agent-loop chat — `forceStopChat` will abort it so the
+ *  loop unwinds cleanly across turn boundaries, not just mid-stream. */
 export function claimChat(args: {
   conversationId: string;
   conversationTitle: string;
   streamId: string;
+  abortController?: AbortController;
 }): void {
   chatSlot.kind = "chat";
   chatSlot.conversationId = args.conversationId;
   chatSlot.conversationTitle = args.conversationTitle;
   chatSlot.streamId = args.streamId;
+  chatSlot.abortController = args.abortController ?? null;
   chatSlot.status = "running";
   startTimer();
 }
@@ -73,7 +85,17 @@ export function claimChat(args: {
 export async function forceStopChat(): Promise<boolean> {
   if (chatSlot.kind !== "chat") return false;
   const id = chatSlot.streamId;
+  const ctrl = chatSlot.abortController;
   resetSlot();
+  // Agent-loop path: aborting the controller unwinds the loop. The
+  // controller itself fires `ollama_chat_cancel` against the active
+  // turn's stream, so we don't have to duplicate that here.
+  if (ctrl) {
+    try {
+      ctrl.abort();
+    } catch {}
+    return true;
+  }
   if (!id) return false;
   try {
     await invoke("ollama_chat_cancel", { streamId: id });
@@ -99,6 +121,7 @@ function resetSlot() {
   chatSlot.conversationId = null;
   chatSlot.conversationTitle = "";
   chatSlot.streamId = null;
+  chatSlot.abortController = null;
   chatSlot.status = "idle";
   chatSlot.startedAt = 0;
   chatSlot.elapsed = 0;
