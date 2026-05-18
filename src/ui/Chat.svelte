@@ -22,6 +22,8 @@
   } from "./chat-slot.svelte";
   import { transcribeUi } from "./transcribe-state.svelte";
   import { stickToBottom } from "./stick-to-bottom";
+  import { meshClient } from "../mesh-client.svelte";
+  import { canServeInference } from "../mesh-capabilities";
 
   let {
     activeModel,
@@ -95,6 +97,35 @@
   let input = $state("");
   let streaming = $state(false);
   let activeStreamId = $state<string | null>(null);
+  /** When non-null, the next `send` routes the prompt to this peer
+   *  via the mesh instead of running locally. Value is the peer's
+   *  Trystero peer_id. Cleared automatically if the peer drops or
+   *  shifts out of `active`. */
+  let routeViaPeerId = $state<string | null>(null);
+  /** Cancel handle returned by `meshClient.sendInferRequest`. Used
+   *  by the Stop button while a mesh-routed response is streaming. */
+  let routeCancel: (() => void) | null = null;
+
+  /** Peers that could plausibly serve this chat. Filtered to active
+   *  + authorized + non-busy + has at least one LLM advertised. */
+  let availableInferencePeers = $derived(
+    meshClient.peers.filter(
+      (p) =>
+        p.status === "active" &&
+        p.authorized &&
+        canServeInference(p.capabilities, activeFamily, activeMode),
+    ),
+  );
+
+  /** Drop a stale "via" pin if the picked peer is no longer
+   *  available (dropped, went busy, or shelved). Defensive — the
+   *  picker itself filters by `availableInferencePeers` so the
+   *  user can't intentionally pick a stale one. */
+  $effect(() => {
+    if (!routeViaPeerId) return;
+    const stillThere = availableInferencePeers.some((p) => p.peer_id === routeViaPeerId);
+    if (!stillThere) routeViaPeerId = null;
+  });
   let settingsTab = $state<SettingsTab | null>(null);
   /** When the StatusBar's "{family} · {model}" button is clicked, this
    *  carries the active family name so SettingsPanel opens the Family
@@ -326,11 +357,54 @@
       // surfaces. Best-effort; failures are non-fatal so we don't block
       // the actual generation on stats bookkeeping.
       void invoke("usage_record_chat_sent").catch(() => {});
-      await invoke("ollama_chat_stream", {
-        streamId,
-        model: activeModel,
-        messages: history.map((m) => ({ role: m.role, content: m.content })),
-      });
+
+      if (routeViaPeerId) {
+        // Phase 2: mesh-routed inference. The remote peer runs
+        // against its local ollama and streams chunks back over the
+        // data channel. We synthesize the same delta/thinking_delta
+        // events the local path would emit so the rest of the
+        // existing UI (bubble append, stop button, persist) works
+        // unchanged.
+        await new Promise<void>((resolve, reject) => {
+          meshClient
+            .sendInferRequest({
+              target_peer_id: routeViaPeerId!,
+              messages: history.map((m) => ({ role: m.role, content: m.content })),
+              family: activeFamily,
+              mode: activeMode,
+              on_chunk: (frame) => {
+                if (frame.thinking_delta) {
+                  if (assistantIdx === -1) assistantIdx = ensureAssistantBubble();
+                  appendTo(assistantIdx, "thinking", frame.thinking_delta);
+                } else if (frame.delta) {
+                  if (assistantIdx === -1) assistantIdx = ensureAssistantBubble();
+                  appendTo(assistantIdx, "content", frame.delta);
+                }
+              },
+              on_done: () => {
+                routeCancel = null;
+                resolve();
+              },
+              on_error: (msg) => {
+                routeCancel = null;
+                reject(new Error(msg));
+              },
+            })
+            .then((handle) => {
+              routeCancel = handle.cancel;
+            })
+            .catch((e) => {
+              routeCancel = null;
+              reject(e);
+            });
+        });
+      } else {
+        await invoke("ollama_chat_stream", {
+          streamId,
+          model: activeModel,
+          messages: history.map((m) => ({ role: m.role, content: m.content })),
+        });
+      }
 
       if (assistantIdx === -1) {
         messages = [...messages, { role: "assistant", content: "(empty response)" }];
@@ -379,6 +453,15 @@
   }
 
   async function stop() {
+    // Mesh-routed: fire `infer_cancel` over the data channel and let
+    // the pending promise unwind via on_done(cancelled=true).
+    if (routeCancel) {
+      try {
+        routeCancel();
+      } catch {}
+      routeCancel = null;
+      return;
+    }
     if (!activeStreamId) return;
     // Fire-and-forget: the cancel command itself is fast, and the in-flight
     // invoke() in send() will resolve naturally once the Rust side observes
@@ -552,18 +635,46 @@
   />
 
   {#if !tpHoldsSlot}
+    {#if availableInferencePeers.length > 0 || routeViaPeerId}
+      <!-- Cloud Mesh Phase 2: "via" picker. When set to a peer, the
+           next Send routes the prompt over the mesh and streams the
+           response back through the data channel. The local model
+           stays cold; the peer's LLM does the work. Hidden entirely
+           when no peer is reachable for inference, so single-device
+           users never see it. -->
+      <div class="route-row">
+        <label class="route-label" for="route-picker">via:</label>
+        <select
+          id="route-picker"
+          class="route-picker"
+          bind:value={routeViaPeerId}
+          disabled={streaming}
+          title="Pick a peer to route this prompt through. The peer's LLM runs the request and streams tokens back over the mesh."
+        >
+          <option value={null}>this device (local)</option>
+          {#each availableInferencePeers as p (p.peer_id)}
+            <option value={p.peer_id}>
+              {p.label || `${p.device_pubkey.slice(0, 8)}…`}{p.device_suffix ? ` -${p.device_suffix}` : ""}
+            </option>
+          {/each}
+        </select>
+        {#if routeViaPeerId}
+          <span class="route-hint">remote inference active</span>
+        {/if}
+      </div>
+    {/if}
     <div class="input-row">
       <textarea
         bind:value={input}
         onkeydown={onKeydown}
-        placeholder={textModelMissing ? "Download the text model to start chatting…" : "Message…"}
+        placeholder={textModelMissing && !routeViaPeerId ? "Download the text model to start chatting…" : "Message…"}
         rows="1"
-        disabled={textModelMissing}
+        disabled={textModelMissing && !routeViaPeerId}
       ></textarea>
       {#if streaming}
         <button class="stop" onclick={stop} title="Stop generating">Stop</button>
       {:else}
-        <button onclick={send} disabled={!input.trim() || textModelMissing}>Send</button>
+        <button onclick={send} disabled={!input.trim() || (textModelMissing && !routeViaPeerId)}>Send</button>
       {/if}
     </div>
   {/if}
@@ -701,12 +812,50 @@
   .dots span:nth-child(2) { animation-delay: .2s; }
   .dots span:nth-child(3) { animation-delay: .4s; }
   @keyframes blink { 0%,80%,100% { opacity: .3; } 40% { opacity: 1; } }
+  .route-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.35rem 0.75rem 0 0.75rem;
+    background: #0f0f0f;
+    border-top: 1px solid #1e1e1e;
+    font-size: 0.72rem;
+    color: #888;
+  }
+  .route-label {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.62rem;
+    color: #777;
+  }
+  .route-picker {
+    background: #131313;
+    border: 1px solid #2a2a2a;
+    color: #ccc;
+    border-radius: 5px;
+    padding: 0.15rem 0.4rem;
+    font-size: 0.74rem;
+    cursor: pointer;
+  }
+  .route-picker:focus { outline: none; border-color: #3a3a55; }
+  .route-picker:disabled { opacity: 0.5; cursor: default; }
+  .route-hint {
+    color: #b9c9ee;
+    font-style: italic;
+    font-size: 0.7rem;
+  }
   .input-row {
     display: flex;
     gap: .5rem;
     padding: .75rem;
     border-top: 1px solid #1e1e1e;
     background: #0f0f0f;
+  }
+  /* When the route-row sits above input-row they share the same
+     background so the divider line only renders once at the top of
+     the route-row. */
+  .route-row + .input-row {
+    border-top: none;
   }
   textarea {
     flex: 1;

@@ -224,6 +224,14 @@ function mergeCloudMesh(raw: Partial<CloudMeshConfig> | undefined): CloudMeshCon
   const signaling = (raw.signaling_servers ?? []).filter(
     (s) => !LEGACY_PEERJS_SIGNALING_URLS.includes(s),
   );
+  // Phase 2 fields are optional in both the persisted shape and the
+  // runtime defaults — older configs that predate them just stay on
+  // the implicit defaults (`available` accepting, `diag_quiet` off).
+  const accepting =
+    raw.accepting === "available" || raw.accepting === "limited" || raw.accepting === "busy"
+      ? raw.accepting
+      : "available";
+  const diag_quiet = typeof raw.diag_quiet === "boolean" ? raw.diag_quiet : false;
   return {
     enabled: raw.enabled ?? DEFAULT_CLOUD_MESH.enabled,
     network_id: raw.network_id ?? DEFAULT_CLOUD_MESH.network_id,
@@ -231,6 +239,8 @@ function mergeCloudMesh(raw: Partial<CloudMeshConfig> | undefined): CloudMeshCon
     signaling_servers: signaling,
     stun_servers: raw.stun_servers ?? [...DEFAULT_CLOUD_MESH.stun_servers],
     turn_servers: raw.turn_servers ?? [...DEFAULT_CLOUD_MESH.turn_servers],
+    accepting,
+    diag_quiet,
   };
 }
 

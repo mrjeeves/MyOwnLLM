@@ -18,6 +18,7 @@ Full reference manual for MyOwnLLM. For a one-page overview and quick start, see
   - [Import & Export](#import--export)
   - [Update](#update)
 - [GUI](#gui)
+- [Cloud Mesh](#cloud-mesh)
 - [Provider system](#provider-system)
 - [Manifest format](#manifest-format)
 - [Imports & merged catalogs](#imports--merged-catalogs)
@@ -673,6 +674,123 @@ Launch the GUI by running `myownllm` with no arguments, or open the application 
 
 ---
 
+## Cloud Mesh
+
+**Two MyOwnLLM instances with the same Network ID find each other, mutually authenticate, and share work peer-to-peer over WebRTC.** No MyOwnLLM-operated signaling server, no API key, no cloud round-trip. Every device becomes a window into the same mesh: phone audio in, desktop transcription out, a laptop's idle GPU answering prompts from the tablet on the kitchen counter.
+
+Cloud Mesh ships off by default. To turn it on, open **Settings → Cloud Mesh → Identity** and lock a Network ID.
+
+### Concepts
+
+| Term | What it is |
+|------|------------|
+| **Network ID** | Short human name like `office-mesh` (3–64 chars of `[a-z0-9_-]`). Hashed under domain tag `myownllm-network-v1:` to a 52-char base32 handle — the handle is what hits the wire, the name is what you share. Same name on two devices = same mesh. |
+| **Device ID** | Permanent per-install identifier: `<base32-pubkey>-<SUFFIX>`. The pubkey is a long-lived ed25519 key under `~/.myownllm/.secrets/identity.json` (0600 on Unix). The 5-char uppercase-hex `SUFFIX` is a stable display tag (`sha256(pubkey).first_5_hex_chars`) — that's the part you read aloud to confirm a peer is who they say they are. |
+| **Auth handshake** | On every peer encounter, both sides exchange a `hello` (pubkey + 32-byte nonce + 6-char verification code), then `auth_response` (each signs the other's nonce under domain tag `myownllm-mesh-auth-v1:`). Mutual ed25519 verification = identity. Followed by user `approve` / `deny`. |
+| **Verification code** | Per-request 6-char `[a-z0-9]` code each side generates. The code is the eyeball-check ("the code I see in the app matches the code you read me over the phone") — not load-bearing for security (the signatures are), but the UX confirmation that the request is the one you expect. |
+| **Roster** | Per–Network ID list of approved Device IDs at `~/.myownllm/mesh/roster.json`. Reconnects from rostered peers auto-allow without re-prompting. Switching Network ID atomically swaps to a fresh empty roster — old approvals don't carry across networks. |
+
+### Quick start
+
+1. **Device A:** open **Settings → Cloud Mesh → Identity**. Type a name (e.g. `home-mesh`) or click **Generate** to get a random one. Click the lock to commit.
+2. **Device B:** same tab. Type the **same** name. Click the lock.
+3. Within seconds each device sees the other in **Network requests**. The host side (lex-lesser pubkey) prompts first ("X wants to connect"). Compare the verification code shown to what the other person reads aloud; if they match, click **Approve**.
+4. The guest side gets a follow-up prompt ("X authorized you — confirm?"). Approve there too. Both sides flip to **live** in the Connections list and the peer joins the roster.
+5. After approval, reconnects auto-allow silently — you only see a prompt for genuinely new peers.
+
+### What the mesh does for you
+
+| Feature | Where it shows up |
+|---------|-------------------|
+| **Move a conversation between devices** | Right-click any conversation in the sidebar → **Move to device → \<peer\>**. The sender's copy is deleted after the receiver acks. Also reachable from the **Network** sub-tab. |
+| **Remote inference** | In the chat compose row, the **via:** picker lets you route a prompt to any peer that has an LLM advertised. The peer's local Ollama runs the request and streams tokens back over the data channel. Stop, cancel, and reasoning-mode all work the same as local. |
+| **Catalog visibility** | The **Network** sub-tab renders a grid — rows are conversations, columns are devices. `host` = lives there, `—` = not there, `moving…` = mid-transfer. Click an `—` cell on a row hosted locally to Move that conversation to that peer. |
+| **Capability badges** | Each peer's row shows what they can do — `LLM`, `ASR`, `mic`, `diarize`, plus a one-liner hardware summary (`Pi 5 · 4 GB RAM`). Sourced from each device's broadcast `capabilities_update`. |
+| **Accepting policy** | Per-device toggle on the Identity tab. `available` = take any work, `limited` = only if no better peer exists, `busy` = refuse incoming inference. Other peers see your choice in real time. |
+| **Standby peers** | Once the mesh grows past 3 active connections, the ring selector parks the further-out peers in `standby` — data channel stays open as a heartbeat but app traffic flows only through ring neighbors. Keeps Pi-class devices from melting under N² connection counts on a 10-device mesh. The selector is deterministic on the sorted pubkey ring, so both ends agree without coordination. |
+
+### Transport: Trystero over Nostr (default)
+
+Discovery and WebRTC connection setup go through [Trystero](https://trystero.dev), which proxies signed signaling messages through decentralized infrastructure (Nostr relays by default, with BitTorrent / MQTT / IPFS available as compile-time alternatives). **MyOwnLLM operates none of these.** The default is the community-run public Nostr relay pool.
+
+The relay sees only the small WebRTC offer/answer envelopes during connection setup — never the mesh's actual traffic. Once peers connect, the data channel is direct and end-to-end.
+
+### Self-hosting a relay (LAN / office / air-gapped)
+
+For an office or home network where you don't want connection setup to traverse public relays, point Trystero at your own. **Settings → Cloud Mesh → Settings → Signaling relays** takes a list of WebSocket URLs; the disclosure under "Self-host a Nostr relay" gives you one-line Docker commands for `strfry` (lightweight C++, ~10 MB RAM) and `nostr-rs-relay` (Rust, persistent SQLite).
+
+```sh
+# Lightweight option
+docker run -d -p 7777:7777 dockurr/strfry
+
+# Then in MyOwnLLM: add ws://your-host:7777 to the relay list.
+```
+
+Two devices both pointed at the same private relay find each other through it without ever hitting the public Nostr network.
+
+### NAT traversal: STUN + optional TURN
+
+WebRTC needs STUN to discover NAT mappings; the defaults are Google's public STUN pool, which works on ~95% of networks. The other 5% (symmetric NAT, both peers behind it) need a TURN relay — that's user-supplied because TURN consumes real bandwidth. Add TURN entries in **Settings → Cloud Mesh → Settings → TURN servers** with their URL + credentials.
+
+### Activity log
+
+Connect → handshake → approve → re-handshake → catalog announce — every event lands in the **Activity** panel on the Identity tab as a ring-buffered log (newest at top, 80-entry cap). Useful when debugging a "peer didn't show up" situation. The `quiet logs` checkbox suppresses `info` events in the log while keeping `warn` and `error` — useful once steady-state and you don't want the chatter.
+
+### Resilience (post-sleep, network blips)
+
+The mesh client watches for OS sleep / network drop via four signals (`visibilitychange`, `focus`, `online`, `pageshow`) plus a heartbeat-tick clock-gap detector. On wake it pings every peer with a tight 1.5 s probe; if any peer doesn't pong it enters a backoff schedule of re-handshakes (2 s, 5 s, 10 s, 20 s, 30 s, then capped) before escalating to a forced Trystero room rejoin. Rejoins are throttled (1m → 2m → 5m → 10m → 30m) so a peer that's genuinely offline doesn't drag the rest of the mesh through a churn loop.
+
+You can force-reconnect a peer manually from its row in the Connections list.
+
+### Wire protocol (for the curious)
+
+Every message is a JSON envelope with a discriminated `kind` field, framed over Trystero's typed `makeAction("mesh")` data channel. The kinds (all in `src/mesh-protocol.ts`):
+
+```
+# Handshake
+hello                    pubkey + nonce + verification code + capabilities
+auth_response            signature over the other side's nonce
+approve / deny           after user approval / denial
+
+# Liveness
+ping / pong              heartbeat with timestamp echo
+
+# Capabilities + ring topology
+capabilities_update      re-broadcast on local hardware/model change
+shelve / unshelve        ring selector toggles a peer between active and standby
+
+# Catalog gossip
+catalog_announce         full list of conversations hosted on the sender
+
+# Move (single-RTT, Phase 1)
+move_offer / move_accept / move_decline / move_payload / move_complete
+
+# Move (2-phase visibility, Phase 2 — broadcast to everyone)
+move_prepare / move_commit / move_abort
+
+# Remote inference
+infer_request            messages + family/mode + think hint
+infer_chunk              one delta or thinking-delta per frame
+infer_done / infer_error
+infer_cancel             abort an in-flight inference
+```
+
+The protocol version is `1` and stays there across additive Phase 2 changes — v0.2.14 Phase 1 peers and Phase 2 peers can share a mesh, with the v1 side simply not seeing the ring shelving / remote inference / catalog niceties.
+
+### Persistence
+
+```
+~/.myownllm/
+├── .secrets/
+│   └── identity.json    (ed25519 keypair; 0600 on Unix)
+└── mesh/
+    └── roster.json      (per-Network-ID approved peers; 0600 on Unix)
+```
+
+Both files are local-only. Identity carries across Network ID changes; the roster does not.
+
+---
+
 ## Provider system
 
 ### What is a Provider?
@@ -1092,6 +1210,19 @@ The `manifests/` cache stores one entry per URL. When a manifest reached via an 
     "check_interval_hours": 6,
     "stable_url": null,
     "beta_url": null
+  },
+  "cloud_mesh": {
+    "enabled": false,
+    "network_id": "",                // canonical form; empty until the user locks one
+    "locked": false,                 // true = field is committed and mesh client should run
+    "signaling_servers": [],         // empty = Trystero's built-in Nostr relays; populate to override
+    "stun_servers": [
+      "stun:stun.l.google.com:19302",
+      "stun:stun1.l.google.com:19302"
+    ],
+    "turn_servers": [],              // [{ "url": "turn:host:port", "username": "...", "credential": "..." }, ...]
+    "accepting": "available",        // "available" | "limited" | "busy" — Phase 2
+    "diag_quiet": false              // when true, info events suppressed in Activity log — Phase 2
   },
   "providers": [
     { "name": "MyOwnLLM Default", "url": "https://raw.githubusercontent.com/mrjeeves/MyOwnLLM/main/manifests/default.json" },

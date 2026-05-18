@@ -7,8 +7,10 @@
  * discriminated `kind` field. The two
  * pre-active phases are:
  *
- *   1. `hello` — each side announces its claimed Device ID and a
- *      random nonce. Sent immediately on channel open.
+ *   1. `hello` — each side announces its claimed Device ID, a random
+ *      nonce, a verification code, AND a capabilities blob (LLMs
+ *      loaded, ASR backends present, hardware fingerprint, accepting-
+ *      jobs hint). Sent immediately on channel open.
  *   2. `auth_response` — each side returns the other's nonce signed
  *      with its own private key. Receiving a valid signature
  *      authenticates that the sender owns the keypair matching its
@@ -19,6 +21,17 @@
  * for user approval. The receiver sends `approve` once cleared; the
  * connection becomes ACTIVE on both sides at that point.
  *
+ * Post-active, peers exchange:
+ *   - `capabilities_update` whenever local hardware / models change
+ *   - `shelve` / `unshelve` to negotiate ring topology (Phase 2)
+ *   - `catalog_announce` so every peer knows what's hosted where
+ *   - `move_*` for conversation transfer (Phase 1 single-RTT;
+ *     Phase 2 layers `move_prepare` / `move_commit` / `move_abort`
+ *     so an in-flight transfer is visible in the catalog)
+ *   - `infer_request` + `infer_chunk` + `infer_done` + `infer_error`
+ *     + `infer_cancel` for remote LLM inference
+ *   - `ping` / `pong` for keepalive
+ *
  * Domain separation: every signed payload is prefixed with the tag
  * below so a signature obtained for one protocol step can't be
  * replayed in another.
@@ -26,6 +39,17 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+/** Wire-protocol version. Stays at 1 across Phase 2 because every
+ *  Phase 2 change is additive: new optional fields on existing
+ *  messages (capabilities, max_connections on hello) and brand-new
+ *  message kinds (shelve, unshelve, capabilities_update, infer_*,
+ *  move_prepare/commit/abort). A v1 receiver missing an optional
+ *  field falls back to its default; a v1 receiver getting an
+ *  unknown message kind silently drops it via the default switch
+ *  arm. A 0.2.14 peer and a Phase 2 peer can share a mesh, with the
+ *  v1 side simply not seeing the ring shelving / remote inference /
+ *  catalog niceties. Bump this only when an existing message's
+ *  wire shape changes incompatibly. */
 export const PROTOCOL_VERSION = 1;
 export const SIGN_DOMAIN_TAG = "myownllm-mesh-auth-v1:";
 
@@ -36,12 +60,88 @@ export type MeshMessage =
   | DenyMessage
   | PingMessage
   | PongMessage
+  | CapabilitiesUpdateMessage
+  | ShelveMessage
+  | UnshelveMessage
   | CatalogAnnounceMessage
   | MoveOfferMessage
   | MoveAcceptMessage
   | MoveDeclineMessage
   | MovePayloadMessage
-  | MoveCompleteMessage;
+  | MoveCompleteMessage
+  | MovePrepareMessage
+  | MoveCommitMessage
+  | MoveAbortMessage
+  | InferRequestMessage
+  | InferChunkMessage
+  | InferDoneMessage
+  | InferErrorMessage
+  | InferCancelMessage;
+
+// ---- capabilities --------------------------------------------------------
+
+/** GPU class as the resolver knows it; mirrors `src/types.ts::GpuType`
+ *  but kept inline here so the protocol module has no transitive deps
+ *  on the rest of the app. */
+export type CapabilityGpu = "nvidia" | "amd" | "apple" | "none";
+
+/** Self-reported willingness to take jobs from peers. The mesh router
+ *  treats `busy` as "don't offer me work"; `limited` means "only if no
+ *  better target exists"; `available` is the default. */
+export type AcceptingPolicy = "available" | "limited" | "busy";
+
+/** Per-peer advertisement of what this device can serve. Sent inside
+ *  `hello` (so peers know immediately what's on offer) and again via
+ *  `capabilities_update` whenever local state changes (model pulled,
+ *  ASR backend swap, accepting policy toggled).
+ *
+ *  The shape is intentionally informational — every list field can be
+ *  empty without breaking anything. v2 readers tolerate unknown extra
+ *  fields so future capabilities can be added without bumping the
+ *  protocol version. */
+export interface Capabilities {
+  /** LLM tags this peer can serve via `infer_request`. One entry per
+   *  resolved model the peer has locally pulled; the router matches
+   *  by `family` + `mode` to find candidates. Empty when ollama isn't
+   *  installed or no models are present. */
+  llms: Array<{ tag: string; family: string; mode: string }>;
+  /** ASR backends this peer has loaded (or is configured to load on
+   *  demand). The `tier` is the resolver's tier name, surfaced for
+   *  the UI to pick the most-capable host when several peers can
+   *  transcribe. */
+  asr: Array<{ backend: "moonshine" | "parakeet"; tier: string }>;
+  /** True if speaker diarization is wired up locally. */
+  diarize: boolean;
+  /** Hardware fingerprint summary. Drives routing heuristics ("pick
+   *  the NVIDIA box for the big model") and is surfaced in the
+   *  Connections card as a one-line "Pi 5 · 4 GB" hint so the user
+   *  can sanity-check the mesh. */
+  hardware: {
+    gpu_type: CapabilityGpu;
+    ram_gb: number;
+    vram_gb: number | null;
+    /** Friendly board/SoC label when known (Pi 5, M2 Pro, etc.). */
+    soc?: string | null;
+    /** CPU arch ("x86_64", "aarch64", …). */
+    arch?: string;
+  };
+  /** Sensors and IO surfaces this device exposes for sharing — used
+   *  by the mic-routing picker to know which peers can offer audio. */
+  inputs: { mic: boolean; camera: boolean };
+  outputs: { speaker: boolean; display: boolean };
+  /** Willingness to accept jobs. Defaults to `available`. */
+  accepting: AcceptingPolicy;
+}
+
+export const EMPTY_CAPABILITIES: Capabilities = {
+  llms: [],
+  asr: [],
+  diarize: false,
+  hardware: { gpu_type: "none", ram_gb: 0, vram_gb: null, soc: null, arch: "" },
+  inputs: { mic: false, camera: false },
+  outputs: { speaker: false, display: false },
+  accepting: "available",
+};
 
 export interface HelloMessage {
   kind: "hello";
@@ -65,6 +165,15 @@ export interface HelloMessage {
    *  think it is. Not load-bearing — the ed25519 signatures
    *  authenticate identity; this is just a UX confirmation. */
   verification_code: string;
+  /** Capabilities the sender advertises. Phase 2 addition. v1 peers
+   *  omit the field; the receiver treats `undefined` as
+   *  `EMPTY_CAPABILITIES` so the connection still completes. */
+  capabilities?: Capabilities;
+  /** Maximum concurrent connections this peer is willing to maintain.
+   *  Feeds the ring-topology selector — a peer that says "I can hold
+   *  8" absorbs more of the load when nearby ones are at the floor.
+   *  Omitted by v1 peers; defaults to 6 when missing. */
+  max_connections?: number;
 }
 
 export interface AuthResponseMessage {
@@ -95,17 +204,52 @@ export interface PongMessage {
   t: number;
 }
 
+/** Push an updated `Capabilities` blob to peers. Sent whenever local
+ *  state changes (new model pulled, accepting toggle flipped, etc.).
+ *  Receivers replace their cached copy wholesale. */
+export interface CapabilitiesUpdateMessage {
+  kind: "capabilities_update";
+  capabilities: Capabilities;
+}
+
+// ---- ring topology ------------------------------------------------------
+
+/** "I'm not going to send you application traffic for now — keep the
+ *  data channel open as a heartbeat so we can flip back to active
+ *  quickly when the ring rebalances." Phase 2 ring topology. Both
+ *  sides put each other in `shelved` state on receive; either side
+ *  can `unshelve` later when the selector promotes them. */
+export interface ShelveMessage {
+  kind: "shelve";
+  /** Why we're shelving — surfaced in the Activity log so the user
+   *  can see "shelved bob (out-of-ring)" vs "shelved bob (over
+   *  capacity)". Optional. */
+  reason?: string;
+}
+
+export interface UnshelveMessage {
+  kind: "unshelve";
+}
+
 // ---- catalog + move -----------------------------------------------------
 
 /** Lightweight metadata for a conversation hosted on the announcer.
  *  Catalog entries propagate freely between peers so any peer can
  *  render a list of "what's where" without forcing content
- *  replication. The hosting peer is whoever sent the announcement. */
+ *  replication. The hosting peer is whoever sent the announcement.
+ *
+ *  Phase 2 adds `pending_move` so an in-flight 2-phase Move shows
+ *  in the Network view as "moving…" rather than appearing twice. */
 export interface CatalogEntry {
   guid: string;
   title: string;
   mode: string;
   updated_at: string;
+  /** True when this entry is the source side of an active 2-phase
+   *  Move: the catalog still lists it on the source for continuity,
+   *  but the destination peer should not show it as "available to
+   *  move to". Optional; default false. */
+  pending_move?: boolean;
 }
 
 export interface CatalogAnnounceMessage {
@@ -151,6 +295,101 @@ export interface MovePayloadMessage {
 export interface MoveCompleteMessage {
   kind: "move_complete";
   guid: string;
+}
+
+// ---- 2-phase Move (Phase 2) ---------------------------------------------
+
+/** Source side announces "I'm preparing to ship `guid` to `target`".
+ *  Broadcast to all peers so the catalog view can render
+ *  `pending_move=true` on the source row instead of showing two
+ *  copies during the transfer window. Independent of the
+ *  offer/accept handshake — the source still drives it directly with
+ *  the destination via `move_offer`. */
+export interface MovePrepareMessage {
+  kind: "move_prepare";
+  guid: string;
+  /** Pubkey of the destination peer, so other peers can show the
+   *  receiving side too if they want. */
+  to_pubkey: string;
+}
+
+/** Receiver tells the broadcast circle "I have it now". Other peers
+ *  flip the entry from source's catalog to receiver's catalog on
+ *  hearing this; until then they keep showing the source as the
+ *  host. The actual content delivery is via the existing
+ *  `move_payload` / `move_complete` data channel exchange. */
+export interface MoveCommitMessage {
+  kind: "move_commit";
+  guid: string;
+}
+
+/** Source / receiver tells everyone "transfer didn't complete; treat
+ *  the entry as still hosted on the source". Triggered when receiver
+ *  declines, peer drops mid-move, or the source's local-delete after
+ *  ack fails. Lets the catalog UI clear the `pending_move` flag
+ *  without waiting for the next full catalog announce. */
+export interface MoveAbortMessage {
+  kind: "move_abort";
+  guid: string;
+  reason: string;
+}
+
+// ---- remote inference (Phase 2) -----------------------------------------
+
+/** Ask a peer to run inference on its local ollama. The peer
+ *  validates the request (sender must be in roster), looks up the
+ *  closest match for `family`/`mode` in its loaded models, and
+ *  streams tokens back via `infer_chunk` until a terminal
+ *  `infer_done` or `infer_error`. The caller can interrupt with
+ *  `infer_cancel` carrying the same `id`. */
+export interface InferRequestMessage {
+  kind: "infer_request";
+  /** Caller-assigned id; echoed in every chunk and the terminal
+   *  message so the caller can demux multiple concurrent inferences
+   *  over the same connection. */
+  id: string;
+  /** Chat-completion-style message list. Mirrors the shape the
+   *  local `ollama_chat_stream` command takes — keeps the protocol
+   *  trivial to map to/from the existing UI path. */
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+  /** Family/mode resolved by the caller. The peer uses its own
+   *  resolver to pick the actual tag — sender doesn't care which
+   *  exact variant runs, only that it's in the requested family. */
+  family: string;
+  mode: string;
+  /** When true, request reasoning tokens via the peer's `think:true`
+   *  path. Optional; defaults false. */
+  think?: boolean;
+}
+
+export interface InferChunkMessage {
+  kind: "infer_chunk";
+  id: string;
+  /** Visible-content token delta. Mutually exclusive with
+   *  `thinking_delta`. */
+  delta?: string;
+  /** Reasoning-model thinking delta (e.g. Qwen reasoning). */
+  thinking_delta?: string;
+}
+
+export interface InferDoneMessage {
+  kind: "infer_done";
+  id: string;
+  /** True when the peer terminated the stream because it received
+   *  our `infer_cancel`. Lets the caller distinguish a graceful
+   *  abort from a natural end-of-response. */
+  cancelled?: boolean;
+}
+
+export interface InferErrorMessage {
+  kind: "infer_error";
+  id: string;
+  message: string;
+}
+
+export interface InferCancelMessage {
+  kind: "infer_cancel";
+  id: string;
 }
 
 /** Compose the payload that a peer signs in response to a `hello`.
@@ -204,6 +443,15 @@ export function generateVerificationCode(): string {
   let out = "";
   for (const b of bytes) out += ALPHABET[b % ALPHABET.length];
   return out;
+}
+
+/** Generate a short opaque id used for `infer_request` /
+ *  `move_*` correlation. Base32 of 12 random bytes → 20 chars; tiny
+ *  on the wire and effectively unguessable. */
+export function generateMeshId(): string {
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  return base32Encode(bytes);
 }
 
 /** Sign a base32-encoded message via the Rust signing command.
@@ -284,4 +532,74 @@ export async function deriveNetworkHandle(network_id: string): Promise<string> {
   const bytes = new TextEncoder().encode(tagged);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return base32Encode(new Uint8Array(digest));
+}
+
+// ---- ring topology helpers ----------------------------------------------
+
+/** Select the ring-preferred subset of peers for this node.
+ *
+ *  Given the local pubkey and the sorted list of all
+ *  authorized+present peer pubkeys (including us), return the
+ *  subset of peer pubkeys we'd like to keep on as "active" data
+ *  channels. The rest are shelved (data channel kept open as a
+ *  heartbeat, no app traffic).
+ *
+ *  Selection rule: sort peers lexicographically as a ring, take
+ *  the two immediate ring-neighbors (one in each direction) plus
+ *  the lexically-closest non-neighbor that's also under capacity.
+ *  Deterministic so both sides agree on who's in vs. out without
+ *  needing extra coordination.
+ *
+ *  Capacity below `n_preferred` is treated as "give me everyone I
+ *  can reach" — a 2-peer mesh has both sides keep each other on,
+ *  shelving is a non-event. */
+export function selectRingNeighbors(args: {
+  /** Local pubkey. */
+  self_pubkey: string;
+  /** All peer pubkeys we're currently connected to (NOT including
+   *  ourselves). Order doesn't matter — sorted internally. */
+  peer_pubkeys: string[];
+  /** Max number of "preferred" peers we want to keep active.
+   *  Defaults to 3 — 2 ring neighbors + 1 shortcut. */
+  n_preferred?: number;
+}): Set<string> {
+  const n = args.n_preferred ?? 3;
+  if (args.peer_pubkeys.length === 0) return new Set();
+  if (args.peer_pubkeys.length <= n) {
+    // Below capacity — every peer stays preferred. Saves a sort
+    // and avoids the noise of shelving people when there's no
+    // reason to.
+    return new Set(args.peer_pubkeys);
+  }
+  // Insert self into the ring so we can compute "the two on either
+  // side of me". Sort lexicographically; pubkeys are deterministic
+  // strings so this gives the same order on every node, which is
+  // what makes the selection symmetric (both ends pick each other).
+  const ring = Array.from(new Set([args.self_pubkey, ...args.peer_pubkeys])).sort();
+  const myIdx = ring.indexOf(args.self_pubkey);
+  const preferred = new Set<string>();
+  // The two ring-neighbors (clockwise + counterclockwise). Modulo
+  // arithmetic so the ends of the ring wrap around to each other —
+  // a 5-node ring [a,b,c,d,e] has `a`'s neighbors be `b` and `e`.
+  if (ring.length > 1) {
+    preferred.add(ring[(myIdx + 1) % ring.length]);
+    preferred.add(ring[(myIdx - 1 + ring.length) % ring.length]);
+  }
+  // Fill up to `n` with the lexically-closest non-neighbor peers.
+  // "Closest" is by ring distance to self_pubkey — we walk
+  // outward from our position. Could pick by hardware capacity in
+  // a follow-up, but the lex-distance heuristic gives stable
+  // shortcuts that don't churn as peers ping in/out.
+  for (let dist = 2; preferred.size < n && dist < ring.length; dist++) {
+    const cw = ring[(myIdx + dist) % ring.length];
+    if (cw !== args.self_pubkey && !preferred.has(cw)) {
+      preferred.add(cw);
+      if (preferred.size >= n) break;
+    }
+    const ccw = ring[(myIdx - dist + ring.length) % ring.length];
+    if (ccw !== args.self_pubkey && !preferred.has(ccw)) {
+      preferred.add(ccw);
+    }
+  }
+  return preferred;
 }

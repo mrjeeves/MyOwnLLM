@@ -200,6 +200,16 @@ export interface CloudMeshConfig {
   /** TURN relay servers — optional fallback when STUN can't punch
    *  through. Empty by default; users add their own credentials. */
   turn_servers: TurnServer[];
+  /** Self-reported willingness to take inference / transcription
+   *  jobs from peers. `available` = default; `limited` = only if no
+   *  better peer exists; `busy` = don't offer me work at all.
+   *  Surfaced in the Connections card and broadcast in the
+   *  `Capabilities` blob. */
+  accepting?: "available" | "limited" | "busy";
+  /** When true, the mesh client suppresses informational messages
+   *  in the Activity log (warnings + errors still land). Set via
+   *  the "Quiet logs" toggle on the Cloud Mesh → Identity tab. */
+  diag_quiet?: boolean;
 }
 
 /** Microphone capture settings used by transcribe mode. Audio capture

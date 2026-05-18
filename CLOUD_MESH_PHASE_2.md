@@ -1,330 +1,265 @@
 # Cloud Mesh — Phase 2
 
-Phase 1 (this branch, PR #172) lands the substrate: identity, Network ID,
-Trystero transport, bidirectional auth handshake with verification codes,
-roster, Move RPC for conversations, and a settings tab with persistent
-offline-rostered peers visible in the Connections list. **Two MyOwnLLM
-instances with the same Network ID can now find each other, mutually
-authenticate, approve, and move conversations between themselves.** That
-is the working baseline.
+Phase 1 (PR #172) landed the substrate: identity, Network ID,
+Trystero transport, bidirectional auth handshake with verification
+codes, roster, Move RPC for conversations, and a settings tab with
+persistent offline-rostered peers visible in the Connections list.
+**Two MyOwnLLM instances with the same Network ID can now find each
+other, mutually authenticate, approve, and move conversations
+between themselves.**
 
-Phase 2 is what turns that baseline into the actual product the README
-promises: every device becoming a window into the same mesh, with mic
-audio, transcription, and inference flowing across devices based on who
-has the capability and who has the user's attention. Phase 2 also covers
-the topology + resilience work needed to make the mesh comfortable at
-more than a handful of devices.
+Phase 2 (this branch) builds on that substrate: ring topology with
+bounded connections, capability advertisement, catalog gossip with a
+unified Network view, remote inference over the mesh, 2-phase Move
+semantics, an Activity-log quiet toggle, and a per-device accepting
+policy. The protocol stays at version 1 — every Phase 2 change is
+additive (new optional fields on `hello`, new message kinds), so
+v0.2.14 Phase 1 peers and Phase 2 peers can share a mesh without
+either side breaking.
 
-This doc is for a fresh agent picking up the work after the Phase 1
-context has been compacted. Read the existing `src/mesh-client.svelte.ts`,
-`src/mesh-protocol.ts`, `src-tauri/src/mesh/`, and the Cloud Mesh
-sub-tabs (`src/ui/settings/CloudMesh*.svelte`) before designing — most
-of the substrate is in place and Phase 2 builds on top.
+This doc is for a fresh agent picking up the work after Phase 2 has
+landed. Read the updated `src/mesh-client.svelte.ts`,
+`src/mesh-protocol.ts`, `src/mesh-capabilities.ts`,
+`src-tauri/src/mesh/`, and the Cloud Mesh sub-tabs
+(`src/ui/settings/CloudMesh*.svelte`) before designing further work.
+The remaining items below are scoped to mic / transcription / file
+routing — the protocol scaffolding is now in place, the lift is the
+WebRTC MediaStream bridge and the cpal handoff.
 
 ---
 
-## What's already done (Phase 1)
+## What's already done (Phase 1, recap)
 
 - **Identity** — long-lived ed25519 keypair persisted to
   `~/.myownllm/.secrets/identity.json` (0600 / 0700 perms on Unix).
   Device ID surfaced as `pubkey-SUFFIX` where SUFFIX is a 5-char
   uppercase-hex tag derived from `sha256(base32_pubkey_string)`.
   TypeScript mirror in `mesh-protocol.ts::pubkeySuffix`.
-- **Network ID** — short human name (`office-mesh`-style, 3–64 chars of
-  `[a-z0-9_-]`). Hashed under domain tag `myownllm-network-v1:` to a 52-
-  char base32 handle; that's the Trystero room id. The name is what the
-  user shares; the handle is what hits the wire.
-- **Transport** — Trystero (`joinRoom` + `makeAction("mesh")`). Default
-  strategy is Nostr; the Settings tab has a list of relay URLs (empty =
-  Trystero defaults) and a disclosure with `docker run` commands for
-  self-hosting `strfry` or `nostr-rs-relay`.
+- **Network ID** — short human name (`office-mesh`-style, 3–64 chars
+  of `[a-z0-9_-]`). Hashed under domain tag `myownllm-network-v1:`
+  to a 52-char base32 handle; that's the Trystero room id. The name
+  is what the user shares; the handle is what hits the wire.
+- **Transport** — Trystero (`joinRoom` + `makeAction("mesh")`).
+  Default strategy is Nostr; the Settings tab has a list of relay
+  URLs (empty = Trystero defaults) and a disclosure with `docker
+  run` commands for self-hosting `strfry` or `nostr-rs-relay`.
 - **Auth handshake** — `hello` (pubkey + nonce + label + 6-char
   verification code), `auth_response` (signs peer's nonce under
-  `myownllm-mesh-auth-v1:` domain tag), `approve`, `deny`. Bidirectional:
-  host (lex-lesser pubkey) prompts first ("X wants to connect"), guest
-  prompts second after receiving host's approve ("X authorized you,
-  confirm?"). Both sides roster each other on their own approval.
-- **Roster** — `~/.myownllm/mesh/roster.json`, per–Network ID. Switching
-  Network ID wipes the roster. Auto-allow on reconnect for any pubkey
-  the roster contains.
+  `myownllm-mesh-auth-v1:` domain tag), `approve`, `deny`.
+  Bidirectional: host (lex-lesser pubkey) prompts first ("X wants
+  to connect"), guest prompts second after receiving host's approve
+  ("X authorized you, confirm?"). Both sides roster each other on
+  their own approval.
+- **Roster** — `~/.myownllm/mesh/roster.json`, per–Network ID.
+  Switching Network ID wipes the roster. Auto-allow on reconnect
+  for any pubkey the roster contains.
 - **Move RPC** — right-click on a Sidebar conversation → "Move to
   device → \<peer\>". Source loads, ships, deletes-on-ack; receiver
-  declines duplicates by GUID. Not 2-phase yet; duplicates possible if
-  delete fails post-ack.
-- **UI** — Settings → Cloud Mesh tab has three sub-tabs (Identity /
-  Settings / LAN). Identity has: compact identity card (device body +
-  suffix pill + label inline; network id + lock + Generate + Copy),
-  thin status bar, Network Requests (with suffix + verification code
-  tiles side-by-side for at-a-glance confirmation), Connections
-  (showing offline rostered peers too, de-emphasized), Activity log
-  (ring-buffered diagnostic events).
+  declines duplicates by GUID.
+- **UI** — Settings → Cloud Mesh tab has sub-tabs (Identity /
+  Network / Settings / LAN). Identity has: compact identity card
+  (device body + suffix pill + label inline; network id + lock +
+  Generate + Copy), thin status bar, Network Requests, Connections
+  (showing offline rostered peers too), Activity log.
 - **Settings-attention indicator** — unified primitive
   (`src/settings-attention.svelte.ts`) that the dot on any Settings
-  sub-tab subscribes to; lights up on the Cloud Mesh tab when there's
-  a pending Network Request.
+  sub-tab subscribes to; lights up on the Cloud Mesh tab when
+  there's a pending Network Request.
 
 ---
 
-## Phase 2 work, ordered roughly by dependency
+## What's done in Phase 2
 
-### 1. Ring topology with bounded connections
+### ✅ Ring topology with bounded connections
 
-**Why.** Currently Trystero gives us full mesh — every node opens a
-WebRTC connection to every other node in the room. Fine for the
-2–5 device case; quadratic blow-up at 10+ where weaker devices (Pi,
-phone) start dropping under the connection count.
+`selectRingNeighbors` in `mesh-protocol.ts` is the pure selector.
+Each node computes the same ring (sort all authorized + present
+pubkeys lex; treat as a ring; take the two immediate neighbors plus
+the closest non-neighbor under capacity) and emits `shelve` /
+`unshelve` for peers that crossed states. Both ends pick each other
+symmetrically because the input — the sorted pubkey set — is
+deterministic.
 
-**Design.**
+- Default `n_preferred = 3` (`RING_DEFAULT_PREFERRED`). At or below
+  3 active peers the selector returns the full set: a 2-laptop home
+  mesh and a 3-device office stay fully connected, shelving is a
+  non-event until the mesh genuinely grows.
+- Floor of `RING_MIN_PREFERRED = 2` ensures the ring stays
+  connected end-to-end even if a peer advertises a smaller
+  `max_connections`.
+- Shelved peers stay open as heartbeat-only — the Trystero data
+  channel is kept warm so an `unshelve` can flip them back to
+  active without re-doing WebRTC setup. UI status: `shelved`,
+  shown as `standby` in the Connections card.
+- Re-evaluation fires on every `maybePromoteToActive` (peer
+  becomes active) and every `dropConnection` (peer leaves), which
+  is exactly when the ring needs to rebalance.
 
-- Maintain a logical "ring neighbors" set per node: up to N peers
-  (default 3, configurable). N=1 = leaf (signaling-only via
-  neighbors), N≥2 = router-eligible.
-- Selection rule (deterministic so peers don't fight): sort all
-  authorized + present peers by their pubkey, treat as a ring, take
-  the two ring-neighbors (one in each direction) plus the
-  lexically-closest non-neighbor that's also under capacity. That
-  gives ring redundancy (each node has two ring partners) plus one
-  shortcut for routing latency.
-- Capacity awareness: each node advertises its `max_connections`
-  in `hello` (extended). A node that says "I can hold 8" absorbs
-  more of the load when nearby nodes are at their floor of 2.
-- Trystero opens its connections eagerly; we can't tell it "don't
-  connect to this peer." Instead, after handshake, the non-preferred
-  peer is **shelved**: we set its status to `shelved`, send `shelve`
-  in the protocol (peer puts us in the same state), and the data
-  channel is kept open as a heartbeat-only channel — no app traffic.
-  Whenever the preferred set changes (a neighbor goes offline, a
-  new peer joins), we re-evaluate and unshelve the right peers.
-- Implementation entry point: a new `RingState` class alongside
-  `MeshClient` that observes `peers` changes and emits `shelve` /
-  `unshelve` messages. `MeshMessage` gains two variants.
+### ✅ Connection resilience & ring shifting on churn
 
-**UX.** Shelved peers still show in Connections but with a
-"standby" status badge. The user shouldn't have to think about
-it — the ring re-balances silently when peers join or leave.
+`reevaluateRing` runs after every connection lifecycle event, so a
+joining or leaving peer triggers shelve/unshelve cascades right
+away. The pre-existing wake-from-suspend / re-handshake / forced
+rediscovery paths from Phase 1 still apply unchanged — the ring is
+overlay logic on top of Trystero's connection state.
 
-**Open question.** Should shelved peers be closed entirely (saves
-WebRTC budget but reconnect latency) or kept idle? Trystero will
-re-open dropped peers automatically next time discovery runs, so
-close-and-reopen is viable. Start with shelved-but-open; revisit
-under measurement.
+### ✅ Capability advertisement
 
-### 2. Connection resilience & "ring shifting" on churn
+`Capabilities` (in `mesh-protocol.ts`) carries LLMs, ASR backends,
+diarize support, hardware fingerprint, input/output sensors, and
+the self-reported accepting policy. Sent in `hello` and
+re-broadcast as `capabilities_update` whenever the snapshot
+changes. The snapshot is computed by `snapshotCapabilities` in
+`mesh-capabilities.ts` against `detect_hardware`,
+`ollama_list_models`, `asr_models_list`, `diarize_models_list`,
+and `audio_input_devices`.
 
-**Why.** Currently each onPeerLeave drops the connection state and
-the peer either reappears (good) or stays offline (shown as
-offline-rostered). The ring needs to actively rebalance when
-nodes come and go.
+- The Cloud Mesh → Identity tab has an `accepting` dropdown:
+  `available` / `limited` / `busy`. Set to `busy`, the device
+  refuses incoming `infer_request` messages and is filtered out
+  of peer-side routing pickers.
+- Capability changes hook into `onModeSwap` in `App.svelte` (model
+  warmed) and could extend further to a device-change watcher on
+  cpal in the future. Each callsite simply calls
+  `meshClient.noteCapabilitiesChanged()`.
+- Connections list shows a `LLM` / `ASR` / `mic` / `busy` /
+  `limited` badge row under each active peer plus a one-line
+  hardware summary (`Pi 5 · 4 GB RAM`, etc.).
 
-**Design.**
+### ✅ Catalog gossip + Network view
 
-- When a ring-neighbor leaves: walk the next-closest pubkey in the
-  ring direction and promote that peer to ring-neighbor (send
-  `unshelve`). Update local ring state.
-- When a new peer joins and is closer to us in the ring than a
-  current shelved peer: shift positions. The peer who's now further
-  away gets a `shelve` from us.
-- Persist last-known reachable peers (already in roster) so a
-  fresh launch can attempt to greet ring-positioned roster entries
-  even before Trystero discovery has caught up. This requires a
-  small extension: store the last-known peer-id-on-Trystero per
-  roster entry as a hint for reconnection. Optional — Trystero
-  rediscovers anyway.
+`catalog_announce` is now wired both ways. On every
+`maybePromoteToActive` we send our current catalog to the
+just-active peer, and `App.svelte`'s `refreshConversations` calls
+`meshClient.noteCatalogChanged()` after each mutation — that
+collapses into a debounced broadcast within `CATALOG_DEBOUNCE_MS`
+(1.5 s). A 60 s safety-net refresh catches out-of-band mutations
+that bypass the save path.
 
-**Caveat.** All of this is overlay on top of Trystero. Trystero
-itself doesn't care; the shelve/unshelve protocol is application-
-layer, used only to gate which connections do useful work.
+The new `CloudMeshNetwork.svelte` sub-tab renders the unified
+grid: rows are conversations, columns are devices (us first,
+peers after, sorted by label). Each cell is `host` / `moving…` /
+`—`. Click an `—` cell on a row hosted locally to Move that
+conversation to that peer; this is the same `moveConversation`
+RPC the Sidebar right-click menu uses.
 
-### 3. Capability advertisement
+The Network view also renders a per-device capability card up top
+so the user can see at a glance which peers can serve LLM / ASR /
+mic, what hardware they're running, and what their accepting
+policy is.
 
-**Why.** Mic routing, remote inference, remote transcription, file
-sharing — each needs to know who in the mesh can serve what. A peer
-running on a Pi 5 with no GPU isn't the right target for a Llama-70B
-request; a phone isn't where you want to send a transcription job.
+### ✅ Remote inference (chat) over the mesh
 
-**Design.**
+`infer_request` / `infer_chunk` / `infer_done` / `infer_error` /
+`infer_cancel` are the five new message kinds. The Chat view has a
+new "via" picker just above the input row — when set to a peer,
+`doSend` routes through `meshClient.sendInferRequest` instead of
+the local `ollama_chat_stream` invoke. The peer's mesh client
+serves the request by:
 
-- Each node publishes a `Capabilities` blob in `hello` (and on
-  change, via a new `capabilities_update` message):
+1. Validating that the requester is in `active` state (roster
+   peer who's authenticated, not just a stranger in the same
+   Trystero room).
+2. Checking local accepting policy isn't `busy`.
+3. Picking a locally-pulled tag that matches the requested
+   family/mode (or any LLM if no match).
+4. Subscribing to `myownllm://chat-stream/<id>` and forwarding
+   each frame as `infer_chunk` over the data channel.
+5. Sending a terminal `infer_done` on natural end or cancel.
 
-  ```ts
-  interface Capabilities {
-    /** Loaded LLMs available for remote inference. */
-    llms: Array<{ tag: string; family: string; mode: Mode }>;
-    /** Available ASR backends + their hardware tier. */
-    asr: Array<{ backend: "moonshine" | "parakeet"; tier: string }>;
-    /** Available speaker diarization. */
-    diarize: boolean;
-    /** Hardware fingerprint summary for routing heuristics. */
-    hardware: { gpu_type: GpuType; ram_gb: number; vram_gb: number | null };
-    /** Sensors / IO surfaces this device exposes for sharing. */
-    inputs: { mic: boolean; camera: boolean };
-    outputs: { speaker: boolean; display: boolean };
-    /** Self-reported workload preference: how willing are we to
-     *  accept jobs from peers? "available" / "limited" / "busy". */
-    accepting: "available" | "limited" | "busy";
-  }
-  ```
+The "via" picker is hidden when no peer is reachable for
+inference, so single-device users never see it. The Stop button
+sends `infer_cancel` over the channel.
 
-- Per-peer capabilities cached on `ConnectionState`. UI surfaces
-  a small badge row per peer showing what they can do ("LLM",
-  "ASR", "mic", "camera"). Mostly informational for v1; routing
-  uses it programmatically.
+### ✅ 2-phase Move
 
-- Capabilities update on local hardware changes (model pull,
-  ASR backend swap, mic unplugged). Hook into the existing
-  `model-lifecycle` recompute and the cpal device-change
-  callback (which we don't currently subscribe to — TODO).
+`move_prepare` / `move_commit` / `move_abort` are broadcast to
+every active peer (not just the destination). The catalog UI
+reads them as `pending_move=true` on the source row instead of
+flickering between two copies during the transfer window. The
+existing direct `move_offer` → `accept` → `payload` → `complete`
+exchange between source and destination still drives content
+delivery; the broadcast is purely advisory.
 
-### 4. Mic routing across the mesh
+Source side: `moveConversation` calls `broadcastMovePrepare`
+before sending the offer; `handleMoveComplete` calls
+`broadcastMoveCommit` after the local delete. Receiver:
+`handleMovePayload` calls `broadcastMoveCommit` after a
+successful write. Both sides clear the flag and broadcast
+`move_abort` on failure paths.
 
-**This is the headline Phase 2 feature.** It's what makes the
-mesh feel like the product the README promises: phone audio in,
-desktop transcription out.
+### ✅ Diagnostics off button
 
-**Design.**
-
-- The Hardware settings tab's mic picker already lists local
-  audio inputs (via `audio_input_devices` Tauri command, backed
-  by cpal). Extend the list to include **remote mics** from
-  active peers that advertise `inputs.mic: true`. Render them
-  with a small device label + peer suffix.
-- New config fields on `MicConfig`:
-  ```ts
-  /** Mic the user picked for this device, in order of preference.
-   *  When the first entry is a remote mic and the peer is online,
-   *  audio streams from there; if the peer drops, fall back to
-   *  `local_default`. */
-  current: { kind: "local" | "remote"; device_name: string; peer_pubkey?: string };
-  local_default: { device_name: string };
-  ```
-- Transport: WebRTC **media track**, not the data channel. Trystero
-  supports media via `room.addStream(stream, peerId)`. On the
-  source device, `getUserMedia({ audio: { deviceId: ... } })`
-  followed by `room.addStream(stream, target)`. On the
-  consumer side, `room.onPeerStream((stream, peerId) => ...)`.
-- The cpal-based transcribe pipeline currently consumes the local
-  audio device directly. For remote audio, we need to bridge the
-  MediaStream into the cpal stream. Two options:
-  - **WebView-side capture** (`MediaRecorder` → chunked PCM →
-    Tauri command → cpal stream). Familiar but adds latency.
-  - **A separate WebRTC-track-to-PCM path** that bypasses cpal
-    entirely and feeds the ASR backend directly via a Rust
-    callback. Cleaner but rewrites half the audio plumbing.
-  - Pick #1 for v1; benchmark, then decide.
-- Failure mode: peer drops mid-transcription. Detect via
-  `room.onPeerLeave` (we already handle this), revert
-  `current` to `local_default`, log a notice in the
-  transcribe UI ("switched to local mic — peer disconnected").
-
-### 5. Remote inference (chat) over the mesh
-
-**Why.** Same shape as mic routing but for LLM responses. A
-laptop joins the mesh; suddenly the phone can issue chat
-prompts that get answered by the laptop's Gemma rather than
-forcing the phone to load its own model.
-
-**Design.**
-
-- New RPC: `infer_request` carrying `{prompt, family, mode, stream:bool}`.
-- Receiver runs against its local `ollama` instance and streams
-  tokens back via a series of `infer_chunk` messages, terminated
-  by `infer_done` or `infer_error`.
-- Routing: chat-mode UI gets a "via" picker (default: local). When
-  set to a peer, all `ollama_chat_stream` calls in `App.svelte`'s
-  chat path are intercepted and routed over the mesh instead.
-- Cancellation: `infer_cancel`. The existing
-  `ollama_chat_cancel` Tauri command becomes a no-op for
-  remote-routed sessions; we send `infer_cancel` to the peer.
-- Auth: only peers in the local roster can issue infer requests.
-  Adversarial peers in the same room (knowing the Network ID
-  isn't enough — they need to have been approved) can't abuse
-  a remote inference budget. The auth handshake already
-  enforces this; just make sure `infer_request` validation
-  rejects non-active peers.
-
-### 6. Remote transcription (the same, for ASR + diarize)
-
-Mirrors mic routing + remote inference. The transcription
-pipeline runs on a capable device; the mic-bearing device just
-streams audio in and renders transcript out.
-
-**Tricky part.** The diarize state (speaker embeddings,
-clustering history) needs to live with the *conversation*, not
-the device. Either:
-- The conversation lives on the transcription host (Move
-  semantics already gives us this), or
-- The diarize state is shipped along with the audio stream
-  (heavier, more state to sync).
-
-Start with option 1: if you want a conversation transcribed
-remotely, **Move it to the device that'll do the work first**,
-then route audio. Simplest semantics.
-
-### 7. Catalog gossip + "Network" view
-
-**Why.** Currently the Move-conversation menu lists every
-active peer, but a user can't see which peers already host
-which conversations. Without a catalog, the user has to keep
-the mental map themselves.
-
-**Design.**
-
-- `catalog_announce` is already wired in `mesh-protocol.ts` —
-  type defined, never sent or handled. Phase 2 turns it on:
-  on every `peerStatus → active` transition, send our local
-  conversation catalog (GUIDs + titles + modes + updated_at)
-  to the peer. On any local mutation (new conversation, Move
-  in / out, rename, delete), broadcast an updated catalog.
-- Peer's catalog cached in `ConnectionState.catalog`.
-- New view: **Settings → Cloud Mesh → Network** (fourth sub-
-  tab) showing a unified list of conversations across the
-  mesh: rows are conversations, columns are peers, cell shows
-  "host" / "—". Click a cell to Move that conversation there
-  (if it's not already there).
-
-### 8. 2-phase Move
-
-The current Move is single-RTT (`offer` → `accept` → `payload`
-→ `complete` → source-delete). If receiver dies between writing
-and acking, source still has it (duplicate but no loss). If
-source dies between ack and delete, both keep it (duplicate).
-
-For 2-phase:
-- `move_prepare` (replicated to other peers as a "transfer
-  in-flight" marker)
-- `move_commit` once receiver has durably written
-- `move_finalize` once source has deleted
-
-Worth doing once we have catalog gossip — the in-flight markers
-become part of the catalog so other peers see "this is being
-moved" rather than two copies.
-
-### 9. File sharing
-
-Once mic routing works, generalize the data-channel layer to
-support file sends. RTC data channels have a 16 KB chunk limit
-in some browsers; chunking + reassembly + a progress event API.
-Same shape as Move-payload but for arbitrary bytes.
-
-### 10. Cleanup and small fixes
-
-- **Diagnostics off button.** The Activity log defaults to
-  verbose. Add a toggle to quiet it in steady-state and dump
-  to a file on demand.
-- **Trystero strategy picker.** Currently we use Nostr (default);
-  expose a picker so users can pin to BitTorrent / MQTT / IPFS
-  if their network blocks Nostr relays. Trystero strategies are
-  per-import — runtime switching means we'd load multiple
-  trystero builds. Probably do this as a build-time config
-  rather than runtime.
-- **Mobile/touch friendliness.** The Cloud Mesh tab UI was
-  designed for a desktop window. Phone form factor will need
-  the tiles + tabs reflowing.
+The Activity panel has a `quiet logs` checkbox next to the
+`accepting` dropdown. When checked, `logDiag` becomes a no-op for
+`info` events — warnings and errors still land in the ring buffer.
+Persisted via `cloud_mesh.diag_quiet` in config so a relaunch
+retains the preference.
 
 ---
 
-## What NOT to do in Phase 2
+## What's NOT done in Phase 2 — follow-up items
+
+The headline pieces from the original Phase 2 doc that still
+need work, plus where the half-done pieces sit:
+
+### Mic routing across the mesh (#4 from the original doc)
+
+**Status:** capability + UX scaffolding ready; the actual WebRTC
+MediaStream → cpal bridge is the remaining lift.
+
+- Capabilities now advertise `inputs.mic` per device.
+- Trystero's `room.addStream(stream, peerId)` and
+  `room.onPeerStream((stream, peerId) => …)` are typed in the
+  Trystero version we pin (0.24.0) and ready to use.
+- Two paths from there:
+  1. **WebView-side capture** (`MediaRecorder` → chunked PCM
+     → Tauri command → cpal stream). Familiar but adds latency.
+  2. **WebRTC-track-to-PCM** that bypasses cpal entirely and
+     feeds the ASR backend directly via a Rust callback.
+- Pick #1 for v1; benchmark before considering #2. The risk is
+  that path #1 has Linux/Windows variability in WebView audio
+  capabilities that need real-device testing.
+- Mic dropdown UX: extend `Hardware → Microphone` to include
+  remote mics from `peers` where `capabilities.inputs.mic` is
+  true. `MicConfig` gains a new `current: { kind: "local"
+  | "remote"; device_name: string; peer_pubkey?: string }`
+  field (and `local_default` to fall back to when the peer
+  drops). Wire in `TranscribeView.svelte`'s mic picker.
+
+### Remote transcription (#6 from the original doc)
+
+Depends on mic routing. Same pattern as remote inference: an
+`asr_request` RPC, stream `asr_chunk` frames back. The diarize
+state needs to live with the conversation — start with "Move
+the conversation to the transcription host first, then route
+audio" (option 1 from the original doc).
+
+### File sharing (#9 from the original doc)
+
+Once the data channel layer handles arbitrary bytes (chunking +
+reassembly + progress events), drop it in. Same shape as the
+existing Move-payload but for arbitrary files.
+
+### Trystero strategy picker (#10 from the original doc)
+
+Currently we use Nostr (default). Trystero strategies are
+per-import — runtime switching means loading multiple trystero
+builds. Probably do this as a build-time config rather than
+runtime; document the alternate strategies (`trystero/torrent`,
+`trystero/mqtt`, `trystero/ipfs`) in DOCS.md so power users can
+fork and rebuild.
+
+### Mobile / touch friendliness (#10 from the original doc)
+
+The Cloud Mesh tab UI was designed for a desktop window. Phone
+form factor will need the tiles + tabs reflowing. The Network
+sub-tab's grid in particular needs a card-stack mode for narrow
+viewports.
+
+---
+
+## What NOT to do in Phase 2 follow-up
 
 - **Don't replace the auth handshake.** It works, it's
   cryptographically solid (ed25519 signatures over
@@ -332,30 +267,44 @@ Same shape as Move-payload but for arbitrary bytes.
   Any "let's just use TLS / Noise / X" rewrite is wasted effort.
 - **Don't add a CRDT for catalog/roster yet.** OR-Set with
   signed ops will be useful once we hit multi-network or
-  cross-device-edit conflicts, but for Phase 2's scope (single
-  user, single mesh, single hosting peer per conversation) the
-  simple "broadcast on change, last-write-wins per field"
-  model is fine.
+  cross-device-edit conflicts, but the simple
+  "broadcast on change, last-write-wins per field" model is
+  fine for the current scope (single user, single mesh, single
+  hosting peer per conversation).
 - **Don't ship a TURN server.** STUN handles ~95% of NAT
   cases; the remaining 5% (symmetric NAT, both peers behind
   it) is for the user to add their own TURN credentials in
   Settings → Cloud Mesh → Settings. Running a TURN service
   costs real bandwidth and we're not on the hook for it.
+- **Don't bump `PROTOCOL_VERSION` for additive changes.** The
+  version stays at 1 across all Phase 2 work because every
+  change is additive (new optional fields, new message kinds
+  that v1 receivers silently drop in the default `switch`
+  arm). Bump only when an existing message's wire shape
+  changes incompatibly. This lets a v0.2.14 (Phase 1) peer
+  and a Phase 2 peer share a mesh, with the v1 side simply
+  not seeing the ring shelving / remote inference / catalog
+  niceties.
 
 ---
 
-## Where to start
+## Where to start (follow-up work)
 
-1. Read `src/mesh-client.svelte.ts` end to end — it's ~900 lines
-   but the structure is straightforward (lifecycle → discovery →
-   handshake → protocol handlers). The protocol is in
-   `mesh-protocol.ts` (~250 lines). Rust side is split across
-   `src-tauri/src/mesh/{identity,signing,roster,commands}.rs`.
-2. Run the app on two devices, lock the same Network ID, watch
-   the Activity panel during connect → approve → move. You'll
-   see exactly what events fire in what order.
-3. Pick item 1 (ring topology) or item 4 (mic routing) as the
-   first lift. Items 2 & 3 follow naturally from 1; items 5–7
-   follow naturally from 4. Item 8 is independent and small.
-4. Each commit on the same branch (this PR's already large; new
-   work likely opens a fresh PR after this one merges).
+1. Read `src/mesh-client.svelte.ts` end to end — it's ~1900 lines
+   now but the structure is the same as Phase 1 (lifecycle →
+   discovery → handshake → protocol handlers). The new bits group
+   under section headings (`// ---- capabilities ----`,
+   `// ---- ring topology ----`, `// ---- catalog gossip ----`,
+   `// ---- remote inference ----`). The protocol is in
+   `mesh-protocol.ts` and the capability snapshot in
+   `mesh-capabilities.ts`.
+2. Run two instances locally, lock the same Network ID, watch
+   the Activity panel during connect → approve → catalog
+   announce → move. The Network sub-tab fills in once both
+   sides flip to `active`.
+3. For mic routing, start by extending `MicConfig` with the new
+   `current` shape, hooking `room.addStream` on the source
+   device and `room.onPeerStream` on the receiver. Get the
+   stream into a `MediaRecorder` first to prove end-to-end
+   audio delivery before tackling the cpal bridge.
+4. Each major area opens its own PR on top of this one.

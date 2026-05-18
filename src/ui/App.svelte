@@ -166,6 +166,13 @@
     const list = await listConversations();
     conversations = list.conversations;
     folders = list.folders;
+    // Cloud Mesh Phase 2: every refresh follows a mutation (save,
+    // rename, delete, move, folder ops) and `noteCatalogChanged`
+    // debounces, so this is the simplest hook point that catches
+    // them all without sprinkling notifications across each
+    // callsite. The mesh client checks itself whether it's running
+    // before broadcasting — cheap no-op when the mesh is off.
+    meshClient.noteCatalogChanged();
   }
 
   onMount(async () => {
@@ -331,6 +338,9 @@
         activeFamilyName = config.active_family;
         supportedModes = modesForActiveFamily(manifest, activeFamilyName);
         activeModel = displayModelFor(activeMode, hardware, manifest, config);
+        // Cloud Mesh: a mode swap means a new model is now warm; peers
+        // need to know we can serve it. Cheap re-snapshot + broadcast.
+        meshClient.noteCapabilitiesChanged();
       });
 
       // After everything else is wired, see if a previous MyOwnLLM process

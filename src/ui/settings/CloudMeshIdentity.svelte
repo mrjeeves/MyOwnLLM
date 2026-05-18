@@ -3,6 +3,7 @@
   import { loadConfig, updateConfig } from "../../config";
   import { meshUi } from "../../mesh-state.svelte";
   import { meshClient } from "../../mesh-client.svelte";
+  import { capabilityBadges, summarizeCapabilities } from "../../mesh-capabilities";
   import { scrollAffordance } from "../scroll-affordance";
   import {
     generateNetworkId,
@@ -101,6 +102,8 @@
         return "awaiting peer";
       case "active":
         return "live";
+      case "shelved":
+        return "standby";
       case "offline":
         return "offline";
       case "denied":
@@ -523,6 +526,18 @@
                   {/if}
                 </div>
                 <code class="peer-pubkey" title={p.device_pubkey}>{shortPubkeyBody(p.device_pubkey)}</code>
+                {#if (p.status === "active" || p.status === "shelved")}
+                  {@const summary = summarizeCapabilities(p.capabilities)}
+                  {@const badges = capabilityBadges(p.capabilities)}
+                  {#if summary || badges.length > 0}
+                    <div class="cap-line">
+                      {#if summary}<span class="cap-summary">{summary}</span>{/if}
+                      {#each badges as b}
+                        <span class="cap-chip" data-kind={b}>{b}</span>
+                      {/each}
+                    </div>
+                  {/if}
+                {/if}
                 {#if p.status === "pending_remote" && p.local_approved && p.verification_code}
                   <div class="verify-line">
                     Your code: <code class="code-pill">{p.verification_code}</code>
@@ -552,7 +567,29 @@
     </section>
 
     <section class="block">
-      <h3>Activity</h3>
+      <div class="block-head">
+        <h3>Activity</h3>
+        <label class="accepting-toggle" title="When set to busy, peers won't route inference / transcription jobs to this device. Limited = only if no better peer exists.">
+          accepting
+          <select
+            value={meshClient.accepting}
+            onchange={(e) =>
+              meshClient.setAccepting((e.target as HTMLSelectElement).value as "available" | "limited" | "busy")}
+          >
+            <option value="available">available</option>
+            <option value="limited">limited</option>
+            <option value="busy">busy</option>
+          </select>
+        </label>
+        <label class="quiet-toggle" title="Suppress info-level chatter in the log below. Warnings and errors still land. Persists across launches.">
+          <input
+            type="checkbox"
+            checked={meshClient.diag_quiet}
+            onchange={(e) => meshClient.setDiagQuiet((e.target as HTMLInputElement).checked)}
+          />
+          quiet logs
+        </label>
+      </div>
       {#if meshClient.diag.length === 0}
         <div class="empty-state">
           Nothing yet. Mesh activity (broker handshake, peer discovery,
@@ -822,6 +859,38 @@
     color: #aaa;
   }
 
+  .block-head {
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+    flex-wrap: wrap;
+  }
+  .block-head h3 { flex: 0 0 auto; }
+  .accepting-toggle,
+  .quiet-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.7rem;
+    color: #888;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+  }
+  .accepting-toggle select {
+    background: #131313;
+    color: #ccc;
+    border: 1px solid #2a2a2a;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.35rem;
+    cursor: pointer;
+  }
+  .quiet-toggle input[type="checkbox"] {
+    accent-color: #6e6ef7;
+    margin: 0;
+  }
+
   .diag-log {
     display: flex;
     flex-direction: column;
@@ -938,6 +1007,43 @@
     color: #555;
     margin-top: 0.1rem;
     user-select: all;
+  }
+  .cap-line {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    margin-top: 0.18rem;
+  }
+  .cap-summary {
+    font-size: 0.7rem;
+    color: #888;
+    letter-spacing: 0.02em;
+  }
+  .cap-chip {
+    font-size: 0.6rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    background: #1a1a2a;
+    color: #b9b9ee;
+    border-radius: 3px;
+    padding: 0.05rem 0.35rem;
+  }
+  .cap-chip[data-kind="LLM"] {
+    background: #1a2618;
+    color: #b9ddae;
+  }
+  .cap-chip[data-kind="ASR"] {
+    background: #1a2632;
+    color: #aedde0;
+  }
+  .cap-chip[data-kind="busy"] {
+    background: #2a1818;
+    color: #f88;
+  }
+  .cap-chip[data-kind="limited"] {
+    background: #2a220e;
+    color: #d6b25a;
   }
   .verify-line {
     font-size: 0.74rem;
