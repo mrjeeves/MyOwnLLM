@@ -678,7 +678,7 @@ Launch the GUI by running `myownllm` with no arguments, or open the application 
 
 **Two MyOwnLLM instances with the same Network ID find each other, mutually authenticate, and share work peer-to-peer over WebRTC.** No MyOwnLLM-operated signaling server, no API key, no cloud round-trip. Every device becomes a window into the same mesh: phone audio in, desktop transcription out, a laptop's idle GPU answering prompts from the tablet on the kitchen counter.
 
-Cloud Mesh ships off by default. To turn it on, open **Settings → Cloud Mesh → Identity** and lock a Network ID.
+Cloud Mesh ships off by default. To turn it on, open **Settings → Cloud Mesh → Status** and follow the wizard — pick or generate a Network ID, lock it, and the mesh client comes up.
 
 ### Concepts
 
@@ -692,22 +692,23 @@ Cloud Mesh ships off by default. To turn it on, open **Settings → Cloud Mesh �
 
 ### Quick start
 
-1. **Device A:** open **Settings → Cloud Mesh → Identity**. Type a name (e.g. `home-mesh`) or click **Generate** to get a random one. Click the lock to commit.
+1. **Device A:** open **Settings → Cloud Mesh → Status**. The wizard says "Pick a Network ID" — type a name (e.g. `home-mesh`) or click **Generate** for a random one. Click the lock to commit.
 2. **Device B:** same tab. Type the **same** name. Click the lock.
-3. Within seconds each device sees the other in **Network requests**. The host side (lex-lesser pubkey) prompts first ("X wants to connect"). Compare the verification code shown to what the other person reads aloud; if they match, click **Approve**.
-4. The guest side gets a follow-up prompt ("X authorized you — confirm?"). Approve there too. Both sides flip to **live** in the Connections list and the peer joins the roster.
+3. Within seconds the wizard on each device flips to "approval(s) waiting" with a card showing the request. The host side (lex-lesser pubkey) prompts first ("X wants to connect"). Compare the verification code shown to what the other person reads aloud; if they match, click **Approve**.
+4. The guest side gets a follow-up prompt ("X authorized you — confirm?"). Approve there too. Both sides flip to **Connected** and the peer joins the Ring on the **Connections** tab.
 5. After approval, reconnects auto-allow silently — you only see a prompt for genuinely new peers.
 
 ### What the mesh does for you
 
 | Feature | Where it shows up |
 |---------|-------------------|
-| **Move a conversation between devices** | Right-click any conversation in the sidebar → **Move to device → \<peer\>**. The sender's copy is deleted after the receiver acks. Also reachable from the **Network** sub-tab. |
+| **Move a conversation between devices** | Right-click any conversation in the sidebar → **Move to device → \<peer\>**. The sender's copy is deleted after the receiver acks. Also reachable from the **Connections** tab's Catalog grid (click any "—" cell on a locally-hosted row). |
 | **Remote inference** | In the chat compose row, the **via:** picker lets you route a prompt to any peer that has an LLM advertised. The peer's local Ollama runs the request and streams tokens back over the data channel. Stop, cancel, and reasoning-mode all work the same as local. |
-| **Catalog visibility** | The **Network** sub-tab renders a grid — rows are conversations, columns are devices. `host` = lives there, `—` = not there, `moving…` = mid-transfer. Click an `—` cell on a row hosted locally to Move that conversation to that peer. |
+| **Catalog visibility** | The **Connections** tab's Catalog section renders a grid — rows are conversations, columns are devices. `host` = lives there, `—` = not there, `moving…` = mid-transfer. Click an `—` cell on a row hosted locally to Move that conversation to that peer. |
+| **Resource map** | Under **Connections → Resources in use**, every in-flight inference (outbound + inbound) and Move shows as a live row: `→` = you using a peer's resources, `←` = a peer using yours. |
 | **Capability badges** | Each peer's row shows what they can do — `LLM`, `ASR`, `mic`, `diarize`, plus a one-liner hardware summary (`Pi 5 · 4 GB RAM`). Sourced from each device's broadcast `capabilities_update`. |
-| **Accepting policy** | Per-device toggle on the Identity tab. `available` = take any work, `limited` = only if no better peer exists, `busy` = refuse incoming inference. Other peers see your choice in real time. |
-| **Standby peers** | Once the mesh grows past 3 active connections, the ring selector parks the further-out peers in `standby` — data channel stays open as a heartbeat but app traffic flows only through ring neighbors. Keeps Pi-class devices from melting under N² connection counts on a 10-device mesh. The selector is deterministic on the sorted pubkey ring, so both ends agree without coordination. |
+| **Accepting policy** | Per-device toggle on the Status tab (in the Activity block). `available` = take any work, `limited` = only if no better peer exists, `busy` = refuse incoming inference. Other peers see your choice in real time. |
+| **Ring + indirect peers** | The **Connections** tab splits peers into two groups. The **Ring** is the set the local selector is actively routing through — it auto-heals on every join / leave by re-running the deterministic ring selector. **Indirect** is peers we know about but aren't routing through right now — shelved (data channel open as heartbeat, parked because the mesh grew past the ring capacity) or offline rostered (approved before, not in the room right now). Keeps Pi-class devices from melting under N² connection counts on a 10-device mesh. |
 
 ### Transport: Trystero over Nostr (default)
 
@@ -734,7 +735,7 @@ WebRTC needs STUN to discover NAT mappings; the defaults are Google's public STU
 
 ### Activity log
 
-Connect → handshake → approve → re-handshake → catalog announce — every event lands in the **Activity** panel on the Identity tab as a ring-buffered log (newest at top, 80-entry cap). Useful when debugging a "peer didn't show up" situation. The `quiet logs` checkbox suppresses `info` events in the log while keeping `warn` and `error` — useful once steady-state and you don't want the chatter.
+Connect → handshake → approve → re-handshake → catalog announce — every event lands in the **Activity** panel on the Status tab as a ring-buffered log (newest at top, 80-entry cap). Useful when debugging a "peer didn't show up" situation. The `quiet logs` checkbox suppresses `info` events in the log while keeping `warn` and `error` — useful once steady-state and you don't want the chatter.
 
 ### Resilience (post-sleep, network blips)
 

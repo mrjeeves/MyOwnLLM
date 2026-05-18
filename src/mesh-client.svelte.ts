@@ -380,6 +380,25 @@ class MeshClient {
    *  a spinner instead of letting the user fire a second request
    *  on top. */
   remote_infer_in_flight = $state(false);
+  /** Reactive snapshot of active resources for the Connections tab's
+   *  "Resources in use" panel. Updated whenever a resource enters
+   *  or leaves the pending maps below.
+   *
+   *  - `outbound_infers` — chat prompts we're routing to remote peers
+   *  - `inbound_infers` — inference jobs we're serving for remote
+   *    callers (counts as our local LLM doing real work)
+   *  - `outbound_moves` — conversations we're shipping out
+   *  - `inbound_moves` — conversations being shipped to us
+   *
+   *  Each entry carries enough context to render a row ("→ inferring
+   *  against laptop-2") without the UI having to dig into the wire
+   *  state. */
+  resources = $state<{
+    outbound_infers: Array<{ id: string; peer_pubkey: string; peer_label: string }>;
+    inbound_infers: Array<{ id: string; peer_pubkey: string; peer_label: string }>;
+    outbound_moves: Array<{ guid: string; title: string; peer_pubkey: string; peer_label: string }>;
+    inbound_moves: Array<{ guid: string; title: string; peer_pubkey: string; peer_label: string }>;
+  }>({ outbound_infers: [], inbound_infers: [], outbound_moves: [], inbound_moves: [] });
 
   private logDiag(level: DiagLevel, msg: string): void {
     // Suppress info chatter when the user has flipped Quiet mode.
@@ -522,6 +541,14 @@ class MeshClient {
    *  (source-side of an in-flight 2-phase Move). Cleared on
    *  `move_commit` / `move_abort` / drop. */
   private pending_move_guids = new Set<string>();
+  /** Conversations being moved TO us. Populated on `move_accept` (we
+   *  acked the offer) and cleared on `move_payload` write completion
+   *  (success) or `move_decline` / drop (failure). Feeds the
+   *  "inbound moves" section of the resource map. */
+  private pending_moves_in = new Map<
+    string,
+    { peer_id: string; peer_pubkey: string; title: string }
+  >();
 
   // ---- lifecycle -------------------------------------------------------
 
@@ -728,7 +755,9 @@ class MeshClient {
     }
     this.pending_infers_out.clear();
     this.pending_infers_in.clear();
+    this.pending_moves_in.clear();
     this.pending_move_guids.clear();
+    this.refreshResources();
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
       if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
@@ -913,6 +942,7 @@ class MeshClient {
           else reject(new Error(err ?? "move failed"));
         },
       });
+      this.refreshResources();
       // Phase 2: 2-phase Move. Announce `move_prepare` to all
       // active peers (not just the destination) so their catalog
       // view can render the entry as "moving…" rather than
@@ -924,7 +954,7 @@ class MeshClient {
       this.broadcastMovePrepare(guid, conn.device_pubkey);
       // Republish so OUR own catalog row flips to pending_move
       // alongside the broadcast — gives instant feedback in the
-      // Network view.
+      // Connections grid.
       void this.refreshLocalCatalog();
       this.send(conn, {
         kind: "move_offer",
@@ -1625,6 +1655,15 @@ class MeshClient {
       });
       return;
     }
+    // Track inbound move so the Connections tab's resource map shows
+    // it as "← receiving X from Y" while the payload's in flight.
+    // Cleared in handleMovePayload (success / failure) and on drop.
+    this.pending_moves_in.set(msg.guid, {
+      peer_id: conn.peer_id,
+      peer_pubkey: conn.device_pubkey,
+      title: msg.title,
+    });
+    this.refreshResources();
     this.send(conn, { kind: "move_accept", guid: msg.guid });
   }
 
@@ -1648,6 +1687,8 @@ class MeshClient {
     const incoming = msg.conversation as Conversation | undefined;
     if (!incoming || typeof incoming !== "object" || incoming.id !== msg.guid) {
       this.send(conn, { kind: "move_decline", guid: msg.guid, reason: "malformed payload" });
+      this.pending_moves_in.delete(msg.guid);
+      this.refreshResources();
       return;
     }
     try {
@@ -1655,8 +1696,8 @@ class MeshClient {
       this.send(conn, { kind: "move_complete", guid: msg.guid });
       // Receiver side: broadcast the commit so other peers update
       // their cached catalog (clear the source's `pending_move`)
-      // and the entry now shows under us in the Network view. Our
-      // own catalog refreshes asynchronously — saveConversation
+      // and the entry now shows under us in the Connections view.
+      // Our own catalog refreshes asynchronously — saveConversation
       // doesn't notify the mesh on its own.
       this.broadcastMoveCommit(msg.guid);
       void this.refreshLocalCatalog();
@@ -1666,6 +1707,9 @@ class MeshClient {
         guid: msg.guid,
         reason: `write failed: ${String(e)}`,
       });
+    } finally {
+      this.pending_moves_in.delete(msg.guid);
+      this.refreshResources();
     }
   }
 
@@ -1705,6 +1749,7 @@ class MeshClient {
     const pending = this.pending_moves_out.get(guid);
     if (!pending) return;
     this.pending_moves_out.delete(guid);
+    this.refreshResources();
     pending.on_complete?.(ok, err);
   }
 
@@ -1755,6 +1800,14 @@ class MeshClient {
         }
       }
     }
+    // Inbound moves from this peer never complete — drop them so
+    // the resource map reflects the drop immediately. (handlePayload
+    // would normally clear them on success.)
+    for (const [guid, pending] of this.pending_moves_in) {
+      if (pending.peer_id === peer_id) {
+        this.pending_moves_in.delete(guid);
+      }
+    }
     // Cancel any inference we initiated against this peer; resolve
     // pending callers with a failure so they unblock immediately.
     for (const [id, pending] of this.pending_infers_out) {
@@ -1772,6 +1825,7 @@ class MeshClient {
         this.pending_infers_in.delete(id);
       }
     }
+    this.refreshResources();
     this.republishPeers();
     if (this.computePeers().every((p) => p.status !== "pending_approval")) {
       settingsAttention.set("cloud-mesh", null);
@@ -1902,6 +1956,52 @@ class MeshClient {
       // Suffix is cosmetic — log nothing, leave cache empty,
       // UI will fall back to label-only.
     }
+  }
+
+  /** Rebuild `this.resources` from the current pending maps. Cheap
+   *  to call — runs whenever any of the four pending maps change.
+   *  Looks up labels per pubkey via the connection map so the UI
+   *  doesn't have to cross-reference. */
+  private refreshResources(): void {
+    const labelFor = (peer_id: string) => {
+      const conn = this.connections.get(peer_id);
+      return {
+        pubkey: conn?.device_pubkey ?? "",
+        label: conn?.label || conn?.device_pubkey.slice(0, 8) || peer_id.slice(0, 8),
+      };
+    };
+    const outbound_infers: typeof this.resources.outbound_infers = [];
+    for (const [id, p] of this.pending_infers_out) {
+      const { pubkey, label } = labelFor(p.target_peer_id);
+      outbound_infers.push({ id, peer_pubkey: pubkey, peer_label: label });
+    }
+    const inbound_infers: typeof this.resources.inbound_infers = [];
+    for (const [id, p] of this.pending_infers_in) {
+      const { pubkey, label } = labelFor(p.requester_peer_id);
+      inbound_infers.push({ id, peer_pubkey: pubkey, peer_label: label });
+    }
+    const outbound_moves: typeof this.resources.outbound_moves = [];
+    for (const [guid, p] of this.pending_moves_out) {
+      const { pubkey, label } = labelFor(p.target_peer_id);
+      outbound_moves.push({
+        guid,
+        title: p.conversation.title || "Untitled",
+        peer_pubkey: pubkey,
+        peer_label: label,
+      });
+    }
+    const inbound_moves: typeof this.resources.inbound_moves = [];
+    for (const [guid, p] of this.pending_moves_in) {
+      inbound_moves.push({
+        guid,
+        title: p.title || "Untitled",
+        peer_pubkey: p.peer_pubkey,
+        peer_label:
+          this.connections.get(p.peer_id)?.label ||
+          p.peer_pubkey.slice(0, 8),
+      });
+    }
+    this.resources = { outbound_infers, inbound_infers, outbound_moves, inbound_moves };
   }
 
   // ---- capabilities ----------------------------------------------------
@@ -2140,14 +2240,17 @@ class MeshClient {
       on_chunk: args.on_chunk,
       on_done: (cancelled) => {
         this.remote_infer_in_flight = this.pending_infers_out.size > 1;
+        this.refreshResources();
         args.on_done(cancelled);
       },
       on_error: (message) => {
         this.remote_infer_in_flight = this.pending_infers_out.size > 1;
+        this.refreshResources();
         args.on_error(message);
       },
     });
     this.remote_infer_in_flight = true;
+    this.refreshResources();
     this.send(conn, {
       kind: "infer_request",
       id,
@@ -2165,6 +2268,7 @@ class MeshClient {
       const pending = this.pending_infers_out.get(id);
       if (pending) {
         this.pending_infers_out.delete(id);
+        this.refreshResources();
         pending.on_done(true);
       }
     };
@@ -2184,6 +2288,7 @@ class MeshClient {
     const pending = this.pending_infers_out.get(id);
     if (!pending) return;
     this.pending_infers_out.delete(id);
+    this.refreshResources();
     pending.on_done(cancelled);
   }
 
@@ -2191,6 +2296,7 @@ class MeshClient {
     const pending = this.pending_infers_out.get(id);
     if (!pending) return;
     this.pending_infers_out.delete(id);
+    this.refreshResources();
     pending.on_error(message);
   }
 
@@ -2229,6 +2335,7 @@ class MeshClient {
       requester_peer_id: conn.peer_id,
       local_stream_id,
     });
+    this.refreshResources();
 
     // Subscribe to the same event channel the GUI's chat path uses.
     // Forward each delta as an `infer_chunk` over the data channel
@@ -2263,6 +2370,7 @@ class MeshClient {
               cancelled: !!f.cancelled,
             });
             this.pending_infers_in.delete(msg.id);
+            this.refreshResources();
             unlisten?.();
             unlisten = null;
           }
@@ -2294,11 +2402,13 @@ class MeshClient {
       if (this.pending_infers_in.has(msg.id)) {
         this.send(conn, { kind: "infer_done", id: msg.id, cancelled: false });
         this.pending_infers_in.delete(msg.id);
+        this.refreshResources();
       }
     } catch (e) {
       this.logDiag("warn", `infer serve failed for ${msg.id}: ${String(e)}`);
       this.send(conn, { kind: "infer_error", id: msg.id, message: String(e) });
       this.pending_infers_in.delete(msg.id);
+      this.refreshResources();
     } finally {
       unlisten?.();
     }

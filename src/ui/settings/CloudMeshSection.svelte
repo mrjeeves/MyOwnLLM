@@ -1,36 +1,47 @@
 <script lang="ts">
-  import CloudMeshIdentity from "./CloudMeshIdentity.svelte";
+  import CloudMeshStatus from "./CloudMeshStatus.svelte";
+  import CloudMeshConnections from "./CloudMeshConnections.svelte";
   import CloudMeshAddresses from "./CloudMeshAddresses.svelte";
-  import CloudMeshNetwork from "./CloudMeshNetwork.svelte";
   import RemoteSection from "./RemoteSection.svelte";
 
-  /** Sub-tab strip mirrors the pattern Models uses. Identity is the
-   *  home view — your device card and the live connection management
-   *  surface (status, peers, pending requests, activity). Network is
-   *  the cross-device catalog grid added in Phase 2 — conversations
-   *  by peer, click-to-move. Settings is set-once configuration
-   *  (STUN, TURN, custom signaling relays). LAN is the existing
-   *  axum-served browser UI, preserved here so users who relied on
-   *  it don't lose it during the Remote-tab rename. */
-  let tab = $state<"identity" | "network" | "settings" | "lan">("identity");
+  /** Sub-tab strip mirrors the pattern Models uses.
+   *
+   *  - **Status** is the home view: a wizard that walks the user
+   *    through "pick a Network ID → lock → join → connect → approve
+   *    peers." Until the wizard goes green, the rest of the mesh
+   *    surface doesn't really matter, so the wizard occupies the
+   *    top of the tab; below it, only the things that need user
+   *    action (pending approvals) plus the Activity log show.
+   *  - **Connections** lists the ring (currently routed peers,
+   *    auto-healed on every join/leave), indirect peers we know
+   *    about but aren't actively routing through (shelved or
+   *    offline rostered), an in-use resource map (inbound/outbound
+   *    inferences + moves), and the cross-device catalog grid.
+   *  - **Settings** is set-once configuration (STUN, TURN, custom
+   *    signaling relays).
+   *  - **HTTP** (previously "LAN") is the local axum-served browser
+   *    UI for phone/tablet access — renamed because "LAN" was
+   *    misleading: the same surface is reachable from any HTTP
+   *    client, mesh or no mesh. */
+  let tab = $state<"status" | "connections" | "settings" | "http">("status");
 </script>
 
 <div class="section">
   <div class="h-tabs">
-    <button class:active={tab === "identity"} onclick={() => (tab = "identity")}>Identity</button>
-    <button class:active={tab === "network"} onclick={() => (tab = "network")}>Network</button>
+    <button class:active={tab === "status"} onclick={() => (tab = "status")}>Status</button>
+    <button class:active={tab === "connections"} onclick={() => (tab = "connections")}>Connections</button>
     <button class:active={tab === "settings"} onclick={() => (tab = "settings")}>Settings</button>
-    <button class:active={tab === "lan"} onclick={() => (tab = "lan")}>LAN</button>
+    <button class:active={tab === "http"} onclick={() => (tab = "http")}>HTTP</button>
   </div>
 
   <div class="content">
-    {#if tab === "identity"}
-      <CloudMeshIdentity />
-    {:else if tab === "network"}
-      <CloudMeshNetwork />
+    {#if tab === "status"}
+      <CloudMeshStatus />
+    {:else if tab === "connections"}
+      <CloudMeshConnections />
     {:else if tab === "settings"}
       <CloudMeshAddresses />
-    {:else if tab === "lan"}
+    {:else if tab === "http"}
       <RemoteSection />
     {/if}
   </div>

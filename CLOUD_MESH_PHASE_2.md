@@ -56,11 +56,16 @@ WebRTC MediaStream bridge and the cpal handoff.
 - **Move RPC** — right-click on a Sidebar conversation → "Move to
   device → \<peer\>". Source loads, ships, deletes-on-ack; receiver
   declines duplicates by GUID.
-- **UI** — Settings → Cloud Mesh tab has sub-tabs (Identity /
-  Network / Settings / LAN). Identity has: compact identity card
-  (device body + suffix pill + label inline; network id + lock +
-  Generate + Copy), thin status bar, Network Requests, Connections
-  (showing offline rostered peers too), Activity log.
+- **UI** — Settings → Cloud Mesh tab has sub-tabs (Status /
+  Connections / Settings / HTTP). Status drives a wizard from
+  fresh → drafted → starting → solo → approvals → online, with the
+  compact identity card + lock controls inside the wizard body and
+  pending Network requests + the Activity log below. Connections
+  holds the live mesh surface: the Ring (auto-healing active set),
+  Indirect (shelved + offline), Resources in use (live in/out
+  inferences + moves), and the Catalog grid. Settings is the
+  signaling / STUN / TURN config. HTTP (previously "LAN") is the
+  axum-served browser UI for phones / tablets.
 - **Settings-attention indicator** — unified primitive
   (`src/settings-attention.svelte.ts`) that the dot on any Settings
   sub-tab subscribes to; lights up on the Cloud Mesh tab when
@@ -114,7 +119,8 @@ changes. The snapshot is computed by `snapshotCapabilities` in
 `ollama_list_models`, `asr_models_list`, `diarize_models_list`,
 and `audio_input_devices`.
 
-- The Cloud Mesh → Identity tab has an `accepting` dropdown:
+- The Cloud Mesh → Status tab has an `accepting` dropdown in the
+  Activity block:
   `available` / `limited` / `busy`. Set to `busy`, the device
   refuses incoming `infer_request` messages and is filtered out
   of peer-side routing pickers.
@@ -126,7 +132,7 @@ and `audio_input_devices`.
   `limited` badge row under each active peer plus a one-line
   hardware summary (`Pi 5 · 4 GB RAM`, etc.).
 
-### ✅ Catalog gossip + Network view
+### ✅ Catalog gossip + Connections view
 
 `catalog_announce` is now wired both ways. On every
 `maybePromoteToActive` we send our current catalog to the
@@ -136,17 +142,22 @@ collapses into a debounced broadcast within `CATALOG_DEBOUNCE_MS`
 (1.5 s). A 60 s safety-net refresh catches out-of-band mutations
 that bypass the save path.
 
-The new `CloudMeshNetwork.svelte` sub-tab renders the unified
-grid: rows are conversations, columns are devices (us first,
-peers after, sorted by label). Each cell is `host` / `moving…` /
-`—`. Click an `—` cell on a row hosted locally to Move that
-conversation to that peer; this is the same `moveConversation`
-RPC the Sidebar right-click menu uses.
+The `CloudMeshConnections.svelte` sub-tab renders the catalog as
+a unified grid: rows are conversations, columns are devices (us
+first, peers after, sorted by label). Each cell is `host` /
+`moving…` / `—`. Click an `—` cell on a row hosted locally to
+Move that conversation to that peer; this is the same
+`moveConversation` RPC the Sidebar right-click menu uses.
 
-The Network view also renders a per-device capability card up top
-so the user can see at a glance which peers can serve LLM / ASR /
-mic, what hardware they're running, and what their accepting
-policy is.
+The Connections tab also has a **Ring** section (active peers our
+local selector is routing through, auto-healed on every join /
+leave), an **Indirect** section (shelved + offline rostered
+peers), and a **Resources in use** map showing every in-flight
+inference (outbound + inbound) and Move as a live row with
+`→` / `←` direction markers. Each ring / indirect peer row
+surfaces a capability summary + badges so the user can see at a
+glance which peers can serve LLM / ASR / mic, what hardware
+they're running, and what their accepting policy is.
 
 ### ✅ Remote inference (chat) over the mesh
 
@@ -300,7 +311,7 @@ viewports.
    `mesh-capabilities.ts`.
 2. Run two instances locally, lock the same Network ID, watch
    the Activity panel during connect → approve → catalog
-   announce → move. The Network sub-tab fills in once both
+   announce → move. The Connections sub-tab fills in once both
    sides flip to `active`.
 3. For mic routing, start by extending `MicConfig` with the new
    `current` shape, hooking `room.addStream` on the source

@@ -35,7 +35,7 @@ That's what we thought AI was going to be before it turned into a host of separa
 
 **What ships now alongside — Cloud Mesh:**
 
-Every MyOwnLLM instance becomes a window into the same mesh. Devices share a Network ID (a short human name like `office-mesh`, hashed for namespace cleanliness), find each other through [Trystero](https://trystero.dev) over public Nostr relays — no MyOwnLLM-operated signaling server, no API key to register, no single point of failure — and connect peer-to-peer over WebRTC. Mutual ed25519 auth handshake with a per-request verification code locks down who's actually on your mesh. A second laptop joins and its LLM becomes a *route* in the chat compose ("via:" picker); conversations move between devices from the right-click menu or the **Network** sub-tab's cross-device grid. The mesh self-balances: it stays full-mesh at small sizes and switches to a deterministic ring topology past three peers so Pi-class devices don't melt under N² connection counts. Self-host a Nostr relay for an air-gapped office/LAN mesh; one-line Docker command in the Settings tab. Mic / transcription / file routing are scaffolded (capability advertisement, peer pickers) and land in a follow-up PR. See **Settings → Cloud Mesh** in the GUI, or [DOCS.md › Cloud Mesh](DOCS.md#cloud-mesh) for the full reference.
+Every MyOwnLLM instance becomes a window into the same mesh. Devices share a Network ID (a short human name like `office-mesh`, hashed for namespace cleanliness), find each other through [Trystero](https://trystero.dev) over public Nostr relays — no MyOwnLLM-operated signaling server, no API key to register, no single point of failure — and connect peer-to-peer over WebRTC. Mutual ed25519 auth handshake with a per-request verification code locks down who's actually on your mesh. A second laptop joins and its LLM becomes a *route* in the chat compose ("via:" picker); conversations move between devices from the right-click menu or the **Connections** tab's cross-device grid. The mesh self-balances: it stays full-mesh at small sizes and switches to a deterministic ring topology past three peers so Pi-class devices don't melt under N² connection counts. Self-host a Nostr relay for an air-gapped office/LAN mesh; one-line Docker command in the Settings sub-tab. Mic / transcription / file routing are scaffolded (capability advertisement, peer pickers) and land in a follow-up PR. See **Settings → Cloud Mesh** in the GUI, or [DOCS.md › Cloud Mesh](DOCS.md#cloud-mesh) for the full reference.
 
 ## Install
 
@@ -71,7 +71,7 @@ A first-class capture pipeline, not a sidebar feature. Mic in, segmented transcr
 - **Crash-resilient by design.** Audio chunks land on disk before the ASR backend sees them, so a force-quit can be drained on next launch. Transcripts, speaker labels, diarize state, and the talking-points list are all part of the conversation record.
 - **In-process.** No Python venv, no whisper-server sidecar, no cloud round-trip. ASR, diarization, and the chat model used to summarise all run inside `myownllm` itself, coordinated through two singleton slots on the GUI's mode bar.
 
-Both paths — chat and transcription — are designed to be available on the GUI, the headless `serve` API, and the LAN remote view. The desktop GUI is the most complete today; full audio capture over `serve` / remote is on the near-term roadmap.
+Both paths — chat and transcription — are designed to be available on the GUI, the headless `serve` API, and the HTTP remote view. The desktop GUI is the most complete today; full audio capture over `serve` / remote is on the near-term roadmap.
 
 ## Highlights
 
@@ -84,7 +84,7 @@ Both paths — chat and transcription — are designed to be available on the GU
 | **Manifests, not config** | A JSON file at a URL is the source of truth. `imports` compose merged catalogs across publishers — no coordination required. |
 | **Runs on a Pi 5** | Default manifest ships Gemma 4 edge variants (`e2b` / `e4b`), Apache-2.0, ~7.6 tok/s on a Pi 5. Same manifest gives a 4090 the 4090 tag. |
 | **Desktop GUI** | Tauri + Svelte 5. Two singleton slots (chat-model, transcription) with conversation folders, in-place rename, crash-recoverable state. |
-| **LAN remote** | Open the GUI from your phone on the same network. Single-user lock with kick-and-hide. (Tab now lives under **Cloud Mesh → LAN**.) |
+| **HTTP remote** | Open the GUI from your phone (or any HTTP client) on the same network. Single-user lock with kick-and-hide. (Lives under **Cloud Mesh → HTTP**.) |
 | **Self-updating** | Stages quietly on launch, applies on next start. Last good manifest stays cached for offline runs. |
 | **Scriptable end-to-end** | Every CLI subcommand returns parseable text or `--json`. |
 
