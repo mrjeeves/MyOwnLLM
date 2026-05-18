@@ -1191,7 +1191,10 @@
     supported={supportedModes}
     tokensUsed={0}
     contextSize={0}
+    thinkingEnabled={false}
+    thinkingAvailable={false}
     onChange={handleModeChange}
+    onThinkingChange={() => {}}
     onRequestStopTranscribe={() => onRequestStopTranscribe()}
     onRequestStopChat={() => onRequestStopChat()}
   />

@@ -73,6 +73,14 @@ export interface Conversation {
   /** Whether diarization was enabled for this conversation. Persisted
    *  so a re-open resumes with the toggle in the right state. */
   diarize_enabled?: boolean;
+  /** Whether the user has requested reasoning / "thinking" tokens
+   *  for this conversation. Drives the `think` flag we pass to the
+   *  local `ollama_chat_stream` and to the mesh's
+   *  `infer_request.think`. Sticky per-conversation so a chat
+   *  that's been deliberately set to "reason more carefully" keeps
+   *  doing that across reloads. Optional — undefined = off, the
+   *  pre-thinking-toggle default. */
+  thinking_enabled?: boolean;
   talking_points?: string[];
   /** One-step undo buffer for talking points. Populated when the user
    *  regenerates: the prior `talking_points` array is stashed here so the
