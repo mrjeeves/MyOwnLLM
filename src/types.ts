@@ -175,18 +175,23 @@ export interface TurnServer {
  *  several (home-mesh, office-mesh, …); only one is active at a
  *  time (single Trystero room joined per process), but the others
  *  retain their roster + per-network settings so switching back is
- *  one click and reuses the prior approvals. */
+ *  one click and reuses the prior approvals.
+ *
+ *  The Network ID IS the display name — it's a short
+ *  user-readable handle like `home-mesh`, NOT a secret. Anyone
+ *  who knows the ID can knock (you'll see their request), but
+ *  joining still requires explicit approval. If you find yourself
+ *  fielding requests from strangers who guessed your ID, pick a
+ *  more unique one. */
 export interface NetworkConfig {
   /** Stable internal id, generated when the network is first
    *  saved. Independent of `network_id` so renaming the
-   *  user-facing name is allowed without breaking the
+   *  user-facing handle is allowed without breaking the
    *  `active_network_id` pointer. */
   id: string;
-  /** Display name picked by the user. Defaults to `network_id`
-   *  when first added; user can override. */
-  label: string;
   /** Canonical base32-lowercase form of the user-typed Network
-   *  ID. Doubles as the per-network roster filename. */
+   *  ID — and the only thing the user ever reads. Doubles as the
+   *  per-network roster filename. */
   network_id: string;
   /** True when the user has committed this network (i.e. should
    *  be live when it's the active one). Per-network so switching

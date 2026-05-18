@@ -3,9 +3,10 @@
    *  the Sidebar's "+ Add Network" button and from the Status
    *  tab's Saved networks section.
    *
-   *  Two inputs:
-   *    - Label (free text, defaults to the network ID itself)
-   *    - Network ID (or Generate)
+   *  One input: the Network ID itself (or Generate). That ID
+   *  doubles as the display name throughout the app — there's
+   *  no separate label field, because two parallel names would
+   *  just be confusing.
    *
    *  Three save modes:
    *    - **Save**: add the network to the saved list, leave it
@@ -20,13 +21,12 @@
    *  and persists. Errors (invalid network_id, etc.) surface
    *  inline; the modal stays open until the user dismisses. */
 
-  import { addNetwork, setActiveNetwork } from "../../config";
+  import { addNetwork } from "../../config";
   import { generateNetworkId, normalizeNetworkId } from "../../mesh";
   import { meshClient } from "../../mesh-client.svelte";
 
   let { onClose } = $props<{ onClose: () => void }>();
 
-  let label = $state("");
   let networkIdDraft = $state("");
   let saving = $state(false);
   let error = $state("");
@@ -51,7 +51,7 @@
     try {
       const normalized = await normalizeNetworkId(trimmed);
       await addNetwork(
-        { network_id: normalized, label: label.trim() || normalized },
+        { network_id: normalized },
         { activate: mode !== "save", locked: mode === "lock" },
       );
       // Activate via setActiveNetwork too when `mode` is activate
@@ -105,23 +105,13 @@
   <div class="body" onclick={stopBubble} role="presentation">
     <p class="hint">
       Same Network ID on two devices = same mesh. The ID isn't a
-      password — it's a rendezvous handle. Every join still requires
-      an in-app approval before peers can talk.
+      password — it's a rendezvous handle and the display name. If
+      another device picks the same handle by accident you'll see
+      their join requests; just don't approve them. <strong>Pick
+      something unique</strong> if you don't want to field
+      knocks from strangers — random words, your name + a number,
+      or click Generate for a 52-char hash.
     </p>
-
-    <label class="field">
-      <span class="field-label">label</span>
-      <input
-        type="text"
-        bind:value={label}
-        placeholder="e.g. home-mesh, office, camping"
-        maxlength="64"
-        disabled={saving}
-        spellcheck="false"
-        autocomplete="off"
-        class="text-input"
-      />
-    </label>
 
     <label class="field">
       <span class="field-label">network id</span>
@@ -129,14 +119,14 @@
         <input
           type="text"
           bind:value={networkIdDraft}
-          placeholder="type one, or click Generate"
+          placeholder="e.g. home-mesh, dave-laptop-2024, or click Generate"
           maxlength="64"
           disabled={saving}
           spellcheck="false"
           autocomplete="off"
           class="text-input mono"
         />
-        <button class="btn-small" onclick={onGenerate} disabled={saving} title="Generate a random Network ID">
+        <button class="btn-small" onclick={onGenerate} disabled={saving} title="Generate a random 52-char Network ID — unique by construction, no collision risk">
           Generate
         </button>
       </div>

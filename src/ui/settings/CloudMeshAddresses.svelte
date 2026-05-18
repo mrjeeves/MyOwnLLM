@@ -165,12 +165,9 @@
             onchange={(e) => selectEditing((e.target as HTMLSelectElement).value)}
           >
             {#each networks as net (net.id)}
-              <option value={net.id}>{net.label || net.network_id}</option>
+              <option value={net.id}>{net.network_id}</option>
             {/each}
           </select>
-          {#if editing}
-            <code class="picker-id">{editing.network_id}</code>
-          {/if}
         </div>
       </section>
     {/if}
@@ -391,12 +388,6 @@
     cursor: pointer;
   }
   .picker:focus { outline: none; border-color: #3a3a55; }
-  .picker-id {
-    font-family: monospace;
-    font-size: 0.7rem;
-    color: #555;
-    user-select: all;
-  }
 
   .block { display: flex; flex-direction: column; gap: 0.55rem; }
   .block h3 {

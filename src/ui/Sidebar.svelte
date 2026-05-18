@@ -1029,13 +1029,13 @@
           }
         }}
         title={isActive
-          ? `${net.label || net.network_id} (active — click to ${isCollapsed ? "expand" : "collapse"})`
-          : `${net.label || net.network_id} (click to switch)`}
+          ? `${net.network_id} (active — click to ${isCollapsed ? "expand" : "collapse"})`
+          : `${net.network_id} (click to switch)`}
       >
         <span class="folder-caret" aria-hidden="true">
           {#if isActive}{isCollapsed ? "▸" : "▾"}{:else}○{/if}
         </span>
-        <span class="net-row-name">{net.label || net.network_id}</span>
+        <span class="net-row-name">{net.network_id}</span>
         {#if isActive}
           <span class="net-row-active">active</span>
         {/if}
@@ -1389,7 +1389,7 @@
     {:else}
       {@const target = menu.target}
       {@const isActive = target.network.id === activeNetworkId}
-      <div class="menu-section-label">{target.network.label || target.network.network_id}</div>
+      <div class="menu-section-label">{target.network.network_id}</div>
       {#if !isActive}
         <button onclick={() => switchToNetwork(target.network.id)} title="Stop the current mesh and join this one">
           Switch to this network
@@ -1458,7 +1458,7 @@
   {@const target = forgetModal}
   <div class="forget-overlay" onclick={() => (forgetModal = null)} role="presentation"></div>
   <div class="forget-modal" role="dialog" aria-label="Forget network">
-    <h3>Forget "{target.label || target.network_id}"?</h3>
+    <h3>Forget "{target.network_id}"?</h3>
     <p>
       Removes this network from your saved list and deletes its
       roster file. Re-adding the same Network ID later starts fresh

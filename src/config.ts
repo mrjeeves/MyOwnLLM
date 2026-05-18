@@ -234,11 +234,14 @@ function cleanSignaling(raw: string[] | undefined): string[] {
 /** Build a `NetworkConfig` from a partial saved entry, filling
  *  per-network defaults. Used both for normal loads (where most
  *  fields are present) and for the legacy single-network migration
- *  (where everything came from the old flat shape). */
+ *  (where everything came from the old flat shape).
+ *
+ *  Legacy entries that carry a stray `label` field (from an
+ *  earlier draft of this PR that briefly had per-network labels)
+ *  are silently ignored — the Network ID is the display name. */
 function mergeNetwork(raw: Partial<NetworkConfig>): NetworkConfig {
   return {
     id: raw.id || newNetworkInternalId(),
-    label: raw.label || raw.network_id || "",
     network_id: raw.network_id || "",
     locked: raw.locked ?? false,
     signaling_servers: cleanSignaling(raw.signaling_servers),
@@ -297,7 +300,6 @@ function mergeCloudMesh(raw: Partial<CloudMeshConfig> | undefined): CloudMeshCon
     }
     const migrated = mergeNetwork({
       network_id: legacyNetworkId,
-      label: legacyNetworkId,
       locked: legacy["locked"] === true,
       signaling_servers: (legacy["signaling_servers"] as string[] | undefined) ?? undefined,
       stun_servers: (legacy["stun_servers"] as string[] | undefined) ?? undefined,
@@ -359,15 +361,30 @@ export function activeNetwork(cfg: Config): NetworkConfig | null {
   return cfg.cloud_mesh.networks.find((n) => n.id === cfg.cloud_mesh.active_network_id) ?? null;
 }
 
-/** Append a new saved network and (optionally) set it active. */
+/** Append a new saved network and (optionally) set it active.
+ *  Network ID doubles as the display name — there's no separate
+ *  label field. Throws if a network with the same `network_id`
+ *  is already saved (re-saving the same handle is a no-op the
+ *  caller should treat as success). */
 export async function addNetwork(
-  init: { network_id: string; label?: string },
+  init: { network_id: string },
   options?: { activate?: boolean; locked?: boolean },
 ): Promise<Config> {
   const cfg = await loadConfig();
+  const existing = cfg.cloud_mesh.networks.find((n) => n.network_id === init.network_id);
+  if (existing) {
+    // Caller already has a network with this handle — treat as
+    // "switch to it" when activate=true so the UX matches user
+    // intent ("add this network" really means "make sure I have
+    // this network and it's active"). Otherwise just return the
+    // current config unchanged.
+    if (options?.activate && cfg.cloud_mesh.active_network_id !== existing.id) {
+      return await setActiveNetwork(existing.id);
+    }
+    return cfg;
+  }
   const newNet: NetworkConfig = mergeNetwork({
     network_id: init.network_id,
-    label: init.label || init.network_id,
     locked: options?.locked ?? false,
   });
   const networks = [...cfg.cloud_mesh.networks, newNet];

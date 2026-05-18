@@ -398,7 +398,7 @@
         {#if active && active.locked}
           <span class="net-pill" title="Current Network ID">
             <span class="net-pill-label">network</span>
-            <span class="net-pill-value">{active.label || active.network_id}</span>
+            <span class="net-pill-value">{active.network_id}</span>
           </span>
         {/if}
         <span class="status-meta">
@@ -447,6 +447,13 @@
             <p class="wizard-help">
               Approve below — each request shows a 6-char code that
               should match what the other side reads to you.
+              {#if pendingRequests.length >= 3}
+                <br />
+                Seeing requests from people you don't know? Network
+                IDs aren't private — anyone who picks the same handle
+                lands in the same room. Switch to a more unique
+                Network ID and the stranger traffic stops.
+              {/if}
             </p>
           {:else if wizardStep === "online"}
             <p class="wizard-help">
@@ -604,14 +611,11 @@
                   {#if net.id === activeId}
                     <span class="active-dot" title="Currently active"></span>
                   {/if}
-                  <span class="network-label">{net.label || net.network_id}</span>
+                  <span class="network-label">{net.network_id}</span>
                   {#if net.locked}
                     <span class="lock-pill" title="Locked = the mesh client joins this network when it's active">🔒 locked</span>
                   {/if}
                 </div>
-                {#if net.network_id !== net.label}
-                  <code class="network-id" title={net.network_id}>{net.network_id}</code>
-                {/if}
               </div>
               {#if net.id !== activeId}
                 <button class="btn-small ghost" onclick={() => switchToNetwork(net.id)} title="Stop the current mesh and join this one">
@@ -787,7 +791,7 @@
   {@const target = forgetModal}
   <div class="modal-overlay" onclick={() => (forgetModal = null)} role="presentation"></div>
   <div class="modal" role="dialog" aria-label="Forget network">
-    <h3>Forget "{target.label || target.network_id}"?</h3>
+    <h3>Forget "{target.network_id}"?</h3>
     <p class="modal-body">
       Removes this network from your saved list and deletes its
       roster file. Re-adding the same Network ID later starts fresh
@@ -1150,13 +1154,7 @@
     align-items: center;
     gap: 0.4rem;
   }
-  .network-label { font-size: 0.85rem; color: #e8e8e8; }
-  .network-id {
-    font-family: monospace;
-    font-size: 0.68rem;
-    color: #555;
-    user-select: all;
-  }
+  .network-label { font-size: 0.85rem; color: #e8e8e8; font-family: monospace; }
   .active-dot {
     width: 7px;
     height: 7px;

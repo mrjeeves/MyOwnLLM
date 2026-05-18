@@ -239,9 +239,14 @@ on a well-defined "current network" surface.
 
 **Config shape (`cloud_mesh`):**
 - `networks: NetworkConfig[]` — saved entries, each with a stable
-  internal `id`, user-picked `label`, canonical `network_id`,
-  `locked` flag, per-network signaling / STUN / TURN, and per-
-  network `accepting` policy.
+  internal `id`, canonical `network_id` (which IS the display
+  name — no separate label field), `locked` flag, per-network
+  signaling / STUN / TURN, and per-network `accepting` policy.
+  The Network ID isn't a secret: anyone using the same handle
+  lands in the same room and can knock (you'll see their
+  request), but joining still requires approval. "Pick a more
+  unique handle if you're seeing stranger requests" is the
+  intended remedy.
 - `active_network_id: string | null` — id of the currently-joined
   network. Null = mesh client stays off.
 - `diag_quiet` stays global (it's a UI preference, not a per-
@@ -294,10 +299,12 @@ returns the updated `Config`.
 
 **Add Network modal (`AddNetworkModal.svelte`):**
 Shared between the Sidebar's "+ Add" and the Status tab's "+ Add
-network" buttons. Label + Network ID inputs (Generate button),
-three save modes: Save (don't activate), Save & activate
-(activate, don't lock), Save & start (activate + lock = start
-joining immediately, ⌘/Ctrl + Enter shortcut).
+network" buttons. Single Network ID input (with Generate button
+for a 52-char hash) — no separate label, because the Network ID
+IS the display name. Three save modes: Save (don't activate),
+Save & activate (activate, don't lock), Save & start (activate +
+lock = start joining immediately, ⌘/Ctrl + Enter shortcut).
+Inline hint explains the "not a secret" semantics.
 
 ### ✅ Diagnostics off button
 

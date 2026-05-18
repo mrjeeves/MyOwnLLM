@@ -703,7 +703,7 @@ Cloud Mesh ships off by default. To turn it on, open **Settings → Cloud Mesh �
 | Feature | Where it shows up |
 |---------|-------------------|
 | **Cross-device conversation list** | The main **sidebar** has an always-visible **Network** section at the bottom with one row per saved network and a **+ Add** button. Click a saved network to switch to it; the active network is highlighted and expanded with its connected peers as nested groups. Peer conversations appear under each peer-group row, **organized into the same folder tree the peer uses on-host** — so `Work/Projects/Q4 planning` on the source shows up as nested expandable folders on every device, not as a flat list. Right-click a network → switch / settings / forget. Right-click a peer → settings. |
-| **Saved networks** | The mesh is a single-active-network model: only one Trystero room joined at a time, but the user can save several (`home-mesh`, `office-mesh`, `camping-mesh`) and switch between them with one click. Each saved network keeps its own roster file (`~/.myownllm/mesh/rosters/{network_id}.json`) so switching back skips re-authentication for previously-approved peers. Per-network settings: accepting policy, signaling relays, STUN, TURN. |
+| **Saved networks** | The mesh is a single-active-network model: only one Trystero room joined at a time, but the user can save several (`home-mesh`, `office-mesh`, `camping-mesh`) and switch between them with one click. Each saved network keeps its own roster file (`~/.myownllm/mesh/rosters/{network_id}.json`) so switching back skips re-authentication for previously-approved peers. Per-network settings: accepting policy, signaling relays, STUN, TURN. **The Network ID is the display name** — there's no separate label field. The ID isn't secret either: anyone using the same handle lands in the same room and can knock (you'll see their request), but joining still requires approval. Pick something unique if you don't want to field knocks from strangers; click **Generate** for a 52-char hash that won't collide with anyone. |
 | **Push a local conversation** | Right-click any local conversation in the sidebar → **Push to device → \<peer\>**. The sender's copy is deleted after the receiver acks; the receiver lands the conversation in the same folder it lived in on the source (creating intermediate folders if needed). Single-RTT today; tracked with a `moving…` pill on the catalog row across all peers while in flight. |
 | **Pull a remote conversation** | Right-click a remote conversation under any Network group → **← Pull from \<peer\>**. The remote peer drives the Move handshake with you as the destination; the conversation appears in your local sidebar in the same folder it lived in on the source. Source must be in your roster — strangers in the same Trystero room can't be pulled from. |
 | **Remote inference** | In the chat compose row, the **via:** picker lets you route a prompt to any peer that has an LLM advertised. The peer's local Ollama runs the request and streams tokens back over the data channel. Stop, cancel, and reasoning-mode all work the same as local. |
@@ -1232,8 +1232,7 @@ The `manifests/` cache stores one entry per URL. When a manifest reached via an 
     "networks": [                       // saved networks; one is active at a time
       {
         "id": "net-abc123",             // stable internal id, generated on save
-        "label": "home-mesh",           // user-picked display name
-        "network_id": "home-mesh",      // canonical Network ID — doubles as roster filename
+        "network_id": "home-mesh",      // canonical Network ID — display name + roster filename
         "locked": true,                 // true = mesh client joins when this is active
         "signaling_servers": [],        // per-network; empty = Trystero defaults
         "stun_servers": [
@@ -1245,7 +1244,6 @@ The `manifests/` cache stores one entry per URL. When a manifest reached via an 
       },
       {
         "id": "net-def456",
-        "label": "office",
         "network_id": "acme-office",
         "locked": true,
         "signaling_servers": ["wss://relay.internal.acme:7777"],
