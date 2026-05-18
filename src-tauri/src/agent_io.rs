@@ -392,13 +392,9 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn shell_times_out_windows() {
-        let out = run_shell_inner(
-            "ping 127.0.0.1 -n 6 > NUL".to_string(),
-            None,
-            Some(200),
-        )
-        .await
-        .unwrap();
+        let out = run_shell_inner("ping 127.0.0.1 -n 6 > NUL".to_string(), None, Some(200))
+            .await
+            .unwrap();
         assert!(out.timed_out);
         assert!(out.exit_code.is_none());
     }
