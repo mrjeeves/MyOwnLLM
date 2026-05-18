@@ -126,15 +126,17 @@
     next_reconnect_at: number | null;
   }): string {
     if (p.reconnect_attempts <= 0) return "";
-    const max = 5; // Mirrors MAX_REHANDSHAKE_ATTEMPTS in mesh-client.
+    // No max — mesh-client retries indefinitely, capped at 30s per
+    // attempt. Display attempts as a free-running counter so the
+    // user can see we're still trying.
     if (p.next_reconnect_at === null) {
-      return `reconnecting ${p.reconnect_attempts}/${max}`;
+      return `reconnecting · attempt ${p.reconnect_attempts}`;
     }
     const remaining = Math.max(0, p.next_reconnect_at - now);
     if (remaining <= 0) {
-      return `reconnecting ${p.reconnect_attempts}/${max} · retrying…`;
+      return `reconnecting · attempt ${p.reconnect_attempts} · retrying…`;
     }
-    return `reconnecting ${p.reconnect_attempts}/${max} · next in ${Math.ceil(remaining / 1000)}s`;
+    return `reconnecting · attempt ${p.reconnect_attempts} · next in ${Math.ceil(remaining / 1000)}s`;
   }
 
   onMount(async () => {
@@ -516,6 +518,17 @@
                 {/if}
               </div>
               <span class="peer-status" data-status={p.status}>{statusLabel(p)}</span>
+              {#if p.status === "offline" || p.reconnect_attempts > 0}
+                <button
+                  class="btn-small ghost"
+                  onclick={() => meshClient.reconnectPeer(p.peer_id)}
+                  title={p.status === "offline"
+                    ? "Force a fresh discovery pass — briefly disturbs every connected peer to nudge Trystero into seeing this one again."
+                    : "Skip the backoff and re-handshake right now."}
+                >
+                  Reconnect
+                </button>
+              {/if}
               <button class="btn-small ghost" onclick={() => meshClient.removePeer(p.peer_id)} title={p.status === "offline" ? "Forget this peer (removes from roster)" : "Disconnect and revoke approval"}>
                 {p.status === "offline" ? "Forget" : "Remove"}
               </button>
