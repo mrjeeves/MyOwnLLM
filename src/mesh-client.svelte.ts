@@ -30,6 +30,15 @@
 import type { Room, joinRoom as JoinRoomType } from "trystero";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+// Web Worker that owns the periodic mesh ticks (heartbeat,
+// offline-rostered check, catalog refresh). Running these on a
+// separate event loop is what makes the connection survive heavy
+// main-thread work — file encoding, SHA-256, Svelte re-renders on
+// inference tokens — without mis-firing wake detection and cycling
+// every peer through a forced rediscovery. See
+// `mesh-scheduler-worker.ts` for the wire protocol and the
+// rationale.
+import MeshSchedulerWorker from "./mesh-scheduler-worker.ts?worker";
 // `save` from plugin-dialog opens the OS save dialog and returns the
 // chosen path (or null on cancel). The Rust side then writes via
 // `mesh_file_save_at` (or refuses if the path's outside the user's
@@ -271,6 +280,14 @@ const CATALOG_DEBOUNCE_MS = 1_500;
  *  ship a wire-incompatible protocol change. */
 const TRYSTERO_APP_ID = "myownllm-cloud-mesh-v1";
 
+/** Scheduler-worker tick IDs. The worker fires `{type:'tick', id, t}`
+ *  messages on these labels at the cadence we register via the
+ *  `schedule` message. Kept const so the main-thread dispatcher
+ *  switches on stable string identity rather than ad-hoc literals. */
+const SCHED_HEARTBEAT = "heartbeat";
+const SCHED_OFFLINE_CHECK = "offline-check";
+const SCHED_CATALOG_REFRESH = "catalog-refresh";
+
 export type DiagLevel = "info" | "warn" | "error";
 export interface DiagEntry {
   ts: number;
@@ -373,9 +390,6 @@ interface ConnectionState {
    *  decide if the connection is still alive — catches the
    *  "laptop suspended, WebRTC layer didn't notice" case. */
   last_recv_at: number;
-  /** setInterval handle for the keepalive ping. Active from the
-   *  moment the connection state is created until it's dropped. */
-  heartbeat_timer: number | null;
   /** How many app-level re-handshake attempts we've fired since
    *  the peer last sent us anything. Reset to 0 on any inbound
    *  message. Re-handshakes continue indefinitely (no MAX);
@@ -566,13 +580,34 @@ class MeshClient {
       on_complete?: (ok: boolean, err?: string) => void;
     }
   >();
-  /** Wall-clock ms of the last heartbeat tick from ANY connection.
-   *  Used to detect OS sleep/suspend: if the gap between two ticks
-   *  is way larger than HEARTBEAT_INTERVAL_MS, the JS engine was
-   *  frozen and we shouldn't trust the silence windows on any of
-   *  our connections — they look stale only because real time
-   *  advanced while we weren't running. */
+  /** Last heartbeat tick the scheduler worker fired, as the worker's
+   *  own `performance.now()` reading. Used to detect OS sleep/suspend:
+   *  if the gap between two ticks is way larger than
+   *  HEARTBEAT_INTERVAL_MS, the JS engine was frozen and we shouldn't
+   *  trust the silence windows on any of our connections — they look
+   *  stale only because real time advanced while we weren't running.
+   *
+   *  Critically, this is the WORKER'S clock, not the main thread's.
+   *  Heavy main-thread work — base64 of a multi-MB file, sha-256 of
+   *  the assembled buffer, a Svelte re-render burst on inference
+   *  tokens — delays main-thread `setInterval` callbacks but the
+   *  worker keeps ticking and stamps each fired tick with the time
+   *  *it* fired. When the main thread drains a backlog of queued
+   *  ticks, each one carries its own monotonic timestamp so the
+   *  per-tick delta stays at HEARTBEAT_INTERVAL_MS and wake
+   *  detection doesn't mis-fire. The worker pauses with the rest
+   *  of the page on real OS suspend, so the genuine "we just woke
+   *  up" gap still surfaces. */
   private last_global_tick_at = 0;
+  /** Scheduler worker that owns the periodic mesh ticks. Spawned in
+   *  start(), terminated in stop(). Null while the mesh is offline. */
+  private scheduler: Worker | null = null;
+  /** Queued requestAnimationFrame handle for batched file-resource
+   *  UI refreshes. A multi-MB file transfer calls
+   *  `scheduleRefreshFileResources` on every chunk; rAF coalesces
+   *  those into one Svelte reactive update per frame instead of
+   *  per-chunk. Null when no frame is pending. */
+  private rAF_handle: number | null = null;
   /** Wall-clock ms of the most recent forced Trystero room rejoin
    *  (the rescue path triggered by failed wake probes,
    *  unresponsive re-handshakes, or the periodic
@@ -935,22 +970,99 @@ class MeshClient {
     // rejoin a few seconds later, defeating the throttle's whole
     // purpose. The value survives across rejoin cycles by design.
     this.installLifecycleHooks();
-    this.offline_check_timer = window.setInterval(() => {
-      this.offlineRosteredCheckTick();
-    }, OFFLINE_ROSTERED_CHECK_INTERVAL_MS);
+    // Spin up the scheduler worker. All three periodic ticks live
+    // there — the worker's own event loop is what keeps them from
+    // drifting under heavy main-thread load (the bug that turned
+    // big file transfers into a forced rediscovery cycle).
+    this.startScheduler();
     // Seed the initial catalog asynchronously so the Network sub-tab
-    // has something to render even before a peer connects, then keep
-    // it refreshed on a slow tick to catch out-of-band mutations.
+    // has something to render even before a peer connects.
     void this.refreshLocalCatalog();
-    this.catalog_refresh_timer = window.setInterval(() => {
-      void this.refreshLocalCatalog();
-    }, CATALOG_REFRESH_INTERVAL_MS);
     this.logDiag("info", `online — listening for peers in room ${room_id.slice(0, 12)}…`);
+  }
+
+  /** Spawn the scheduler worker and register the three periodic
+   *  ticks the mesh runs on. Idempotent — a re-entrant call (e.g.
+   *  from a force-rediscovery race) tears the old worker down first
+   *  so we never have two scheduling the same ids. */
+  private startScheduler(): void {
+    if (this.scheduler !== null) {
+      this.stopScheduler();
+    }
+    let worker: Worker;
+    try {
+      worker = new MeshSchedulerWorker();
+    } catch (e) {
+      this.logDiag(
+        "error",
+        `scheduler worker failed to spawn: ${String(e)} — falling back to main-thread timers`,
+      );
+      // Fallback: the old setInterval shape, kept so a worker-less
+      // environment (rare — Tauri 2 / Chrome 105+ have full Worker
+      // support) still gets liveness, just without the busy-main-
+      // thread immunity.
+      this.offline_check_timer = window.setInterval(() => {
+        this.offlineRosteredCheckTick();
+      }, OFFLINE_ROSTERED_CHECK_INTERVAL_MS);
+      this.catalog_refresh_timer = window.setInterval(() => {
+        void this.refreshLocalCatalog();
+      }, CATALOG_REFRESH_INTERVAL_MS);
+      return;
+    }
+    worker.onmessage = (e: MessageEvent<{ type: "tick"; id: string; t: number }>) => {
+      const msg = e.data;
+      if (msg.type !== "tick") return;
+      switch (msg.id) {
+        case SCHED_HEARTBEAT:
+          this.runHeartbeatTick(msg.t);
+          break;
+        case SCHED_OFFLINE_CHECK:
+          this.offlineRosteredCheckTick();
+          break;
+        case SCHED_CATALOG_REFRESH:
+          void this.refreshLocalCatalog();
+          break;
+      }
+    };
+    worker.onerror = (e: ErrorEvent) => {
+      this.logDiag("warn", `scheduler worker error: ${e.message || String(e)}`);
+    };
+    this.scheduler = worker;
+    this.scheduleTick(SCHED_HEARTBEAT, HEARTBEAT_INTERVAL_MS);
+    this.scheduleTick(SCHED_OFFLINE_CHECK, OFFLINE_ROSTERED_CHECK_INTERVAL_MS);
+    this.scheduleTick(SCHED_CATALOG_REFRESH, CATALOG_REFRESH_INTERVAL_MS);
+  }
+
+  private scheduleTick(id: string, interval_ms: number): void {
+    if (this.scheduler === null) return;
+    this.scheduler.postMessage({ type: "schedule", id, interval_ms });
+  }
+
+  private stopScheduler(): void {
+    if (this.scheduler !== null) {
+      try {
+        this.scheduler.postMessage({ type: "clear_all" });
+      } catch {
+        // Worker may already be in a bad state — terminate below
+        // handles the cleanup either way.
+      }
+      this.scheduler.onmessage = null;
+      this.scheduler.onerror = null;
+      this.scheduler.terminate();
+      this.scheduler = null;
+    }
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
     this.uninstallLifecycleHooks();
+    this.stopScheduler();
+    if (this.rAF_handle !== null) {
+      cancelAnimationFrame(this.rAF_handle);
+      this.rAF_handle = null;
+    }
+    // Fallback-path timers — only set when the worker spawn failed.
+    // The worker path tears down via stopScheduler() above.
     if (this.offline_check_timer !== null) {
       clearInterval(this.offline_check_timer);
       this.offline_check_timer = null;
@@ -993,7 +1105,6 @@ class MeshClient {
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
       if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
-      if (c.heartbeat_timer !== null) clearInterval(c.heartbeat_timer);
     }
     this.connections.clear();
     if (this.room) {
@@ -1289,42 +1400,48 @@ class MeshClient {
       );
       this.dropConnection(peer_id);
     }, HANDSHAKE_TIMEOUT_MS);
-    // Keepalive: every HEARTBEAT_INTERVAL_MS we ping and check
-    // staleness. If the peer's gone (e.g. their device sleeping)
-    // Trystero may not notice via WebRTC alone — this app-level
-    // tick is the source of truth for "did we hear from them
-    // recently."
-    conn.heartbeat_timer = window.setInterval(() => {
-      this.heartbeatTick(conn);
-    }, HEARTBEAT_INTERVAL_MS);
+    // No per-connection keepalive timer here — a single
+    // scheduler-worker-driven `runHeartbeatTick` walks every
+    // connection on each fire. Keeps app-level liveness firing on
+    // schedule even when the main thread is busy with heavy work.
     this.republishPeers();
   }
 
-  private heartbeatTick(conn: ConnectionState): void {
-    const now = Date.now();
-
-    // Wake detection. setInterval pauses while the OS is suspended,
-    // so a tick-to-tick gap much larger than the configured
-    // interval is the most reliable signal that JS just resumed.
-    // Without this, the very first post-wake tick would compute
-    // (now - last_recv_at) against a pre-sleep timestamp, blow
-    // past HEARTBEAT_TIMEOUT_MS, and start dropping/re-handshaking
-    // every peer at once — even though our channel state is fine
-    // and the peer is probably reachable. Run handleWake once per
-    // detected gap; subsequent ticks in the same wake see the
-    // freshly-reset timestamps and proceed normally.
+  /** Single global heartbeat tick, fired by the scheduler worker.
+   *  Runs wake-detection once against the worker's monotonic clock,
+   *  then visits every connection for its per-peer liveness work.
+   *  Replaces the previous per-connection `setInterval` shape — N
+   *  timers became 1, and the wake clock decouples from main-thread
+   *  busy time. */
+  private runHeartbeatTick(worker_t: number): void {
+    // Wake detection. The worker keeps ticking on its own event
+    // loop, so a tick-to-tick gap larger than the threshold only
+    // happens when the WHOLE page paused (real OS suspend). A busy
+    // main thread that delayed the message arrival doesn't widen
+    // this gap because each tick carries its own `performance.now()`
+    // stamp from when the worker fired it. Run handleWake once per
+    // detected gap; subsequent ticks see the freshly-reset
+    // timestamps and proceed normally.
     if (
       this.last_global_tick_at > 0 &&
-      now - this.last_global_tick_at > WAKE_DETECTION_THRESHOLD_MS
+      worker_t - this.last_global_tick_at > WAKE_DETECTION_THRESHOLD_MS
     ) {
-      const gap_s = Math.round((now - this.last_global_tick_at) / 1000);
+      const gap_s = Math.round((worker_t - this.last_global_tick_at) / 1000);
       this.logDiag(
         "info",
         `wake detected (${gap_s}s gap since last tick) — resetting liveness windows and probing peers`,
       );
-      this.handleWake(now);
+      this.handleWake(Date.now());
     }
-    this.last_global_tick_at = now;
+    this.last_global_tick_at = worker_t;
+
+    for (const conn of this.connections.values()) {
+      this.heartbeatTickConn(conn);
+    }
+  }
+
+  private heartbeatTickConn(conn: ConnectionState): void {
+    const now = Date.now();
 
     // Always ping. Keeps the channel warm and gives a dead-WebRTC
     // peer a chance to send us *anything* back; the send itself
@@ -1490,7 +1607,7 @@ class MeshClient {
         return;
       }
       for (const conn of this.connections.values()) {
-        this.heartbeatTick(conn);
+        this.heartbeatTickConn(conn);
       }
     }, WAKE_PROBE_DELAY_MS);
   }
@@ -1564,7 +1681,6 @@ class MeshClient {
       remote_approved: false,
       local_approved: false,
       last_recv_at: Date.now(),
-      heartbeat_timer: null,
       approver_role: false, // set in handleHello once we know both pubkeys
       handshake_timer: null,
       handshake_hello_retry_timer: null,
@@ -2197,7 +2313,6 @@ class MeshClient {
     if (!c) return;
     if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
     if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
-    if (c.heartbeat_timer !== null) clearInterval(c.heartbeat_timer);
     this.connections.delete(peer_id);
     for (const [guid, pending] of this.pending_moves_out) {
       if (pending.target_peer_id === peer_id) {
@@ -2361,6 +2476,30 @@ class MeshClient {
 
   private republishPeers(): void {
     this.peers = this.computePeers();
+  }
+
+  /** rAF-batched variant of `refreshFileResources`. The file-receive
+   *  hot path calls this on every chunk — rAF coalesces a thousand
+   *  calls in a tight loop into one Svelte reactive update per
+   *  frame, instead of allocating + re-rendering per chunk. The
+   *  pending frame is cancelled in `stop()` so no stale rebuild
+   *  fires after the mesh tears down. */
+  private scheduleRefreshFileResources(): void {
+    if (this.rAF_handle !== null) return;
+    if (typeof requestAnimationFrame === "undefined") {
+      // Headless / SSR — fall back to a microtask so tests still
+      // see the rebuild without depending on a frame loop.
+      this.rAF_handle = -1;
+      queueMicrotask(() => {
+        this.rAF_handle = null;
+        this.refreshFileResources();
+      });
+      return;
+    }
+    this.rAF_handle = requestAnimationFrame(() => {
+      this.rAF_handle = null;
+      this.refreshFileResources();
+    });
   }
 
   private async refreshRoster(): Promise<void> {
@@ -3029,7 +3168,11 @@ class MeshClient {
         is_final: i === total - 1,
       });
       pending.chunks_sent = i + 1;
-      this.refreshFileResources();
+      // rAF-batched: progress UI updates collapse to ~60/sec instead
+      // of firing per chunk. The yield below still gives the event
+      // loop a chance to drain inbound messages, scheduler ticks,
+      // and the queued rAF callback between chunk batches.
+      this.scheduleRefreshFileResources();
       // Yield to the event loop every 8 chunks so a multi-MB transfer
       // doesn't block the UI thread for visible periods. Trystero's
       // own send queue handles flow control under us.
@@ -3219,7 +3362,11 @@ class MeshClient {
       }
     }
     pending.on_progress?.(pending.bytes_received, pending.size_bytes);
-    this.refreshFileResources();
+    // Hot path: a multi-MB receive fires this hundreds of times in
+    // quick succession. rAF-batch the UI rebuild so a thousand
+    // chunks collapse into ~60 reactive updates/sec instead of
+    // re-allocating + re-rendering the files array per chunk.
+    this.scheduleRefreshFileResources();
   }
 
   /** Sender ack'd it shipped every chunk. Reassemble, verify the
