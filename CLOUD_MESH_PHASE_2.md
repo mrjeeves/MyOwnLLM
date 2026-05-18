@@ -2,12 +2,20 @@
 
 Phase 1 (PR #172) landed the substrate: identity, Network ID,
 Trystero transport, bidirectional auth handshake with verification
-codes, roster, and Move RPC. Phase 2 (this branch, PR #174) turns
-that substrate into the actual mesh product — ring topology, peer
-capability advertisement, catalog gossip integrated into the main
-sidebar, remote inference + pull/push moves with folder
-preservation, and a multi-network model where the user can save
-and switch between several meshes with one click.
+codes, roster, and Move RPC. Phase 2 (PR #174 → completed in PR
+#175) turns that substrate into the actual mesh product — ring
+topology, peer capability advertisement, catalog gossip integrated
+into the main sidebar, remote inference + pull/push moves with
+folder preservation, a multi-network model where the user can save
+and switch between several meshes with one click, file sharing,
+and a feature matrix that lets nodes running different app
+versions communicate cleanly.
+
+Phase 3 (next branch) layers click-to-open remote conversations
+on top: a remote convo in the sidebar will become directly
+clickable to open + interact with, instead of only being
+relocatable via Pull. The wire scaffolding lives here; Phase 3 is
+the UI + session-subscription RPCs.
 
 This doc is for a fresh agent picking up the work after Phase 2
 has landed. Read the updated `src/mesh-client.svelte.ts`,
@@ -16,7 +24,7 @@ has landed. Read the updated `src/mesh-client.svelte.ts`,
 network roster files), and the Networks sub-tabs
 (`src/ui/settings/CloudMesh*.svelte`) before designing further.
 
-The remaining items below are scoped to mic / transcription / file
+The remaining items below are scoped to mic / transcription
 routing — the protocol scaffolding is in place, the lift is the
 WebRTC MediaStream bridge and the cpal handoff.
 
@@ -211,6 +219,148 @@ Quiet-logs checkbox on the Activity tab. When checked, `logDiag`
 becomes a no-op for `info` events — warnings + errors still land
 in the ring buffer. Persisted via global `cloud_mesh.diag_quiet`.
 
+### ✅ Feature matrix — cross-version peer communication
+
+Peers running different builds need to know which optional message
+kinds they actually share before sending. The matrix is the
+mechanism:
+
+- `Capabilities.app_version` carries the sender's
+  `package.json::version` (injected at build time via Vite's
+  `define` → `__APP_VERSION__`).
+- `Capabilities.features: string[]` lists the optional features
+  the sender implements. Stable string ids defined in
+  `mesh-protocol.ts::FEATURES` (`infer_request`,
+  `move_request`, `two_phase_move`, `move_target_folder`,
+  `capabilities_v1`, `catalog_announce`, `ring_shelve`,
+  `file_transfer_v1`, `app_version`).
+- `peerSupportsFeature(cap, FEATURES.X)` is the gate every
+  optional send checks. Returns true for explicitly-advertised
+  features; falls back to the Phase 2.0 baseline when `features`
+  is missing but the capabilities blob is present (so a Phase 2.0
+  → Phase 2.1 peer pair still does catalog gossip / ring
+  shelving / etc); returns false for Phase 1 peers with no
+  capabilities at all.
+- `formatPeerCompat(cap)` renders the per-peer status:
+  `"v0.2.14 · all features"` or `"v0.3.0 · 7/9 (missing
+  file_transfer, app_version…)"`. Surfaced in:
+  - Connections card (sub-line under each peer row, hover-title
+    has the full missing-feature list)
+  - Sidebar (small pill next to peer label when peer's
+    `app_version` differs from ours)
+
+**Adding a new optional message kind** is a 4-step ritual:
+
+1. Add a new entry to `FEATURES` with a stable id and a comment
+   noting which phase shipped it.
+2. Add it to `ADVERTISED_FEATURES` so the local snapshot
+   includes it.
+3. Gate every `send` / broadcast of the new kind behind
+   `peerSupportsFeature(conn.capabilities, FEATURES.X)`.
+4. Make sure the receive path is forward-compatible — older
+   builds hit the `default` arm in `handleMessageOn` and drop
+   unknown kinds. The send-side gate skips peers that can't
+   parse the frame, saving bandwidth and keeping the activity
+   log accurate about what's actually being transmitted.
+
+`PROTOCOL_VERSION` stays at 1. The feature matrix handles
+additive change at finer granularity; bump `PROTOCOL_VERSION`
+only for incompatible shape changes to existing kinds.
+
+### ✅ File sharing (Phase 2.1)
+
+Arbitrary-byte file transfer between active peers. Modeled on
+the Move RPC:
+
+- `file_offer { id, filename, size_bytes, mime_type?, chunk_size,
+  sha256? }` — sender announces; receiver opens a save-as
+  dialog and replies `file_accept` (or `file_decline` on
+  cancel/rejection).
+- `file_chunk { id, index, bytes_b64, is_final }` — payload
+  travels as base64 inside the JSON action channel. `FILE_CHUNK_BYTES`
+  (48 KB raw → 64 KB encoded) stays under the per-message data-
+  channel budget on every WebRTC stack we ship with.
+- `file_complete { id }` — sender ack'd all chunks; receiver
+  verifies SHA-256 (when provided) and writes to the user-chosen
+  path via the new `mesh_file_save_at` Rust command.
+- `file_abort { id, reason }` — either side aborts; clean up on
+  receipt.
+
+Cap: `FILE_MAX_BYTES = 500 MB` per transfer. Receiver buffers
+chunks in memory until `file_complete` lands, then writes
+atomically. Bigger transfers would OOM the WebView; a streaming
+write path is a follow-up.
+
+**UI:**
+- Sidebar: right-click any connected peer → `Send file…` opens
+  the file picker. Hidden `<input type="file">` at the bottom of
+  the sidebar drives one shared picker.
+- Inbound: a stacked toast at the bottom-left lists each pending
+  offer with `Save as…` / `Decline` buttons. Save opens the OS
+  save dialog (plugin-dialog's `save`), accepts on confirmed
+  path, declines silently on cancel.
+- Live transfers (in and out): progress bars in the toast stacks
+  + a row in the Connections card's "Resources in use" panel.
+- Gating: `sendFile` checks `peerSupportsFeature(cap,
+  FEATURES.FILE_TRANSFER)` up-front so a v0.2.14 peer that
+  silently drops `file_offer` doesn't leave the sender stuck on a
+  "waiting for accept" state.
+
+**Authorization:** Same as Move / infer — only active rostered
+peers may ship us bytes.
+
+### ✅ Trystero strategy picker (build-time)
+
+The Trystero signaling strategy is now selected at build time via
+`VITE_TRYSTERO_STRATEGY`:
+
+```
+# default (no env var needed)
+pnpm build
+
+# alternate strategy — requires the namespaced package to be
+# installed first, otherwise we fall back to nostr at runtime
+# with a logged warning
+pnpm add @trystero-p2p/torrent
+VITE_TRYSTERO_STRATEGY=torrent pnpm build
+```
+
+Supported strategies (per `vite.config.ts::KNOWN_STRATEGIES`):
+`nostr`, `torrent`, `mqtt`, `firebase`, `ipfs`, `supabase`.
+Default stays `nostr` (Phase 1 + Phase 2 baseline: no credentials
+to register, no project to set up).
+
+Runtime: `mesh-client.svelte.ts::loadJoinRoom()` dynamic-imports
+the namespaced package on first `start()` call. The bundler
+splits each strategy into its own chunk so a non-default build
+only ships one. A misconfigured build (env var set but package
+not installed) falls back to Nostr at runtime with a console
+warning rather than refusing to start.
+
+The strategy choice is per-build, not per-network — runtime
+switching means loading multiple Trystero bundles into the same
+WebView, which roughly doubles the JS size for a rarely-toggled
+preference. Build-time selection keeps the default install
+slim.
+
+### ✅ Wizard ergonomics
+
+The Status tab's pill is augmented with a "what to do next"
+coachmark anchored just below it. The same state-machine that
+derives the pill tone derives the coachmark text, so the two
+never disagree:
+
+- No active network → "Add a network below to start sharing"
+- Drafted but unlocked → "Click 🔒 next to {network_id}"
+- Locked, online, no peers → "Open the same network on another
+  device"
+- Connected → coachmark hides (the user knows what to do from
+  here)
+
+The arrow ↓ in front of the coachmark bobs gently to direct the
+user toward the saved-networks list below — that's where every
+action the coachmark suggests lives.
+
 ---
 
 ## Persistence layout
@@ -262,35 +412,16 @@ Depends on mic routing. Same pattern as remote inference: an
 `asr_request` RPC, stream `asr_chunk` frames back. Start with
 "Move the conversation to the transcription host first, then
 route audio" to side-step diarize-state-with-conversation
-questions.
-
-### File sharing
-
-Once the data channel layer handles arbitrary bytes (chunking +
-reassembly + progress events), drop it in. Same shape as
-Move-payload but for arbitrary files.
-
-### Trystero strategy picker
-
-Currently Nostr (default). Strategies are per-import — runtime
-switching means loading multiple trystero builds. Probably do
-this as a build-time config rather than runtime.
+questions. When this lands, add an `asr_v1` entry to `FEATURES`
+and gate the send behind `peerSupportsFeature`.
 
 ### Mobile / touch friendliness
 
 The Networks tab UI was designed for a desktop window. Phone
-form factor will need the tiles + tabs reflowing.
-
-### Wizard ergonomics
-
-The Status tab dropped its step-derived wizard in favor of a
-single status pill + inline controls. If onboarding tests show
-new users still get stuck, consider re-adding a "What to do
-next" coachmark anchored to the status pill — the step copy
-that used to live in the wizard body is gone but the underlying
-state machine (idle / drafted / starting / solo / approvals /
-online / error) is recoverable from `statusPill.tone + active +
-meshClient.status`.
+form factor will need the tiles + tabs reflowing. Sidebar's
+file-transfer toasts position-fixed to corners need to reflow
+into a stack at the top of the screen when the viewport is
+narrow.
 
 ---
 
@@ -318,25 +449,87 @@ meshClient.status`.
   version stays at 1 across all Phase 2 work because every
   change is additive. A v0.2.14 (Phase 1) peer and a Phase 2
   peer can share a mesh, with the v1 side simply not seeing
-  the ring shelving / remote inference / catalog niceties.
+  the ring shelving / remote inference / catalog niceties. The
+  feature matrix (`Capabilities.features`) handles fine-grained
+  additive capability negotiation; reserve `PROTOCOL_VERSION`
+  for incompatible wire-shape changes only.
+- **Don't extend `mesh_file_save_at` to write outside the user
+  flow.** The dialog handoff is what justifies bypassing the fs
+  plugin's allowlist — any future RPC that wants to write
+  arbitrary paths needs its own dialog-confirmed flow, not a
+  fall-through to the same command.
 
 ---
 
 ## Where to start (follow-up work)
 
-1. Read `src/mesh-client.svelte.ts` end to end — it's ~2200
+1. Read `src/mesh-client.svelte.ts` end to end — it's ~3200
    lines but the structure groups under section headings
    (`// ---- capabilities ----`, `// ---- ring topology ----`,
-   etc.). The protocol is in `mesh-protocol.ts` (~500 lines),
-   capability snapshot in `mesh-capabilities.ts`, multi-
-   network helpers in `src/config.ts`.
+   `// ---- catalog gossip ----`, `// ---- remote inference ----`,
+   `// ---- file transfer (Phase 2.1) ----`). The protocol is
+   in `mesh-protocol.ts` (~700 lines with the feature matrix +
+   file transfer kinds), capability snapshot in
+   `mesh-capabilities.ts` (now also surfaces version pills and
+   compat helpers), multi-network helpers in `src/config.ts`.
 2. Run two instances locally on the same Network ID, watch
    the Activity tab during connect → approve → catalog
-   announce → move → pull. The sidebar Networks section
-   fills in once both sides flip to `active`.
+   announce → move → pull → file send. The sidebar Networks
+   section fills in once both sides flip to `active`. Try
+   sending a file from one device's peer right-click menu and
+   watch it land on the other.
 3. For mic routing, start by extending `MicConfig` with the
    new `current` shape, hooking `room.addStream` on the source
    device and `room.onPeerStream` on the receiver. Get the
    stream into a `MediaRecorder` first to prove end-to-end
-   audio delivery before tackling the cpal bridge.
+   audio delivery before tackling the cpal bridge. When you
+   land this, add `mic_route_v1` (or similar) to the
+   `FEATURES` table and gate the protocol behind it.
 4. Each major area opens its own PR on top of this one.
+
+---
+
+## Phase 3 — click-to-open remote conversations
+
+The next phase will make remote conversations directly
+interactive without needing a Pull. Today the sidebar shows
+each peer's conversations under their group, but clicking one
+does nothing — the only way to use it is to Pull it onto your
+device. Phase 3 makes that click open the remote conversation
+in-place: messages arrive over the wire as the host writes them,
+sending a chat message routes through the host's LLM via the
+existing remote-inference RPC, transcript segments stream in
+real-time. The host's device has to be reachable for the
+session to stay live (it doesn't need to be the same one the
+user is sitting at, but it can't be asleep).
+
+Outline for the next PR:
+
+1. New `FEATURES.SESSION_VIEW = "session_view_v1"` advertised
+   by builds that implement the host side. Sidebar's
+   "click-to-open" affordance gates on
+   `peerSupportsFeature(cap, FEATURES.SESSION_VIEW)`.
+2. New RPCs (proposed): `session_fetch { guid }` →
+   `session_snapshot { conversation }`, `session_subscribe
+   { guid }` / `session_unsubscribe { guid }`, host-driven
+   `session_event { guid, kind, … }` for incremental updates
+   (`message_streaming` deltas, `message_done`,
+   `transcript_segment`, `talking_points_changed`,
+   `title_changed`).
+3. Receiver-side: a `remoteConversation` store mirroring
+   `Conversation` shape but read-only locally. Sending a
+   message routes through `meshClient.sendInferRequest` AND
+   ships the user turn back to the host so it lands in the
+   host's stored conversation. The host then streams the
+   assistant reply via `session_event` so every subscriber
+   sees the same content.
+4. Chat surface: open a remote convo and the title bar shows
+   a "remote · {peer_label}" pill. Compose row routes
+   automatically (no manual via picker). Disconnect handling:
+   if the host drops mid-stream, surface a banner with
+   reconnect / pull / disconnect options.
+
+The protocol additions are purely additive — the feature flag
+makes them invisible to peers that don't implement them, so
+landing Phase 3 on a subset of devices works without breaking
+v0.2.14 / Phase 2 peers in the same mesh.

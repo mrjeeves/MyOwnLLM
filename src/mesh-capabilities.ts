@@ -22,7 +22,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { HardwareProfile, Mode } from "./types";
 import type { Capabilities, AcceptingPolicy } from "./mesh-protocol";
-import { EMPTY_CAPABILITIES } from "./mesh-protocol";
+import {
+  ADVERTISED_FEATURES,
+  APP_VERSION,
+  EMPTY_CAPABILITIES,
+  FEATURES,
+  peerSupportsFeature,
+  summarizePeerCompat,
+} from "./mesh-protocol";
 import { getActiveManifest } from "./providers";
 import { loadConfig } from "./config";
 
@@ -43,6 +50,11 @@ export async function snapshotCapabilities(
 ): Promise<Capabilities> {
   const cap: Capabilities = structuredClone(EMPTY_CAPABILITIES);
   cap.accepting = accepting;
+  // Build version + feature matrix. Constant per build (no detection
+  // needed) but worth stamping fresh on each snapshot so a build
+  // upgrade between snapshots is reflected immediately.
+  cap.app_version = APP_VERSION;
+  cap.features = [...ADVERTISED_FEATURES];
 
   // Hardware. The router treats `none` GPU + 0 GB RAM as "don't send
   // me real work" — same as an outright failure to detect.
@@ -205,3 +217,40 @@ export function capabilityBadges(cap: Capabilities): string[] {
   else if (cap.accepting === "limited") out.push("limited");
   return out;
 }
+
+/** "v0.2.14 — 9/9 features" or "v0.3.0 — 7/9 features (missing
+ *  file_transfer)" for the Connections card. Lets the user see at a
+ *  glance whether a peer is on a different release than them and
+ *  what optional capabilities they don't share. Empty string when
+ *  the peer hasn't advertised a version (Phase 1 peer or version
+ *  field was stripped). */
+export function formatPeerCompat(cap: Capabilities, ourVersion: string = APP_VERSION): string {
+  if (!cap.app_version) {
+    return "";
+  }
+  const { matched, total, missing } = summarizePeerCompat(cap);
+  const ver = cap.app_version === ourVersion ? `v${cap.app_version}` : `v${cap.app_version} ≠ ours`;
+  if (matched === total) {
+    return `${ver} · all features`;
+  }
+  // Truncate the missing list to keep the chip readable; the full
+  // list shows on hover via title attribute on the call site.
+  const trimmed = missing.slice(0, 2).join(", ");
+  const ellipsis = missing.length > 2 ? "…" : "";
+  return `${ver} · ${matched}/${total} (missing ${trimmed}${ellipsis})`;
+}
+
+/** Full missing-feature list as a tooltip-friendly string. Used on
+ *  the hover-title alongside the truncated `formatPeerCompat`. */
+export function describePeerMissingFeatures(cap: Capabilities): string {
+  const { missing } = summarizePeerCompat(cap);
+  if (missing.length === 0) return "All advertised features supported.";
+  return `Peer doesn't advertise: ${missing.join(", ")}.`;
+}
+
+/** Convenience re-exports so callers that already pull from
+ *  mesh-capabilities don't need a second import for the feature
+ *  matrix helpers. The local import above makes the names
+ *  available inside this module; this export line re-surfaces
+ *  them to anything that imports from `mesh-capabilities`. */
+export { APP_VERSION, FEATURES, peerSupportsFeature };

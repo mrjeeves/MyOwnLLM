@@ -13,7 +13,10 @@
     supported,
     tokensUsed,
     contextSize,
+    thinkingEnabled,
+    thinkingAvailable,
     onChange,
+    onThinkingChange,
     onRequestStopTranscribe,
     onRequestStopChat,
   } = $props<{
@@ -27,7 +30,19 @@
     /** Model's reported context window. 0 means "not yet known" — we hide
      *  the saturation block in that case rather than render `0 / 0`. */
     contextSize: number;
+    /** Whether the user has requested reasoning tokens for the active
+     *  conversation. Drives both the brain toggle's visual state and the
+     *  `think` flag we pass to local + remote inference. */
+    thinkingEnabled: boolean;
+    /** Render the brain toggle? Hidden when the current mode doesn't
+     *  involve generation (transcribe doesn't think). Chat.svelte
+     *  passes `current === "text"`. */
+    thinkingAvailable: boolean;
     onChange: (mode: Mode) => void;
+    /** Toggle the thinking-requested flag for the active conversation.
+     *  Persisted by the caller (Chat.svelte writes through
+     *  saveConversation). */
+    onThinkingChange: (next: boolean) => void;
     /** Stop transcription. Routed to the App-level confirm dialog so the
      *  pending-chunks warning lives in one place. */
     onRequestStopTranscribe: () => void;
@@ -228,6 +243,34 @@
     {/each}
   </div>
 
+  {#if thinkingAvailable}
+    <!-- Thinking toggle: a brain icon that flips the `think` flag on
+         the active conversation. Persists per-conversation via
+         saveConversation so a chat set to "reason carefully" keeps
+         doing that across reloads. The local / remote send paths
+         both read this flag — toggling it once on either device
+         changes what the model is asked to do on the very next send. -->
+    <button
+      class="brain-toggle"
+      class:active={thinkingEnabled}
+      onclick={() => onThinkingChange(!thinkingEnabled)}
+      aria-pressed={thinkingEnabled}
+      title={thinkingEnabled
+        ? "Thinking on — model emits reasoning tokens before its answer (click to turn off)."
+        : "Thinking off — click to ask the model for reasoning tokens before answering."}
+      aria-label={thinkingEnabled ? "Disable thinking" : "Enable thinking"}
+    >
+      <!-- Minimal brain glyph. The outline matches the line weight
+           of the context-ring stroke so the two reads as a set. -->
+      <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+        <path
+          fill="currentColor"
+          d="M9.5 3a3 3 0 0 0-2.83 2A3 3 0 0 0 4 8c0 .69.24 1.32.63 1.83A3 3 0 0 0 5 15a3 3 0 0 0 1.06 2.29A3 3 0 0 0 11 19V5a3 3 0 0 0-1.5-2zM15 19a3 3 0 0 0 2.94-2.71A3 3 0 0 0 19 15a3 3 0 0 0 .37-5.17C19.76 9.32 20 8.69 20 8a3 3 0 0 0-2.67-3 3 3 0 0 0-2.83-2A3 3 0 0 0 13 5v14a3 3 0 0 0 2-1z"
+        />
+      </svg>
+    </button>
+  {/if}
+
   {#if contextSize > 0}
     <div
       class="ctx"
@@ -393,4 +436,30 @@
   .num { color: #aaa; }
   .sep { color: #444; }
   .den { color: #666; }
+
+  /* Brain toggle — sits just before the context ring so the two
+     read as a pair ("how much we're using" + "how hard we're
+     thinking about it"). Inactive state matches the .ctx muted
+     palette; active state pops to the same purple as the chat
+     send button so a hot-toggle is unmistakable. */
+  .brain-toggle {
+    background: none;
+    border: 1px solid transparent;
+    color: #555;
+    border-radius: 5px;
+    padding: .2rem .35rem;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    line-height: 0;
+    flex-shrink: 0;
+    transition: color .12s, background .12s, border-color .12s;
+  }
+  .brain-toggle:hover { color: #aaa; background: #1a1a1a; }
+  .brain-toggle.active {
+    color: #d8d8ff;
+    background: #2a2a55;
+    border-color: #3a3a7a;
+  }
+  .brain-toggle.active:hover { background: #3a3a7a; }
 </style>

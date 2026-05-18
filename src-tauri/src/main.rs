@@ -540,6 +540,49 @@ fn write_text_to_path(path: String, contents: String) -> Result<(), String> {
     std::fs::write(&path, contents).map_err(|e| format!("write {path}: {e}"))
 }
 
+/// Write a base64-encoded blob to the user-chosen filesystem path.
+/// Same consent model as `write_text_to_path` — the JS side runs
+/// the save dialog and hands us the confirmed path, so the fs
+/// plugin's tight allowlist (scoped to `~/.myownllm/**`) doesn't
+/// have to widen to cover the Cloud Mesh's "save received file
+/// anywhere" UX.
+///
+/// Used by the Cloud Mesh file-transfer receiver path: bytes
+/// arrive as base64 chunks, get assembled in JS, then land here as
+/// a single base64 string to write atomically. We could stream
+/// chunks if the per-call size becomes an issue, but for the
+/// FILE_MAX_BYTES = 500 MB cap (post base64 ≈ 666 MB string)
+/// browsers handle the single shot without complaint.
+#[tauri::command]
+fn mesh_file_save_at(path: String, bytes_b64: String) -> Result<(), String> {
+    // RFC 4648 standard base64 (with `+/` and `=` padding) — matches
+    // what `btoa` produces in the WebView. Use the existing
+    // data-encoding dep so we don't need to add a base64 crate.
+    let raw = data_encoding::BASE64
+        .decode(bytes_b64.as_bytes())
+        .map_err(|e| format!("decode payload: {e}"))?;
+    // Refuse pathological inputs early so a typo in the JS path
+    // selector doesn't end up writing to a directory.
+    if path.trim().is_empty() {
+        return Err("empty target path".to_string());
+    }
+    let target = std::path::PathBuf::from(&path);
+    if target.is_dir() {
+        return Err(format!("target {} is a directory", path));
+    }
+    // Best-effort: make sure the parent directory exists. The
+    // save-dialog typically lands the user inside an existing folder,
+    // but a user-typed filename in a non-existent path would
+    // otherwise return a less-helpful OS error.
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create parent dir {}: {e}", parent.display()))?;
+        }
+    }
+    std::fs::write(&target, raw).map_err(|e| format!("write {path}: {e}"))
+}
+
 #[tauri::command]
 fn update_status() -> Result<self_update::UpdateStatus, String> {
     self_update::status().map_err(|e| e.to_string())
@@ -728,6 +771,7 @@ fn main() {
             mesh::commands::mesh_roster_add,
             mesh::commands::mesh_roster_remove,
             mesh::commands::mesh_roster_delete,
+            mesh_file_save_at,
             transcribe_start,
             transcribe_stop,
             transcribe_pause,

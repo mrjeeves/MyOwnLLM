@@ -159,6 +159,14 @@
   /** Model context window (tokens). Refreshed when the model changes. 0 =
    *  not yet known — ModeBar hides the saturation block in that case. */
   let contextSize = $state(0);
+  /** User-toggled "ask for reasoning tokens" preference for the active
+   *  conversation. Hydrated from `activeConversation.thinking_enabled`
+   *  whenever the active conversation flips, and persisted via
+   *  saveConversation on toggle so a chat that's set to think keeps
+   *  thinking across reloads. The send() path reads this and forwards
+   *  it as `think` to both the local `ollama_chat_stream` and the
+   *  mesh's `infer_request.think`. */
+  let thinkingEnabled = $state(false);
 
   // -----------------------------------------------------------------------
   // Token estimation. Chars/4 is the standard rough-cut estimate for
@@ -223,6 +231,10 @@
       // null = empty chat (parent's "New chat" or initial mount).
       activeConversation = null;
       messages = [];
+      // Fresh chat: thinking defaults off. The brain toggle in the
+      // ModeBar surfaces this; the user's first toggle persists once
+      // saveConversation runs after the first send.
+      thinkingEnabled = false;
       return;
     }
     let cancelled = false;
@@ -231,10 +243,12 @@
       if (!c) {
         activeConversation = null;
         messages = [];
+        thinkingEnabled = false;
         return;
       }
       activeConversation = c;
       messages = c.messages.map((m) => ({ ...m }));
+      thinkingEnabled = !!c.thinking_enabled;
     });
     return () => {
       cancelled = true;
@@ -296,10 +310,37 @@
       if (thinking) out.thinking = thinking;
       return out;
     });
+    // Persist the per-conversation thinking preference so a re-open
+    // brings the brain toggle back in the same state. We elide the
+    // field entirely when off so legacy JSON files don't gain a
+    // pointless `false` line on first save under the new build.
+    if (thinkingEnabled) conv.thinking_enabled = true;
+    else delete conv.thinking_enabled;
     await saveConversation(conv);
     activeConversation = conv;
     onConversationChanged(conv.id);
     return conv;
+  }
+
+  /** Toggle handler wired from ModeBar's brain checkbox. Persists
+   *  on the next save (or right away if a conversation already
+   *  exists on disk) so the flag survives a reload. */
+  async function setThinkingEnabled(next: boolean) {
+    thinkingEnabled = next;
+    // Persist immediately when we already have a conversation on
+    // disk — the user expects the brain state to stick. For a
+    // fresh / empty chat we'll fold it into the first send's
+    // persist() call.
+    if (activeConversation) {
+      const conv = activeConversation;
+      if (next) conv.thinking_enabled = true;
+      else delete conv.thinking_enabled;
+      try {
+        await saveConversation(conv);
+      } catch (e) {
+        console.warn("persist thinking toggle failed:", e);
+      }
+    }
   }
 
   function send() {
@@ -381,7 +422,8 @@
         // data channel. We synthesize the same delta/thinking_delta
         // events the local path would emit so the rest of the
         // existing UI (bubble append, stop button, persist) works
-        // unchanged.
+        // unchanged. `think` rides along so a remotely-served chat
+        // gets reasoning tokens too when the brain toggle is on.
         await new Promise<void>((resolve, reject) => {
           meshClient
             .sendInferRequest({
@@ -389,6 +431,7 @@
               messages: history.map((m) => ({ role: m.role, content: m.content })),
               family: activeFamily,
               mode: activeMode,
+              think: thinkingEnabled,
               on_chunk: (frame) => {
                 if (frame.thinking_delta) {
                   if (assistantIdx === -1) assistantIdx = ensureAssistantBubble();
@@ -420,6 +463,7 @@
           streamId,
           model: activeModel,
           messages: history.map((m) => ({ role: m.role, content: m.content })),
+          think: thinkingEnabled,
         });
       }
 
@@ -646,38 +690,49 @@
     supported={supportedModes}
     {tokensUsed}
     {contextSize}
+    {thinkingEnabled}
+    thinkingAvailable={activeMode === "text"}
     onChange={handleModeChange}
+    onThinkingChange={setThinkingEnabled}
     onRequestStopTranscribe={() => onRequestStopTranscribe()}
     onRequestStopChat={() => onRequestStopChat()}
   />
 
   {#if !tpHoldsSlot}
+    <!-- Compose tools row: left side reserved for upcoming
+         file-upload pills (input/manifests/screenshots/etc.); right
+         side hosts the Cloud Mesh "via:" picker. The row only
+         renders when there's something to show on either side, so
+         single-device users with no pending uploads never see an
+         empty bar. -->
     {#if availableInferencePeers.length > 0 || routeViaPeerId}
-      <!-- Cloud Mesh Phase 2: "via" picker. When set to a peer, the
-           next Send routes the prompt over the mesh and streams the
-           response back through the data channel. The local model
-           stays cold; the peer's LLM does the work. Hidden entirely
-           when no peer is reachable for inference, so single-device
-           users never see it. -->
-      <div class="route-row">
-        <label class="route-label" for="route-picker">via:</label>
-        <select
-          id="route-picker"
-          class="route-picker"
-          bind:value={routeViaPeerId}
-          disabled={streaming}
-          title="Pick a peer to route this prompt through. The peer's LLM runs the request and streams tokens back over the mesh."
-        >
-          <option value={null}>this device (local)</option>
-          {#each availableInferencePeers as p (p.peer_id)}
-            <option value={p.peer_id}>
-              {p.label || `${p.device_pubkey.slice(0, 8)}…`}{p.device_suffix ? ` -${p.device_suffix}` : ""}
-            </option>
-          {/each}
-        </select>
-        {#if routeViaPeerId}
-          <span class="route-hint">remote inference active</span>
-        {/if}
+      <div class="compose-tools">
+        <div class="compose-tools-files" aria-label="File uploads">
+          <!-- Reserved bar for file-attachment pills. Hooked up in
+               a follow-up PR. Empty for now but holds the layout
+               slot so the "via:" picker sits visually to the
+               right consistently. -->
+        </div>
+        <div class="compose-tools-route">
+          <label class="route-label" for="route-picker">via:</label>
+          <select
+            id="route-picker"
+            class="route-picker"
+            bind:value={routeViaPeerId}
+            disabled={streaming}
+            title="Pick a peer to route this prompt through. The peer's LLM runs the request and streams tokens back over the mesh."
+          >
+            <option value={null}>this device (local)</option>
+            {#each availableInferencePeers as p (p.peer_id)}
+              <option value={p.peer_id}>
+                {p.label || `${p.device_pubkey.slice(0, 8)}…`}{p.device_suffix ? ` -${p.device_suffix}` : ""}
+              </option>
+            {/each}
+          </select>
+          {#if routeViaPeerId}
+            <span class="route-hint">remote inference active</span>
+          {/if}
+        </div>
       </div>
     {/if}
     <div class="input-row">
@@ -831,15 +886,41 @@
   .dots span:nth-child(2) { animation-delay: .2s; }
   .dots span:nth-child(3) { animation-delay: .4s; }
   @keyframes blink { 0%,80%,100% { opacity: .3; } 40% { opacity: 1; } }
-  .route-row {
+  /* Compose tools row: left side reserved for upcoming file
+     upload pills, right side hosts the Cloud Mesh "via:" picker.
+     Same background as the input row below so the divider line
+     only renders once at the top of this row (see the adjacency
+     selector below). */
+  .compose-tools {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: .5rem;
     padding: 0.35rem 0.75rem 0 0.75rem;
     background: #0f0f0f;
     border-top: 1px solid #1e1e1e;
     font-size: 0.72rem;
     color: #888;
+  }
+  /* File-pills slot. Flexes to fill the left side regardless of
+     how many pills land here later. min-width: 0 so a long peer
+     label on the right side can shrink it freely. */
+  .compose-tools-files {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: .35rem;
+    /* Reserve enough height that a future file-pill row doesn't
+       resize the bar on first attach. Matches the picker's
+       intrinsic height. */
+    min-height: 1.3rem;
+  }
+  /* Route picker container — right-aligned. */
+  .compose-tools-route {
+    display: flex;
+    align-items: center;
+    gap: .4rem;
+    flex-shrink: 0;
   }
   .route-label {
     text-transform: uppercase;
@@ -870,10 +951,10 @@
     border-top: 1px solid #1e1e1e;
     background: #0f0f0f;
   }
-  /* When the route-row sits above input-row they share the same
+  /* When compose-tools sits above input-row they share the same
      background so the divider line only renders once at the top of
-     the route-row. */
-  .route-row + .input-row {
+     compose-tools. */
+  .compose-tools + .input-row {
     border-top: none;
   }
   textarea {
