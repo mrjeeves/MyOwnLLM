@@ -357,14 +357,28 @@ mod tests {
 
     // Windows-only variants of the two tests above so the timeout +
     // stderr paths still get coverage on the Windows CI runner.
+    //
+    // Choices that landed after a CI failure round-trip:
+    //
+    //   - Use plain `exit 3`, not `exit /b 3`. `/b` is documented to
+    //     "exit batch", and from a `cmd /C` invocation it doesn't
+    //     always set the parent cmd's exit code the way you'd hope —
+    //     the value can come back as 1 instead of 3. Plain `exit N`
+    //     is unambiguous.
+    //   - Use `ping 127.0.0.1 -n 6 > NUL` as the sleep, not
+    //     `timeout /t 5 /nobreak`. `timeout.exe` refuses to run when
+    //     stdin is redirected (we wire `Stdio::null()`), printing
+    //     "ERROR: Input redirection is not supported, exiting the
+    //     process immediately." and exiting in <1ms — which makes
+    //     the surrounding `tokio::time::timeout` wrapper see a fast
+    //     exit rather than a timeout. `ping` doesn't care about
+    //     stdin and runs ~1 s per echo, so 6 echoes ≈ 5 s of
+    //     wall-clock — well past the 200 ms test budget below.
     #[cfg(windows)]
     #[tokio::test]
     async fn shell_separates_stderr_windows() {
-        // `&` chains commands in cmd; `1>&2` redirects stderr the same
-        // way; `exit /b 3` returns the desired exit code without
-        // closing the cmd window.
         let out = run_shell_inner(
-            "echo out & echo err 1>&2 & exit /b 3".to_string(),
+            "echo out & echo err 1>&2 & exit 3".to_string(),
             None,
             Some(5_000),
         )
@@ -378,11 +392,13 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn shell_times_out_windows() {
-        // `timeout` is a cmd builtin; redirecting stdin via < NUL keeps
-        // it from complaining about non-interactive input.
-        let out = run_shell_inner("timeout /t 5 /nobreak > NUL".to_string(), None, Some(200))
-            .await
-            .unwrap();
+        let out = run_shell_inner(
+            "ping 127.0.0.1 -n 6 > NUL".to_string(),
+            None,
+            Some(200),
+        )
+        .await
+        .unwrap();
         assert!(out.timed_out);
         assert!(out.exit_code.is_none());
     }
