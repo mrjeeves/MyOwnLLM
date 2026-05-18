@@ -237,9 +237,16 @@ const REHANDSHAKE_RESCUE_ATTEMPTS = 3;
 const REDISCOVERY_BACKOFF_SCHEDULE_MS = [
   60_000, // 1m  — first attempt after going offline
   120_000, // 2m
-  300_000, // 5m
-  600_000, // 10m
-  1_800_000, // 30m  — final, repeated indefinitely
+  180_000, // 3m
+  300_000, // 5m — final, repeated indefinitely
+  // Capped at 5m (was 30m). The previous tail made the network
+  // feel "broken forever" when a bad stretch pushed us to the
+  // back of the schedule — a peer that came back during the
+  // 30-min wait stayed invisible until the wait elapsed.
+  // 5m is a tolerable polling cadence for a peer that's
+  // genuinely off, and `consecutive_rediscovery_attempts` now
+  // resets on any onPeerJoin so the schedule unwinds the moment
+  // signaling recovers anyway.
 ];
 /** Cadence at which we check whether any rostered peer is offline
  *  and, if so, ask for a rediscovery. Catches the asymmetric
@@ -609,6 +616,16 @@ class MeshClient {
   /** Scheduler worker that owns the periodic mesh ticks. Spawned in
    *  start(), terminated in stop(). Null while the mesh is offline. */
   private scheduler: Worker | null = null;
+  /** Last-seen catalog per peer pubkey, kept across disconnects so
+   *  the sidebar can render an offline peer's conversations dimmed
+   *  rather than vanishing them on every connection blip. Populated
+   *  whenever a `catalog_announce` lands (live overrides cache);
+   *  preserved in `dropConnection` for authenticated rostered peers;
+   *  cleared explicitly by `forgetPeerCache` (the right-click
+   *  Forget action on an offline peer in the sidebar). Lives in
+   *  memory only — a relaunch reseeds from the next live announce,
+   *  which is what the user said they expect on next sight. */
+  private catalog_cache = new Map<string, CatalogEntry[]>();
   /** Queued requestAnimationFrame handle for batched file-resource
    *  UI refreshes. A multi-MB file transfer calls
    *  `scheduleRefreshFileResources` on every chunk; rAF coalesces
@@ -1230,6 +1247,13 @@ class MeshClient {
       this.republishPeers();
       return;
     }
+    // Offline-rostered branch: the user explicitly asked for a
+    // refresh, so unwind the rediscovery-backoff counter (otherwise
+    // a previous bad stretch could leave the auto path locked at the
+    // 5-minute interval and the click would feel ignored) and
+    // bypass the throttle by calling forceRediscovery directly.
+    this.consecutive_rediscovery_attempts = 0;
+    this.last_force_rediscovery_at = 0;
     await this.forceRediscovery();
   }
 
@@ -1367,6 +1391,15 @@ class MeshClient {
   private handlePeerJoin(peer_id: string): void {
     if (this.connections.has(peer_id)) return;
     this.logDiag("info", `peer joined: ${peer_id.slice(0, 8)}…`);
+    // ANY new peer arrival is proof that Trystero's signaling layer
+    // is working again — reset the auto-rediscovery backoff counter
+    // so the next outage gets the fast 60s first-rejoin window
+    // rather than whatever 30-minute interval we'd worked our way
+    // up to during a bad stretch. Previously this only reset on a
+    // successful auth_response, which meant a peer that joined but
+    // never completed crypto left us locked at the back of the
+    // schedule indefinitely.
+    this.consecutive_rediscovery_attempts = 0;
     const conn = this.createConnState(peer_id);
     this.connections.set(peer_id, conn);
     this.sendHello(conn);
@@ -1817,6 +1850,12 @@ class MeshClient {
         conn.catalog = Array.isArray(msg.conversations)
           ? msg.conversations.slice(0, 1024)
           : [];
+        // Mirror into the persistent cache so an offline render of
+        // this peer (after they drop) still shows the last-known
+        // conversation set instead of going blank.
+        if (conn.device_pubkey) {
+          this.catalog_cache.set(conn.device_pubkey, conn.catalog);
+        }
         this.republishPeers();
         break;
       case "move_offer":
@@ -2320,6 +2359,14 @@ class MeshClient {
     if (!c) return;
     if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
     if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
+    // Preserve the catalog from this connection so the offline
+    // sidebar render still shows the peer's conversations dimmed
+    // instead of going blank. Only worth caching for peers we'd
+    // also render as offline-rostered — anonymous handshake-failed
+    // strangers shouldn't leak into the sidebar.
+    if (c.device_pubkey && c.catalog.length > 0 && this.roster_pubkeys.has(c.device_pubkey)) {
+      this.catalog_cache.set(c.device_pubkey, c.catalog);
+    }
     this.connections.delete(peer_id);
     for (const [guid, pending] of this.pending_moves_out) {
       if (pending.target_peer_id === peer_id) {
@@ -2473,12 +2520,27 @@ class MeshClient {
         reconnect_attempts: 0,
         next_reconnect_at: null,
         capabilities: structuredClone(EMPTY_CAPABILITIES),
-        catalog: [],
+        // Cached catalog from the peer's last `catalog_announce`.
+        // Empty when we've never seen them with content; the
+        // sidebar uses this to decide whether to render the
+        // offline group at all (no cache = don't clutter).
+        catalog: this.catalog_cache.get(pubkey) ?? [],
         local_shelved: false,
         remote_shelved: false,
       });
     }
     return [...active, ...offline];
+  }
+
+  /** Drop a peer's cached catalog. Wired to the sidebar's right-
+   *  click → Forget on an offline peer. Idempotent. On next sight
+   *  the peer will reseed the cache via their first
+   *  `catalog_announce`, so this is non-destructive — it just hides
+   *  the dimmed group from the sidebar until the peer comes back. */
+  forgetPeerCache(pubkey: string): void {
+    if (this.catalog_cache.delete(pubkey)) {
+      this.republishPeers();
+    }
   }
 
   private republishPeers(): void {
