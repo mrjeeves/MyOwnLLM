@@ -60,19 +60,91 @@ import {
  *  timeout, because verifying a code with a peer out-of-band can
  *  easily take more than 30s. */
 const HANDSHAKE_TIMEOUT_MS = 30_000;
+/** During the handshake window we re-send `hello` on this cadence.
+ *  Right after a Trystero room rejoin the data channel can be open
+ *  (so onPeerJoin fires) but not yet ready for an immediate send,
+ *  swallowing the very first hello and stranding both sides
+ *  waiting on auth_response. Repeating the hello a few times
+ *  across the window gives the channel time to settle without
+ *  bloating the timeout. */
+const HANDSHAKE_HELLO_RETRY_INTERVAL_MS = 5_000;
 /** App-level keepalive on each active connection. We send a ping
  *  every interval and also use the tick to check whether we've
- *  heard from the peer recently enough; if not, the connection
- *  is dead and we drop it. Catches the case where the local
- *  device suspended (laptop lid closed) — Trystero's WebRTC
- *  layer doesn't always notice the peer's gone, so without an
- *  app-level liveness check we'd sit on a stale connection
- *  showing "live" indefinitely. */
+ *  heard from the peer recently enough; if not, we enter the
+ *  re-handshake loop. 10s is the chosen poll cadence — tight
+ *  enough that Phase 2 ring routing has a recent liveness signal,
+ *  loose enough not to noise up the data channel. */
 const HEARTBEAT_INTERVAL_MS = 10_000;
-/** Drop the connection if we haven't heard anything (ping, pong,
- *  protocol message — anything) within this window. 25s gives us
- *  two missed pings of grace before we consider the peer dead. */
+/** Consider the channel stale (start re-handshaking) if no message
+ *  has arrived in this window. ~2.5 missed pings of grace before
+ *  we enter the reconnect loop; chosen to be tolerant of a brief
+ *  network jitter without burying real stalls. Post-wake detection
+ *  is much faster via WAKE_PROBE_DELAY_MS — this window only
+ *  governs steady-state stalls. */
 const HEARTBEAT_TIMEOUT_MS = 25_000;
+/** When the gap between two heartbeat ticks is larger than this,
+ *  assume the device just woke from sleep / suspend. setInterval
+ *  pauses while the JS engine is frozen, so a gap much greater
+ *  than the configured interval is the most reliable wake signal
+ *  we have from inside the runtime — independent of whether the
+ *  OS fires a visibility / focus event for us. */
+const WAKE_DETECTION_THRESHOLD_MS = HEARTBEAT_INTERVAL_MS * 2;
+/** After a wake event we send fresh pings to every peer. If we
+ *  haven't heard anything back within this window, treat the
+ *  channel as dead and enter the re-handshake loop right away —
+ *  without this short probe we'd sit silently waiting for the
+ *  full HEARTBEAT_TIMEOUT_MS to elapse before noticing the
+ *  post-wake stall. Sized so a healthy peer's pong (sub-second
+ *  RTT typical) lands comfortably inside the window. */
+const WAKE_PROBE_DELAY_MS = 1_500;
+/** Backoff schedule for app-level re-handshake attempts when a
+ *  peer goes silent past HEARTBEAT_TIMEOUT_MS. Each attempt
+ *  re-sends `hello`; if the underlying WebRTC channel is still
+ *  warm but our app state went stale (typical post-suspend), the
+ *  peer answers and we recover without losing approval state.
+ *  Indexed by attempt count (1 → SCHEDULE[0]); attempts beyond
+ *  the schedule's length stay at the final entry, so reconnection
+ *  continues indefinitely but never faster than 30s per attempt. */
+const REHANDSHAKE_BACKOFF_MS_SCHEDULE = [2_000, 5_000, 10_000, 20_000, 30_000];
+/** After this many failed re-handshakes against a peer, escalate
+ *  from app-level retry to a Trystero room rejoin. App-level
+ *  hellos sit on top of the WebRTC datachannel; if that channel
+ *  is half-dead (typical post-suspend), the hellos go into the
+ *  void no matter how many we send. A fresh discovery cycle is
+ *  the only way to get a new datachannel. Throttled via
+ *  REDISCOVERY_BACKOFF_SCHEDULE_MS so a flaky peer doesn't
+ *  drag every other connection through repeated rejoins. */
+const REHANDSHAKE_RESCUE_ATTEMPTS = 3;
+/** Minimum wall-clock gap between two forced room rejoins,
+ *  indexed by consecutive_rediscovery_attempts. A peer that
+ *  genuinely is offline (other laptop shut down for the night)
+ *  shouldn't drag the rest of the mesh through a rejoin every
+ *  minute forever — the backoff stretches the cadence out the
+ *  longer they stay gone. The counter resets the moment any
+ *  peer successfully completes auth, so a peer that pops back
+ *  online gets the next outage's full reactivity. */
+const REDISCOVERY_BACKOFF_SCHEDULE_MS = [
+  60_000, // 1m  — first attempt after going offline
+  120_000, // 2m
+  300_000, // 5m
+  600_000, // 10m
+  1_800_000, // 30m  — final, repeated indefinitely
+];
+/** Cadence at which we check whether any rostered peer is offline
+ *  and, if so, ask for a rediscovery. Catches the asymmetric
+ *  case where one side rejoins after a sleep but the other side
+ *  has a stuck Trystero subscription that never produces an
+ *  onPeerJoin for the wake-side's new peer_id. The actual rejoin
+ *  is throttled by REDISCOVERY_BACKOFF_SCHEDULE_MS so this
+ *  check polls more often than rejoins fire. */
+const OFFLINE_ROSTERED_CHECK_INTERVAL_MS = 60_000;
+/** Delay between Trystero `leave()` and the new `joinRoom()` in
+ *  forceRediscovery. Without this gap the new join can race a
+ *  half-cleaned ICE/relay teardown and produce a "phantom"
+ *  connection that fires onPeerJoin without a working data
+ *  channel — exactly the symptom we hit, where both sides see
+ *  the peer join but neither's hello ever lands. */
+const REDISCOVERY_REJOIN_GAP_MS = 1_500;
 const DIAG_MAX = 80;
 /** Globally-unique app identifier passed to Trystero so MyOwnLLM
  *  peers don't accidentally match peers from unrelated apps that
@@ -125,6 +197,17 @@ export interface PeerEntry {
   /** Six-char verification code the user reads to confirm the
    *  request is the one they expect. */
   verification_code: string;
+  /** Count of consecutive app-level re-handshake attempts since we
+   *  last heard from this peer. 0 means the connection is healthy
+   *  on the keepalive path. Surfaced on the connection card so
+   *  the user can see when we're working through a stall (typical
+   *  on wake from suspend) before giving up. */
+  reconnect_attempts: number;
+  /** Wall-clock ms when the next re-handshake attempt is allowed
+   *  to fire. Null when no re-handshake is pending. The card
+   *  renders a countdown so it's visible that we're throttling
+   *  rather than stuck. */
+  next_reconnect_at: number | null;
 }
 
 interface ConnectionState {
@@ -145,6 +228,12 @@ interface ConnectionState {
    *  prompts the user / auto-approves and sends `approve`. */
   approver_role: boolean;
   handshake_timer: number | null;
+  /** setInterval handle for re-sending `hello` until the peer
+   *  responds with auth_response. Cleared on successful
+   *  authentication, on handshake timeout, and on drop. Separate
+   *  from handshake_timer (a one-shot timeout watchdog) so the
+   *  two roles stay legible. */
+  handshake_hello_retry_timer: number | null;
   /** Last time we received ANY message from this peer (ping,
    *  pong, protocol envelope). Used by the heartbeat tick to
    *  decide if the connection is still alive — catches the
@@ -153,6 +242,30 @@ interface ConnectionState {
   /** setInterval handle for the keepalive ping. Active from the
    *  moment the connection state is created until it's dropped. */
   heartbeat_timer: number | null;
+  /** How many app-level re-handshake attempts we've fired since
+   *  the peer last sent us anything. Reset to 0 on any inbound
+   *  message. Re-handshakes continue indefinitely (no MAX);
+   *  Phase 2 needs the liveness signal to keep trying so the ring
+   *  can react the moment a peer reappears. The conn is only
+   *  dropped when Trystero itself fires onPeerLeave, or the user
+   *  hits Remove. */
+  rehandshake_attempts: number;
+  /** Wall-clock ms before which the next re-handshake is
+   *  suppressed. 0 = no throttle pending. Updated each time we
+   *  send a fresh `hello` from the heartbeat tick. */
+  rehandshake_backoff_until: number;
+  /** Wall-clock ms of the most recent wake event for this conn
+   *  (lifecycle hook fire or detected heartbeat gap). Paired with
+   *  `wake_probe_pending` to give the peer a short probe window
+   *  to respond after wake before the heartbeat declares the
+   *  channel stale — see WAKE_PROBE_DELAY_MS. */
+  wake_at: number;
+  /** True between a wake event and the next inbound message from
+   *  this peer. While true, the heartbeat treats silence past
+   *  WAKE_PROBE_DELAY_MS as stale even though HEARTBEAT_TIMEOUT_MS
+   *  hasn't elapsed — recovers from post-suspend half-dead
+   *  channels in ~1.5s instead of ~15s. */
+  wake_probe_pending: boolean;
 }
 
 class MeshClient {
@@ -165,6 +278,13 @@ class MeshClient {
   my_peer_id = $state("");
   peers = $state<PeerEntry[]>([]);
   diag = $state<DiagEntry[]>([]);
+  /** True while forceRediscovery() is mid-flight (stop → wait →
+   *  reconcile). The Connections list reads this so offline cards
+   *  can show "rediscovering…" instead of a static "offline"
+   *  during the rejoin window — otherwise the card flickers from
+   *  live to gone to offline to handshaking to live with no
+   *  indication that the system is actively working on it. */
+  is_rediscovering = $state(false);
 
   private logDiag(level: DiagLevel, msg: string): void {
     const entry: DiagEntry = { ts: Date.now(), level, msg };
@@ -197,6 +317,43 @@ class MeshClient {
     string,
     { target_peer_id: string; conversation: Conversation; on_complete?: (ok: boolean, err?: string) => void }
   >();
+  /** Wall-clock ms of the last heartbeat tick from ANY connection.
+   *  Used to detect OS sleep/suspend: if the gap between two ticks
+   *  is way larger than HEARTBEAT_INTERVAL_MS, the JS engine was
+   *  frozen and we shouldn't trust the silence windows on any of
+   *  our connections — they look stale only because real time
+   *  advanced while we weren't running. */
+  private last_global_tick_at = 0;
+  /** Wall-clock ms of the most recent forced Trystero room rejoin
+   *  (the rescue path triggered by failed wake probes,
+   *  unresponsive re-handshakes, or the periodic
+   *  offline-rostered-peer check). Throttle gate for
+   *  maybeForceRediscovery() — keeps any number of stuck peers
+   *  from each triggering their own rejoin in quick succession. */
+  private last_force_rediscovery_at = 0;
+  /** How many rediscoveries have fired since the last successful
+   *  auth_response. Indexes into REDISCOVERY_BACKOFF_SCHEDULE_MS
+   *  to grow the throttle window the longer we've been
+   *  unsuccessfully trying. Reset in handleAuthResponse on any
+   *  successful authentication. */
+  private consecutive_rediscovery_attempts = 0;
+  /** setInterval handle for the offline-rostered-peer check.
+   *  Polls every OFFLINE_ROSTERED_CHECK_INTERVAL_MS so the
+   *  non-wake side of an asymmetric sleep still gets a chance
+   *  to refresh its Trystero subscription when a rostered peer
+   *  has been gone too long. */
+  private offline_check_timer: number | null = null;
+  /** Bound lifecycle handlers, kept around so we can remove them
+   *  in stop(). Each observable (visibility, focus, online,
+   *  pageshow) is a hint that we may have just resumed from a
+   *  paused state; the handler converges them all on
+   *  handleWake(). */
+  private lifecycle_handlers: {
+    visibility: () => void;
+    online: () => void;
+    focus: () => void;
+    pageshow: () => void;
+  } | null = null;
 
   // ---- lifecycle -------------------------------------------------------
 
@@ -258,8 +415,13 @@ class MeshClient {
     this.error = "";
     this.identity = opts.identity;
     this.network_id = opts.networkId;
-    this.peers = [];
     this.connections.clear();
+    // Recompute peers immediately — with connections cleared, this
+    // collapses to just the offline-rostered entries from the
+    // existing in-memory roster. Critical during a rediscovery
+    // cycle: without this the Connections list would flash empty
+    // between stop() and the first onPeerJoin of the new room.
+    this.republishPeers();
 
     try {
       this.network_handle = await deriveNetworkHandle(opts.networkId);
@@ -271,6 +433,10 @@ class MeshClient {
     }
 
     await this.refreshRoster();
+    // Roster may have changed since the last run — resync the peer
+    // list so the offline-rostered entries reflect the on-disk
+    // truth before any onPeerJoin updates start landing.
+    this.republishPeers();
 
     const ice_servers = buildIceServers(opts.stunServers, opts.turnServers);
     const room_id = this.network_handle;
@@ -333,13 +499,30 @@ class MeshClient {
     // open/connect handshake to wait for like with peerjs.
     this.status = "online";
     this.my_peer_id = `trystero/${room_id.slice(0, 8)}`;
+    this.last_global_tick_at = 0;
+    // NB: last_force_rediscovery_at intentionally not reset here.
+    // forceRediscovery() runs stop()+reconcile()+start(); reseting
+    // the throttle on the post-rejoin start would let any peer
+    // that immediately hits the rescue threshold trigger another
+    // rejoin a few seconds later, defeating the throttle's whole
+    // purpose. The value survives across rejoin cycles by design.
+    this.installLifecycleHooks();
+    this.offline_check_timer = window.setInterval(() => {
+      this.offlineRosteredCheckTick();
+    }, OFFLINE_ROSTERED_CHECK_INTERVAL_MS);
     this.logDiag("info", `online — listening for peers in room ${room_id.slice(0, 12)}…`);
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.uninstallLifecycleHooks();
+    if (this.offline_check_timer !== null) {
+      clearInterval(this.offline_check_timer);
+      this.offline_check_timer = null;
+    }
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
+      if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
       if (c.heartbeat_timer !== null) clearInterval(c.heartbeat_timer);
     }
     this.connections.clear();
@@ -354,6 +537,7 @@ class MeshClient {
     this.my_peer_id = "";
     this.status = "off";
     this.error = "";
+    this.last_global_tick_at = 0;
     settingsAttention.set("cloud-mesh", null);
     this.logDiag("info", "stopped");
   }
@@ -425,6 +609,80 @@ class MeshClient {
     return null;
   }
 
+  /** User-triggered reconnect. Context-aware so a single "Reconnect"
+   *  button on the connection card does the right thing for the
+   *  card's state:
+   *
+   *  - Active connection mid-re-handshake: clear the backoff and
+   *    fire a fresh hello right now instead of waiting out the
+   *    schedule. Cheap, surgical, doesn't disturb other peers.
+   *  - Offline rostered peer (Trystero says they're gone, so we
+   *    can't talk to them directly): force a full room rediscovery
+   *    by leaving and re-joining. Briefly disturbs other peers
+   *    but it's the only way to nudge Trystero into refreshing
+   *    its peer set when its own discovery loop hasn't seen the
+   *    peer come back yet. */
+  async reconnectPeer(peer_id: string): Promise<void> {
+    const conn = this.connections.get(peer_id);
+    if (conn) {
+      conn.rehandshake_backoff_until = 0;
+      conn.wake_probe_pending = false;
+      this.logDiag(
+        "info",
+        `user-triggered re-handshake to ${peer_id.slice(0, 8)}…`,
+      );
+      this.sendHello(conn);
+      // Counts as an attempt for UI purposes — clamps the user's
+      // ability to hammer the button into a tight loop.
+      conn.rehandshake_attempts += 1;
+      const backoff_ms = REHANDSHAKE_BACKOFF_MS_SCHEDULE[
+        Math.min(conn.rehandshake_attempts - 1, REHANDSHAKE_BACKOFF_MS_SCHEDULE.length - 1)
+      ];
+      conn.rehandshake_backoff_until = Date.now() + backoff_ms;
+      this.republishPeers();
+      return;
+    }
+    await this.forceRediscovery();
+  }
+
+  /** Tear down the Trystero room and rejoin to force a fresh
+   *  discovery pass. The heavy hammer — every active connection
+   *  closes and re-handshakes from scratch — but the only way to
+   *  recover when Trystero's own discovery has stalled (e.g.
+   *  relay socket dropped silently, peer's announcement isn't
+   *  reaching us). Used by the per-peer Reconnect button on
+   *  offline cards and reachable by retry handlers built on top
+   *  of it. */
+  async forceRediscovery(): Promise<void> {
+    if (this.status !== "online" || !this.identity) return;
+    this.is_rediscovering = true;
+    try {
+      // Stamp the throttle so any auto-rediscovery (wake probe,
+      // rescue threshold) that fires in the next minute treats
+      // this as the recent rejoin and stays its hand. User clicks
+      // bypass the throttle check itself — that's intentional —
+      // but they should still inform the automatic path.
+      this.last_force_rediscovery_at = Date.now();
+      this.logDiag("info", "rediscovery — leaving and rejoining mesh room");
+      await this.stop();
+      // stop() blanks `this.peers` so a final-shutdown caller
+      // gets a clean UI; here we're going right back into a join,
+      // so immediately republish to show the offline-rostered
+      // view across the gap. Otherwise the connection card
+      // visibly disappears for a second or two, which is the
+      // exact UX confusion that prompted this change.
+      this.republishPeers();
+      // Give Trystero's underlying transport a beat to fully tear
+      // down before the new join — see REDISCOVERY_REJOIN_GAP_MS.
+      await new Promise<void>((resolve) =>
+        window.setTimeout(resolve, REDISCOVERY_REJOIN_GAP_MS),
+      );
+      await this.reconcile();
+    } finally {
+      this.is_rediscovering = false;
+    }
+  }
+
   async moveConversation(guid: string, target_peer_id: string): Promise<void> {
     const conn = this.connections.get(target_peer_id);
     if (!conn || this.peerStatus(conn) !== "active") {
@@ -462,7 +720,32 @@ class MeshClient {
     const conn = this.createConnState(peer_id);
     this.connections.set(peer_id, conn);
     this.sendHello(conn);
+    // Re-send hello on a tight interval until the peer
+    // reciprocates with auth_response. Right after a Trystero
+    // room rejoin the very first hello tends to be sent before
+    // the underlying data channel is fully ready and gets
+    // silently dropped — without a retry both sides sit on a
+    // dead handshake until the watchdog fires. Cleared in
+    // handleAuthResponse / handshake_timer / dropConnection.
+    conn.handshake_hello_retry_timer = window.setInterval(() => {
+      if (conn.peer_authenticated) {
+        if (conn.handshake_hello_retry_timer !== null) {
+          clearInterval(conn.handshake_hello_retry_timer);
+          conn.handshake_hello_retry_timer = null;
+        }
+        return;
+      }
+      this.logDiag(
+        "info",
+        `re-sending hello to ${peer_id.slice(0, 8)}… (no auth_response yet)`,
+      );
+      this.sendHello(conn);
+    }, HANDSHAKE_HELLO_RETRY_INTERVAL_MS);
     conn.handshake_timer = window.setTimeout(() => {
+      if (conn.handshake_hello_retry_timer !== null) {
+        clearInterval(conn.handshake_hello_retry_timer);
+        conn.handshake_hello_retry_timer = null;
+      }
       // Only fire if we never made it past the cryptographic
       // handshake. Once `peer_authenticated` is set the watchdog
       // is cleared explicitly in handleAuthResponse, so this
@@ -487,15 +770,248 @@ class MeshClient {
 
   private heartbeatTick(conn: ConnectionState): void {
     const now = Date.now();
-    if (now - conn.last_recv_at > HEARTBEAT_TIMEOUT_MS) {
+
+    // Wake detection. setInterval pauses while the OS is suspended,
+    // so a tick-to-tick gap much larger than the configured
+    // interval is the most reliable signal that JS just resumed.
+    // Without this, the very first post-wake tick would compute
+    // (now - last_recv_at) against a pre-sleep timestamp, blow
+    // past HEARTBEAT_TIMEOUT_MS, and start dropping/re-handshaking
+    // every peer at once — even though our channel state is fine
+    // and the peer is probably reachable. Run handleWake once per
+    // detected gap; subsequent ticks in the same wake see the
+    // freshly-reset timestamps and proceed normally.
+    if (
+      this.last_global_tick_at > 0 &&
+      now - this.last_global_tick_at > WAKE_DETECTION_THRESHOLD_MS
+    ) {
+      const gap_s = Math.round((now - this.last_global_tick_at) / 1000);
       this.logDiag(
-        "warn",
-        `peer ${conn.peer_id.slice(0, 8)}… silent for ${Math.round((now - conn.last_recv_at) / 1000)}s — dropping`,
+        "info",
+        `wake detected (${gap_s}s gap since last tick) — resetting liveness windows and probing peers`,
       );
-      this.dropConnection(conn.peer_id);
+      this.handleWake(now);
+    }
+    this.last_global_tick_at = now;
+
+    // Always ping. Keeps the channel warm and gives a dead-WebRTC
+    // peer a chance to send us *anything* back; the send itself
+    // silently fails if the underlying data channel is gone.
+    this.send(conn, { kind: "ping", t: now });
+
+    const silence_ms = now - conn.last_recv_at;
+    const post_wake_silent =
+      conn.wake_probe_pending &&
+      conn.wake_at > 0 &&
+      now - conn.wake_at >= WAKE_PROBE_DELAY_MS;
+    // Two paths into re-handshake:
+    //   1. Already mid-reconnect (attempts > 0) — keep walking
+    //      the backoff schedule until the peer responds.
+    //   2. Fresh stall — silence exceeded the timeout, or wake
+    //      probe expired without a pong.
+    // Without (1), the very next regular tick after entering
+    // re-handshake would see silence_ms reset (it was reset on
+    // wake) and decide we're healthy, so the schedule would
+    // never advance past attempt 1 until silence_ms genuinely
+    // re-accumulates HEARTBEAT_TIMEOUT_MS.
+    const in_reconnect = conn.rehandshake_attempts > 0;
+    const newly_stale =
+      !in_reconnect && (silence_ms > HEARTBEAT_TIMEOUT_MS || post_wake_silent);
+
+    if (!in_reconnect && !newly_stale) {
       return;
     }
-    this.send(conn, { kind: "ping", t: now });
+    conn.wake_probe_pending = false;
+
+    if (now < conn.rehandshake_backoff_until) {
+      // Still throttled — the ping above already went out; just
+      // wait for the backoff window to pass.
+      return;
+    }
+
+    conn.rehandshake_attempts += 1;
+    // Attempts past the schedule's length stay at the last entry,
+    // so we never re-handshake faster than the 30s cap but also
+    // never give up — Phase 2 routing needs the loop to keep
+    // running so a peer that wakes back up an hour later still
+    // recovers without manual intervention.
+    const next_backoff_ms = REHANDSHAKE_BACKOFF_MS_SCHEDULE[
+      Math.min(conn.rehandshake_attempts - 1, REHANDSHAKE_BACKOFF_MS_SCHEDULE.length - 1)
+    ];
+    conn.rehandshake_backoff_until = now + next_backoff_ms;
+    const reason = newly_stale
+      ? post_wake_silent
+        ? `no response within ${WAKE_PROBE_DELAY_MS / 1000}s of wake`
+        : `silent ${Math.round(silence_ms / 1000)}s`
+      : `still unresponsive`;
+    this.logDiag(
+      "warn",
+      `peer ${conn.peer_id.slice(0, 8)}… ${reason} — re-handshake attempt ${conn.rehandshake_attempts} (next in ${next_backoff_ms / 1000}s)`,
+    );
+    this.sendHello(conn);
+    this.republishPeers();
+
+    // App-level hellos can only reach a peer whose WebRTC channel
+    // is still alive at the Trystero layer. Once we've burned
+    // through several attempts with no response, escalate to a
+    // room rejoin — the underlying channel is likely dead and
+    // only a fresh discovery cycle can produce a new one.
+    if (conn.rehandshake_attempts === REHANDSHAKE_RESCUE_ATTEMPTS) {
+      this.maybeForceRediscovery(
+        `${conn.peer_id.slice(0, 8)}… unresponsive after ${REHANDSHAKE_RESCUE_ATTEMPTS} re-handshakes`,
+      );
+    }
+  }
+
+  /** Throttled wrapper around forceRediscovery. Multiple stuck
+   *  peers can call this in quick succession — the throttle
+   *  ensures only one rejoin actually happens per
+   *  REDISCOVERY_BACKOFF_SCHEDULE_MS window. Logged either
+   *  way so the Activity panel shows what's been suppressed. */
+  private maybeForceRediscovery(reason: string): void {
+    const now = Date.now();
+    const idx = Math.min(
+      this.consecutive_rediscovery_attempts,
+      REDISCOVERY_BACKOFF_SCHEDULE_MS.length - 1,
+    );
+    const min_interval = REDISCOVERY_BACKOFF_SCHEDULE_MS[idx];
+    if (now - this.last_force_rediscovery_at < min_interval) {
+      const wait_s = Math.ceil(
+        (min_interval - (now - this.last_force_rediscovery_at)) / 1000,
+      );
+      this.logDiag(
+        "info",
+        `rediscovery throttled (${reason}) — next rejoin allowed in ${wait_s}s`,
+      );
+      return;
+    }
+    this.last_force_rediscovery_at = now;
+    this.consecutive_rediscovery_attempts += 1;
+    this.logDiag(
+      "info",
+      `auto rediscovery #${this.consecutive_rediscovery_attempts} — ${reason}`,
+    );
+    void this.forceRediscovery();
+  }
+
+  /** Periodic safety net: if any peer in our roster isn't currently
+   *  in our active connection set, ask for a rediscovery. Covers
+   *  the asymmetric-sleep case the heartbeat-rescue path can't
+   *  reach — once Trystero on this side has fired onPeerLeave for
+   *  the absent peer there's no per-peer heartbeat left to drive
+   *  a rejoin from, so we need a separate poll. The actual rejoin
+   *  is throttled by REDISCOVERY_BACKOFF_SCHEDULE_MS, so calling
+   *  every OFFLINE_ROSTERED_CHECK_INTERVAL_MS just keeps the
+   *  pressure on — only one rejoin per window actually fires. */
+  private offlineRosteredCheckTick(): void {
+    if (this.roster_pubkeys.size === 0) return;
+    const active_pubkeys = new Set<string>();
+    for (const conn of this.connections.values()) {
+      if (conn.device_pubkey) active_pubkeys.add(conn.device_pubkey);
+    }
+    let offline = 0;
+    for (const pk of this.roster_pubkeys) {
+      if (!active_pubkeys.has(pk)) offline += 1;
+    }
+    if (offline === 0) return;
+    this.maybeForceRediscovery(
+      `${offline} rostered peer(s) offline — refreshing Trystero discovery`,
+    );
+  }
+
+  /** Treat every active connection as if it just resumed: clear
+   *  the silence window, mark a wake-probe pending, send a fresh
+   *  ping, and schedule an early heartbeat tick so we don't wait
+   *  the full HEARTBEAT_INTERVAL_MS to notice that the peer
+   *  didn't pong. If the peer answers, handleMessage clears the
+   *  pending flag and the next regular tick sees a healthy
+   *  connection; if not, the early tick enters the re-handshake
+   *  loop within WAKE_PROBE_DELAY_MS of wake. */
+  private handleWake(now: number): void {
+    if (this.connections.size === 0) return;
+    for (const conn of this.connections.values()) {
+      conn.last_recv_at = now;
+      conn.wake_at = now;
+      conn.wake_probe_pending = true;
+      conn.rehandshake_backoff_until = 0;
+      this.send(conn, { kind: "ping", t: now });
+    }
+    window.setTimeout(() => {
+      // Count peers that didn't reply to the wake ping. If none
+      // responded the WebRTC channels are almost certainly dead
+      // (the laptop-slept-while-home-office-stayed-on case) and
+      // we need a fresh discovery pass — Trystero keeps the
+      // peer ids in its room state until it notices the
+      // half-closed datachannels itself, which can take minutes.
+      // Short-circuiting to a rejoin here gets us reconnected
+      // in seconds instead.
+      let unresponsive = 0;
+      let total = 0;
+      for (const conn of this.connections.values()) {
+        total++;
+        if (conn.wake_probe_pending) unresponsive++;
+      }
+      if (total > 0 && unresponsive === total) {
+        this.maybeForceRediscovery(
+          `wake probe: all ${total} peer(s) unresponsive`,
+        );
+        return;
+      }
+      for (const conn of this.connections.values()) {
+        this.heartbeatTick(conn);
+      }
+    }, WAKE_PROBE_DELAY_MS);
+  }
+
+  /** Bind OS lifecycle observables that signal the JS runtime may
+   *  have just resumed from a paused state — laptop opened,
+   *  network came back, tab refocused. Each one funnels into
+   *  handleWake(), which gives stale-looking connections a chance
+   *  to prove they're still alive before we drop them. Multiple
+   *  hooks because no single event covers every platform: e.g.
+   *  Tauri webview doesn't always fire `visibilitychange` on lid
+   *  events, and `online` only fires on actual network toggles. */
+  private installLifecycleHooks(): void {
+    if (this.lifecycle_handlers !== null) return;
+    if (typeof window === "undefined") return;
+    const wake = () => {
+      // Reset the inter-tick clock so the heartbeat tick that
+      // runs immediately after doesn't also fire its own wake
+      // detection on the same event.
+      this.last_global_tick_at = Date.now();
+      this.handleWake(Date.now());
+    };
+    const handlers = {
+      visibility: () => {
+        if (typeof document !== "undefined" && document.visibilityState === "visible") {
+          wake();
+        }
+      },
+      online: wake,
+      focus: wake,
+      pageshow: wake,
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", handlers.visibility);
+    }
+    window.addEventListener("online", handlers.online);
+    window.addEventListener("focus", handlers.focus);
+    window.addEventListener("pageshow", handlers.pageshow);
+    this.lifecycle_handlers = handlers;
+  }
+
+  private uninstallLifecycleHooks(): void {
+    if (this.lifecycle_handlers === null) return;
+    const h = this.lifecycle_handlers;
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", h.visibility);
+    }
+    if (typeof window !== "undefined") {
+      window.removeEventListener("online", h.online);
+      window.removeEventListener("focus", h.focus);
+      window.removeEventListener("pageshow", h.pageshow);
+    }
+    this.lifecycle_handlers = null;
   }
 
   private handlePeerLeave(peer_id: string): void {
@@ -519,6 +1035,11 @@ class MeshClient {
       heartbeat_timer: null,
       approver_role: false, // set in handleHello once we know both pubkeys
       handshake_timer: null,
+      handshake_hello_retry_timer: null,
+      rehandshake_attempts: 0,
+      rehandshake_backoff_until: 0,
+      wake_at: 0,
+      wake_probe_pending: false,
     };
   }
 
@@ -556,7 +1077,20 @@ class MeshClient {
 
   private async handleMessage(peer_id: string, msg: MeshMessage): Promise<void> {
     const conn = this.connections.get(peer_id);
-    if (conn) conn.last_recv_at = Date.now();
+    if (conn) {
+      conn.last_recv_at = Date.now();
+      // ANY inbound message is proof of life — clear the wake
+      // probe and the re-handshake backoff so the UI reverts the
+      // "reconnecting" badge and we stop sending re-handshake
+      // hellos. The conditional republish keeps the UI quiet for
+      // healthy traffic (which is the common case).
+      conn.wake_probe_pending = false;
+      if (conn.rehandshake_attempts !== 0 || conn.rehandshake_backoff_until !== 0) {
+        conn.rehandshake_attempts = 0;
+        conn.rehandshake_backoff_until = 0;
+        this.republishPeers();
+      }
+    }
     if (!conn) {
       // Message from a peer we don't have state for — possible if
       // trystero delivers a message before onPeerJoin fires, or
@@ -681,12 +1215,22 @@ class MeshClient {
       return;
     }
     conn.peer_authenticated = true;
-    // Cryptographic handshake is complete — kill the watchdog. The
-    // peer is now genuinely waiting on user approval (locally or
-    // remotely) and that can take as long as it takes.
+    // A successful auth means the mesh is fundamentally working —
+    // reset the rediscovery backoff counter so the next outage
+    // gets the fast first-rejoin window, not whatever stretched
+    // schedule we'd worked our way up to.
+    this.consecutive_rediscovery_attempts = 0;
+    // Cryptographic handshake is complete — kill the watchdog and
+    // the hello-retry interval. The peer is now genuinely waiting
+    // on user approval (locally or remotely) and that can take
+    // as long as it takes.
     if (conn.handshake_timer !== null) {
       clearTimeout(conn.handshake_timer);
       conn.handshake_timer = null;
+    }
+    if (conn.handshake_hello_retry_timer !== null) {
+      clearInterval(conn.handshake_hello_retry_timer);
+      conn.handshake_hello_retry_timer = null;
     }
     this.logDiag(
       "info",
@@ -852,6 +1396,7 @@ class MeshClient {
     const c = this.connections.get(peer_id);
     if (!c) return;
     if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
+    if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
     if (c.heartbeat_timer !== null) clearInterval(c.heartbeat_timer);
     this.connections.delete(peer_id);
     for (const [guid, pending] of this.pending_moves_out) {
@@ -897,6 +1442,8 @@ class MeshClient {
         local_approved: c.local_approved,
         remote_approved: c.remote_approved,
         verification_code: c.approver_role ? c.their_verification_code : c.our_verification_code,
+        reconnect_attempts: c.rehandshake_attempts,
+        next_reconnect_at: c.rehandshake_attempts > 0 ? c.rehandshake_backoff_until : null,
       };
     });
 
@@ -924,6 +1471,8 @@ class MeshClient {
         local_approved: false,
         remote_approved: false,
         verification_code: "",
+        reconnect_attempts: 0,
+        next_reconnect_at: null,
       });
     }
     return [...active, ...offline];

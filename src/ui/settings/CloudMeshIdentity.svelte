@@ -78,6 +78,18 @@
   }
 
   function statusLabel(p: { status: string; local_approved: boolean; remote_approved: boolean; approver_role: boolean }): string {
+    // While the client is mid-rediscovery (leaving + rejoining the
+    // Trystero room), offline-rostered peers are about to get a
+    // fresh discovery pass. Surface that so the card reads as
+    // "actively working on it" rather than going dark for the
+    // duration of the rejoin window.
+    if (
+      p.status === "offline" &&
+      meshClient.is_rediscovering &&
+      meshClient.status !== "off"
+    ) {
+      return "rediscovering…";
+    }
     switch (p.status) {
       case "connecting":
         return "connecting";
@@ -104,6 +116,39 @@
     const d = new Date(ts);
     const pad = (n: number) => String(n).padStart(2, "0");
     return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  /** Live wall-clock used to render reconnection countdowns. Updates
+   *  once a second only while at least one connection is mid-
+   *  reconnect, so we don't burn a ticker when the mesh is idle. */
+  let now = $state(Date.now());
+  let reconnecting = $derived(
+    meshClient.peers.some((p) => p.reconnect_attempts > 0),
+  );
+  $effect(() => {
+    if (!reconnecting) return;
+    const h = window.setInterval(() => {
+      now = Date.now();
+    }, 1_000);
+    return () => window.clearInterval(h);
+  });
+
+  function reconnectLabel(p: {
+    reconnect_attempts: number;
+    next_reconnect_at: number | null;
+  }): string {
+    if (p.reconnect_attempts <= 0) return "";
+    // No max — mesh-client retries indefinitely, capped at 30s per
+    // attempt. Display attempts as a free-running counter so the
+    // user can see we're still trying.
+    if (p.next_reconnect_at === null) {
+      return `reconnecting · attempt ${p.reconnect_attempts}`;
+    }
+    const remaining = Math.max(0, p.next_reconnect_at - now);
+    if (remaining <= 0) {
+      return `reconnecting · attempt ${p.reconnect_attempts} · retrying…`;
+    }
+    return `reconnecting · attempt ${p.reconnect_attempts} · next in ${Math.ceil(remaining / 1000)}s`;
   }
 
   onMount(async () => {
@@ -461,6 +506,8 @@
               class="peer-row"
               class:awaiting={p.status === "pending_remote"}
               class:offline={p.status === "offline"}
+              class:reconnecting={p.reconnect_attempts > 0}
+              class:rediscovering={p.status === "offline" && meshClient.is_rediscovering && meshClient.status !== "off"}
             >
               <div class="peer-main">
                 <div class="peer-label">
@@ -469,6 +516,11 @@
                     <span class="peer-suffix" title="Stable display tag derived from this peer's pubkey">-{p.device_suffix}</span>
                   {/if}
                   {#if p.authorized && p.status !== "offline"}<span class="badge ok">approved</span>{/if}
+                  {#if p.reconnect_attempts > 0}
+                    <span class="badge reconnect" title="App-level re-handshake in progress — typical after waking from sleep or a brief network blip. Drops after 5 attempts without a response.">
+                      {reconnectLabel(p)}
+                    </span>
+                  {/if}
                 </div>
                 <code class="peer-pubkey" title={p.device_pubkey}>{shortPubkeyBody(p.device_pubkey)}</code>
                 {#if p.status === "pending_remote" && p.local_approved && p.verification_code}
@@ -479,6 +531,17 @@
                 {/if}
               </div>
               <span class="peer-status" data-status={p.status}>{statusLabel(p)}</span>
+              {#if p.status === "offline" || p.reconnect_attempts > 0}
+                <button
+                  class="btn-small ghost"
+                  onclick={() => meshClient.reconnectPeer(p.peer_id)}
+                  title={p.status === "offline"
+                    ? "Force a fresh discovery pass — briefly disturbs every connected peer to nudge Trystero into seeing this one again."
+                    : "Skip the backoff and re-handshake right now."}
+                >
+                  Reconnect
+                </button>
+              {/if}
               <button class="btn-small ghost" onclick={() => meshClient.removePeer(p.peer_id)} title={p.status === "offline" ? "Forget this peer (removes from roster)" : "Disconnect and revoke approval"}>
                 {p.status === "offline" ? "Forget" : "Remove"}
               </button>
@@ -835,6 +898,22 @@
   .peer-row.offline .peer-name,
   .peer-row.offline .peer-suffix { color: #888; }
   .peer-row.offline .peer-pubkey { color: #555; }
+  /* Rediscovering peers override the muted offline look — the
+     client is actively rejoining the room to find them again, so
+     the row reads as "in flight" rather than "gone". */
+  .peer-row.rediscovering {
+    opacity: 1;
+    background: #131310;
+    border-color: #3a2f10;
+  }
+  .peer-row.rediscovering .peer-name,
+  .peer-row.rediscovering .peer-suffix { color: #ddd; }
+  .peer-row.rediscovering .peer-pubkey { color: #888; }
+  .peer-row.rediscovering .peer-status {
+    color: #d6b25a;
+    background: #2a220e;
+    animation: reconnect-pulse 1.6s ease-in-out infinite;
+  }
 
   .peer-name {
     font-size: 0.85rem;
@@ -1020,6 +1099,23 @@
   .badge.pending {
     color: #ffd166;
     background: #2a2210;
+  }
+  .badge.reconnect {
+    color: #d6b25a;
+    background: #2a220e;
+    text-transform: none;
+    letter-spacing: 0;
+    font-family: monospace;
+    /* Subtle pulse so the row reads as "actively working" rather
+       than "stuck" while the backoff window counts down. */
+    animation: reconnect-pulse 1.6s ease-in-out infinite;
+  }
+  .peer-row.reconnecting {
+    border-color: #3a2f10;
+  }
+  @keyframes reconnect-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
   }
   .btn-small.primary {
     background: #2a3a55;
