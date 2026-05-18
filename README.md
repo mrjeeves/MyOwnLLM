@@ -2,46 +2,17 @@
 
 # MyOwnLLM
 
-### Distributed Intelligence.<br>Make your own LLM — not just local, but meshed across every device you own,<br>each one adding its powers to the whole.
+### An AI that runs on every device you own — and manages itself.
 
-[**myownllm.net**](https://myownllm.net) — installers, screenshots, the pitch
-
-[Docs](DOCS.md) · [Architecture](ARCHITECTURE.md) · [Contributing](CONTRIBUTING.md) · [License](LICENSE)
+[**Download**](https://myownllm.net) · [Docs](DOCS.md) · [Architecture](ARCHITECTURE.md) · [Contributing](CONTRIBUTING.md)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-macOS_·_Linux_·_Windows_·_Pi_5-2ea44f.svg)](DOCS.md#installation)
-[![OpenAI-compatible](https://img.shields.io/badge/OpenAI-compatible-10a37f.svg)](DOCS.md#api-server)
-[![Ollama-compatible](https://img.shields.io/badge/Ollama-compatible-ff7a59.svg)](DOCS.md#api-server)
-[![Anthropic-compatible](https://img.shields.io/badge/Anthropic-compatible-d97757.svg)](DOCS.md#api-server)
+[![Platforms](https://img.shields.io/badge/macOS_·_Linux_·_Windows_·_Pi-2ea44f.svg)](DOCS.md#installation)
+[![OpenAI · Ollama · Anthropic compatible](https://img.shields.io/badge/API-compatible-10a37f.svg)](DOCS.md#api-server)
 
 </div>
 
----
-
-## Why this exists
-
-The local-LLM piece *is* a solved problem now. Ollama installs in one command. LMStudio gives you a model picker with backend choice. We use both of those ourselves, because they work. So this isn't another local-LLM installer dressed up in different copy.
-
-What *isn't* free and easy is everything else that was supposed to come with the AI revolution. Multi-speaker diarized transcription that doesn't ship your meetings to a vendor. A speaker timeline that stays stable for two hours instead of resetting every window. A talking-points summary that grows with the conversation in real time. *Distributed intelligence* — every device you own contributing to a shared pool of compute and capability, so a phone, a Pi 5, a laptop, and a workstation make **one** AI rather than four separate metered subscriptions. Your phone's mic + diarization; the Pi 5's idle hours of LLM throughput; the workstation's GPU when you need the big model. Pick the host per surface — chat through the laptop, talking points through the Pi, transcription on whichever box has the mic — and pin it; the pin survives reconnects and reloads. A peer dropping pauses the work tied to it instead of silently routing to a smaller model on the box in front of you.
-
-That's what we thought AI was going to be before it turned into a host of separate metered APIs. MyOwnLLM is the pieces that didn't get built — packaged as a desktop app, scriptable from the CLI, with a local OpenAI-compatible endpoint thrown in because if we're already on your machine, we may as well serve a model too.
-
-**What ships today:**
-
-|   |   |
-|---|---|
-| **Multi-speaker diarized transcription** | Mic-to-text in ~1 s on a Pi 5 (English) or 80–200 ms on capable hardware (25 languages), with `pyannote-segmentation-3.0` + an embedder driving speaker IDs that stay stable across the whole session — not just a single window. Click a speaker pill to rename them; labels persist with the session. A live Talking-Points summary grows alongside the transcript. In-process — no Python venv, no whisper-server sidecar, no cloud round-trip. |
-| **A local LLM endpoint that just works** | OpenAI-compatible HTTP on `127.0.0.1:1473` (also Ollama, also Anthropic), serving whichever model fits the machine — picked by a JSON manifest you, your team, or someone you trust controls. Cursor, Continue, Aider, Cline, Zed, Open WebUI, opencode, **OpenClaw**, OpenClaude, and your own scripts target it on day one. No metered tokens, no vendor lock-in. |
-
-**What ships now alongside — Cloud Mesh:**
-
-Every MyOwnLLM instance becomes a window into the same mesh. Devices share a Network ID (a short human name like `office-mesh`, hashed for namespace cleanliness), find each other through [Trystero](https://trystero.dev) over public Nostr relays — no MyOwnLLM-operated signaling server, no API key to register, no single point of failure — and connect peer-to-peer over WebRTC. Mutual ed25519 auth handshake with a per-request verification code locks down who's actually on your mesh. A second laptop joins and its LLM becomes a routing target in the **model selector** under each surface (chat, transcribe, talking points) — picking a peer there hands inference to that device. Pins are by **device pubkey**, persisted in localStorage, so a reload or a peer hop doesn't drop them; the last-known capabilities are cached so an offline pinned host still renders with its model hint and an "(offline)" tag. When a pinned peer drops, the surface using it **pauses or errors** rather than silently downgrading to local — you decide between waiting, picking a different host, or falling back to this device. Conversations move between devices from the right-click menu or the **Connections** tab's cross-device grid. The mesh self-balances: it stays full-mesh at small sizes and switches to a deterministic ring topology past three peers so Pi-class devices don't melt under N² connection counts. Self-host a Nostr relay for an air-gapped office/LAN mesh; one-line Docker command in the Settings sub-tab. Transcribe routing is wired on the sender + protocol surface; the receiver's Rust audio pipeline lands in a follow-up. See **Settings → Cloud Mesh** in the GUI, or [DOCS.md › Cloud Mesh](DOCS.md#cloud-mesh) for the full reference.
-
 ## Install
-
-The fast path is [**myownllm.net**](https://myownllm.net) — signed installers for every platform.
-
-Or one line in a shell:
 
 ```sh
 # macOS / Linux
@@ -53,69 +24,39 @@ curl -fsSL https://raw.githubusercontent.com/mrjeeves/MyOwnLLM/main/scripts/inst
 irm https://raw.githubusercontent.com/mrjeeves/MyOwnLLM/main/scripts/install.ps1 | iex
 ```
 
-Then:
+Signed installers for every platform: [**myownllm.net**](https://myownllm.net).
+
+## One binary, three personas
 
 ```sh
-myownllm          # opens the GUI
-myownllm serve    # headless API on :1473
+myownllm          # desktop GUI (Tauri + Svelte 5)
+myownllm serve    # OpenAI / Ollama / Anthropic HTTP on :1473
 myownllm run      # terminal chat
 ```
 
-## Live transcription, on your machine
+## What it does
 
-A first-class capture pipeline, not a sidebar feature. Mic in, segmented transcript out, with speakers attributed and a live summary growing alongside it — all in-process, all on-device.
+- **One AI across your devices.** Boxes on the same Network ID find each other via [Trystero](https://trystero.dev) over public Nostr relays — no MyOwnLLM-operated broker, no account, no API key. Share inference, pass conversations, pin a peer per surface. Self-host a relay for an air-gapped LAN.
+- **Every device makes it stronger.** A Pi can borrow the workstation's model over the mesh; the workstation can serve the laptop's chat. Manifest-driven hardware tier selection covers Pi 4 2 GB through a 4090; edge variants for Gemma 4 (`e2b`/`e4b`) and Qwen 3.6 down to 0.8b.
+- **It's its own IT.** The chat is a tool-calling agent with four tools today — `networks` (mesh: status / add / approve / switch / forget / reconnect / rediscover / accepting / recent activity), `shell`, `read_file`, `write_file`. `shell` and `write_file` route through a per-device permission gate (Deny / Allow once / Always for this command-or-path / Always for the tool); decisions persist in `Config.agent_permissions.by_device[<device_id>]`. **Tools execute on the caller's box even when inference is on a remote peer** — your Pi can borrow the 4090 and still configure the Pi.
+- **Diarized live transcription.** Moonshine or Parakeet TDT (25 languages), `pyannote-segmentation-3.0` + online clustering. Speaker IDs stay stable across the whole session — not per window. In-process; no Python venv, no whisper sidecar.
+- **Talking Points.** A live LLM loop summarises the growing transcript into a bullet list while you talk. Pausable, persisted with the session, on-device.
+- **Three wire formats, one server.** OpenAI on `:1473`, plus Ollama and Anthropic. Cursor, Continue, Aider, Cline, Zed, Open WebUI, opencode all just work.
+- **Self-updating.** Stages on launch, applies next start. Last-good manifest cached for offline runs.
 
-- **Streaming ASR.** Moonshine Small on a Pi 5 (English, ~500 ms), Parakeet TDT 0.6B v3 on capable hardware (25 languages, 80–200 ms). Streaming-native: one segment per audio chunk, no 5-second minimum.
-- **Speaker diarization.** Opt-in toggle. `pyannote-segmentation-3.0` plus a speaker embedder (`wespeaker-r34` on capable hardware, `campp-small` on the lower rung), with online agglomerative clustering on the Rust side — speaker IDs stay stable across the entire conversation, not just a single window. Click a speaker pill to rename them; the labels persist with the session.
-- **Talking Points.** A continuous LLM loop summarises the live transcript into a growing bullet list while you talk. The list updates as the conversation evolves, is persisted with the session, and can be paused, resumed, or stopped from the mode bar. It claims the chat-model slot while running so it can use whichever local model your hardware tier picked for text.
-- **Crash-resilient by design.** Audio chunks land on disk before the ASR backend sees them, so a force-quit can be drained on next launch. Transcripts, speaker labels, diarize state, and the talking-points list are all part of the conversation record.
-- **In-process.** No Python venv, no whisper-server sidecar, no cloud round-trip. ASR, diarization, and the chat model used to summarise all run inside `myownllm` itself, coordinated through two singleton slots on the GUI's mode bar.
-
-Both paths — chat and transcription — are designed to be available on the GUI, the headless `serve` API, and the HTTP remote view. The desktop GUI is the most complete today; full audio capture over `serve` / remote is on the near-term roadmap.
-
-## Highlights
-
-|   |   |
-|---|---|
-| **Multi-speaker diarized transcription** | Speaker IDs that stay stable across the whole session, not just a single window. `pyannote-segmentation-3.0` + a speaker embedder, online clustering on the Rust side. The part the rest of the ecosystem hand-waves. |
-| **Cloud Mesh — Distributed Intelligence** | Devices on the same Network ID find each other via Trystero (Nostr relays, no central broker) and connect peer-to-peer over WebRTC. Mutual ed25519 auth handshake with per-request verification code; identity is a long-lived keypair under `~/.myownllm/.secrets/`. **Per-surface model selector** picks the host for chat, transcribe, and talking points independently — pin by device pubkey so reconnects don't drop the pick. Talking Points routes end-to-end; chat routes via `infer_request`; transcribe protocol is shipped with a Rust pipeline follow-up. Pinned peers go offline? The surface **pauses or errors** so you don't get silent fallback to a smaller local model. **Catalog gossip** + a **Network** sub-tab show every conversation on every device in one grid; click an empty cell to Move it. Ring topology with bounded connections so 10-device meshes work. Self-host a Nostr relay for an air-gapped mesh. |
-| **Three wire formats, one server** | OpenAI on `:1473`, plus Ollama and Anthropic. Point Cursor, Continue, Aider, Cline, Zed, Open WebUI, opencode, OpenClaw, OpenClaude or your own scripts at it and it just works. |
-| **Virtual model IDs** | `myownllm` and `myownllm-transcribe`. Stable names; the right tag for your hardware auto-resolves. |
-| **Manifests, not config** | A JSON file at a URL is the source of truth. `imports` compose merged catalogs across publishers — no coordination required. |
-| **Runs on a Pi 5** | Default manifest ships Gemma 4 edge variants (`e2b` / `e4b`), Apache-2.0, ~7.6 tok/s on a Pi 5. Same manifest gives a 4090 the 4090 tag. |
-| **Desktop GUI** | Tauri + Svelte 5. Two singleton slots (chat-model, transcription) with conversation folders, in-place rename, crash-recoverable state. |
-| **HTTP remote** | Open the GUI from your phone (or any HTTP client) on the same network. Single-user lock with kick-and-hide. (Lives under **Networks → HTTP**.) |
-| **Self-updating** | Stages quietly on launch, applies on next start. Last good manifest stays cached for offline runs. |
-| **Scriptable end-to-end** | Every CLI subcommand returns parseable text or `--json`. |
-
-## CLI
+## Drop-in OpenAI
 
 ```sh
-myownllm                 # GUI
-myownllm serve           # API server
-myownllm run             # terminal chat
-myownllm status          # provider, hardware, daemon, update
-myownllm models          # what's pulled, what could be
-myownllm families        # list / switch family
-myownllm providers       # list / switch provider
-myownllm update          # check / apply / configure self-update
+myownllm serve &
+curl http://127.0.0.1:1473/v1/chat/completions \
+  -H 'Authorization: Bearer myownllm' \
+  -d '{"model":"myownllm","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-Full reference: [DOCS.md › CLI](DOCS.md#cli).
+## Platforms
 
-## Build from source
-
-```sh
-git clone https://github.com/mrjeeves/MyOwnLLM && cd MyOwnLLM
-just setup && just build
-```
-
-Repo layout, dev loop, and commit style live in [CONTRIBUTING.md](CONTRIBUTING.md).
+macOS 12+ (Apple Silicon) · Linux x86_64 / aarch64 · Windows 10+ · Raspberry Pi 4 & 5. Signed, auto-updating, ~50 MB app plus first-run model.
 
 ## More
 
-- [**myownllm.net**](https://myownllm.net) — installers, screenshots, the pitch
-- [DOCS.md](DOCS.md) — manifest format, client configs, provider/family system, auto-update, lifecycle, scripting, repackaging
-- [ARCHITECTURE.md](ARCHITECTURE.md) — internals, modules, data flow
-- [CONTRIBUTING.md](CONTRIBUTING.md) — setup, repo layout, commit style
-- [LICENSE](LICENSE) — MIT
+[DOCS.md](DOCS.md) — manifests, CLI, API, lifecycle, scripting · [ARCHITECTURE.md](ARCHITECTURE.md) — internals, modules, data flow · [CONTRIBUTING.md](CONTRIBUTING.md) — setup, repo layout, commit style · [LICENSE](LICENSE) — MIT
