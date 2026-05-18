@@ -731,25 +731,30 @@ pub enum ChatStreamOutcome {
 }
 
 /// Streamed chat completion. Invokes `on_content` for each visible token
-/// chunk and `on_thinking` for any reasoning/thinking deltas (thinking
-/// models emit those in `message.thinking`; non-thinking models never call
-/// it). `on_done` fires exactly once at stream end. Same CORS-bypass
-/// rationale as `chat_once`.
+/// chunk, `on_thinking` for any reasoning/thinking deltas (thinking models
+/// emit those in `message.thinking`; non-thinking models never call it),
+/// and `on_tool_call` for each complete `message.tool_calls[]` entry the
+/// model emits when `tools` is supplied. `on_done` fires exactly once at
+/// stream end. Same CORS-bypass rationale as `chat_once`.
 ///
 /// Pass a unique `stream_id`; calling `cancel(stream_id)` from another task
 /// aborts the in-flight request and resolves the future as `Cancelled`.
-pub async fn chat_stream<FC, FT, FE>(
+#[allow(clippy::too_many_arguments)] // four callbacks + four config params is the natural shape
+pub async fn chat_stream<FC, FT, FU, FE>(
     stream_id: &str,
     model: &str,
     messages: serde_json::Value,
     think: Option<bool>,
+    tools: Option<serde_json::Value>,
     mut on_content: FC,
     mut on_thinking: FT,
+    mut on_tool_call: FU,
     on_done: FE,
 ) -> Result<ChatStreamOutcome>
 where
     FC: FnMut(&str),
     FT: FnMut(&str),
+    FU: FnMut(&serde_json::Value),
     FE: FnOnce(ChatStreamOutcome),
 {
     ensure_running().await?;
@@ -770,6 +775,14 @@ where
     if let Some(t) = think {
         body["think"] = serde_json::json!(t);
     }
+    // `tools`: the OpenAI-style function-tool list. Ollama 0.3+ accepts it
+    // for tool-supporting models and emits `message.tool_calls[]` once the
+    // model has decided to call one. Skipping the field entirely keeps
+    // backwards-compat behaviour for non-tool callers (Talking Points,
+    // title generation, chats without a tool-using system prompt).
+    if let Some(t) = tools {
+        body["tools"] = t;
+    }
 
     // Register the cancel notifier BEFORE the network call so a cancel
     // racing with an early-arriving first byte still wins.
@@ -779,7 +792,15 @@ where
         .await
         .insert(stream_id.to_string(), notify.clone());
 
-    let result = chat_stream_inner(&client, body, notify, &mut on_content, &mut on_thinking).await;
+    let result = chat_stream_inner(
+        &client,
+        body,
+        notify,
+        &mut on_content,
+        &mut on_thinking,
+        &mut on_tool_call,
+    )
+    .await;
     cancels().lock().await.remove(stream_id);
 
     match &result {
@@ -789,16 +810,18 @@ where
     result
 }
 
-async fn chat_stream_inner<FC, FT>(
+async fn chat_stream_inner<FC, FT, FU>(
     client: &reqwest::Client,
     body: serde_json::Value,
     notify: Arc<Notify>,
     on_content: &mut FC,
     on_thinking: &mut FT,
+    on_tool_call: &mut FU,
 ) -> Result<ChatStreamOutcome>
 where
     FC: FnMut(&str),
     FT: FnMut(&str),
+    FU: FnMut(&serde_json::Value),
 {
     // Race the POST itself against cancel — a user hitting Stop before the
     // first byte should still abort instead of waiting for the model to
@@ -853,6 +876,16 @@ where
             if let Some(delta) = v["message"]["content"].as_str() {
                 if !delta.is_empty() {
                     on_content(delta);
+                }
+            }
+            // Tool calls arrive as a full JSON array on the same frame as
+            // (or just before) the terminal `done: true`. Each element is
+            // `{function: {name, arguments}}` — pass through verbatim so the
+            // frontend agent loop can route on the function name without
+            // the Rust side having to know about specific tools.
+            if let Some(calls) = v["message"]["tool_calls"].as_array() {
+                for call in calls {
+                    on_tool_call(call);
                 }
             }
             if v["done"].as_bool().unwrap_or(false) {

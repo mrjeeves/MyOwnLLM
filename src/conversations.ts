@@ -17,12 +17,36 @@ import type { Mode } from "./types";
 /**
  * One turn of a chat. Mirrors the in-memory `Message` shape used by the
  * chat panel; persisted to JSON so reloading a conversation is a verbatim
- * round-trip (including `thinking` blocks from reasoning models).
+ * round-trip (including `thinking` blocks from reasoning models and
+ * any tool-calling intermediate steps).
+ *
+ * `role: "tool"` carries the JSON-stringified return value of a tool the
+ * assistant called (the `name` field names the tool). An assistant turn
+ * that called tools mid-thought carries those in `tool_calls`; the
+ * subsequent tool messages are paired by `tool_call_id`.
  */
+export interface ToolCall {
+  /** Caller-assigned id (we use `crypto.randomUUID()` slices) — echoed
+   *  in the tool-result message so multi-tool turns pair correctly. */
+  id: string;
+  function: {
+    name: string;
+    arguments: Record<string, unknown>;
+  };
+}
+
 export interface StoredMessage {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "tool" | "system";
   content: string;
   thinking?: string;
+  /** Set on assistant turns that invoked one or more tools before
+   *  emitting their final text. Empty / undefined when no tools were
+   *  called. */
+  tool_calls?: ToolCall[];
+  /** Set on `role: "tool"` messages — the tool that produced this
+   *  result, and the id of the tool_call it pairs with. */
+  name?: string;
+  tool_call_id?: string;
 }
 
 /** One unit of transcribed speech. Mirrors `transcribe::EmittedSegment`

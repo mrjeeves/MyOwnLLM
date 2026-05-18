@@ -1,6 +1,5 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import TopBar from "./TopBar.svelte";
   import TextBar from "./TextBar.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
@@ -12,6 +11,7 @@
     generateTitle,
     type Conversation,
     type StoredMessage,
+    type ToolCall,
   } from "../conversations";
   import type { SettingsTab } from "../update-state.svelte";
   import type { HardwareProfile, Mode } from "../types";
@@ -25,6 +25,8 @@
   import { meshClient } from "../mesh-client.svelte";
   import { routingPins, setTextPin } from "./routing-pins.svelte";
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
+  import { runAgent, type AgentEvent } from "../agent-loop";
+  import { AGENT_SYSTEM_PROMPT, CHAT_TOOLS } from "../agent-tools";
 
   let {
     activeModel,
@@ -104,21 +106,18 @@
     streaming?: boolean;
   }
 
-  // Per-stream payload from ollama_chat_stream (one of these fields is set per frame).
-  interface StreamFrame {
-    delta?: string;
-    thinking_delta?: string;
-    done?: boolean;
-    cancelled?: boolean;
-  }
-
   let messages = $state<Message[]>([]);
   let input = $state("");
   let streaming = $state(false);
-  let activeStreamId = $state<string | null>(null);
-  /** Cancel handle returned by `meshClient.sendInferRequest`. Used
-   *  by the Stop button while a mesh-routed response is streaming. */
-  let routeCancel: (() => void) | null = null;
+  /** Abort controller for the in-flight agent loop, or null when idle.
+   *  The TopBar's Stop button (`stop()` below + `forceStopChat()` from
+   *  the chat slot) fires it; the agent loop then unwinds at the next
+   *  turn boundary and cancels any in-flight stream as part of unwinding. */
+  let agentAbortController: AbortController | null = null;
+  /** Tool-call ids currently mid-execution (between
+   *  `tool_call_started` and `tool_call_finished` for the same id).
+   *  Drives the "running" indicator on tool pills in the transcript. */
+  let inFlightToolCallIds = $state<Set<string>>(new Set());
   /** Inline status when a send was blocked because the pinned peer
    *  is offline. Cleared on next send or when the user changes the
    *  pin. We pause-or-error rather than silently downgrade so the
@@ -333,25 +332,25 @@
     input = "";
   });
 
-  /** Append `delta` to either `content` or `thinking` on the assistant
-   *  message at `idx`, returning a fresh array (so Svelte detects the change). */
-  function appendTo(idx: number, field: "content" | "thinking", delta: string) {
-    const next = messages.slice();
-    const prev = next[idx];
-    next[idx] = { ...prev, [field]: (prev[field] ?? "") + delta };
-    messages = next;
+  /** Sync `messages` from the agent's working array (single source of
+   *  truth for non-streaming state). Clones each entry so Svelte sees
+   *  the array as a fresh reference. */
+  function syncFromWorking(working: Message[]) {
+    messages = working.map((m) => ({ ...m }));
   }
 
-  function ensureAssistantBubble(): number {
-    // Reuse the trailing assistant placeholder if there is one. Otherwise
-    // append a fresh streaming bubble. Returns its index.
-    const last = messages.length - 1;
-    if (last >= 0 && messages[last].role === "assistant" && messages[last].streaming) {
-      return last;
+  /** Build the lookup map { tool_call_id → tool result content } so
+   *  the assistant tool-call pills can render the result preview
+   *  without scanning the whole messages array per pill. */
+  const toolResultsById = $derived.by(() => {
+    const map = new Map<string, { name: string; content: string }>();
+    for (const m of messages) {
+      if (m.role === "tool" && m.tool_call_id) {
+        map.set(m.tool_call_id, { name: m.name ?? "", content: m.content });
+      }
     }
-    messages = [...messages, { role: "assistant", content: "", streaming: true }];
-    return messages.length - 1;
-  }
+    return map;
+  });
 
   /** Persist the current message list under `activeConversation`, creating
    *  the record on first save. Keeps disk in sync with whatever the user
@@ -372,9 +371,12 @@
       conv.family = activeFamily;
       conv.mode = activeMode;
     }
-    conv.messages = messages.map(({ role, content, thinking }) => {
-      const out: StoredMessage = { role, content };
-      if (thinking) out.thinking = thinking;
+    conv.messages = messages.map((m) => {
+      const out: StoredMessage = { role: m.role, content: m.content };
+      if (m.thinking) out.thinking = m.thinking;
+      if (m.tool_calls && m.tool_calls.length > 0) out.tool_calls = m.tool_calls;
+      if (m.name) out.name = m.name;
+      if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
       return out;
     });
     // Persist the per-conversation thinking preference so a re-open
@@ -451,9 +453,25 @@
     if (streaming) return;
     input = "";
     const wasFreshChat = messages.length === 0;
-    const history = [...messages, { role: "user" as const, content: text }];
-    messages = history;
+
+    // `working` is the agent loop's source-of-truth array. The loop
+    // appends assistant turns (with any tool_calls), tool results, and
+    // continuation turns to it as it runs. We mirror it into `messages`
+    // on each event so Svelte paints the transcript incrementally.
+    //
+    // The system prompt onboards the model as an IT helper for the
+    // Networks system. Prepended only when there isn't already a
+    // system turn at the top — reloaded conversations replay the
+    // existing turns, so we don't want to duplicate the prompt every
+    // send (which would balloon the prompt over time).
+    const working: Message[] = messages.map((m) => ({ ...m }));
+    if (working.length === 0 || working[0].role !== "system") {
+      working.unshift({ role: "system", content: AGENT_SYSTEM_PROMPT });
+    }
+    working.push({ role: "user", content: text });
+    syncFromWorking(working);
     streaming = true;
+    inFlightToolCallIds = new Set();
 
     // Save the user turn immediately so a crash mid-stream doesn't lose it.
     let conv: Conversation | null = null;
@@ -463,121 +481,116 @@
       console.warn("save before send failed:", e);
     }
 
-    // Per-call channel so concurrent (or rapidly retried) streams can't
-    // crosstalk. crypto.randomUUID is available in the Tauri WebView.
-    const streamId = crypto.randomUUID();
-    activeStreamId = streamId;
+    // Bump the persistent "chats sent" counter that the Usage tab
+    // surfaces. Best-effort; failures are non-fatal so we don't block
+    // the actual generation on stats bookkeeping.
+    void invoke("usage_record_chat_sent").catch(() => {});
 
-    // Claim the chat slot for the duration of this stream so the TopBar
-    // shows a running indicator and any other conversation's send routes
-    // through the conflict modal. The streamId lets the TopBar's force-
-    // stop control cancel an in-flight generation.
-    if (conv) claimChat({ conversationId: conv.id, conversationTitle: conv.title || "Chat", streamId });
-    let unlisten: UnlistenFn | null = null;
-    let assistantIdx = -1;
+    const controller = new AbortController();
+    agentAbortController = controller;
+    // Index of the currently-streaming assistant bubble in `messages`.
+    // Reset to -1 between agent turns so the next turn opens a fresh
+    // bubble (we still see the previous one in the transcript — it's
+    // pushed to `working` by the agent and rendered from there).
+    let liveIdx = -1;
+
+    // Claim the chat slot for the duration of this run. The agent
+    // controller goes in too so the TopBar's Stop button (which fires
+    // `forceStopChat()`) aborts the loop even between turns.
+    if (conv) {
+      claimChat({
+        conversationId: conv.id,
+        conversationTitle: conv.title || "Chat",
+        streamId: "", // agent path manages per-turn ids; no single id to expose
+        abortController: controller,
+      });
+    }
+
     try {
-      unlisten = await listen<StreamFrame>(
-        `myownllm://chat-stream/${streamId}`,
-        (e) => {
-          const frame = e.payload;
-          if (frame.thinking_delta) {
-            if (assistantIdx === -1) assistantIdx = ensureAssistantBubble();
-            appendTo(assistantIdx, "thinking", frame.thinking_delta);
-          } else if (frame.delta) {
-            if (assistantIdx === -1) assistantIdx = ensureAssistantBubble();
-            appendTo(assistantIdx, "content", frame.delta);
+      await runAgent({
+        messages: working,
+        tools: CHAT_TOOLS,
+        model: activeModel,
+        family: activeFamily,
+        mode: activeMode,
+        think: thinkingEnabled,
+        viaDevicePubkey: routeViaDevicePubkey,
+        signal: controller.signal,
+        onEvent: (event: AgentEvent) => {
+          switch (event.kind) {
+            case "assistant_delta":
+            case "thinking_delta": {
+              const field = event.kind === "assistant_delta" ? "content" : "thinking";
+              if (liveIdx === -1) {
+                // Start a fresh streaming assistant bubble at the end
+                // of the transcript. We DON'T push it to `working`
+                // here — the agent will push the finished assistant
+                // message into `working` at turn_finished.
+                const bubble: Message = { role: "assistant", content: "", streaming: true };
+                bubble[field] = event.delta;
+                messages = [...messages, bubble];
+                liveIdx = messages.length - 1;
+              } else {
+                const next = messages.slice();
+                const prev = next[liveIdx];
+                next[liveIdx] = {
+                  ...prev,
+                  [field]: (prev[field] ?? "") + event.delta,
+                };
+                messages = next;
+              }
+              break;
+            }
+            case "tool_call_started":
+              inFlightToolCallIds = new Set([
+                ...inFlightToolCallIds,
+                event.call.id,
+              ]);
+              break;
+            case "tool_call_finished": {
+              const next = new Set(inFlightToolCallIds);
+              next.delete(event.call.id);
+              inFlightToolCallIds = next;
+              // Tool result is already in `working`; pick it up so the
+              // pill renders with the result.
+              syncFromWorking(working);
+              break;
+            }
+            case "turn_finished":
+              // Agent pushed the completed assistant turn (including
+              // tool_calls if any) into `working`. Sync — that replaces
+              // our streaming placeholder with the final message.
+              syncFromWorking(working);
+              liveIdx = -1;
+              break;
+            case "done":
+              syncFromWorking(working);
+              break;
+            case "error":
+              messages = [
+                ...working.map((m) => ({ ...m })),
+                { role: "assistant", content: `(error: ${event.message})` },
+              ];
+              break;
           }
-          // `done` is handled in the finally block (which also fires on cancel
-          // and on the invoke promise rejecting), so we don't need to act here.
         },
-      );
-
-      // Going through the Rust-side ollama_chat_stream command instead of
-      // tauri-plugin-http: Ollama's CORS allowlist on Windows rejects
-      // requests originating from the Tauri WebView (`http://tauri.localhost`)
-      // with HTTP 403 even after the model is downloaded. reqwest from Rust
-      // doesn't set Origin, so the daemon accepts the call.
-      // Bump the persistent "chats sent" counter that the Usage tab
-      // surfaces. Best-effort; failures are non-fatal so we don't block
-      // the actual generation on stats bookkeeping.
-      void invoke("usage_record_chat_sent").catch(() => {});
-
-      if (routeViaDevicePubkey) {
-        // Mesh-routed inference. The pinned host runs against its
-        // local ollama and streams chunks back over the data channel.
-        // Resolve the pubkey to the current peer_id at send time
-        // (Trystero session ids regenerate per reconnect; pinning by
-        // pubkey is the stable identity). If the pin doesn't match
-        // an active peer we error explicitly instead of silently
-        // falling back to local — the user picked a host, the host
-        // is currently away, the right answer is to surface that and
-        // let them decide rather than misroute their request.
-        const target = routedPeer;
-        if (!target || target.status !== "active") {
-          throw new Error(
-            "Pinned peer is offline. Pick another host or 'this device' in the bar above and resend.",
-          );
-        }
-        await new Promise<void>((resolve, reject) => {
-          meshClient
-            .sendInferRequest({
-              target_peer_id: target.peer_id,
-              messages: history.map((m) => ({ role: m.role, content: m.content })),
-              family: activeFamily,
-              mode: activeMode,
-              think: thinkingEnabled,
-              on_chunk: (frame) => {
-                if (frame.thinking_delta) {
-                  if (assistantIdx === -1) assistantIdx = ensureAssistantBubble();
-                  appendTo(assistantIdx, "thinking", frame.thinking_delta);
-                } else if (frame.delta) {
-                  if (assistantIdx === -1) assistantIdx = ensureAssistantBubble();
-                  appendTo(assistantIdx, "content", frame.delta);
-                }
-              },
-              on_done: () => {
-                routeCancel = null;
-                resolve();
-              },
-              on_error: (msg) => {
-                routeCancel = null;
-                reject(new Error(msg));
-              },
-            })
-            .then((handle) => {
-              routeCancel = handle.cancel;
-            })
-            .catch((e) => {
-              routeCancel = null;
-              reject(e);
-            });
-        });
-      } else {
-        await invoke("ollama_chat_stream", {
-          streamId,
-          model: activeModel,
-          messages: history.map((m) => ({ role: m.role, content: m.content })),
-          think: thinkingEnabled,
-        });
-      }
-
-      if (assistantIdx === -1) {
-        messages = [...messages, { role: "assistant", content: "(empty response)" }];
-      }
+      });
     } catch (e) {
-      messages = [...messages, { role: "assistant", content: `(error: ${e})` }];
+      messages = [
+        ...messages,
+        { role: "assistant", content: `(error: ${e instanceof Error ? e.message : e})` },
+      ];
     } finally {
       streaming = false;
-      activeStreamId = null;
-      // Drop the streaming flag on the last assistant bubble so its
+      agentAbortController = null;
+      inFlightToolCallIds = new Set();
+      // Drop the streaming flag on any straggler bubble so its
       // <details> can collapse cleanly once the answer is in.
-      if (assistantIdx !== -1) {
+      if (liveIdx !== -1 && liveIdx < messages.length) {
         const next = messages.slice();
-        const prev = next[assistantIdx];
-        next[assistantIdx] = { ...prev, streaming: false };
+        next[liveIdx] = { ...next[liveIdx], streaming: false };
         messages = next;
       }
-      unlisten?.();
       try {
         await persist();
       } catch (e) {
@@ -607,23 +620,12 @@
     }
   }
 
-  async function stop() {
-    // Mesh-routed: fire `infer_cancel` over the data channel and let
-    // the pending promise unwind via on_done(cancelled=true).
-    if (routeCancel) {
-      try {
-        routeCancel();
-      } catch {}
-      routeCancel = null;
-      return;
-    }
-    if (!activeStreamId) return;
-    // Fire-and-forget: the cancel command itself is fast, and the in-flight
-    // invoke() in send() will resolve naturally once the Rust side observes
-    // the notify and unwinds.
-    try {
-      await invoke("ollama_chat_cancel", { streamId: activeStreamId });
-    } catch {}
+  function stop() {
+    // The agent loop owns its own per-turn stream ids; aborting the
+    // controller fires `ollama_chat_cancel` (local path) or
+    // `infer_cancel` (mesh path) on whatever turn is in flight, then
+    // unwinds the loop without starting another round.
+    agentAbortController?.abort();
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -685,6 +687,46 @@
   function jumpToTpSession() {
     if (!chatSlot.conversationId) return;
     onJumpToTranscribe();
+  }
+
+  // ---------------------------------------------------------------------
+  // Tool-call pill formatters. Keep the inline summary tight (one line)
+  // and reveal full args/result on expand. Both args and result render
+  // as `<pre>`-formatted JSON so a triage flow against `networks` reads
+  // like a structured log rather than a wall of stringified payloads.
+  // ---------------------------------------------------------------------
+  function formatArgsSummary(args: Record<string, unknown>): string {
+    if (!args || typeof args !== "object") return "";
+    const keys = Object.keys(args);
+    if (keys.length === 0) return "";
+    // Prefer the `action` field when present (the Networks tool's dispatch
+    // discriminator) — it's the most informative single token for the
+    // collapsed pill.
+    const action = typeof args.action === "string" ? args.action : null;
+    if (action) {
+      const other = keys.filter((k) => k !== "action").length;
+      return other > 0 ? `${action} · +${other}` : action;
+    }
+    return keys.slice(0, 3).join(", ") + (keys.length > 3 ? "…" : "");
+  }
+
+  function formatJson(value: unknown): string {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  }
+
+  /** Tool results are JSON-stringified by the handler. Pretty-print if
+   *  it parses; fall back to the raw string for non-JSON output (e.g.
+   *  the error path that returns plain text). */
+  function formatToolResult(raw: string): string {
+    try {
+      return JSON.stringify(JSON.parse(raw), null, 2);
+    } catch {
+      return raw;
+    }
   }
 </script>
 
@@ -748,24 +790,63 @@
       </div>
     {/if}
     {#each messages as msg, i (i)}
-      <div class="message {msg.role}">
-        <div class="bubble">
-          {#if msg.thinking}
-            {@const isThinking = msg.streaming && !msg.content}
-            <details class="thinking-block">
-              <summary class:shimmer={isThinking}>
-                {isThinking ? "Thinking…" : "Thoughts"}
-              </summary>
-              <div class="thinking-content">{msg.thinking}</div>
-            </details>
-          {/if}
-          {#if msg.content}
-            <span class="content">{msg.content}</span>
-          {:else if msg.streaming && !msg.thinking}
-            <span class="dots"><span></span><span></span><span></span></span>
-          {/if}
+      {#if msg.role === "system"}
+        <!-- IT-onboarding system prompt; hidden from the transcript so the user
+             sees only the conversation they care about. -->
+      {:else if msg.role === "tool"}
+        <!-- Tool results render inline under the assistant call pill above;
+             no standalone bubble in the transcript. -->
+      {:else}
+        <div class="message {msg.role}">
+          <div class="bubble">
+            {#if msg.thinking}
+              {@const isThinking = msg.streaming && !msg.content}
+              <details class="thinking-block">
+                <summary class:shimmer={isThinking}>
+                  {isThinking ? "Thinking…" : "Thoughts"}
+                </summary>
+                <div class="thinking-content">{msg.thinking}</div>
+              </details>
+            {/if}
+            {#if msg.content}
+              <span class="content">{msg.content}</span>
+            {:else if msg.streaming && !msg.thinking && (!msg.tool_calls || msg.tool_calls.length === 0)}
+              <span class="dots"><span></span><span></span><span></span></span>
+            {/if}
+            {#if msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0}
+              <div class="tool-calls">
+                {#each msg.tool_calls as call (call.id)}
+                  {@const running = inFlightToolCallIds.has(call.id)}
+                  {@const result = toolResultsById.get(call.id)}
+                  <details class="tool-call" class:running>
+                    <summary>
+                      <span class="tool-icon" aria-hidden="true">
+                        {#if running}⋯{:else if result}✓{:else}⚠{/if}
+                      </span>
+                      <span class="tool-name">{call.function.name}</span>
+                      <span class="tool-action">{formatArgsSummary(call.function.arguments)}</span>
+                    </summary>
+                    <div class="tool-detail">
+                      <div class="tool-field">
+                        <span class="tool-field-label">arguments</span>
+                        <pre>{formatJson(call.function.arguments)}</pre>
+                      </div>
+                      {#if result}
+                        <div class="tool-field">
+                          <span class="tool-field-label">result</span>
+                          <pre>{formatToolResult(result.content)}</pre>
+                        </div>
+                      {:else if running}
+                        <div class="tool-pending">running…</div>
+                      {/if}
+                    </div>
+                  </details>
+                {/each}
+              </div>
+            {/if}
+          </div>
         </div>
-      </div>
+      {/if}
     {/each}
     {#if streaming && (messages.length === 0 || messages[messages.length - 1].role !== "assistant")}
       <div class="message assistant">
@@ -920,10 +1001,14 @@
     border-radius: 14px;
     font-size: .9rem;
     line-height: 1.5;
-    white-space: pre-wrap;
   }
   .user .bubble { background: #6e6ef7; color: #fff; border-bottom-right-radius: 4px; }
   .assistant .bubble { background: #1e1e1e; color: #e8e8e8; border-bottom-left-radius: 4px; }
+  /* `pre-wrap` lives on the content span (not the bubble) so model
+     output preserves user-typed newlines without the whitespace
+     between sibling elements (e.g. content → tool-calls div) also
+     rendering as a visible blank line. */
+  .bubble .content { white-space: pre-wrap; }
   .thinking-block {
     margin-bottom: .5rem;
     border-left: 2px solid #444;
@@ -979,6 +1064,98 @@
   .dots span:nth-child(2) { animation-delay: .2s; }
   .dots span:nth-child(3) { animation-delay: .4s; }
   @keyframes blink { 0%,80%,100% { opacity: .3; } 40% { opacity: 1; } }
+  /* Tool-call pills surface what the IT-onboarded model is doing under
+     the hood — calling `networks` with action=status, switching the active
+     network, etc. Collapsed by default to keep the transcript readable;
+     the user expands one when they want to audit args / result. */
+  .tool-calls {
+    display: flex;
+    flex-direction: column;
+    gap: .3rem;
+    margin-top: .55rem;
+  }
+  .tool-call {
+    background: #181818;
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    font-size: .75rem;
+  }
+  .tool-call.running {
+    background: #1c1c24;
+    border-color: #3a3a55;
+  }
+  .tool-call summary {
+    display: flex;
+    align-items: center;
+    gap: .45rem;
+    padding: .35rem .6rem;
+    cursor: pointer;
+    color: #aaa;
+    list-style: none;
+    user-select: none;
+  }
+  .tool-call summary::-webkit-details-marker { display: none; }
+  .tool-call summary::before {
+    content: "▸";
+    color: #666;
+    font-size: .7rem;
+    width: .8em;
+  }
+  .tool-call[open] summary::before { content: "▾"; }
+  .tool-icon {
+    display: inline-block;
+    width: 1em;
+    text-align: center;
+    color: #888;
+  }
+  .tool-call.running .tool-icon { color: #b9b9ee; animation: blink 1.4s infinite; }
+  .tool-name {
+    font-family: monospace;
+    color: #6e6ef7;
+  }
+  .tool-action {
+    color: #888;
+    font-family: monospace;
+    font-size: .72rem;
+  }
+  .tool-detail {
+    padding: .2rem .65rem .55rem .65rem;
+    display: flex;
+    flex-direction: column;
+    gap: .45rem;
+    border-top: 1px solid #2a2a2a;
+  }
+  .tool-field {
+    display: flex;
+    flex-direction: column;
+    gap: .2rem;
+  }
+  .tool-field-label {
+    color: #666;
+    font-size: .62rem;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+  }
+  .tool-detail pre {
+    margin: 0;
+    padding: .35rem .5rem;
+    background: #0f0f0f;
+    border: 1px solid #1e1e1e;
+    border-radius: 4px;
+    color: #ccc;
+    font-family: monospace;
+    font-size: .72rem;
+    line-height: 1.45;
+    max-height: 220px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .tool-pending {
+    color: #888;
+    font-style: italic;
+    font-size: .72rem;
+  }
   /* Inline status banner for a blocked send. Sits between the
      TextBar and the input row when the pinned peer is offline or
      a send was refused for routing reasons. Amber palette to match
