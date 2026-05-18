@@ -709,7 +709,7 @@ Cloud Mesh ships off by default. To turn it on, open **Settings → Networks →
 | **Remote inference** | In the chat compose row, the **via:** picker lets you route a prompt to any peer that has an LLM advertised. The peer's local Ollama runs the request and streams tokens back over the data channel. Stop, cancel, and reasoning-mode all work the same as local. |
 | **Resource map** | Under **Networks → Connections → Resources in use**, every in-flight inference (outbound + inbound) and Move shows as a live row: `→` = you using a peer's resources, `←` = a peer using yours. |
 | **Capability badges** | Each peer's row shows what they can do — `LLM`, `ASR`, `mic`, `diarize`, plus a one-liner hardware summary (`Pi 5 · 4 GB RAM`). Sourced from each device's broadcast `capabilities_update`. |
-| **Accepting policy** | Per-device toggle on the Status tab (in the Activity block). `available` = take any work, `limited` = only if no better peer exists, `busy` = refuse incoming inference. Other peers see your choice in real time. |
+| **Accepting policy** | Per-network toggle on the Status tab, inline with the status pill. `available` = take any work, `limited` = only if no better peer exists, `busy` = refuse incoming inference. Each saved network has its own setting — you can be `available` at home and `busy` on an office mesh simultaneously. |
 | **Ring + indirect peers** | The **Connections** tab splits peers into two groups. The **Ring** is the set the local selector is actively routing through — it auto-heals on every join / leave by re-running the deterministic ring selector. **Indirect** is peers we know about but aren't routing through right now — shelved (data channel open as heartbeat, parked because the mesh grew past the ring capacity) or offline rostered (approved before, not in the room right now). Keeps Pi-class devices from melting under N² connection counts on a 10-device mesh. |
 
 ### Transport: Trystero over Nostr (default)
@@ -737,7 +737,7 @@ WebRTC needs STUN to discover NAT mappings; the defaults are Google's public STU
 
 ### Activity log
 
-Connect → handshake → approve → re-handshake → catalog announce — every event lands in the **Activity** panel on the Status tab as a ring-buffered log (newest at top, 80-entry cap). Useful when debugging a "peer didn't show up" situation. The `quiet logs` checkbox suppresses `info` events in the log while keeping `warn` and `error` — useful once steady-state and you don't want the chatter.
+Connect → handshake → approve → re-handshake → catalog announce — every event lands in the **Networks → Activity** sub-tab as a ring-buffered log (newest at top, 80-entry cap). Useful when debugging a "peer didn't show up" situation. The `quiet logs` checkbox suppresses `info` events while keeping `warn` and `error` — useful once steady-state and you don't want the chatter. Quiet is global (a UI preference, not per-network).
 
 ### Resilience (post-sleep, network blips)
 

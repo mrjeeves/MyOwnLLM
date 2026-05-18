@@ -21,11 +21,11 @@
 
 import type { SettingsTab } from "../update-state.svelte";
 
-/** Sub-tab inside the Cloud Mesh section. When `pendingTab ===
- *  "cloud-mesh"`, `CloudMeshSection` reads this on mount to pick
- *  the right inner tab. Null = use the section's default
- *  (Status). */
-export type CloudMeshSubTab = "status" | "connections" | "settings" | "http";
+/** Sub-tab inside the Networks (formerly "Cloud Mesh") section.
+ *  When `pendingTab === "cloud-mesh"`, `CloudMeshSection` reads
+ *  this on mount to pick the right inner tab. Null = use the
+ *  section's default (Status). */
+export type CloudMeshSubTab = "status" | "connections" | "activity" | "settings" | "http";
 
 class SettingsRouteState {
   pendingTab = $state<SettingsTab | null>(null);

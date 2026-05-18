@@ -1,39 +1,32 @@
 <script lang="ts">
   import CloudMeshStatus from "./CloudMeshStatus.svelte";
   import CloudMeshConnections from "./CloudMeshConnections.svelte";
+  import CloudMeshActivity from "./CloudMeshActivity.svelte";
   import CloudMeshAddresses from "./CloudMeshAddresses.svelte";
   import RemoteSection from "./RemoteSection.svelte";
   import type { CloudMeshSubTab } from "../settings-route.svelte";
 
   let { initialSubTab = null } = $props<{
-    /** Deep-link target so the Sidebar's per-peer "Settings" menu
-     *  can land directly on Connections. Null = default (Status).
-     *  Read once on mount; further tab changes are user-driven. */
     initialSubTab?: CloudMeshSubTab | null;
   }>();
 
   /** Sub-tab strip mirrors the pattern Models uses.
    *
-   *  - **Status** is the home view: a wizard that walks the user
-   *    through "pick a Network ID → lock → join → connect → approve
-   *    peers." Until the wizard goes green, the rest of the mesh
-   *    surface doesn't really matter, so the wizard occupies the
-   *    top of the tab; below it, only the things that need user
-   *    action (pending approvals) plus the Activity log show.
+   *  - **Status** is the home view: identity card, status pill +
+   *    accepting policy, saved networks list (with add / switch /
+   *    forget / lock), and pending Network requests when present.
+   *    The wizard for adding/locking a network all happens here.
    *  - **Connections** lists the ring (currently routed peers,
    *    auto-healed on every join/leave), indirect peers we know
    *    about but aren't actively routing through (shelved or
    *    offline rostered), and an in-use resource map
-   *    (inbound/outbound inferences + moves). The cross-device
-   *    catalog now lives directly in the main sidebar — each
-   *    connected peer is an expandable group there — so it's no
-   *    longer duplicated as a grid here.
-   *  - **Settings** is set-once configuration (STUN, TURN, custom
-   *    signaling relays).
-   *  - **HTTP** (previously "LAN") is the local axum-served browser
-   *    UI for phone/tablet access — renamed because "LAN" was
-   *    misleading: the same surface is reachable from any HTTP
-   *    client, mesh or no mesh. */
+   *    (inbound/outbound inferences + moves).
+   *  - **Activity** is the ring-buffered diagnostic log with a
+   *    quiet-mode toggle. Moved off the Status tab so steady-state
+   *    chatter doesn't crowd the controllable surfaces.
+   *  - **Settings** is per-network signaling / STUN / TURN config.
+   *  - **HTTP** (previously "LAN") is the local axum-served
+   *    browser UI for phone/tablet access. */
   // svelte-ignore state_referenced_locally
   let tab = $state<CloudMeshSubTab>(initialSubTab ?? "status");
 </script>
@@ -42,6 +35,7 @@
   <div class="h-tabs">
     <button class:active={tab === "status"} onclick={() => (tab = "status")}>Status</button>
     <button class:active={tab === "connections"} onclick={() => (tab = "connections")}>Connections</button>
+    <button class:active={tab === "activity"} onclick={() => (tab = "activity")}>Activity</button>
     <button class:active={tab === "settings"} onclick={() => (tab = "settings")}>Settings</button>
     <button class:active={tab === "http"} onclick={() => (tab = "http")}>HTTP</button>
   </div>
@@ -51,6 +45,8 @@
       <CloudMeshStatus />
     {:else if tab === "connections"}
       <CloudMeshConnections />
+    {:else if tab === "activity"}
+      <CloudMeshActivity />
     {:else if tab === "settings"}
       <CloudMeshAddresses />
     {:else if tab === "http"}
