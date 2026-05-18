@@ -1,6 +1,6 @@
 [package]
 name = "myownllm"
-version = "0.2.16"
+version = "0.2.17"
 description = "MyOwnLLM — detect hardware, pick best local model, start it."
 authors = []
 license = "MIT"
