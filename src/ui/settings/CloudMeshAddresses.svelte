@@ -1,11 +1,22 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { loadConfig, updateConfig } from "../../config";
-  import type { TurnServer } from "../../types";
+  import { activeNetwork, loadConfig, updateNetwork } from "../../config";
+  import { meshClient } from "../../mesh-client.svelte";
+  import type { NetworkConfig, TurnServer } from "../../types";
 
-  /** Trystero signaling relays (Nostr WebSocket URLs). Empty list
-   *  = use Trystero's built-in defaults; populated = override
-   *  with the user's own relays, typically self-hosted. */
+  /** All saved networks + which one is currently active. The
+   *  Settings tab edits one network at a time via the picker
+   *  below — defaults to the active one but the user can switch
+   *  to edit any saved network's transport config without
+   *  affecting which network is live. */
+  let networks = $state<NetworkConfig[]>([]);
+  let editingId = $state<string | null>(null);
+  let editing = $derived(networks.find((n) => n.id === editingId) ?? null);
+
+  /** Working copies of the editing network's address fields.
+   *  Persisted on blur / Add via `persist()`. Re-seeded whenever
+   *  the picker changes so unsaved drafts don't leak between
+   *  networks. */
   let signalingRelays = $state<string[]>([]);
   let stunServers = $state<string[]>([]);
   let turnServers = $state<TurnServer[]>([]);
@@ -20,32 +31,68 @@
    *  accidentally get persisted with empty fields. */
   let turnDraft = $state<TurnServer>({ url: "", username: "", credential: "" });
 
-  onMount(async () => {
+  async function reload(preserveEditingId = true) {
     try {
       const cfg = await loadConfig();
-      signalingRelays = [...cfg.cloud_mesh.signaling_servers];
-      stunServers = [...cfg.cloud_mesh.stun_servers];
-      turnServers = cfg.cloud_mesh.turn_servers.map((t) => ({ ...t }));
+      networks = cfg.cloud_mesh.networks;
+      const active = activeNetwork(cfg);
+      // Pick the edit target: preserve the user's current choice
+      // when possible; fall back to active; fall back to first
+      // saved; null if nothing saved yet.
+      let next: NetworkConfig | null = null;
+      if (preserveEditingId && editingId) {
+        next = networks.find((n) => n.id === editingId) ?? null;
+      }
+      if (!next) next = active ?? networks[0] ?? null;
+      editingId = next?.id ?? null;
+      if (next) {
+        signalingRelays = [...next.signaling_servers];
+        stunServers = [...next.stun_servers];
+        turnServers = next.turn_servers.map((t) => ({ ...t }));
+      } else {
+        signalingRelays = [];
+        stunServers = [];
+        turnServers = [];
+      }
     } catch (e) {
       error = String(e);
-    } finally {
-      loading = false;
     }
+  }
+
+  onMount(async () => {
+    await reload(false);
+    loading = false;
   });
 
+  function selectEditing(id: string) {
+    editingId = id;
+    const net = networks.find((n) => n.id === id);
+    if (net) {
+      signalingRelays = [...net.signaling_servers];
+      stunServers = [...net.stun_servers];
+      turnServers = net.turn_servers.map((t) => ({ ...t }));
+    }
+  }
+
   async function persist() {
+    if (!editingId) return;
     saving = true;
     error = "";
     try {
-      const cfg = await loadConfig();
-      await updateConfig({
-        cloud_mesh: {
-          ...cfg.cloud_mesh,
-          signaling_servers: signalingRelays.filter((s) => s.trim() !== ""),
-          stun_servers: stunServers.filter((s) => s.trim() !== ""),
-          turn_servers: turnServers.filter((t) => t.url.trim() !== ""),
-        },
+      await updateNetwork(editingId, {
+        signaling_servers: signalingRelays.filter((s) => s.trim() !== ""),
+        stun_servers: stunServers.filter((s) => s.trim() !== ""),
+        turn_servers: turnServers.filter((t) => t.url.trim() !== ""),
       });
+      // If we just edited the active network, restart the mesh
+      // client so it picks up the new relay set on its next
+      // connection. The user expects "set the relay, see it take
+      // effect" not "set the relay, restart the app."
+      const cfg = await loadConfig();
+      const active = activeNetwork(cfg);
+      if (active && active.id === editingId) {
+        meshClient.reconcile().catch(() => {});
+      }
     } catch (e) {
       error = String(e);
     } finally {
@@ -97,11 +144,38 @@
 <div class="root">
   {#if loading}
     <div class="loading">Loading addresses…</div>
+  {:else if networks.length === 0}
+    <div class="empty-state">
+      No saved networks yet — signaling, STUN, and TURN are
+      per-network in the multi-network model. Add a network on the
+      Status tab first; its address config lives here.
+    </div>
   {:else}
+    <!-- Picker so the user can edit a non-active network's
+         transport without first having to switch to it. Hidden
+         when there's only one network because there's nothing to
+         pick between. -->
+    {#if networks.length > 1}
+      <section class="block">
+        <h3>Editing</h3>
+        <div class="picker-row">
+          <select
+            class="picker"
+            value={editingId}
+            onchange={(e) => selectEditing((e.target as HTMLSelectElement).value)}
+          >
+            {#each networks as net (net.id)}
+              <option value={net.id}>{net.network_id}</option>
+            {/each}
+          </select>
+        </div>
+      </section>
+    {/if}
+
     <section class="block">
       <h3>Signaling relays</h3>
       <div class="block-hint">
-        Cloud Mesh uses <a href="https://trystero.dev" target="_blank" rel="noopener">Trystero</a>
+        Networks use <a href="https://trystero.dev" target="_blank" rel="noopener">Trystero</a>
         for peer discovery — currently over Nostr relays. By default
         Trystero picks from a built-in pool of public relays
         maintained by the Nostr community, so MyOwnLLM operates no
@@ -289,6 +363,31 @@
     color: #555;
     font-size: 0.85rem;
   }
+  .empty-state {
+    padding: 0.85rem 1rem;
+    border-radius: 7px;
+    background: #131318;
+    border: 1px dashed #1e1e25;
+    color: #888;
+    font-size: 0.78rem;
+    line-height: 1.55;
+    max-width: 36rem;
+  }
+  .picker-row {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+  }
+  .picker {
+    background: #131313;
+    color: #e8e8e8;
+    border: 1px solid #2a2a2a;
+    border-radius: 5px;
+    font-size: 0.8rem;
+    padding: 0.3rem 0.5rem;
+    cursor: pointer;
+  }
+  .picker:focus { outline: none; border-color: #3a3a55; }
 
   .block { display: flex; flex-direction: column; gap: 0.55rem; }
   .block h3 {

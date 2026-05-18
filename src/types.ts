@@ -171,35 +171,77 @@ export interface TurnServer {
   credential?: string;
 }
 
-/** Cloud Mesh — peer-to-peer substrate that lets multiple MyOwnLLM instances
- *  share identities, conversations, and (later) sensors / compute. Off by
- *  default. The Device ID is derived from the ed25519 keypair stored under
- *  `~/.myownllm/.secrets/identity.json` and lives outside this config — only
- *  the network membership and address configuration lives here. */
+/** One saved network in the user's mesh catalog. The user can save
+ *  several (home-mesh, office-mesh, …); only one is active at a
+ *  time (single Trystero room joined per process), but the others
+ *  retain their roster + per-network settings so switching back is
+ *  one click and reuses the prior approvals.
+ *
+ *  The Network ID IS the display name — it's a short
+ *  user-readable handle like `home-mesh`, NOT a secret. Anyone
+ *  who knows the ID can knock (you'll see their request), but
+ *  joining still requires explicit approval. If you find yourself
+ *  fielding requests from strangers who guessed your ID, pick a
+ *  more unique one. */
+export interface NetworkConfig {
+  /** Stable internal id, generated when the network is first
+   *  saved. Independent of `network_id` so renaming the
+   *  user-facing handle is allowed without breaking the
+   *  `active_network_id` pointer. */
+  id: string;
+  /** Canonical base32-lowercase form of the user-typed Network
+   *  ID — and the only thing the user ever reads. Doubles as the
+   *  per-network roster filename. */
+  network_id: string;
+  /** True when the user has committed this network (i.e. should
+   *  be live when it's the active one). Per-network so switching
+   *  to a saved-but-unlocked network drops into the wizard's
+   *  "drafted" state. */
+  locked: boolean;
+  /** Per-network signaling / NAT settings. Each network can point
+   *  at a different relay pool — home / office / public mesh all
+   *  configurable independently. Empty signaling = Trystero
+   *  defaults (public Nostr); empty stun = no NAT helpers; empty
+   *  turn = no relay fallback. */
+  signaling_servers: string[];
+  stun_servers: string[];
+  turn_servers: TurnServer[];
+  /** Self-reported willingness to take jobs from this network's
+   *  peers. Per-network so you can be "available" at home and
+   *  "busy" on a shared office mesh simultaneously. */
+  accepting: "available" | "limited" | "busy";
+}
+
+/** Cloud Mesh — peer-to-peer substrate that lets multiple MyOwnLLM
+ *  instances share identities, conversations, and (later) sensors /
+ *  compute. Off by default.
+ *
+ *  The shape is multi-network: the user can save several `networks`
+ *  (each with its own settings + roster on disk) and switch which
+ *  one is active. Only one network is joined at a time — the active
+ *  network drives the live Trystero room, capability advertisements,
+ *  and the Status / Connections tabs. Switching back to a
+ *  previously-active network reuses its roster so peers don't have
+ *  to re-authenticate.
+ *
+ *  The Device ID is derived from the ed25519 keypair stored under
+ *  `~/.myownllm/.secrets/identity.json` and lives outside this
+ *  config — only the network catalog lives here. */
 export interface CloudMeshConfig {
   enabled: boolean;
-  /** Shared rendezvous handle for the mesh. Empty string when no
-   *  network is configured. Persisted in canonical base32-lowercase
-   *  form (256-bit, 52 chars). */
-  network_id: string;
-  /** True when the user has committed the current `network_id`. The
-   *  Cloud Mesh settings tab uses this to gate edits behind a lock
-   *  icon and warning popup so a misclick can't silently swap mesh
-   *  membership. */
-  locked: boolean;
-  /** WebSocket URLs of Nostr signaling relays Trystero should use.
-   *  Empty array = use Trystero's built-in public-relay pool (the
-   *  default). Populated = override with the user's own relays
-   *  (typically self-hosted strfry / nostr-rs-relay). MyOwnLLM
-   *  operates none of these — the public defaults are
-   *  community-run Nostr relays. */
-  signaling_servers: string[];
-  /** STUN server URLs for NAT traversal. Defaults cover Google's
-   *  public stun pool; replace or extend per deployment. */
-  stun_servers: string[];
-  /** TURN relay servers — optional fallback when STUN can't punch
-   *  through. Empty by default; users add their own credentials. */
-  turn_servers: TurnServer[];
+  /** Saved networks. Empty when the user hasn't joined any yet —
+   *  the sidebar still surfaces the empty Network section with an
+   *  "+ Add Network" button. */
+  networks: NetworkConfig[];
+  /** `id` field of the currently-active network, or null when no
+   *  network is active. The mesh client joins this network's room
+   *  (or stays offline when null). */
+  active_network_id: string | null;
+  /** When true, the mesh client suppresses informational messages
+   *  in the Activity log (warnings + errors still land). Stays
+   *  global because it's a UI preference, not a per-network
+   *  policy. Set via the "Quiet logs" toggle on the Status tab. */
+  diag_quiet?: boolean;
 }
 
 /** Microphone capture settings used by transcribe mode. Audio capture

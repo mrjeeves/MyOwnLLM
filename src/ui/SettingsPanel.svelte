@@ -9,6 +9,7 @@
   import CloudMeshSection from "./settings/CloudMeshSection.svelte";
   import { updateUi } from "../update-state.svelte";
   import { settingsAttention } from "../settings-attention.svelte";
+  import type { CloudMeshSubTab } from "./settings-route.svelte";
 
   type Tab =
     | "providers"
@@ -28,6 +29,7 @@
   let {
     initialTab = "families",
     initialDetailFamily = null,
+    initialMeshSubTab = null,
     onClose,
     onChanged,
   } = $props<{
@@ -37,6 +39,10 @@
      *  on the Families tab — otherwise it's ignored to keep the routing
      *  predictable from other deep-links. */
     initialDetailFamily?: string | null;
+    /** Optional Cloud Mesh sub-tab to open straight into. Only
+     *  honoured when `initialTab === "cloud-mesh"`. Drives the deep
+     *  link from the Sidebar's per-peer "Settings" context menu. */
+    initialMeshSubTab?: CloudMeshSubTab | null;
     onClose: () => void;
     onChanged: () => void;
   }>();
@@ -57,7 +63,7 @@
     { id: "storage", label: "Storage" },
     { id: "hardware", label: "Hardware" },
     { id: "usage", label: "Usage" },
-    { id: "cloud-mesh", label: "Cloud Mesh" },
+    { id: "cloud-mesh", label: "Networks" },
     { id: "updates", label: "Updates" },
   ];
 
@@ -120,7 +126,7 @@
       {:else if active === "usage"}
         <UsageSection />
       {:else if active === "cloud-mesh"}
-        <CloudMeshSection />
+        <CloudMeshSection initialSubTab={initialMeshSubTab} />
       {:else if active === "updates"}
         <UpdatesSection />
       {/if}

@@ -29,28 +29,38 @@
 
 import { joinRoom, type Room } from "trystero";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { MeshIdentity } from "./mesh";
 import type { TurnServer } from "./types";
-import { loadConfig } from "./config";
+import { loadConfig, updateConfig, activeNetwork, updateNetwork } from "./config";
 import { settingsAttention } from "./settings-attention.svelte";
 import {
   loadConversation,
   saveConversation,
   deleteConversation,
+  listConversations,
   type Conversation,
 } from "./conversations";
 import {
   authPayload,
   deriveNetworkHandle,
+  generateMeshId,
   generateNonce,
   generateVerificationCode,
   pubkeyPart,
   pubkeySuffix,
+  selectRingNeighbors,
   signMessage,
   verifySignature,
+  EMPTY_CAPABILITIES,
   PROTOCOL_VERSION,
+  type AcceptingPolicy,
+  type Capabilities,
+  type CatalogEntry,
+  type InferRequestMessage,
   type MeshMessage,
 } from "./mesh-protocol";
+import { snapshotCapabilities } from "./mesh-capabilities";
 
 /** Watchdog for the cryptographic handshake only. If a peer doesn't
  *  send a valid `auth_response` within this window we assume the
@@ -146,6 +156,30 @@ const OFFLINE_ROSTERED_CHECK_INTERVAL_MS = 60_000;
  *  the peer join but neither's hello ever lands. */
 const REDISCOVERY_REJOIN_GAP_MS = 1_500;
 const DIAG_MAX = 80;
+/** Maximum mesh size at which we keep every peer "preferred" — at or
+ *  below this many active peers, the ring selector returns the full
+ *  set and no shelving happens. Sized so the 2-laptop and small-
+ *  office cases stay full-mesh (every peer talks to every peer) and
+ *  the bounded behavior only kicks in once the mesh genuinely grows
+ *  past what a Pi-class member can serve. Same value used as the
+ *  default `max_connections` advertised in `hello`. */
+const RING_DEFAULT_PREFERRED = 3;
+/** Floor for our own `max_connections` advert. A peer that
+ *  configures a smaller value still has the ring selector pick at
+ *  least this many ring neighbors so the ring stays connected
+ *  end-to-end. */
+const RING_MIN_PREFERRED = 2;
+/** How often we re-run the catalog walk and broadcast to peers when
+ *  no specific mutation has triggered a push. Acts as a safety net
+ *  for mutations that bypass the mesh-aware save path (e.g. external
+ *  file drops into the conversations directory). 60s is the floor —
+ *  per-mutation broadcasts handle the common case and arrive much
+ *  faster. */
+const CATALOG_REFRESH_INTERVAL_MS = 60_000;
+/** Debounce window for catalog broadcasts. Multiple mutations within
+ *  this window collapse into a single send so a rapid-fire rename
+ *  loop doesn't spam connected peers. */
+const CATALOG_DEBOUNCE_MS = 1_500;
 /** Globally-unique app identifier passed to Trystero so MyOwnLLM
  *  peers don't accidentally match peers from unrelated apps that
  *  happen to use the same `roomId`. Bump the suffix if we ever
@@ -164,6 +198,7 @@ export type PeerStatus =
   | "pending_approval" // local user needs to act (approve or confirm, see approver_role)
   | "pending_remote" // we've acted, OR we're waiting for the host's first move
   | "active" // both sides have approved and exchanged approve messages
+  | "shelved" // ring topology has parked this peer; channel open for heartbeat only
   | "offline" // rostered peer not currently present in the Trystero room
   | "denied" // user denied; close imminent
   | "failed"; // protocol error; close imminent
@@ -208,6 +243,20 @@ export interface PeerEntry {
    *  renders a countdown so it's visible that we're throttling
    *  rather than stuck. */
   next_reconnect_at: number | null;
+  /** Latest capabilities advertised by this peer. Empty when the
+   *  peer hasn't sent a hello yet (early handshake) or is running
+   *  a v1 client that doesn't include capabilities. */
+  capabilities: Capabilities;
+  /** Pubkey → catalog entries hosted on this peer. Empty when the
+   *  peer hasn't broadcast a catalog yet, or is a v1 peer. */
+  catalog: CatalogEntry[];
+  /** True when the local ring selector has parked this peer.
+   *  Independent of `status === "shelved"` because status is the
+   *  derived peer-facing state — `local_shelved` is OUR vote,
+   *  `remote_shelved` is THEIRS, status is "shelved" only when
+   *  both are true. */
+  local_shelved: boolean;
+  remote_shelved: boolean;
 }
 
 interface ConnectionState {
@@ -266,6 +315,21 @@ interface ConnectionState {
    *  hasn't elapsed — recovers from post-suspend half-dead
    *  channels in ~1.5s instead of ~15s. */
   wake_probe_pending: boolean;
+  /** Capabilities the peer most recently advertised. Set on first
+   *  hello and updated on every `capabilities_update`. */
+  capabilities: Capabilities;
+  /** Peer's `max_connections` advert from hello. Defaults to
+   *  RING_DEFAULT_PREFERRED when omitted. The ring selector uses
+   *  this to give over-capacity peers a larger share of the work. */
+  max_connections: number;
+  /** Catalog the peer most recently broadcast. Replaced wholesale
+   *  on each `catalog_announce`. */
+  catalog: CatalogEntry[];
+  /** Has the local ring selector shelved this peer? True after we
+   *  send `shelve`, false again on `unshelve`. */
+  local_shelved: boolean;
+  /** Has the peer shelved us? True on receive of their `shelve`. */
+  remote_shelved: boolean;
 }
 
 class MeshClient {
@@ -285,12 +349,103 @@ class MeshClient {
    *  live to gone to offline to handshaking to live with no
    *  indication that the system is actively working on it. */
   is_rediscovering = $state(false);
+  /** When false, `logDiag` becomes a no-op for level=info. Warns
+   *  and errors always land — those are the ones the user actually
+   *  needs to see when something's wrong. Toggled by the "Quiet
+   *  logs" switch in the Activity panel. Persisted via
+   *  `cloud_mesh.diag_quiet` so a relaunch keeps the user's
+   *  preference. */
+  diag_quiet = $state(false);
+  /** Last-known capabilities snapshot for THIS device. Surfaced in
+   *  the Identity card so the user can see what they're advertising
+   *  to peers. Recomputed on capability-recompute triggers. */
+  my_capabilities = $state<Capabilities>(EMPTY_CAPABILITIES);
+  /** True when a fresh capability snapshot is in flight — purely
+   *  cosmetic, surfaced as a small spinner next to the badge row. */
+  my_capabilities_loading = $state(false);
+  /** Most recent catalog snapshot we've broadcast — surfaced for
+   *  the Network sub-tab so it has something to render even when
+   *  no peers are connected yet. */
+  my_catalog = $state<CatalogEntry[]>([]);
+  /** True when ring shelving / unshelving is mid-evaluation. Used
+   *  by the Connections card to gate the "standby" badge from
+   *  flickering on/off during a transient rebalance. */
+  ring_evaluating = $state(false);
+  /** User-selected accepting policy. Drives `Capabilities.accepting`
+   *  on the next snapshot. Defaults to `available`; persisted via
+   *  `cloud_mesh.accepting`. */
+  accepting = $state<AcceptingPolicy>("available");
+  /** True while an outbound `infer_request` is in flight via the
+   *  mesh — surfaced on the Chat view so the "via" picker can show
+   *  a spinner instead of letting the user fire a second request
+   *  on top. */
+  remote_infer_in_flight = $state(false);
+  /** Reactive snapshot of active resources for the Connections tab's
+   *  "Resources in use" panel. Updated whenever a resource enters
+   *  or leaves the pending maps below.
+   *
+   *  - `outbound_infers` — chat prompts we're routing to remote peers
+   *  - `inbound_infers` — inference jobs we're serving for remote
+   *    callers (counts as our local LLM doing real work)
+   *  - `outbound_moves` — conversations we're shipping out
+   *  - `inbound_moves` — conversations being shipped to us
+   *
+   *  Each entry carries enough context to render a row ("→ inferring
+   *  against laptop-2") without the UI having to dig into the wire
+   *  state. */
+  resources = $state<{
+    outbound_infers: Array<{ id: string; peer_pubkey: string; peer_label: string }>;
+    inbound_infers: Array<{ id: string; peer_pubkey: string; peer_label: string }>;
+    outbound_moves: Array<{ guid: string; title: string; peer_pubkey: string; peer_label: string }>;
+    inbound_moves: Array<{ guid: string; title: string; peer_pubkey: string; peer_label: string }>;
+  }>({ outbound_infers: [], inbound_infers: [], outbound_moves: [], inbound_moves: [] });
 
   private logDiag(level: DiagLevel, msg: string): void {
+    // Suppress info chatter when the user has flipped Quiet mode.
+    // Warns and errors always land — those are the ones that warrant
+    // attention even with a quieted log.
+    if (this.diag_quiet && level === "info") {
+      const fn = console.info;
+      fn(`[mesh] ${msg}`);
+      return;
+    }
     const entry: DiagEntry = { ts: Date.now(), level, msg };
     this.diag = [...this.diag, entry].slice(-DIAG_MAX);
     const fn = level === "error" ? console.error : level === "warn" ? console.warn : console.info;
     fn(`[mesh] ${msg}`);
+  }
+
+  /** Toggle the Quiet-logs preference and persist it under
+   *  `cloud_mesh.diag_quiet` so a relaunch retains the choice.
+   *  Stays global because it's a UI preference, not a per-network
+   *  policy. Safe to call before config is loaded — the persist
+   *  is fire-and-forget. */
+  async setDiagQuiet(quiet: boolean): Promise<void> {
+    this.diag_quiet = quiet;
+    try {
+      const cfg = await loadConfig();
+      await updateConfig({
+        cloud_mesh: { ...cfg.cloud_mesh, diag_quiet: quiet },
+      });
+    } catch {
+      // Best-effort persist — the in-memory toggle still works.
+    }
+  }
+
+  /** Update accepting policy for the currently-active network.
+   *  Triggers a capability re-broadcast so peers see the change
+   *  without having to wait for the periodic snapshot. No-op when
+   *  no network is active. */
+  async setAccepting(next: AcceptingPolicy): Promise<void> {
+    this.accepting = next;
+    try {
+      const cfg = await loadConfig();
+      const active = activeNetwork(cfg);
+      if (active) await updateNetwork(active.id, { accepting: next });
+    } catch {
+      // Persist failure is non-fatal — value still in memory.
+    }
+    void this.refreshCapabilities();
   }
 
   // ---- internal --------------------------------------------------------
@@ -315,7 +470,16 @@ class MeshClient {
   private stopping = false;
   private pending_moves_out = new Map<
     string,
-    { target_peer_id: string; conversation: Conversation; on_complete?: (ok: boolean, err?: string) => void }
+    {
+      target_peer_id: string;
+      conversation: Conversation;
+      /** Folder the conversation lives in on this device (POSIX,
+       *  "" = root). Snapshotted at moveConversation-time and
+       *  echoed in `move_payload` so the receiver preserves the
+       *  user's folder organization on the other side. */
+      source_folder: string;
+      on_complete?: (ok: boolean, err?: string) => void;
+    }
   >();
   /** Wall-clock ms of the last heartbeat tick from ANY connection.
    *  Used to detect OS sleep/suspend: if the gap between two ticks
@@ -354,6 +518,56 @@ class MeshClient {
     focus: () => void;
     pageshow: () => void;
   } | null = null;
+  /** Pending remote inferences we initiated and are waiting on
+   *  chunks for. Keyed by infer-id; values carry the per-chunk
+   *  + done + error callbacks the caller registered. Cleared on
+   *  done/error/cancel and on peer-drop. */
+  private pending_infers_out = new Map<
+    string,
+    {
+      target_peer_id: string;
+      on_chunk: (frame: { delta?: string; thinking_delta?: string }) => void;
+      on_done: (cancelled: boolean) => void;
+      on_error: (message: string) => void;
+    }
+  >();
+  /** Inferences we're SERVING on behalf of remote peers. Keyed by
+   *  infer-id; values track the local `ollama_chat_stream` id so a
+   *  later `infer_cancel` from the requester can fire the matching
+   *  `ollama_chat_cancel`. */
+  private pending_infers_in = new Map<
+    string,
+    { requester_peer_id: string; local_stream_id: string }
+  >();
+  /** Debounce handle for catalog broadcasts. Multiple
+   *  `noteCatalogChanged` calls within CATALOG_DEBOUNCE_MS coalesce
+   *  into a single send. */
+  private catalog_broadcast_timer: number | null = null;
+  /** Periodic refresh timer for the catalog walk. Fires every
+   *  CATALOG_REFRESH_INTERVAL_MS as a safety net for mutations
+   *  that bypass `noteCatalogChanged`. */
+  private catalog_refresh_timer: number | null = null;
+  /** Catalog entries we're currently advertising as `pending_move`
+   *  (source-side of an in-flight 2-phase Move). Cleared on
+   *  `move_commit` / `move_abort` / drop. */
+  private pending_move_guids = new Set<string>();
+  /** Conversations being moved TO us. Populated on `move_accept` (we
+   *  acked the offer) and cleared on `move_payload` write completion
+   *  (success) or `move_decline` / drop (failure). Feeds the
+   *  "inbound moves" section of the resource map. */
+  private pending_moves_in = new Map<
+    string,
+    { peer_id: string; peer_pubkey: string; title: string }
+  >();
+  /** Pulls (`move_request`) we've sent to peers, waiting on a
+   *  `move_request_decline` (failure) or the inbound `move_offer`
+   *  the source kicks off on success. Keyed by request id. The
+   *  resolver lets the Sidebar's "Pull from X" toast surface
+   *  failures without watching the wire. */
+  private pending_pulls_out = new Map<
+    string,
+    { guid: string; peer_id: string; on_settle: (ok: boolean, err?: string) => void }
+  >();
 
   // ---- lifecycle -------------------------------------------------------
 
@@ -368,10 +582,15 @@ class MeshClient {
       return;
     }
 
-    const should_run = cfg.cloud_mesh.locked && cfg.cloud_mesh.network_id !== "";
+    // Pick the active network from the multi-network catalog. The
+    // mesh client joins exactly one Trystero room at a time; the
+    // user's other saved networks live on disk with their rosters
+    // intact, ready for a fast switch via `setActiveNetwork`.
+    const active = activeNetwork(cfg);
+    const should_run = !!active && active.locked && active.network_id !== "";
     if (!should_run) {
       if (this.room) {
-        this.logDiag("info", "reconcile: should_run=false → stopping");
+        this.logDiag("info", "reconcile: no active locked network → stopping");
         await this.stop();
       }
       return;
@@ -381,23 +600,23 @@ class MeshClient {
     // No-op.
     if (
       this.room &&
-      this.network_id === cfg.cloud_mesh.network_id &&
+      this.network_id === active.network_id &&
       this.identity?.device_id === identity.device_id
     ) {
       return;
     }
 
     if (this.room) {
-      this.logDiag("info", "reconcile: config changed → restarting");
+      this.logDiag("info", "reconcile: active network changed → restarting");
       await this.stop();
     }
-    this.logDiag("info", `reconcile: joining mesh for "${cfg.cloud_mesh.network_id}"`);
+    this.logDiag("info", `reconcile: joining mesh for "${active.network_id}"`);
     await this.start({
       identity,
-      networkId: cfg.cloud_mesh.network_id,
-      relayUrls: cfg.cloud_mesh.signaling_servers,
-      stunServers: cfg.cloud_mesh.stun_servers,
-      turnServers: cfg.cloud_mesh.turn_servers,
+      networkId: active.network_id,
+      relayUrls: active.signaling_servers,
+      stunServers: active.stun_servers,
+      turnServers: active.turn_servers,
     });
   }
 
@@ -416,6 +635,22 @@ class MeshClient {
     this.identity = opts.identity;
     this.network_id = opts.networkId;
     this.connections.clear();
+    // Snapshot capabilities + persisted preferences (per-network
+    // accepting, global diag_quiet) before any peer talks to us —
+    // the very first hello we send to a freshly-joined peer should
+    // carry the right accepting policy + capability set rather
+    // than an empty one followed by an immediate
+    // capabilities_update.
+    try {
+      const cfg = await loadConfig();
+      const active = activeNetwork(cfg);
+      if (active) this.accepting = active.accepting;
+      const persistedQuiet = cfg.cloud_mesh.diag_quiet;
+      if (typeof persistedQuiet === "boolean") this.diag_quiet = persistedQuiet;
+    } catch {
+      // Config unavailable — defaults are fine.
+    }
+    void this.refreshCapabilities();
     // Recompute peers immediately — with connections cleared, this
     // collapses to just the offline-rostered entries from the
     // existing in-memory roster. Critical during a rediscovery
@@ -510,6 +745,13 @@ class MeshClient {
     this.offline_check_timer = window.setInterval(() => {
       this.offlineRosteredCheckTick();
     }, OFFLINE_ROSTERED_CHECK_INTERVAL_MS);
+    // Seed the initial catalog asynchronously so the Network sub-tab
+    // has something to render even before a peer connects, then keep
+    // it refreshed on a slow tick to catch out-of-band mutations.
+    void this.refreshLocalCatalog();
+    this.catalog_refresh_timer = window.setInterval(() => {
+      void this.refreshLocalCatalog();
+    }, CATALOG_REFRESH_INTERVAL_MS);
     this.logDiag("info", `online — listening for peers in room ${room_id.slice(0, 12)}…`);
   }
 
@@ -520,6 +762,29 @@ class MeshClient {
       clearInterval(this.offline_check_timer);
       this.offline_check_timer = null;
     }
+    if (this.catalog_broadcast_timer !== null) {
+      clearTimeout(this.catalog_broadcast_timer);
+      this.catalog_broadcast_timer = null;
+    }
+    if (this.catalog_refresh_timer !== null) {
+      clearInterval(this.catalog_refresh_timer);
+      this.catalog_refresh_timer = null;
+    }
+    // Resolve every in-flight remote inference as failed so callers
+    // unblock cleanly instead of hanging on a promise that will
+    // never resolve.
+    for (const [, pending] of this.pending_infers_out) {
+      pending.on_error("mesh stopped");
+    }
+    this.pending_infers_out.clear();
+    this.pending_infers_in.clear();
+    this.pending_moves_in.clear();
+    this.pending_move_guids.clear();
+    for (const [, pending] of this.pending_pulls_out) {
+      pending.on_settle(false, "mesh stopped");
+    }
+    this.pending_pulls_out.clear();
+    this.refreshResources();
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
       if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
@@ -683,6 +948,37 @@ class MeshClient {
     }
   }
 
+  /** Pull a remote conversation onto this device. Asks the source
+   *  peer to push `guid` to us; the source validates and then
+   *  drives the regular Move handshake with us as the destination.
+   *
+   *  The returned promise resolves once the source acknowledges
+   *  the request — either by starting the Move (success) or by
+   *  sending `move_request_decline` (failure with a reason).
+   *  Resolution does NOT wait for the full payload transfer; the
+   *  caller can watch `meshClient.resources.inbound_moves` to
+   *  observe progress, or just rely on the Sidebar refreshing its
+   *  catalog once the receiver-side `move_payload` lands and
+   *  `noteCatalogChanged` fires. */
+  async pullConversation(guid: string, source_peer_id: string): Promise<void> {
+    const conn = this.connections.get(source_peer_id);
+    if (!conn || this.peerStatus(conn) !== "active") {
+      throw new Error("source peer is not active");
+    }
+    const id = generateMeshId();
+    return await new Promise<void>((resolve, reject) => {
+      this.pending_pulls_out.set(id, {
+        guid,
+        peer_id: source_peer_id,
+        on_settle: (ok, err) => {
+          if (ok) resolve();
+          else reject(new Error(err ?? "pull failed"));
+        },
+      });
+      this.send(conn, { kind: "move_request", id, guid });
+    });
+  }
+
   async moveConversation(guid: string, target_peer_id: string): Promise<void> {
     const conn = this.connections.get(target_peer_id);
     if (!conn || this.peerStatus(conn) !== "active") {
@@ -695,15 +991,41 @@ class MeshClient {
     if (!conversation) {
       throw new Error("conversation not found locally");
     }
+    // Look up the source folder so we can echo it in `move_payload`
+    // and the receiver can land the conversation in the same place
+    // (creating intermediate folders if needed). Falls back to root
+    // if the conversation isn't in the listing for any reason.
+    let source_folder = "";
+    try {
+      const { conversations } = await listConversations();
+      source_folder = conversations.find((c) => c.id === guid)?.path ?? "";
+    } catch {
+      // Listing failed — proceed with root as the safe default.
+    }
     return await new Promise<void>((resolve, reject) => {
       this.pending_moves_out.set(guid, {
         target_peer_id,
         conversation,
+        source_folder,
         on_complete: (ok, err) => {
           if (ok) resolve();
           else reject(new Error(err ?? "move failed"));
         },
       });
+      this.refreshResources();
+      // Phase 2: 2-phase Move. Announce `move_prepare` to all
+      // active peers (not just the destination) so their catalog
+      // view can render the entry as "moving…" rather than
+      // showing two copies during the transfer window. The
+      // existing direct offer/accept/payload/complete handshake
+      // with `conn` still drives the actual content delivery; the
+      // broadcast is purely advisory.
+      this.pending_move_guids.add(guid);
+      this.broadcastMovePrepare(guid, conn.device_pubkey);
+      // Republish so OUR own catalog row flips to pending_move
+      // alongside the broadcast — gives instant feedback in the
+      // Connections grid.
+      void this.refreshLocalCatalog();
       this.send(conn, {
         kind: "move_offer",
         guid,
@@ -1040,6 +1362,11 @@ class MeshClient {
       rehandshake_backoff_until: 0,
       wake_at: 0,
       wake_probe_pending: false,
+      capabilities: structuredClone(EMPTY_CAPABILITIES),
+      max_connections: RING_DEFAULT_PREFERRED,
+      catalog: [],
+      local_shelved: false,
+      remote_shelved: false,
     };
   }
 
@@ -1054,6 +1381,8 @@ class MeshClient {
       label: this.identity.label,
       nonce: conn.our_nonce,
       verification_code: conn.our_verification_code,
+      capabilities: this.my_capabilities,
+      max_connections: Math.max(RING_MIN_PREFERRED, RING_DEFAULT_PREFERRED),
     };
     this.send(conn, msg);
   }
@@ -1126,7 +1455,36 @@ class MeshClient {
         break;
       case "pong":
         break;
+      case "capabilities_update":
+        conn.capabilities = mergeCapabilities(msg.capabilities);
+        this.logDiag(
+          "info",
+          `peer ${conn.peer_id.slice(0, 8)}… updated capabilities (accepting=${conn.capabilities.accepting})`,
+        );
+        this.republishPeers();
+        break;
+      case "shelve":
+        if (!conn.remote_shelved) {
+          conn.remote_shelved = true;
+          this.logDiag(
+            "info",
+            `peer ${conn.peer_id.slice(0, 8)}… shelved us${msg.reason ? ` (${msg.reason})` : ""}`,
+          );
+          this.republishPeers();
+        }
+        break;
+      case "unshelve":
+        if (conn.remote_shelved) {
+          conn.remote_shelved = false;
+          this.logDiag("info", `peer ${conn.peer_id.slice(0, 8)}… unshelved us`);
+          this.republishPeers();
+        }
+        break;
       case "catalog_announce":
+        conn.catalog = Array.isArray(msg.conversations)
+          ? msg.conversations.slice(0, 1024)
+          : [];
+        this.republishPeers();
         break;
       case "move_offer":
         await this.handleMoveOffer(conn, msg);
@@ -1135,13 +1493,77 @@ class MeshClient {
         await this.handleMoveAccept(conn, msg);
         break;
       case "move_decline":
-        this.resolveMoveOut(msg.guid, false, msg.reason);
+        this.handleMoveDecline(msg.guid, msg.reason);
         break;
       case "move_payload":
         await this.handleMovePayload(conn, msg);
         break;
       case "move_complete":
         await this.handleMoveComplete(conn, msg);
+        break;
+      case "move_prepare":
+        // Source announced a transfer in flight from itself to
+        // `to_pubkey`. Mark the entry as pending in our cached copy
+        // of the source's catalog so the Network view dims it
+        // without waiting for the next full announce.
+        this.markCatalogPendingMove(conn, msg.guid, true);
+        this.republishPeers();
+        break;
+      case "move_commit":
+        // Receiver confirmed the write — clear the pending flag on
+        // the source's catalog; the next full announce will
+        // promote the receiver's catalog to include the entry.
+        this.markCatalogPendingMove(conn, msg.guid, false);
+        this.republishPeers();
+        break;
+      case "move_abort":
+        this.markCatalogPendingMove(conn, msg.guid, false);
+        this.republishPeers();
+        break;
+      case "move_request":
+        // Same gate as remote inference: only an active (rostered +
+        // authenticated) peer may pull a conversation from us. A
+        // stranger in the same Trystero room hits the early-return.
+        if (this.peerStatus(conn) !== "active") {
+          this.send(conn, {
+            kind: "move_request_decline",
+            id: msg.id,
+            reason: "peer not authorized",
+          });
+          break;
+        }
+        void this.handleMoveRequest(conn, msg);
+        break;
+      case "move_request_decline":
+        this.handleMoveRequestDecline(msg.id, msg.reason);
+        break;
+      case "infer_request":
+        // Authorization gate: only roster peers may issue inference
+        // requests. Mesh discovery alone is not enough.
+        if (this.peerStatus(conn) !== "active") {
+          this.send(conn, {
+            kind: "infer_error",
+            id: msg.id,
+            message: "peer not authorized",
+          });
+          break;
+        }
+        void this.handleInferRequest(conn, msg);
+        break;
+      case "infer_chunk":
+        this.handleInferChunkInbound(msg.id, {
+          delta: msg.delta,
+          thinking_delta: msg.thinking_delta,
+        });
+        break;
+      case "infer_done":
+        this.handleInferDoneInbound(msg.id, !!msg.cancelled);
+        break;
+      case "infer_error":
+        this.handleInferErrorInbound(msg.id, msg.message);
+        break;
+      case "infer_cancel":
+        this.handleInferCancelInbound(conn, msg.id);
         break;
     }
   }
@@ -1159,6 +1581,15 @@ class MeshClient {
     conn.their_nonce = msg.nonce;
     conn.label = msg.label || "";
     conn.their_verification_code = (msg.verification_code || "").slice(0, 16);
+    // Phase 2: peer's capabilities and ring capacity. v1 peers omit
+    // both; the defaults are equivalent to "no LLM/ASR/mic, hold up
+    // to 3 connections" which is the same as a fresh ConnectionState.
+    if (msg.capabilities) {
+      conn.capabilities = mergeCapabilities(msg.capabilities);
+    }
+    if (typeof msg.max_connections === "number" && msg.max_connections > 0) {
+      conn.max_connections = Math.max(RING_MIN_PREFERRED, msg.max_connections);
+    }
     // Cache the display suffix and label for this peer so we can
     // render them even when the peer goes offline later (rostered
     // entries still show in the Connections list).
@@ -1311,6 +1742,15 @@ class MeshClient {
       });
       return;
     }
+    // Track inbound move so the Connections tab's resource map shows
+    // it as "← receiving X from Y" while the payload's in flight.
+    // Cleared in handleMovePayload (success / failure) and on drop.
+    this.pending_moves_in.set(msg.guid, {
+      peer_id: conn.peer_id,
+      peer_pubkey: conn.device_pubkey,
+      title: msg.title,
+    });
+    this.refreshResources();
     this.send(conn, { kind: "move_accept", guid: msg.guid });
   }
 
@@ -1324,6 +1764,11 @@ class MeshClient {
       kind: "move_payload",
       guid: msg.guid,
       conversation: pending.conversation,
+      // Snapshot taken at moveConversation-time so a folder rename
+      // in the brief window between offer and accept doesn't ship
+      // a now-stale path that wouldn't match the receiver's
+      // expectation. Empty string elides on the wire.
+      target_folder: pending.source_folder || undefined,
     });
   }
 
@@ -1334,17 +1779,39 @@ class MeshClient {
     const incoming = msg.conversation as Conversation | undefined;
     if (!incoming || typeof incoming !== "object" || incoming.id !== msg.guid) {
       this.send(conn, { kind: "move_decline", guid: msg.guid, reason: "malformed payload" });
+      this.pending_moves_in.delete(msg.guid);
+      this.refreshResources();
       return;
     }
     try {
-      await saveConversation(incoming);
+      // Preserve the source's folder location so the conversation
+      // lands where the user saw it in their sidebar's Network
+      // view. saveConversation creates intermediate folders as
+      // needed, so deep paths ("Work/Projects/Q4") just work.
+      await saveConversation(incoming, msg.target_folder ?? "");
       this.send(conn, { kind: "move_complete", guid: msg.guid });
+      // Receiver side: broadcast the commit so other peers update
+      // their cached catalog (clear the source's `pending_move`)
+      // and the entry now shows under us in the Connections view.
+      // Our own catalog refreshes asynchronously — saveConversation
+      // doesn't notify the mesh on its own.
+      this.broadcastMoveCommit(msg.guid);
+      void this.refreshLocalCatalog();
+      // If this incoming move was the answer to a Pull we kicked
+      // off, the pull promise resolves once the bytes have landed
+      // locally — that's when the user expects the "Pulling…"
+      // toast to disappear.
+      this.resolvePullByGuid(msg.guid, conn.peer_id, true);
     } catch (e) {
       this.send(conn, {
         kind: "move_decline",
         guid: msg.guid,
         reason: `write failed: ${String(e)}`,
       });
+      this.resolvePullByGuid(msg.guid, conn.peer_id, false, String(e));
+    } finally {
+      this.pending_moves_in.delete(msg.guid);
+      this.refreshResources();
     }
   }
 
@@ -1360,14 +1827,103 @@ class MeshClient {
       this.resolveMoveOut(msg.guid, false, `local delete failed: ${String(e)}`);
       return;
     }
+    // 2-phase Move: announce the commit so other peers update their
+    // cached catalog (clear `pending_move`, drop the entry from our
+    // catalog — it'll appear in the destination's next announce).
+    this.pending_move_guids.delete(msg.guid);
+    this.broadcastMoveCommit(msg.guid);
+    void this.refreshLocalCatalog();
     this.resolveMoveOut(msg.guid, true);
+  }
+
+  /** Receiver declined our move. Surface the failure to the caller
+   *  and clear the pending broadcast state so other peers see the
+   *  entry as still hosted on us. */
+  private handleMoveDecline(guid: string, reason: string): void {
+    if (this.pending_move_guids.delete(guid)) {
+      this.broadcastMoveAbort(guid, reason);
+      void this.refreshLocalCatalog();
+    }
+    this.resolveMoveOut(guid, false, reason);
   }
 
   private resolveMoveOut(guid: string, ok: boolean, err?: string): void {
     const pending = this.pending_moves_out.get(guid);
     if (!pending) return;
     this.pending_moves_out.delete(guid);
+    this.refreshResources();
     pending.on_complete?.(ok, err);
+  }
+
+  /** Inbound `move_request` from a peer: they want us to push the
+   *  named conversation to them. We've already gated on the peer
+   *  being `active`; the remaining checks are: do we still have
+   *  the conversation, and isn't there already a move in flight
+   *  for it. Success path: resolve the requester's pending promise
+   *  immediately and call `moveConversation` to drive the regular
+   *  push handshake. */
+  private async handleMoveRequest(
+    conn: ConnectionState,
+    msg: MeshMessage & { kind: "move_request" },
+  ): Promise<void> {
+    const existing = await loadConversation(msg.guid).catch(() => null);
+    if (!existing) {
+      this.send(conn, {
+        kind: "move_request_decline",
+        id: msg.id,
+        reason: "conversation not found",
+      });
+      return;
+    }
+    if (this.pending_moves_out.has(msg.guid)) {
+      this.send(conn, {
+        kind: "move_request_decline",
+        id: msg.id,
+        reason: "a move for this conversation is already in flight",
+      });
+      return;
+    }
+    // moveConversation throws on the "target not active" / "already
+    // in flight" cases we just checked above — but a peer drop
+    // between the check and the call is possible, so guard. The
+    // requester's pending pull resolves the moment we KICK OFF the
+    // move (not when it finishes) — they'll see progress via the
+    // resource map and the eventual catalog refresh.
+    try {
+      void this.moveConversation(msg.guid, conn.peer_id);
+    } catch (e) {
+      this.send(conn, {
+        kind: "move_request_decline",
+        id: msg.id,
+        reason: String(e),
+      });
+    }
+  }
+
+  private handleMoveRequestDecline(id: string, reason: string): void {
+    const pending = this.pending_pulls_out.get(id);
+    if (!pending) return;
+    this.pending_pulls_out.delete(id);
+    pending.on_settle(false, reason);
+  }
+
+  /** Find a pending pull that matches the incoming Move's guid +
+   *  source peer and resolve it. No-op when the Move wasn't from a
+   *  Pull (it was a regular push). Used by both the success path
+   *  (payload landed) and the local-write failure path. */
+  private resolvePullByGuid(
+    guid: string,
+    peer_id: string,
+    ok: boolean,
+    err?: string,
+  ): void {
+    for (const [id, pending] of this.pending_pulls_out) {
+      if (pending.guid === guid && pending.peer_id === peer_id) {
+        this.pending_pulls_out.delete(id);
+        pending.on_settle(ok, err);
+        return;
+      }
+    }
   }
 
   // ---- helpers ---------------------------------------------------------
@@ -1386,6 +1942,12 @@ class MeshClient {
         conn.handshake_timer = null;
       }
       this.logDiag("info", `peer active: ${conn.device_pubkey.slice(0, 8)}…`);
+      // Phase 2: send our current catalog so the peer can render it
+      // in the Network view without waiting for a mutation, and
+      // re-evaluate the ring now that a new peer has joined the
+      // active set.
+      this.sendCatalogTo(conn);
+      this.reevaluateRing();
     }
     if (this.computePeers().every((p) => p.status !== "pending_approval")) {
       settingsAttention.set("cloud-mesh", null);
@@ -1403,17 +1965,69 @@ class MeshClient {
       if (pending.target_peer_id === peer_id) {
         this.pending_moves_out.delete(guid);
         pending.on_complete?.(false, "peer disconnected mid-move");
+        // Source-side: tell remaining peers the transfer aborted so
+        // their catalog clears the pending flag without waiting for
+        // a full refresh.
+        if (this.pending_move_guids.delete(guid)) {
+          this.broadcastMoveAbort(guid, "peer disconnected mid-move");
+        }
       }
     }
+    // Inbound moves from this peer never complete — drop them so
+    // the resource map reflects the drop immediately. (handlePayload
+    // would normally clear them on success.)
+    for (const [guid, pending] of this.pending_moves_in) {
+      if (pending.peer_id === peer_id) {
+        this.pending_moves_in.delete(guid);
+      }
+    }
+    // Cancel any inference we initiated against this peer; resolve
+    // pending callers with a failure so they unblock immediately.
+    for (const [id, pending] of this.pending_infers_out) {
+      if (pending.target_peer_id === peer_id) {
+        pending.on_error("peer disconnected mid-stream");
+        this.pending_infers_out.delete(id);
+      }
+    }
+    // And drop anything we were serving for this peer — best-effort
+    // cancel the local ollama stream so we're not still generating
+    // tokens nobody's listening for.
+    for (const [id, served] of this.pending_infers_in) {
+      if (served.requester_peer_id === peer_id) {
+        void invoke("ollama_chat_cancel", { streamId: served.local_stream_id }).catch(() => {});
+        this.pending_infers_in.delete(id);
+      }
+    }
+    // Pulls in flight against this peer never complete — fail them.
+    for (const [id, pending] of this.pending_pulls_out) {
+      if (pending.peer_id === peer_id) {
+        this.pending_pulls_out.delete(id);
+        pending.on_settle(false, "peer disconnected");
+      }
+    }
+    this.refreshResources();
     this.republishPeers();
     if (this.computePeers().every((p) => p.status !== "pending_approval")) {
       settingsAttention.set("cloud-mesh", null);
     }
+    // Phase 2: ring needs to know a peer left so it can promote a
+    // shelved one back to active. No-op for a non-shelved peer
+    // beyond the local set bookkeeping.
+    this.reevaluateRing();
   }
 
   private peerStatus(conn: ConnectionState): PeerStatus {
     if (!conn.peer_authenticated) return "handshaking";
-    if (conn.local_approved && conn.remote_approved) return "active";
+    if (conn.local_approved && conn.remote_approved) {
+      // Ring topology: when both sides have shelved each other, the
+      // peer is in "standby" — the data channel is open for
+      // heartbeats but app traffic is suppressed by the selectors.
+      // Mixed states (one side shelved, the other not) are racy
+      // mid-rebalance windows; treat them as still active so a
+      // brief asymmetry doesn't flicker the UI.
+      if (conn.local_shelved && conn.remote_shelved) return "shelved";
+      return "active";
+    }
     // Needs local user action when:
     //   - We're the host AND haven't approved yet (first prompt)
     //   - We're the guest AND the host has already approved
@@ -1444,6 +2058,10 @@ class MeshClient {
         verification_code: c.approver_role ? c.their_verification_code : c.our_verification_code,
         reconnect_attempts: c.rehandshake_attempts,
         next_reconnect_at: c.rehandshake_attempts > 0 ? c.rehandshake_backoff_until : null,
+        capabilities: c.capabilities,
+        catalog: c.catalog,
+        local_shelved: c.local_shelved,
+        remote_shelved: c.remote_shelved,
       };
     });
 
@@ -1473,6 +2091,10 @@ class MeshClient {
         verification_code: "",
         reconnect_attempts: 0,
         next_reconnect_at: null,
+        capabilities: structuredClone(EMPTY_CAPABILITIES),
+        catalog: [],
+        local_shelved: false,
+        remote_shelved: false,
       });
     }
     return [...active, ...offline];
@@ -1515,6 +2137,467 @@ class MeshClient {
       // UI will fall back to label-only.
     }
   }
+
+  /** Rebuild `this.resources` from the current pending maps. Cheap
+   *  to call — runs whenever any of the four pending maps change.
+   *  Looks up labels per pubkey via the connection map so the UI
+   *  doesn't have to cross-reference. */
+  private refreshResources(): void {
+    const labelFor = (peer_id: string) => {
+      const conn = this.connections.get(peer_id);
+      return {
+        pubkey: conn?.device_pubkey ?? "",
+        label: conn?.label || conn?.device_pubkey.slice(0, 8) || peer_id.slice(0, 8),
+      };
+    };
+    const outbound_infers: typeof this.resources.outbound_infers = [];
+    for (const [id, p] of this.pending_infers_out) {
+      const { pubkey, label } = labelFor(p.target_peer_id);
+      outbound_infers.push({ id, peer_pubkey: pubkey, peer_label: label });
+    }
+    const inbound_infers: typeof this.resources.inbound_infers = [];
+    for (const [id, p] of this.pending_infers_in) {
+      const { pubkey, label } = labelFor(p.requester_peer_id);
+      inbound_infers.push({ id, peer_pubkey: pubkey, peer_label: label });
+    }
+    const outbound_moves: typeof this.resources.outbound_moves = [];
+    for (const [guid, p] of this.pending_moves_out) {
+      const { pubkey, label } = labelFor(p.target_peer_id);
+      outbound_moves.push({
+        guid,
+        title: p.conversation.title || "Untitled",
+        peer_pubkey: pubkey,
+        peer_label: label,
+      });
+    }
+    const inbound_moves: typeof this.resources.inbound_moves = [];
+    for (const [guid, p] of this.pending_moves_in) {
+      inbound_moves.push({
+        guid,
+        title: p.title || "Untitled",
+        peer_pubkey: p.peer_pubkey,
+        peer_label:
+          this.connections.get(p.peer_id)?.label ||
+          p.peer_pubkey.slice(0, 8),
+      });
+    }
+    this.resources = { outbound_infers, inbound_infers, outbound_moves, inbound_moves };
+  }
+
+  // ---- capabilities ----------------------------------------------------
+
+  /** Re-snapshot the local capability set and broadcast a
+   *  `capabilities_update` to every active peer. Throttled by the
+   *  caller — `noteCapabilitiesChanged` debounces.
+   *
+   *  Callers that want to know when the snapshot has landed (e.g.
+   *  the Identity card waiting to render the new badge row) can
+   *  await this; it resolves once the snapshot is in `my_capabilities`
+   *  and the broadcast has been queued. */
+  async refreshCapabilities(): Promise<void> {
+    if (this.my_capabilities_loading) return;
+    this.my_capabilities_loading = true;
+    try {
+      const cap = await snapshotCapabilities(this.accepting);
+      this.my_capabilities = cap;
+      // Tell every active peer the new shape — limited to peers that
+      // are at least authenticated so we don't waste a roundtrip on
+      // mid-handshake connections (they'll get the fresh value on
+      // their next hello-retry tick anyway).
+      for (const conn of this.connections.values()) {
+        if (!conn.peer_authenticated) continue;
+        this.send(conn, { kind: "capabilities_update", capabilities: cap });
+      }
+    } catch (e) {
+      this.logDiag("warn", `capabilities snapshot failed: ${String(e)}`);
+    } finally {
+      this.my_capabilities_loading = false;
+    }
+  }
+
+  /** Public entry point for the rest of the app to notify the mesh
+   *  that local capabilities likely changed. Hooks into the
+   *  model-lifecycle recompute and the Hardware tab's mic-device
+   *  toggle. Cheap to call repeatedly — the snapshot itself is
+   *  guarded by `my_capabilities_loading`. */
+  noteCapabilitiesChanged(): void {
+    void this.refreshCapabilities();
+  }
+
+  // ---- ring topology ---------------------------------------------------
+
+  /** Decide which peers our local selector wants active vs. shelved
+   *  and emit `shelve` / `unshelve` to peers that moved between
+   *  states. Both sides run the same selector with the same input
+   *  (the sorted set of authorized + connected pubkeys), so the
+   *  decisions match symmetrically without needing extra
+   *  coordination. */
+  private reevaluateRing(): void {
+    if (!this.identity) return;
+    this.ring_evaluating = true;
+    try {
+      const my_pubkey = pubkeyPart(this.identity.device_id);
+      // Eligible: authenticated peers that are in our roster (or
+      // are authorizing-in right now). Anyone not authenticated yet
+      // is in a transient state and shouldn't influence the ring.
+      const eligible: ConnectionState[] = [];
+      for (const conn of this.connections.values()) {
+        if (!conn.peer_authenticated) continue;
+        if (!conn.device_pubkey) continue;
+        // Roster check is permissive: include peers that are
+        // mid-approval too so the ring doesn't have to wait for the
+        // user to click Approve before shelving the right set.
+        eligible.push(conn);
+      }
+      const preferred = selectRingNeighbors({
+        self_pubkey: my_pubkey,
+        peer_pubkeys: eligible.map((c) => c.device_pubkey),
+        n_preferred: RING_DEFAULT_PREFERRED,
+      });
+      for (const conn of eligible) {
+        const should_be_preferred = preferred.has(conn.device_pubkey);
+        if (!should_be_preferred && !conn.local_shelved) {
+          conn.local_shelved = true;
+          this.send(conn, { kind: "shelve", reason: "out-of-ring" });
+          this.logDiag(
+            "info",
+            `ring shelved ${conn.device_pubkey.slice(0, 8)}… (out-of-ring)`,
+          );
+        } else if (should_be_preferred && conn.local_shelved) {
+          conn.local_shelved = false;
+          this.send(conn, { kind: "unshelve" });
+          this.logDiag(
+            "info",
+            `ring unshelved ${conn.device_pubkey.slice(0, 8)}… (ring-neighbor)`,
+          );
+        }
+      }
+      this.republishPeers();
+    } finally {
+      this.ring_evaluating = false;
+    }
+  }
+
+  // ---- catalog gossip --------------------------------------------------
+
+  /** Walk the local conversation tree and update `my_catalog`. Sends
+   *  a fresh `catalog_announce` to every active peer afterwards.
+   *  Safe to call frequently — internally debounced so a rapid
+   *  series of mutations collapses to one announce. */
+  async refreshLocalCatalog(): Promise<void> {
+    try {
+      const { conversations } = await listConversations();
+      this.my_catalog = conversations.map((c) => ({
+        guid: c.id,
+        title: c.title,
+        mode: c.mode,
+        updated_at: c.updated_at,
+        // Folder location on this device. Peers reproduce the
+        // structure in their Network sidebar; empty (root) is
+        // omitted from the wire payload to save bytes via
+        // `||| undefined`.
+        path: c.path || undefined,
+        // `pending_move` flips true for entries the source is
+        // shipping out right now. We're the source whenever the
+        // guid is in `pending_move_guids`.
+        pending_move: this.pending_move_guids.has(c.id) ? true : undefined,
+      }));
+    } catch (e) {
+      this.logDiag("warn", `catalog refresh failed: ${String(e)}`);
+      return;
+    }
+    this.broadcastCatalogDebounced();
+  }
+
+  /** Public notify hook for code paths that just mutated the
+   *  conversation tree (save / delete / move-folder). Coalesces
+   *  rapid-fire mutations into a single broadcast within
+   *  CATALOG_DEBOUNCE_MS. */
+  noteCatalogChanged(): void {
+    if (this.catalog_broadcast_timer !== null) {
+      clearTimeout(this.catalog_broadcast_timer);
+    }
+    this.catalog_broadcast_timer = window.setTimeout(() => {
+      this.catalog_broadcast_timer = null;
+      void this.refreshLocalCatalog();
+    }, CATALOG_DEBOUNCE_MS);
+  }
+
+  private broadcastCatalogDebounced(): void {
+    // Send immediately if anyone's online; the debounce wrapper
+    // around `refreshLocalCatalog` is what gates the rate.
+    for (const conn of this.connections.values()) {
+      if (!conn.peer_authenticated) continue;
+      if (conn.local_shelved && conn.remote_shelved) continue; // dormant
+      this.sendCatalogTo(conn);
+    }
+  }
+
+  private sendCatalogTo(conn: ConnectionState): void {
+    this.send(conn, {
+      kind: "catalog_announce",
+      conversations: this.my_catalog,
+    });
+  }
+
+  /** Update our cached copy of `conn`'s catalog so an entry's
+   *  `pending_move` flag flips without waiting for the next full
+   *  announce. */
+  private markCatalogPendingMove(
+    conn: ConnectionState,
+    guid: string,
+    pending: boolean,
+  ): void {
+    let mutated = false;
+    conn.catalog = conn.catalog.map((entry) => {
+      if (entry.guid !== guid) return entry;
+      mutated = true;
+      if (pending && !entry.pending_move) return { ...entry, pending_move: true };
+      if (!pending && entry.pending_move) {
+        const { pending_move, ...rest } = entry;
+        // pending_move discarded, ts-unused suppression via void
+        void pending_move;
+        return rest;
+      }
+      return entry;
+    });
+    if (!mutated) {
+      // Entry didn't exist in our cached snapshot yet — we'll catch
+      // up on the next full announce. Logging would be noisy.
+    }
+  }
+
+  private broadcastMovePrepare(guid: string, to_pubkey: string): void {
+    for (const conn of this.connections.values()) {
+      if (!conn.peer_authenticated) continue;
+      this.send(conn, { kind: "move_prepare", guid, to_pubkey });
+    }
+  }
+
+  private broadcastMoveCommit(guid: string): void {
+    for (const conn of this.connections.values()) {
+      if (!conn.peer_authenticated) continue;
+      this.send(conn, { kind: "move_commit", guid });
+    }
+  }
+
+  private broadcastMoveAbort(guid: string, reason: string): void {
+    for (const conn of this.connections.values()) {
+      if (!conn.peer_authenticated) continue;
+      this.send(conn, { kind: "move_abort", guid, reason });
+    }
+  }
+
+  // ---- remote inference ------------------------------------------------
+
+  /** Issue a remote chat-completion request against `target_peer_id`.
+   *  Mirrors the shape of the local `ollama_chat_stream` invoke —
+   *  caller provides messages + per-chunk handler + done/error
+   *  handlers, gets back an opaque `cancel()` that interrupts the
+   *  remote stream by sending `infer_cancel`. Returns the infer-id
+   *  so the caller can correlate frames in its own logs if needed.
+   *
+   *  Authorization: the target must be an `active` peer (i.e. in our
+   *  roster). Discovery alone is not enough — the auth handshake
+   *  must have completed in both directions and the user must have
+   *  approved the peer. */
+  async sendInferRequest(args: {
+    target_peer_id: string;
+    messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+    family: string;
+    mode: string;
+    think?: boolean;
+    on_chunk: (frame: { delta?: string; thinking_delta?: string }) => void;
+    on_done: (cancelled: boolean) => void;
+    on_error: (message: string) => void;
+  }): Promise<{ id: string; cancel: () => void }> {
+    const conn = this.connections.get(args.target_peer_id);
+    if (!conn) throw new Error("target peer not connected");
+    if (this.peerStatus(conn) !== "active") {
+      throw new Error("target peer not in active state");
+    }
+    if (conn.capabilities.accepting === "busy") {
+      throw new Error("target peer is busy");
+    }
+    const id = generateMeshId();
+    this.pending_infers_out.set(id, {
+      target_peer_id: args.target_peer_id,
+      on_chunk: args.on_chunk,
+      on_done: (cancelled) => {
+        this.remote_infer_in_flight = this.pending_infers_out.size > 1;
+        this.refreshResources();
+        args.on_done(cancelled);
+      },
+      on_error: (message) => {
+        this.remote_infer_in_flight = this.pending_infers_out.size > 1;
+        this.refreshResources();
+        args.on_error(message);
+      },
+    });
+    this.remote_infer_in_flight = true;
+    this.refreshResources();
+    this.send(conn, {
+      kind: "infer_request",
+      id,
+      messages: args.messages,
+      family: args.family,
+      mode: args.mode,
+      think: args.think,
+    });
+    const cancel = () => {
+      // Best-effort: send `infer_cancel` and release the pending
+      // entry locally so the caller's done handler fires with
+      // cancelled=true. The remote may have already finished —
+      // either way, our local bookkeeping closes out.
+      this.send(conn, { kind: "infer_cancel", id });
+      const pending = this.pending_infers_out.get(id);
+      if (pending) {
+        this.pending_infers_out.delete(id);
+        this.refreshResources();
+        pending.on_done(true);
+      }
+    };
+    return { id, cancel };
+  }
+
+  private handleInferChunkInbound(
+    id: string,
+    frame: { delta?: string; thinking_delta?: string },
+  ): void {
+    const pending = this.pending_infers_out.get(id);
+    if (!pending) return;
+    pending.on_chunk(frame);
+  }
+
+  private handleInferDoneInbound(id: string, cancelled: boolean): void {
+    const pending = this.pending_infers_out.get(id);
+    if (!pending) return;
+    this.pending_infers_out.delete(id);
+    this.refreshResources();
+    pending.on_done(cancelled);
+  }
+
+  private handleInferErrorInbound(id: string, message: string): void {
+    const pending = this.pending_infers_out.get(id);
+    if (!pending) return;
+    this.pending_infers_out.delete(id);
+    this.refreshResources();
+    pending.on_error(message);
+  }
+
+  private handleInferCancelInbound(conn: ConnectionState, id: string): void {
+    const served = this.pending_infers_in.get(id);
+    if (!served || served.requester_peer_id !== conn.peer_id) return;
+    // Fire-and-forget — the local stream's invoke promise unwinds
+    // through the same `infer_done` send path below as a natural
+    // termination, just with `cancelled=true`.
+    void invoke("ollama_chat_cancel", { streamId: served.local_stream_id }).catch(() => {});
+  }
+
+  /** Serve an inbound `infer_request` against the local ollama. The
+   *  stream is wired into the same `myownllm://chat-stream/<id>`
+   *  event bus the GUI uses, and chunks are forwarded to the
+   *  requester as `infer_chunk` messages on this connection.
+   *
+   *  We resolve the requested family/mode via a tiny mapping: just
+   *  pick the first locally-pulled tag we have that matches. The
+   *  caller's family/mode are treated as a hint, not a hard filter
+   *  — see `canServeInference` in mesh-capabilities.ts. */
+  private async handleInferRequest(
+    conn: ConnectionState,
+    msg: InferRequestMessage,
+  ): Promise<void> {
+    if (this.accepting === "busy") {
+      this.send(conn, {
+        kind: "infer_error",
+        id: msg.id,
+        message: "local accepting policy is busy",
+      });
+      return;
+    }
+    const local_stream_id = `mesh-${msg.id}`;
+    this.pending_infers_in.set(msg.id, {
+      requester_peer_id: conn.peer_id,
+      local_stream_id,
+    });
+    this.refreshResources();
+
+    // Subscribe to the same event channel the GUI's chat path uses.
+    // Forward each delta as an `infer_chunk` over the data channel
+    // and clean up on done / error.
+    interface StreamFrame {
+      delta?: string;
+      thinking_delta?: string;
+      done?: boolean;
+      cancelled?: boolean;
+      error?: string;
+    }
+    let unlisten: (() => void) | null = null;
+    try {
+      unlisten = await listen<StreamFrame>(
+        `myownllm://chat-stream/${local_stream_id}`,
+        (e) => {
+          const f = e.payload;
+          if (f.delta !== undefined) {
+            this.send(conn, { kind: "infer_chunk", id: msg.id, delta: f.delta });
+          }
+          if (f.thinking_delta !== undefined) {
+            this.send(conn, {
+              kind: "infer_chunk",
+              id: msg.id,
+              thinking_delta: f.thinking_delta,
+            });
+          }
+          if (f.done) {
+            this.send(conn, {
+              kind: "infer_done",
+              id: msg.id,
+              cancelled: !!f.cancelled,
+            });
+            this.pending_infers_in.delete(msg.id);
+            this.refreshResources();
+            unlisten?.();
+            unlisten = null;
+          }
+        },
+      );
+
+      // Pick the model. The requester's `mode` is best-effort
+      // matched against our locally-pulled tags; falling back to
+      // the first LLM we have at all if nothing matches.
+      let model = "";
+      const cap = this.my_capabilities;
+      const exactMatch = cap.llms.find(
+        (m) => m.family === msg.family && m.mode === msg.mode,
+      );
+      const modeMatch = cap.llms.find((m) => m.mode === msg.mode);
+      model = exactMatch?.tag ?? modeMatch?.tag ?? cap.llms[0]?.tag ?? "";
+      if (!model) {
+        throw new Error("no local LLM available to serve request");
+      }
+
+      await invoke("ollama_chat_stream", {
+        streamId: local_stream_id,
+        model,
+        messages: msg.messages,
+        think: msg.think ?? false,
+      });
+      // If the invoke resolves without a `done` frame having fired,
+      // synthesise a terminal so the requester unblocks.
+      if (this.pending_infers_in.has(msg.id)) {
+        this.send(conn, { kind: "infer_done", id: msg.id, cancelled: false });
+        this.pending_infers_in.delete(msg.id);
+        this.refreshResources();
+      }
+    } catch (e) {
+      this.logDiag("warn", `infer serve failed for ${msg.id}: ${String(e)}`);
+      this.send(conn, { kind: "infer_error", id: msg.id, message: String(e) });
+      this.pending_infers_in.delete(msg.id);
+      this.refreshResources();
+    } finally {
+      unlisten?.();
+    }
+  }
 }
 
 function buildIceServers(
@@ -1536,6 +2619,56 @@ function buildIceServers(
 function shortLabel(label: string, pubkey: string): string {
   if (label.trim() !== "") return label;
   return pubkey.slice(0, 8);
+}
+
+/** Coerce a peer's claimed capabilities into our local shape so
+ *  missing or oddly-typed fields don't surface as TypeScript
+ *  errors elsewhere. v1 peers omit the blob entirely; v2 peers
+ *  may add fields we don't know about (forward-compat) — we
+ *  preserve whatever maps and drop the rest. */
+function mergeCapabilities(raw: Partial<Capabilities>): Capabilities {
+  const merged: Capabilities = structuredClone(EMPTY_CAPABILITIES);
+  if (Array.isArray(raw.llms)) {
+    merged.llms = raw.llms
+      .filter((m) => m && typeof m === "object" && typeof m.tag === "string")
+      .map((m) => ({
+        tag: String(m.tag),
+        family: typeof m.family === "string" ? m.family : "",
+        mode: typeof m.mode === "string" ? m.mode : "",
+      }));
+  }
+  if (Array.isArray(raw.asr)) {
+    merged.asr = raw.asr
+      .filter((a) => a && typeof a === "object" && (a.backend === "moonshine" || a.backend === "parakeet"))
+      .map((a) => ({
+        backend: a.backend as "moonshine" | "parakeet",
+        tier: typeof a.tier === "string" ? a.tier : "",
+      }));
+  }
+  if (typeof raw.diarize === "boolean") merged.diarize = raw.diarize;
+  if (raw.hardware && typeof raw.hardware === "object") {
+    const hw = raw.hardware as Partial<Capabilities["hardware"]>;
+    if (hw.gpu_type === "nvidia" || hw.gpu_type === "amd" || hw.gpu_type === "apple" || hw.gpu_type === "none") {
+      merged.hardware.gpu_type = hw.gpu_type;
+    }
+    if (typeof hw.ram_gb === "number") merged.hardware.ram_gb = hw.ram_gb;
+    if (typeof hw.vram_gb === "number") merged.hardware.vram_gb = hw.vram_gb;
+    else if (hw.vram_gb === null) merged.hardware.vram_gb = null;
+    if (typeof hw.soc === "string" || hw.soc === null) merged.hardware.soc = hw.soc;
+    if (typeof hw.arch === "string") merged.hardware.arch = hw.arch;
+  }
+  if (raw.inputs && typeof raw.inputs === "object") {
+    merged.inputs.mic = !!raw.inputs.mic;
+    merged.inputs.camera = !!raw.inputs.camera;
+  }
+  if (raw.outputs && typeof raw.outputs === "object") {
+    merged.outputs.speaker = !!raw.outputs.speaker;
+    merged.outputs.display = !!raw.outputs.display;
+  }
+  if (raw.accepting === "available" || raw.accepting === "limited" || raw.accepting === "busy") {
+    merged.accepting = raw.accepting;
+  }
+  return merged;
 }
 
 export const meshClient = new MeshClient();

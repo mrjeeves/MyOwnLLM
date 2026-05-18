@@ -6,14 +6,17 @@
 //! user — that's the "low friction after attachment" half of the
 //! bidirectional-auth contract.
 //!
-//! The roster is scoped to a single Network ID. Changing the Network
-//! ID (the unlock + relock path) atomically swaps to a fresh roster
-//! for the new network — old approvals don't carry across mesh
-//! changes, matching the user-facing warning about
-//! re-authentication.
+//! The roster is scoped to a single Network ID. Each saved network
+//! gets its own roster file under `~/.myownllm/mesh/rosters/`, so
+//! switching the active network swaps to that network's roster
+//! intact rather than wiping it. The user can keep their home-mesh
+//! peers approved separately from their office-mesh peers without
+//! re-authenticating on every switch.
 //!
-//! Stored at `~/.myownllm/mesh/roster.json` (mode 0600 on Unix).
-//! Schema is v1; future migrations bump the version and run on read.
+//! Stored at `~/.myownllm/mesh/rosters/{network_id}.json` (mode 0600
+//! on Unix). A legacy single roster at `~/.myownllm/mesh/roster.json`
+//! is migrated on first read into its per-network home, keyed by
+//! whatever `network_id` it self-reports. Schema is v1.
 
 use std::path::PathBuf;
 
@@ -45,7 +48,27 @@ pub struct Roster {
     pub authorized_devices: Vec<AuthorizedPeer>,
 }
 
-fn roster_path() -> Result<PathBuf> {
+/// Directory holding the per-network roster files. Created lazily on
+/// first write via `save`. Lives alongside the legacy single
+/// `roster.json` so the migration in `load` can spot the old file.
+fn rosters_dir() -> Result<PathBuf> {
+    Ok(crate::myownllm_dir()?.join("mesh").join("rosters"))
+}
+
+/// Per-network roster filename. We use the canonical network_id
+/// directly — it's already a base32 string of `[a-z0-9_-]` chars
+/// (validated by `identity::normalize_network_id`), so it's safe as
+/// a filename without further encoding. Hashes / pathological inputs
+/// can't reach here without bypassing the normalizer.
+fn roster_path(network_id: &str) -> Result<PathBuf> {
+    Ok(rosters_dir()?.join(format!("{network_id}.json")))
+}
+
+/// Legacy single-roster location, pre-multi-network. Used by `load`
+/// to migrate the existing roster into its per-network home on first
+/// read of any network ID — preserving the user's prior approvals
+/// across the upgrade.
+fn legacy_roster_path() -> Result<PathBuf> {
     Ok(crate::myownllm_dir()?.join("mesh").join("roster.json"))
 }
 
@@ -116,12 +139,19 @@ pub fn is_authorized(roster: &Roster, device_id: &str) -> bool {
 // ---- filesystem wrappers ------------------------------------------------
 
 /// Load the roster scoped to the given Network ID. If the on-disk
-/// roster is for a different network (or missing), returns a fresh
-/// empty roster — old approvals don't carry across networks. The
-/// returned roster is in-memory; nothing is written until a caller
-/// invokes `save`.
+/// roster is missing returns a fresh empty roster — the caller is
+/// the first to add a peer for this network. Each saved network
+/// gets its own file, so switching the active network preserves
+/// other networks' rosters untouched. The returned roster is
+/// in-memory; nothing is written until a caller invokes `save`.
+///
+/// On first call after upgrading from the single-roster layout, a
+/// legacy `~/.myownllm/mesh/roster.json` is migrated into its
+/// per-network home based on its self-reported `network_id`, then
+/// deleted. The migration runs lazily on any `load` call.
 pub fn load(current_network_id: &str) -> Result<Roster> {
-    let path = roster_path()?;
+    migrate_legacy_if_present()?;
+    let path = roster_path(current_network_id)?;
     if !path.exists() {
         return Ok(empty_for(current_network_id));
     }
@@ -137,24 +167,76 @@ pub fn load(current_network_id: &str) -> Result<Roster> {
         );
     }
     if roster.network_id != current_network_id {
-        // Network changed — discard the old roster rather than
-        // expose its peers to the new network.
+        // Defensive: a per-network file should always match its
+        // filename. If it doesn't (manual edit, mid-rename crash,
+        // etc.) trust the filename — it's the index we're keyed on.
         return Ok(empty_for(current_network_id));
     }
     Ok(roster)
 }
 
+/// One-shot migration from the pre-multi-network single roster
+/// file. Reads the legacy `roster.json`, writes it to its
+/// per-network path, and removes the legacy file on success. No-op
+/// when the legacy file doesn't exist. Failures are non-fatal —
+/// the legacy file is left in place and the caller continues with
+/// an empty per-network roster, so a malformed legacy file can't
+/// brick the mesh.
+fn migrate_legacy_if_present() -> Result<()> {
+    let legacy = legacy_roster_path()?;
+    if !legacy.exists() {
+        return Ok(());
+    }
+    let raw = match std::fs::read_to_string(&legacy) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    let roster: Roster = match serde_json::from_str(&raw) {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+    if roster.version != ROSTER_VERSION || roster.network_id.is_empty() {
+        // Unparseable / unknown version / never-bound — abandon the
+        // legacy file without migrating. The user just loses the
+        // unbound roster, which had no peers in it anyway.
+        let _ = std::fs::remove_file(&legacy);
+        return Ok(());
+    }
+    // Write to the per-network home, then drop the legacy file. If
+    // a per-network file already exists for this id (shouldn't
+    // happen in practice, but a defensive double-run is fine), it
+    // wins — the legacy file was older.
+    let target = roster_path(&roster.network_id)?;
+    if !target.exists() {
+        save(&roster)?;
+    }
+    let _ = std::fs::remove_file(&legacy);
+    Ok(())
+}
+
 pub fn save(roster: &Roster) -> Result<()> {
-    let path = roster_path()?;
+    let path = roster_path(&roster.network_id)?;
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("roster path has no parent: {}", path.display()))?;
     std::fs::create_dir_all(parent)
-        .with_context(|| format!("create mesh dir at {}", parent.display()))?;
+        .with_context(|| format!("create rosters dir at {}", parent.display()))?;
     let serialized = serde_json::to_string_pretty(roster)?;
     std::fs::write(&path, serialized)
         .with_context(|| format!("write roster to {}", path.display()))?;
     restrict_file_permissions(&path)?;
+    Ok(())
+}
+
+/// Remove the roster file for `network_id`. Used by the "Forget
+/// Network" UX so a removed network doesn't leave its peer
+/// approvals lingering on disk. Idempotent — missing file is fine.
+pub fn delete(network_id: &str) -> Result<()> {
+    let path = roster_path(network_id)?;
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("remove roster at {}", path.display()))?;
+    }
     Ok(())
 }
 

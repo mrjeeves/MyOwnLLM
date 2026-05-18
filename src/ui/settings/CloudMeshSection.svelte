@@ -1,31 +1,55 @@
 <script lang="ts">
-  import CloudMeshIdentity from "./CloudMeshIdentity.svelte";
+  import CloudMeshStatus from "./CloudMeshStatus.svelte";
+  import CloudMeshConnections from "./CloudMeshConnections.svelte";
+  import CloudMeshActivity from "./CloudMeshActivity.svelte";
   import CloudMeshAddresses from "./CloudMeshAddresses.svelte";
   import RemoteSection from "./RemoteSection.svelte";
+  import type { CloudMeshSubTab } from "../settings-route.svelte";
 
-  /** Sub-tab strip mirrors the pattern Models uses. Identity is the
-   *  home view — your device card and the live connection management
-   *  surface (status, peers, pending requests, activity). Settings
-   *  is set-once configuration (STUN, TURN, custom signaling
-   *  relays). LAN is the existing axum-served browser UI, preserved
-   *  here so users who relied on it don't lose it during the
-   *  Remote-tab rename. */
-  let tab = $state<"identity" | "settings" | "lan">("identity");
+  let { initialSubTab = null } = $props<{
+    initialSubTab?: CloudMeshSubTab | null;
+  }>();
+
+  /** Sub-tab strip mirrors the pattern Models uses.
+   *
+   *  - **Status** is the home view: identity card, status pill +
+   *    accepting policy, saved networks list (with add / switch /
+   *    forget / lock), and pending Network requests when present.
+   *    The wizard for adding/locking a network all happens here.
+   *  - **Connections** lists the ring (currently routed peers,
+   *    auto-healed on every join/leave), indirect peers we know
+   *    about but aren't actively routing through (shelved or
+   *    offline rostered), and an in-use resource map
+   *    (inbound/outbound inferences + moves).
+   *  - **Activity** is the ring-buffered diagnostic log with a
+   *    quiet-mode toggle. Moved off the Status tab so steady-state
+   *    chatter doesn't crowd the controllable surfaces.
+   *  - **Settings** is per-network signaling / STUN / TURN config.
+   *  - **HTTP** (previously "LAN") is the local axum-served
+   *    browser UI for phone/tablet access. */
+  // svelte-ignore state_referenced_locally
+  let tab = $state<CloudMeshSubTab>(initialSubTab ?? "status");
 </script>
 
 <div class="section">
   <div class="h-tabs">
-    <button class:active={tab === "identity"} onclick={() => (tab = "identity")}>Identity</button>
+    <button class:active={tab === "status"} onclick={() => (tab = "status")}>Status</button>
+    <button class:active={tab === "connections"} onclick={() => (tab = "connections")}>Connections</button>
+    <button class:active={tab === "activity"} onclick={() => (tab = "activity")}>Activity</button>
     <button class:active={tab === "settings"} onclick={() => (tab = "settings")}>Settings</button>
-    <button class:active={tab === "lan"} onclick={() => (tab = "lan")}>LAN</button>
+    <button class:active={tab === "http"} onclick={() => (tab = "http")}>HTTP</button>
   </div>
 
   <div class="content">
-    {#if tab === "identity"}
-      <CloudMeshIdentity />
+    {#if tab === "status"}
+      <CloudMeshStatus />
+    {:else if tab === "connections"}
+      <CloudMeshConnections />
+    {:else if tab === "activity"}
+      <CloudMeshActivity />
     {:else if tab === "settings"}
       <CloudMeshAddresses />
-    {:else if tab === "lan"}
+    {:else if tab === "http"}
       <RemoteSection />
     {/if}
   </div>
