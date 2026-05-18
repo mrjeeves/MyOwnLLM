@@ -852,6 +852,29 @@ class MeshClient {
     }>
   >([]);
 
+  /** In-flight `session_fetch_request`s we're waiting on the host to
+   *  answer. Keyed by request id; the promise resolves when the host
+   *  ships back `session_fetch_response`. Cleared on stop() so a
+   *  pending fetch unblocks instead of stranding the caller. */
+  private pending_session_fetches = new Map<
+    string,
+    {
+      target_peer_id: string;
+      on_settle: (conversation: Conversation | null, error?: string) => void;
+    }
+  >();
+
+  /** In-flight `session_save_request`s we've shipped to a host,
+   *  awaiting `session_save_response`. Same shape as fetches —
+   *  resolve / reject the caller's promise on the terminal frame. */
+  private pending_session_saves = new Map<
+    string,
+    {
+      target_peer_id: string;
+      on_settle: (ok: boolean, error?: string) => void;
+    }
+  >();
+
   // ---- lifecycle -------------------------------------------------------
 
   async reconcile(): Promise<void> {
@@ -870,10 +893,10 @@ class MeshClient {
     // user's other saved networks live on disk with their rosters
     // intact, ready for a fast switch via `setActiveNetwork`.
     const active = activeNetwork(cfg);
-    const should_run = !!active && active.locked && active.network_id !== "";
+    const should_run = !!active && active.network_id !== "";
     if (!should_run) {
       if (this.room) {
-        this.logDiag("info", "reconcile: no active locked network → stopping");
+        this.logDiag("info", "reconcile: no active network → stopping");
         await this.stop();
       }
       return;
@@ -918,6 +941,15 @@ class MeshClient {
     this.identity = opts.identity;
     this.network_id = opts.networkId;
     this.connections.clear();
+    // Network-scoped caches: a different active network means a
+    // different roster, so the cached catalogs and capability blobs
+    // from peers in the old network shouldn't leak into the sidebar
+    // here. refreshRoster() will reseed roster_pubkeys / labels from
+    // disk below.
+    this.catalog_cache.clear();
+    this.capabilities_cache.clear();
+    this.roster_pubkeys.clear();
+    this.roster_labels.clear();
     // Snapshot capabilities + persisted preferences (per-network
     // accepting, global diag_quiet) before any peer talks to us —
     // the very first hello we send to a freshly-joined peer should
@@ -1173,6 +1205,14 @@ class MeshClient {
     this.pending_files_in.clear();
     this.pending_offers.clear();
     this.inbound_offers = [];
+    for (const [, pending] of this.pending_session_fetches) {
+      pending.on_settle(null, "mesh stopped");
+    }
+    this.pending_session_fetches.clear();
+    for (const [, pending] of this.pending_session_saves) {
+      pending.on_settle(false, "mesh stopped");
+    }
+    this.pending_session_saves.clear();
     this.refreshFileResources();
     this.refreshResources();
     for (const c of this.connections.values()) {
@@ -2053,6 +2093,37 @@ class MeshClient {
       case "transcribe_cancel":
         this.handleTranscribeCancelInbound(conn, msg.id);
         break;
+      case "session_fetch_request":
+        // Active-rostered gate so a stranger in the same Trystero
+        // room can't pump our conversation contents.
+        if (this.peerStatus(conn) !== "active") {
+          this.send(conn, {
+            kind: "session_fetch_response",
+            id: msg.id,
+            error: "peer not authorized",
+          });
+          break;
+        }
+        void this.handleSessionFetchRequest(conn, msg.id, msg.guid);
+        break;
+      case "session_fetch_response":
+        this.handleSessionFetchResponseInbound(msg.id, msg.conversation, msg.error);
+        break;
+      case "session_save_request":
+        if (this.peerStatus(conn) !== "active") {
+          this.send(conn, {
+            kind: "session_save_response",
+            id: msg.id,
+            ok: false,
+            error: "peer not authorized",
+          });
+          break;
+        }
+        void this.handleSessionSaveRequest(conn, msg.id, msg.conversation);
+        break;
+      case "session_save_response":
+        this.handleSessionSaveResponseInbound(msg.id, msg.ok, msg.error);
+        break;
     }
   }
 
@@ -2538,6 +2609,21 @@ class MeshClient {
       }
     }
     this.inbound_offers = this.inbound_offers.filter((o) => o.peer_id !== peer_id);
+    // Session-view fetches / saves can't complete once the host
+    // drops — fail them so the open Chat unwinds with an error
+    // instead of stranding on a promise that never resolves.
+    for (const [id, pending] of this.pending_session_fetches) {
+      if (pending.target_peer_id === peer_id) {
+        this.pending_session_fetches.delete(id);
+        pending.on_settle(null, "host disconnected");
+      }
+    }
+    for (const [id, pending] of this.pending_session_saves) {
+      if (pending.target_peer_id === peer_id) {
+        this.pending_session_saves.delete(id);
+        pending.on_settle(false, "host disconnected");
+      }
+    }
     this.refreshFileResources();
     this.refreshResources();
     this.republishPeers();
@@ -3420,6 +3506,172 @@ class MeshClient {
   ): void {
     if (!this.pending_transcribes_in.has(id)) return;
     // Intentional no-op until the Rust-side piped-input pipeline lands.
+  }
+
+  // ---- session view (Phase 3) -----------------------------------------
+  //
+  // Open a remote conversation in place. The host serves the full
+  // `Conversation` payload on demand and accepts updated snapshots
+  // back from the viewer after each turn. Inference for the open
+  // session routes through the existing remote-inference path
+  // (`infer_request`) pinned to the host, so the model + history
+  // stay on the device that owns the data.
+
+  /** Ask `target_peer_id` for the full conversation `guid`. Resolves
+   *  with the conversation payload (or null when the host doesn't
+   *  have it). Rejects on transport failure / peer drop. Requires
+   *  the peer to be active and advertise SESSION_VIEW. */
+  async fetchRemoteSession(
+    target_peer_id: string,
+    guid: string,
+  ): Promise<Conversation> {
+    const conn = this.connections.get(target_peer_id);
+    if (!conn) throw new Error("target peer not connected");
+    if (this.peerStatus(conn) !== "active") {
+      throw new Error("target peer not in active state");
+    }
+    if (!peerSupportsFeature(conn.capabilities, FEATURES.SESSION_VIEW)) {
+      throw new Error(
+        "host doesn't advertise click-to-open support — pull the conversation onto this device instead",
+      );
+    }
+    const id = generateMeshId();
+    return await new Promise<Conversation>((resolve, reject) => {
+      this.pending_session_fetches.set(id, {
+        target_peer_id,
+        on_settle: (conversation, error) => {
+          if (error || !conversation) {
+            reject(new Error(error ?? "host returned no conversation"));
+            return;
+          }
+          resolve(conversation);
+        },
+      });
+      this.send(conn, { kind: "session_fetch_request", id, guid });
+    });
+  }
+
+  /** Ship an updated `conversation` to its host. Resolves once the
+   *  host writes it to disk and acks. Used after every turn of an
+   *  open remote conversation so the host's persisted state stays
+   *  in sync with what the viewer sees. */
+  async saveRemoteSession(
+    target_peer_id: string,
+    conversation: Conversation,
+  ): Promise<void> {
+    const conn = this.connections.get(target_peer_id);
+    if (!conn) throw new Error("target peer not connected");
+    if (this.peerStatus(conn) !== "active") {
+      throw new Error("target peer not in active state");
+    }
+    if (!peerSupportsFeature(conn.capabilities, FEATURES.SESSION_VIEW)) {
+      throw new Error("host doesn't advertise click-to-open support");
+    }
+    const id = generateMeshId();
+    return await new Promise<void>((resolve, reject) => {
+      this.pending_session_saves.set(id, {
+        target_peer_id,
+        on_settle: (ok, error) => {
+          if (ok) resolve();
+          else reject(new Error(error ?? "host refused save"));
+        },
+      });
+      this.send(conn, { kind: "session_save_request", id, conversation });
+    });
+  }
+
+  /** Read `guid` off our local disk and ship it back. Used by the
+   *  host side of a click-to-open: an active peer asked us for one
+   *  of our conversations, we look it up and answer with the full
+   *  payload or an error. */
+  private async handleSessionFetchRequest(
+    conn: ConnectionState,
+    id: string,
+    guid: string,
+  ): Promise<void> {
+    try {
+      const c = await loadConversation(guid);
+      if (!c) {
+        this.send(conn, {
+          kind: "session_fetch_response",
+          id,
+          error: "conversation not found on host",
+        });
+        return;
+      }
+      this.send(conn, {
+        kind: "session_fetch_response",
+        id,
+        conversation: c as unknown,
+      });
+    } catch (e) {
+      this.send(conn, {
+        kind: "session_fetch_response",
+        id,
+        error: String(e),
+      });
+    }
+  }
+
+  /** Write the conversation a viewer sent us back to disk. The
+   *  receiver's saveConversation finds the existing file by `id`
+   *  (it lives in some folder on disk) and updates in place, so the
+   *  host's catalog stays valid and other peers see the change on
+   *  the next catalog announce. */
+  private async handleSessionSaveRequest(
+    conn: ConnectionState,
+    id: string,
+    raw: unknown,
+  ): Promise<void> {
+    try {
+      const c = raw as Conversation;
+      if (!c || typeof c !== "object" || typeof (c as Conversation).id !== "string") {
+        this.send(conn, {
+          kind: "session_save_response",
+          id,
+          ok: false,
+          error: "malformed conversation payload",
+        });
+        return;
+      }
+      await saveConversation(c);
+      this.send(conn, { kind: "session_save_response", id, ok: true });
+      // Other peers see the new state via the next catalog tick.
+      this.noteCatalogChanged();
+    } catch (e) {
+      this.send(conn, {
+        kind: "session_save_response",
+        id,
+        ok: false,
+        error: String(e),
+      });
+    }
+  }
+
+  private handleSessionFetchResponseInbound(
+    id: string,
+    conversation: unknown,
+    error?: string,
+  ): void {
+    const pending = this.pending_session_fetches.get(id);
+    if (!pending) return;
+    this.pending_session_fetches.delete(id);
+    if (error || !conversation) {
+      pending.on_settle(null, error ?? "no conversation in response");
+      return;
+    }
+    pending.on_settle(conversation as Conversation);
+  }
+
+  private handleSessionSaveResponseInbound(
+    id: string,
+    ok: boolean,
+    error?: string,
+  ): void {
+    const pending = this.pending_session_saves.get(id);
+    if (!pending) return;
+    this.pending_session_saves.delete(id);
+    pending.on_settle(ok, error);
   }
 
   // ---- file transfer (Phase 2.1) --------------------------------------

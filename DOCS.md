@@ -678,7 +678,7 @@ Launch the GUI by running `myownllm` with no arguments, or open the application 
 
 **Distributed Intelligence.** Two (or ten) MyOwnLLM instances with the same Network ID find each other, mutually authenticate, and share work peer-to-peer over WebRTC. No MyOwnLLM-operated signaling server, no API key, no cloud round-trip. Every device becomes a window into the same mesh: phone audio in, desktop transcription out, a laptop's idle GPU answering prompts from the tablet on the kitchen counter — each device adds its powers to the whole, picked per-surface from the model selector at the bottom of each pane.
 
-Cloud Mesh ships off by default. To turn it on, open **Settings → Networks → Status** and follow the wizard — pick or generate a Network ID, lock it, and the mesh client comes up.
+Cloud Mesh ships off by default. To turn it on, open **Settings → Networks → Status** and follow the wizard — pick or generate a Network ID, click **Save & activate**, and the mesh client comes up.
 
 ### Concepts
 
@@ -692,8 +692,8 @@ Cloud Mesh ships off by default. To turn it on, open **Settings → Networks →
 
 ### Quick start
 
-1. **Device A:** open **Settings → Networks → Status**. The wizard says "Pick a Network ID" — type a name (e.g. `home-mesh`) or click **Generate** for a random one. Click the lock to commit.
-2. **Device B:** same tab. Type the **same** name. Click the lock.
+1. **Device A:** open **Settings → Networks → Status**. The wizard says "Pick a Network ID" — type a name (e.g. `home-mesh`) or click **Generate** for a random one. Click **Save & activate** to commit.
+2. **Device B:** same tab. Type the **same** name. Click **Save & activate**.
 3. Within seconds the wizard on each device flips to "approval(s) waiting" with a card showing the request. The host side (lex-lesser pubkey) prompts first ("X wants to connect"). Compare the verification code shown to what the other person reads aloud; if they match, click **Approve**.
 4. The guest side gets a follow-up prompt ("X authorized you — confirm?"). Approve there too. Both sides flip to **Connected** and the peer joins the Ring on the **Connections** tab.
 5. After approval, reconnects auto-allow silently — you only see a prompt for genuinely new peers.

@@ -8,13 +8,12 @@
    *  no separate label field, because two parallel names would
    *  just be confusing.
    *
-   *  Three save modes:
-   *    - **Save**: add the network to the saved list, leave it
-   *      unlocked and inactive. User can switch + lock later.
-   *    - **Save & activate**: same, but flip it active right
-   *      away. Wizard on the Status tab picks up from there.
-   *    - **Save, activate & lock**: shortcut for the "I know my
-   *      Network ID and want to start joining it now" flow.
+   *  Two save modes:
+   *    - **Save**: add the network to the saved list without
+   *      activating. The user can switch to it later from the
+   *      sidebar / Status tab.
+   *    - **Save & activate**: add and switch to it right away.
+   *      The mesh joins on the next reconcile.
    *
    *  Save runs through `addNetwork` from config.ts which
    *  generates a stable internal id, normalizes the network_id,
@@ -40,7 +39,7 @@
     }
   }
 
-  async function save(mode: "save" | "activate" | "lock") {
+  async function save(mode: "save" | "activate") {
     const trimmed = networkIdDraft.trim();
     if (!trimmed) {
       error = "Enter a Network ID or click Generate first.";
@@ -52,21 +51,13 @@
       const normalized = await normalizeNetworkId(trimmed);
       await addNetwork(
         { network_id: normalized },
-        { activate: mode !== "save", locked: mode === "lock" },
+        { activate: mode === "activate" },
       );
-      // Activate via setActiveNetwork too when `mode` is activate
-      // or lock — addNetwork only sets activate=true on the
-      // newly-created network when activate is passed. The mesh
-      // client picks up the change on its next reconcile.
-      if (mode !== "save") {
-        // addNetwork's `activate` option pointed to the new
-        // network's id; reconcile will pick it up on the next
-        // call. Trigger one explicitly so the wizard lights up
-        // without waiting for the user to click around.
+      if (mode === "activate") {
+        // Fire reconcile so the mesh switches to the new active
+        // network without waiting for the user to click around.
         await meshClient.reconcile();
       }
-      // Settled — drop the modal. The caller (Sidebar or Status
-      // tab) re-renders against the fresh config.
       onClose();
     } catch (e) {
       error = String(e);
@@ -81,7 +72,7 @@
       onClose();
     } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      void save("lock");
+      void save("activate");
     }
   }
 
@@ -139,14 +130,11 @@
 
   <div class="actions">
     <button class="cancel" onclick={onClose} disabled={saving}>Cancel</button>
-    <button class="ghost" onclick={() => save("save")} disabled={saving} title="Save to your list, don't activate yet">
+    <button class="ghost" onclick={() => save("save")} disabled={saving} title="Save to your list without joining yet">
       Save
     </button>
-    <button class="ghost" onclick={() => save("activate")} disabled={saving} title="Save and switch to it (don't lock yet)">
+    <button class="primary" onclick={() => save("activate")} disabled={saving} title="Save and start joining immediately (⌘/Ctrl + Enter)">
       Save & activate
-    </button>
-    <button class="primary" onclick={() => save("lock")} disabled={saving} title="Save, activate, and start joining immediately (⌘/Ctrl + Enter)">
-      Save & start
     </button>
   </div>
 </div>

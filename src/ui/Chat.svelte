@@ -34,6 +34,7 @@
     hardware,
     sidebarOpen,
     conversationId,
+    remoteOpen,
     newChatCounter,
     textModelMissing,
     textModel,
@@ -42,6 +43,7 @@
     onModeChange,
     onProviderChange,
     onConversationChanged,
+    onRemoteOpenFailed,
     onRequestStopTranscribe,
     onRequestStopChat,
     onRequestSendChat,
@@ -54,6 +56,18 @@
     hardware: HardwareProfile | null;
     sidebarOpen: boolean;
     conversationId: string | null;
+    /** Phase 3 click-to-open: when set, the panel is rendering a
+     *  conversation that lives on a peer's disk. Inference routes
+     *  through the host via `infer_request`, and every persist
+     *  ships the updated snapshot back via
+     *  `meshClient.saveRemoteSession`. Mutually exclusive with a
+     *  non-null `conversationId`. */
+    remoteOpen: {
+      peer_id: string;
+      peer_pubkey: string;
+      peer_label: string;
+      guid: string;
+    } | null;
     /** Bumped by App when the user clicks "New chat". Watching this in an
      *  effect lets the panel reset cleanly even when the chat is already
      *  empty (so re-clicks still feel responsive). */
@@ -71,6 +85,10 @@
     onModeChange: (mode: Mode) => void;
     onProviderChange: () => void;
     onConversationChanged: (id: string) => void;
+    /** Phase 3: tell App a click-to-open failed (host dropped, refused,
+     *  etc.) so it can clear its `remoteOpen` state and surface the
+     *  error to the user. */
+    onRemoteOpenFailed: (error: string) => void;
     /** Stop the active transcription. Wired by App so the
      *  pending-chunks confirm modal lives in one place. */
     onRequestStopTranscribe: () => void;
@@ -108,8 +126,16 @@
   let routeBlockedReason = $state("");
   /** The active routing pin (resolved from `routingPins.text` on
    *  every render so the picker, the send path, and any other
-   *  caller see the same value). */
-  const routeViaDevicePubkey = $derived(routingPins.text);
+   *  caller see the same value).
+   *
+   *  Phase 3: when a remote conversation is open, the host that
+   *  stores it is the default processing device — override the
+   *  user's per-surface pin so the conversation acts like a cloud
+   *  service hosted on that device. The pin survives the close;
+   *  the override only applies while a remote session is open. */
+  const routeViaDevicePubkey = $derived(
+    remoteOpen ? remoteOpen.peer_pubkey : routingPins.text,
+  );
   /** Resolved current peer entry for the pin, or null when not set
    *  / not in `meshClient.peers`. */
   const routedPeer = $derived(
@@ -200,11 +226,24 @@
     }
   });
 
-  // Refresh context window whenever the active model changes. Failures
-  // (model missing, daemon not yet up) leave the indicator hidden.
+  // Refresh context window whenever the active model changes.
+  // Routing pin changes ALSO retrigger this: when pinned to a peer
+  // the user's "active model" is whatever the peer resolves (we
+  // don't get told the exact tag — only that they advertise the
+  // family). Capabilities don't carry per-model context size today,
+  // so the indicator hides while pinned to a peer rather than
+  // showing a stale local number that would mis-describe what
+  // the user is sending. Failures (model missing, daemon not yet
+  // up) also leave the indicator hidden.
   $effect(() => {
     const model = activeModel;
-    if (!model) {
+    // Reads of `routeViaDevicePubkey` and `remoteOpen` register
+    // them as dependencies so the indicator re-evaluates the
+    // moment the user picks a different host (or opens a remote
+    // session).
+    const pinned = routeViaDevicePubkey;
+    const remote = remoteOpen;
+    if (!model || pinned || remote) {
       contextSize = 0;
       return;
     }
@@ -222,8 +261,33 @@
   });
 
   // Load (or create) a conversation when the parent points us at one.
+  // Phase 3: when `remoteOpen` is set, fetch the conversation over
+  // the mesh from the host instead of reading from local disk — the
+  // host's stored copy is the authoritative source.
   $effect(() => {
+    const remote = remoteOpen;
     const id = conversationId;
+    if (remote) {
+      let cancelled = false;
+      activeConversation = null;
+      messages = [];
+      thinkingEnabled = false;
+      meshClient
+        .fetchRemoteSession(remote.peer_id, remote.guid)
+        .then((c) => {
+          if (cancelled) return;
+          activeConversation = c;
+          messages = c.messages.map((m) => ({ ...m }));
+          thinkingEnabled = !!c.thinking_enabled;
+        })
+        .catch((e) => {
+          if (cancelled) return;
+          onRemoteOpenFailed(String(e instanceof Error ? e.message : e));
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
     if (!id) {
       // null = empty chat (parent's "New chat" or initial mount).
       activeConversation = null;
@@ -291,7 +355,13 @@
 
   /** Persist the current message list under `activeConversation`, creating
    *  the record on first save. Keeps disk in sync with whatever the user
-   *  sees, including thinking blocks. */
+   *  sees, including thinking blocks.
+   *
+   *  Phase 3: when `remoteOpen` is set, the conversation lives on a
+   *  peer's disk. Persist round-trips through `saveRemoteSession` so
+   *  the host (not us) writes the JSON — the host's copy stays the
+   *  authoritative source, and the next catalog announce broadcasts
+   *  the update to every other peer. */
   async function persist(): Promise<Conversation> {
     let conv = activeConversation;
     if (!conv) {
@@ -313,7 +383,12 @@
     // pointless `false` line on first save under the new build.
     if (thinkingEnabled) conv.thinking_enabled = true;
     else delete conv.thinking_enabled;
-    await saveConversation(conv);
+    if (remoteOpen) {
+      conv.updated_at = new Date().toISOString();
+      await meshClient.saveRemoteSession(remoteOpen.peer_id, conv);
+    } else {
+      await saveConversation(conv);
+    }
     activeConversation = conv;
     onConversationChanged(conv.id);
     return conv;
@@ -333,7 +408,12 @@
       if (next) conv.thinking_enabled = true;
       else delete conv.thinking_enabled;
       try {
-        await saveConversation(conv);
+        if (remoteOpen) {
+          conv.updated_at = new Date().toISOString();
+          await meshClient.saveRemoteSession(remoteOpen.peer_id, conv);
+        } else {
+          await saveConversation(conv);
+        }
       } catch (e) {
         console.warn("persist thinking toggle failed:", e);
       }
@@ -652,10 +732,19 @@
     </div>
   {:else}
   <div class="messages" bind:this={messagesEl}>
-    {#if messages.length === 0}
+    {#if remoteOpen && !activeConversation}
       <div class="empty">
-        <span class="model-badge">{activeModel}</span>
-        <p>Ready. Start typing below.</p>
+        <p>Loading conversation from {remoteOpen.peer_label}…</p>
+      </div>
+    {:else if messages.length === 0}
+      <div class="empty">
+        {#if remoteOpen}
+          <span class="model-badge">remote · {remoteOpen.peer_label}</span>
+          <p>Cloud session on {remoteOpen.peer_label}. Start typing below — inference runs there, this conversation stays on their device.</p>
+        {:else}
+          <span class="model-badge">{activeModel}</span>
+          <p>Ready. Start typing below.</p>
+        {/if}
       </div>
     {/if}
     {#each messages as msg, i (i)}
@@ -686,7 +775,7 @@
   </div>
   {/if}
 
-  {#if textModelMissing && textModel}
+  {#if textModelMissing && textModel && !remoteOpen}
     <DownloadOverlay
       kind="text"
       modelName={textModel}
@@ -708,6 +797,10 @@
     thinkingAvailable={activeMode === "text"}
     viaDevicePubkey={routeViaDevicePubkey}
     onViaChange={(p) => {
+      // Remote-session view forces the host as the processing
+      // device — the conversation lives on their disk. Picking a
+      // different host wouldn't make sense, so ignore the change.
+      if (remoteOpen) return;
       setTextPin(p);
       // Clearing or repinning resolves whatever was blocking — drop
       // the inline banner so the user sees the slate as clean.
@@ -715,10 +808,18 @@
     }}
     onThinkingChange={setThinkingEnabled}
     {streaming}
+    routeLockedToRemote={!!remoteOpen}
+    remoteHostLabel={remoteOpen?.peer_label ?? ""}
   />
 
   {#if !tpHoldsSlot}
-    {#if routePinUnavailable}
+    {#if routePinUnavailable && remoteOpen}
+      <div class="route-blocked" role="status">
+        Host {remoteOpen.peer_label} is offline — pick this conversation
+        again when they reconnect, or right-click it in the sidebar to
+        pull a copy onto this device.
+      </div>
+    {:else if routePinUnavailable}
       <div class="route-blocked" role="status">
         Pinned peer is offline — pick another host or 'this device' in the bar
         above to resume.

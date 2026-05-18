@@ -112,6 +112,22 @@
   let conversations = $state<ConversationMeta[]>([]);
   let folders = $state<FolderMeta[]>([]);
   let activeConversationId = $state<string | null>(null);
+  /** Phase 3 click-to-open: when set, Chat is mounted against a
+   *  conversation that lives on a peer's disk rather than ours.
+   *  Inference routes through the host via `infer_request`, and
+   *  every persist round-trips through `session_save_request` so the
+   *  host's on-disk copy stays authoritative. Mutually exclusive
+   *  with `activeConversationId` — opening one clears the other. */
+  let remoteOpen = $state<{
+    peer_id: string;
+    peer_pubkey: string;
+    peer_label: string;
+    guid: string;
+  } | null>(null);
+  /** Inline error from a failed remote open (host dropped mid-fetch,
+   *  refused, etc.). Rendered as a toast near the sidebar so the
+   *  user sees why nothing showed up. */
+  let remoteOpenError = $state<string>("");
   /** Bumped to ask Chat to create a fresh conversation. Plain counter so
    *  re-clicks of "New chat" still trigger a reset even when the chat is
    *  already empty. */
@@ -206,11 +222,10 @@
       if (config.auto_cleanup?.legacy !== false) {
         invoke<number>("legacy_models_remove_all").catch(() => {});
       }
-      // Bring up the Cloud Mesh client if the user has a locked
-      // Network ID from a previous session. Fire-and-forget — the
+      // Bring up the Cloud Mesh client if the user has an active
+      // network from a previous session. Fire-and-forget — the
       // Trystero room-join runs entirely off the startup path and
-      // the user sees its status in Settings → Cloud Mesh →
-      // Identity.
+      // the user sees its status in Settings → Networks → Status.
       meshClient.reconcile().catch(() => {});
 
       if (config.auto_cleanup?.conversations !== false) {
@@ -564,8 +579,10 @@
   const chatStreamLock = $derived(chatSlot.kind === "chat");
 
   function onSelectConversation(id: string) {
-    if (activeConversationId === id) return;
+    if (activeConversationId === id && !remoteOpen) return;
     if (chatStreamLock && id !== chatSlot.conversationId) return;
+    remoteOpen = null;
+    remoteOpenError = "";
     activeConversationId = id;
     suppressNextActiveEvent = true;
     setActiveConversationId(id);
@@ -577,8 +594,43 @@
     }
   }
 
+  /** Phase 3 click-to-open: a remote conversation in the sidebar
+   *  was activated. Routes to Chat with the host as the processing
+   *  device — the conversation lives on the host's disk, so default
+   *  inference goes there too. The actual fetch / save happen
+   *  inside Chat.svelte against `meshClient.fetchRemoteSession`. */
+  function onSelectRemoteConversation(args: {
+    peer_id: string;
+    peer_pubkey: string;
+    peer_label: string;
+    guid: string;
+    mode?: Mode;
+  }) {
+    if (chatStreamLock) return;
+    activeConversationId = null;
+    suppressNextActiveEvent = true;
+    setActiveConversationId(null);
+    remoteOpenError = "";
+    remoteOpen = {
+      peer_id: args.peer_id,
+      peer_pubkey: args.peer_pubkey,
+      peer_label: args.peer_label,
+      guid: args.guid,
+    };
+    if (args.mode && args.mode !== activeMode) {
+      onModeChange(args.mode).catch(() => {});
+    }
+  }
+
+  function clearRemoteOpen(error?: string) {
+    remoteOpen = null;
+    remoteOpenError = error ?? "";
+  }
+
   function onNewConversation() {
     if (chatStreamLock) return;
+    remoteOpen = null;
+    remoteOpenError = "";
     activeConversationId = null;
     newChatCounter += 1;
     suppressNextActiveEvent = true;
@@ -963,8 +1015,10 @@
         items={conversations}
         folders={folders}
         activeId={activeConversationId}
+        activeRemote={remoteOpen ? { peer_pubkey: remoteOpen.peer_pubkey, guid: remoteOpen.guid } : null}
         mode={activeMode}
         onSelect={onSelectConversation}
+        onSelectRemote={onSelectRemoteConversation}
         onNew={onNewConversation}
         onRename={onRenameConversation}
         onDelete={onDeleteConversation}
@@ -975,6 +1029,12 @@
         onDeleteFolder={onDeleteFolder}
         onClose={() => (sidebarOpen = false)}
       />
+      {#if remoteOpenError}
+        <div class="remote-open-error" role="alert">
+          Couldn't open remote conversation: {remoteOpenError}
+          <button class="dismiss" onclick={() => (remoteOpenError = "")} aria-label="Dismiss">✕</button>
+        </div>
+      {/if}
       {#if activeMode === "transcribe"}
         <TranscribeView
           {activeModel}
@@ -1012,6 +1072,7 @@
           {hardware}
           {sidebarOpen}
           conversationId={activeConversationId}
+          remoteOpen={remoteOpen}
           {newChatCounter}
           {textModelMissing}
           textModel={pendingTextModel}
@@ -1020,6 +1081,7 @@
           onModeChange={onModeChange}
           onProviderChange={onProviderChange}
           onConversationChanged={onConversationChanged}
+          onRemoteOpenFailed={(msg) => clearRemoteOpen(msg)}
           onRequestStopTranscribe={requestStopTranscribe}
           onRequestStopChat={requestStopChat}
           onRequestSendChat={requestSendChat}
@@ -1204,6 +1266,32 @@
     font-family: -apple-system, BlinkMacSystemFont, monospace;
     word-break: break-all;
   }
+  .remote-open-error {
+    position: fixed;
+    bottom: 1rem;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #3a1717;
+    color: #ffb4b4;
+    border: 1px solid #5a2424;
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.8rem;
+    display: inline-flex;
+    align-items: center;
+    gap: .6rem;
+    z-index: 60;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  }
+  .remote-open-error .dismiss {
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    padding: 0 .25rem;
+    font-size: .9rem;
+  }
+  .remote-open-error .dismiss:hover { color: #fff; }
   .splash {
     flex: 1;
     display: flex;

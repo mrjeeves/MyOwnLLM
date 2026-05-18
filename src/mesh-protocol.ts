@@ -122,6 +122,12 @@ export const FEATURES = {
    *  `transcribe_segment` frames back) and the caller can stream
    *  `transcribe_audio_chunk` against it. Phase 2.2. */
   REMOTE_TRANSCRIBE: "transcribe_request",
+  /** Sender can fetch and save remote conversations in-place via
+   *  `session_fetch_request` / `session_save_request`. Lets a peer
+   *  open a remote conversation directly in chat (routing inference
+   *  through the host's local model) instead of having to Pull it
+   *  onto local disk first. Phase 3. */
+  SESSION_VIEW: "session_view_v1",
 } as const;
 
 /** The full set of feature ids this build advertises. Sent inside
@@ -139,6 +145,7 @@ export const ADVERTISED_FEATURES: string[] = [
   FEATURES.FILE_TRANSFER,
   FEATURES.APP_VERSION,
   FEATURES.REMOTE_TRANSCRIBE,
+  FEATURES.SESSION_VIEW,
 ];
 
 /** Features a Phase 2.0 peer would have implicitly supported even
@@ -253,7 +260,11 @@ export type MeshMessage =
   | TranscribeSegmentMessage
   | TranscribeDoneMessage
   | TranscribeErrorMessage
-  | TranscribeCancelMessage;
+  | TranscribeCancelMessage
+  | SessionFetchRequestMessage
+  | SessionFetchResponseMessage
+  | SessionSaveRequestMessage
+  | SessionSaveResponseMessage;
 
 // ---- capabilities --------------------------------------------------------
 
@@ -852,6 +863,61 @@ export interface TranscribeErrorMessage {
 export interface TranscribeCancelMessage {
   kind: "transcribe_cancel";
   id: string;
+}
+
+// ---- session view (Phase 3) ----------------------------------------------
+//
+// Click-to-open remote conversations. A peer that has the requested
+// guid in its local catalog serves the full conversation back, and
+// the receiver can ship back updated state after each turn. Routing
+// inference for an opened remote conversation goes through the
+// existing `infer_request` flow with the host as the target, so the
+// model + prompt stay on the device that owns the data.
+//
+// Authorization: same active-rostered-peer gate as Move / infer /
+// file transfer — only authenticated peers may fetch or write
+// conversation contents.
+
+/** Ask the peer to send us the full `Conversation` for `guid`. The
+ *  peer looks the conversation up in its on-disk store and responds
+ *  with `session_fetch_response`. */
+export interface SessionFetchRequestMessage {
+  kind: "session_fetch_request";
+  id: string;
+  guid: string;
+}
+
+/** Peer's reply to `session_fetch_request`. Either carries the full
+ *  conversation payload or an `error` string when the guid doesn't
+ *  exist on the host (deleted, never existed, refused). */
+export interface SessionFetchResponseMessage {
+  kind: "session_fetch_response";
+  id: string;
+  /** Whole `Conversation` shape (see conversations.ts). Encoded
+   *  inline so a single round-trip is enough. Omitted on error. */
+  conversation?: unknown;
+  error?: string;
+}
+
+/** Ship an updated conversation snapshot back to the host. The host
+ *  writes it via the same `saveConversation` path the local UI uses,
+ *  so the new state lands on disk in the same folder and the
+ *  catalog re-broadcast picks it up for every other peer. */
+export interface SessionSaveRequestMessage {
+  kind: "session_save_request";
+  id: string;
+  /** Whole `Conversation` shape. The receiver replaces in place by
+   *  `conversation.id`. */
+  conversation: unknown;
+}
+
+/** Host ack for `session_save_request`. `ok` is true on a successful
+ *  write; `error` carries the reason when not. */
+export interface SessionSaveResponseMessage {
+  kind: "session_save_response";
+  id: string;
+  ok: boolean;
+  error?: string;
 }
 
 /** Compose the payload that a peer signs in response to a `hello`.
