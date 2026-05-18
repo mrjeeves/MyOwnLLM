@@ -469,7 +469,16 @@ class MeshClient {
   private stopping = false;
   private pending_moves_out = new Map<
     string,
-    { target_peer_id: string; conversation: Conversation; on_complete?: (ok: boolean, err?: string) => void }
+    {
+      target_peer_id: string;
+      conversation: Conversation;
+      /** Folder the conversation lives in on this device (POSIX,
+       *  "" = root). Snapshotted at moveConversation-time and
+       *  echoed in `move_payload` so the receiver preserves the
+       *  user's folder organization on the other side. */
+      source_folder: string;
+      on_complete?: (ok: boolean, err?: string) => void;
+    }
   >();
   /** Wall-clock ms of the last heartbeat tick from ANY connection.
    *  Used to detect OS sleep/suspend: if the gap between two ticks
@@ -977,10 +986,22 @@ class MeshClient {
     if (!conversation) {
       throw new Error("conversation not found locally");
     }
+    // Look up the source folder so we can echo it in `move_payload`
+    // and the receiver can land the conversation in the same place
+    // (creating intermediate folders if needed). Falls back to root
+    // if the conversation isn't in the listing for any reason.
+    let source_folder = "";
+    try {
+      const { conversations } = await listConversations();
+      source_folder = conversations.find((c) => c.id === guid)?.path ?? "";
+    } catch {
+      // Listing failed — proceed with root as the safe default.
+    }
     return await new Promise<void>((resolve, reject) => {
       this.pending_moves_out.set(guid, {
         target_peer_id,
         conversation,
+        source_folder,
         on_complete: (ok, err) => {
           if (ok) resolve();
           else reject(new Error(err ?? "move failed"));
@@ -1738,6 +1759,11 @@ class MeshClient {
       kind: "move_payload",
       guid: msg.guid,
       conversation: pending.conversation,
+      // Snapshot taken at moveConversation-time so a folder rename
+      // in the brief window between offer and accept doesn't ship
+      // a now-stale path that wouldn't match the receiver's
+      // expectation. Empty string elides on the wire.
+      target_folder: pending.source_folder || undefined,
     });
   }
 
@@ -1753,7 +1779,11 @@ class MeshClient {
       return;
     }
     try {
-      await saveConversation(incoming);
+      // Preserve the source's folder location so the conversation
+      // lands where the user saw it in their sidebar's Network
+      // view. saveConversation creates intermediate folders as
+      // needed, so deep paths ("Work/Projects/Q4") just work.
+      await saveConversation(incoming, msg.target_folder ?? "");
       this.send(conn, { kind: "move_complete", guid: msg.guid });
       // Receiver side: broadcast the commit so other peers update
       // their cached catalog (clear the source's `pending_move`)
@@ -2257,6 +2287,11 @@ class MeshClient {
         title: c.title,
         mode: c.mode,
         updated_at: c.updated_at,
+        // Folder location on this device. Peers reproduce the
+        // structure in their Network sidebar; empty (root) is
+        // omitted from the wire payload to save bytes via
+        // `||| undefined`.
+        path: c.path || undefined,
         // `pending_move` flips true for entries the source is
         // shipping out right now. We're the source whenever the
         // guid is in `pending_move_guids`.

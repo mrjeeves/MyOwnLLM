@@ -144,14 +144,26 @@ that bypass the save path.
 
 The catalog renders **directly in the main sidebar**: each
 connected peer becomes an expandable group under a "Network"
-divider with their hosted conversations as child rows. Right-click
-menu on a remote conversation → **← Pull from \<peer\>** which
-sends a `move_request` to the source. The source validates the
-requester is `active`-state (mutually authenticated + rostered),
+divider with their hosted conversations as child rows.
+`CatalogEntry` carries the source's folder `path` so the peer's
+folder structure renders verbatim on the receiver side — same
+folder/conversation tree shape as the local sidebar, recursively.
+The peer's "Work/Projects/Q4" appears as nested expandable folders
+on every connected device, not as a flat list of titles.
+
+Right-click menu on a remote conversation → **← Pull from \<peer\>**
+which sends a `move_request` to the source. The source validates
+the requester is `active`-state (mutually authenticated + rostered),
 then drives the regular Move handshake (`move_offer` → `accept`
 → `payload` → `complete`) with the requester as the destination.
 On failure (conversation not found, requester not authorized,
 move in flight) the source replies `move_request_decline`.
+
+`move_payload` now echoes the source folder back in `target_folder`,
+so a pulled or pushed conversation lands in the same folder on the
+receiver (creating intermediate folders if needed). What you saw in
+the sidebar is what you get on disk — Pull `peer-A/Work/Q4 planning`
+and it shows up under your own `Work/` folder, not in root.
 
 Right-click on a local conversation still shows the existing
 **Push to device → \<peer\>** submenu (renamed from "Move to

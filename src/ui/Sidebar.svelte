@@ -3,6 +3,7 @@
   import type { Mode } from "../types";
   import { meshClient } from "../mesh-client.svelte";
   import { settingsRoute } from "./settings-route.svelte";
+  import type { CatalogEntry } from "../mesh-protocol";
 
   /** Peers eligible as Move targets — active and authorized. The
    *  context-menu uses this directly; if the list is empty the
@@ -41,6 +42,79 @@
   function togglePeerCollapsed(pubkey: string) {
     peerCollapsed.has(pubkey) ? peerCollapsed.delete(pubkey) : peerCollapsed.add(pubkey);
     peerCollapsed = new Set(peerCollapsed);
+  }
+
+  /** Build a folder tree from a peer's catalog so we render their
+   *  conversations under the same folder structure they organize
+   *  them on-host. Mirrors the local `tree` derivation —
+   *  intermediate folders for "Work/Projects/Q4" materialize
+   *  automatically so the user sees the same hierarchy here as
+   *  they would on the source device. */
+  type RemoteNode = {
+    path: string;
+    name: string;
+    depth: number;
+    children: RemoteNode[];
+    items: CatalogEntry[];
+  };
+
+  function buildRemoteTree(entries: CatalogEntry[]): RemoteNode {
+    const root: RemoteNode = { path: "", name: "", depth: 0, children: [], items: [] };
+    const byPath = new Map<string, RemoteNode>();
+    byPath.set("", root);
+    const allPaths = new Set<string>();
+    for (const e of entries) if (e.path) allPaths.add(e.path);
+    for (const path of [...allPaths].sort()) {
+      const parts = path.split("/").filter(Boolean);
+      for (let i = 1; i <= parts.length; i++) {
+        const sub = parts.slice(0, i).join("/");
+        if (byPath.has(sub)) continue;
+        const parent = byPath.get(parts.slice(0, i - 1).join("/")) ?? root;
+        const node: RemoteNode = {
+          path: sub,
+          name: parts[i - 1],
+          depth: i - 1,
+          children: [],
+          items: [],
+        };
+        parent.children.push(node);
+        byPath.set(sub, node);
+      }
+    }
+    for (const e of entries) {
+      (byPath.get(e.path ?? "") ?? root).items.push(e);
+    }
+    // Most-recent first inside each folder, same ordering rule as
+    // the local sidebar.
+    const sortItems = (n: RemoteNode) => {
+      n.items.sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+      n.children.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      for (const c of n.children) sortItems(c);
+    };
+    sortItems(root);
+    return root;
+  }
+
+  /** Map from peer device_pubkey → built tree. Recomputes whenever
+   *  a peer's catalog changes (i.e. on every catalog_announce). */
+  let remoteTrees = $derived.by(() => {
+    const out = new Map<string, RemoteNode>();
+    for (const peer of peerGroups) {
+      out.set(peer.device_pubkey, buildRemoteTree(peer.catalog));
+    }
+    return out;
+  });
+
+  /** Collapse state for remote folders. Keyed by
+   *  `${peer_pubkey}:${folder_path}` so a folder on peer-A doesn't
+   *  collapse the same-named folder on peer-B. Default expanded. */
+  let remoteFolderCollapsed = $state<Set<string>>(new Set());
+
+  function toggleRemoteFolderCollapsed(key: string) {
+    remoteFolderCollapsed.has(key)
+      ? remoteFolderCollapsed.delete(key)
+      : remoteFolderCollapsed.add(key);
+    remoteFolderCollapsed = new Set(remoteFolderCollapsed);
   }
 
   /** Tracks an in-flight outgoing Move so the context menu can show
@@ -835,61 +909,23 @@
           {/if}
         </div>
         {#if !isCollapsed}
-          {#if peer.catalog.length === 0}
+          {@const node = remoteTrees.get(peer.device_pubkey)}
+          {#if !node || (node.items.length === 0 && node.children.length === 0)}
             <div class="peer-empty">(no conversations)</div>
           {:else}
-            {#each peer.catalog as entry (entry.guid)}
-              <div
-                class="row remote"
-                class:pending-move={entry.pending_move}
-                role="button"
-                tabindex="0"
-                onclick={(e) => e.stopPropagation()}
-                onkeydown={(e) => {
-                  // Keyboard equivalent of right-click: open the
-                  // context menu via Enter / Space so Pull is
-                  // reachable without a mouse. The opener anchors
-                  // the menu at the focused row's bounding rect
-                  // when handed a KeyboardEvent.
-                  if (e.key === "Enter" || e.key === " ") {
-                    openRemoteItemMenu(
-                      e,
-                      peer.peer_id,
-                      peer.label || peer.device_pubkey.slice(0, 8),
-                      entry.guid,
-                      entry.title,
-                    );
-                  }
-                }}
-                oncontextmenu={(e) =>
-                  openRemoteItemMenu(
-                    e,
-                    peer.peer_id,
-                    peer.label || peer.device_pubkey.slice(0, 8),
-                    entry.guid,
-                    entry.title,
-                  )}
-                title="{entry.title} (hosted on {peer.label || 'this peer'})"
-              >
-                {#if entry.mode === "transcribe" || entry.mode === "diarize"}
-                  <svg
-                    class="mode-icon"
-                    viewBox="0 0 24 24"
-                    width="11"
-                    height="11"
-                    aria-hidden="true"
-                  >
-                    <path
-                      fill="currentColor"
-                      d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"
-                    />
-                  </svg>
-                {/if}
-                <span class="title">{entry.title}</span>
-                {#if entry.pending_move}
-                  <span class="moving-pill">moving…</span>
-                {/if}
-              </div>
+            <!-- Root-level conversations under this peer (depth 1 so
+                 they indent under the peer-group header, matching the
+                 way local root conversations sit under the sidebar
+                 head). -->
+            {#each node.items as entry (entry.guid)}
+              {@render remoteRow(entry, peer, 1)}
+            {/each}
+            <!-- Folders and their nested contents — same recursive
+                 shape as the local sidebar tree, so the host's
+                 organization shows up here exactly as it does on
+                 their device. -->
+            {#each node.children as child (child.path)}
+              {@render remoteFolder(child, peer)}
             {/each}
           {/if}
         {/if}
@@ -897,6 +933,97 @@
     {/if}
   </div>
 </aside>
+
+{#snippet remoteFolder(node: RemoteNode, peer: (typeof peerGroups)[number])}
+  {@const key = `${peer.device_pubkey}:${node.path}`}
+  {@const isFolderCollapsed = remoteFolderCollapsed.has(key)}
+  <div
+    class="folder remote-folder"
+    style="--depth: {node.depth + 1};"
+    role="button"
+    tabindex="0"
+    onclick={(e) => {
+      e.stopPropagation();
+      toggleRemoteFolderCollapsed(key);
+    }}
+    onkeydown={(e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggleRemoteFolderCollapsed(key);
+      }
+    }}
+    title={node.path}
+  >
+    <span class="folder-caret" aria-hidden="true">{isFolderCollapsed ? "▸" : "▾"}</span>
+    <svg class="folder-icon" viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+      <path
+        fill="currentColor"
+        d="M10 4l2 2h6a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h6z"
+      />
+    </svg>
+    <span class="folder-name">{node.name}</span>
+  </div>
+  {#if !isFolderCollapsed}
+    {#each node.items as entry (entry.guid)}
+      {@render remoteRow(entry, peer, node.depth + 2)}
+    {/each}
+    {#each node.children as child (child.path)}
+      {@render remoteFolder(child, peer)}
+    {/each}
+  {/if}
+{/snippet}
+
+{#snippet remoteRow(entry: CatalogEntry, peer: (typeof peerGroups)[number], depth: number)}
+  <div
+    class="row remote"
+    class:pending-move={entry.pending_move}
+    style="--depth: {depth};"
+    role="button"
+    tabindex="0"
+    onclick={(e) => e.stopPropagation()}
+    onkeydown={(e) => {
+      // Keyboard equivalent of right-click: Enter / Space opens
+      // the Pull menu so the action is reachable without a mouse.
+      if (e.key === "Enter" || e.key === " ") {
+        openRemoteItemMenu(
+          e,
+          peer.peer_id,
+          peer.label || peer.device_pubkey.slice(0, 8),
+          entry.guid,
+          entry.title,
+        );
+      }
+    }}
+    oncontextmenu={(e) =>
+      openRemoteItemMenu(
+        e,
+        peer.peer_id,
+        peer.label || peer.device_pubkey.slice(0, 8),
+        entry.guid,
+        entry.title,
+      )}
+    title="{entry.title} (hosted on {peer.label || 'this peer'})"
+  >
+    {#if entry.mode === "transcribe" || entry.mode === "diarize"}
+      <svg
+        class="mode-icon"
+        viewBox="0 0 24 24"
+        width="11"
+        height="11"
+        aria-hidden="true"
+      >
+        <path
+          fill="currentColor"
+          d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"
+        />
+      </svg>
+    {/if}
+    <span class="title">{entry.title}</span>
+    {#if entry.pending_move}
+      <span class="moving-pill">moving…</span>
+    {/if}
+  </div>
+{/snippet}
 
 {#snippet folder(node: Node)}
   {@const isCollapsed = collapsed.has(node.path)}
@@ -1317,12 +1444,18 @@
     font-style: italic;
     padding: .25rem .65rem .35rem 1.45rem;
   }
-  .row.remote {
-    padding-left: calc(.45rem + .9rem);
-    color: #ccc;
-  }
+  /* Remote rows inherit the same depth-based padding-left math as
+     local .row entries (via --depth). The peer's "root" items get
+     --depth: 1 so they sit under the peer-group header; items
+     inside the peer's folders get --depth: folder_depth + 2, the
+     same nesting feel as the local sidebar. */
+  .row.remote { color: #ccc; }
   .row.remote:hover { background: #131820; }
   .row.remote.pending-move { opacity: .65; }
+  /* Remote folders match the local folder styling so the peer's
+     tree visually reads as "their version of the same sidebar." */
+  .folder.remote-folder { color: #ccc; }
+  .folder.remote-folder:hover { background: #131820; }
   .moving-pill {
     font-size: .58rem;
     text-transform: uppercase;

@@ -241,7 +241,9 @@ export interface UnshelveMessage {
  *  replication. The hosting peer is whoever sent the announcement.
  *
  *  Phase 2 adds `pending_move` so an in-flight 2-phase Move shows
- *  in the Network view as "moving…" rather than appearing twice. */
+ *  in the Network view as "moving…" rather than appearing twice,
+ *  and `path` so remote viewers can reproduce the host's folder
+ *  layout in their sidebar. */
 export interface CatalogEntry {
   guid: string;
   title: string;
@@ -252,6 +254,12 @@ export interface CatalogEntry {
    *  but the destination peer should not show it as "available to
    *  move to". Optional; default false. */
   pending_move?: boolean;
+  /** POSIX-style folder path the conversation lives in on the
+   *  hosting peer (empty string or omitted = root). Used by remote
+   *  viewers to reproduce the host's folder structure in the
+   *  sidebar Network section. v1 announcers omit the field and
+   *  the receiver treats it as root. */
+  path?: string;
 }
 
 export interface CatalogAnnounceMessage {
@@ -292,6 +300,12 @@ export interface MovePayloadMessage {
   kind: "move_payload";
   guid: string;
   conversation: unknown;
+  /** Folder path the conversation lived in on the source (POSIX,
+   *  empty string = root). Receiver saves into the same folder
+   *  (creating intermediates if needed) so a Push or Pull
+   *  preserves the user's folder organization across devices.
+   *  Optional; v1 receivers ignore and write to root. */
+  target_folder?: string;
 }
 
 export interface MoveCompleteMessage {
