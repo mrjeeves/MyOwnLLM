@@ -811,6 +811,50 @@
 {/if}
 
 <style>
+  /* Svelte's component-scoped CSS — these wrap styles must live in
+     every component that uses `use:scrollAffordance`, otherwise
+     the wrap has no sizing and the inner `.root` collapses to
+     content height (visible bug: wizard expand can't push items
+     below it down because the wrap doesn't take up the panel's
+     vertical space). */
+  .scroll-affordance-wrap {
+    position: relative;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .scroll-more-hint {
+    position: absolute;
+    left: 50%;
+    bottom: 0.55rem;
+    transform: translateX(-50%);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.15rem 0.55rem 0.2rem;
+    border-radius: 999px;
+    background: rgba(110, 110, 247, 0.18);
+    border: 1px solid rgba(110, 110, 247, 0.4);
+    color: #b8b8ff;
+    font-size: 0.68rem;
+    line-height: 1;
+    letter-spacing: 0.02em;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.18s ease;
+    box-shadow: 0 6px 14px rgba(0, 0, 0, 0.45);
+  }
+  :global([data-overflow-down="true"] + .scroll-more-hint) {
+    opacity: 1;
+    animation: scroll-hint-bob 1.6s ease-in-out infinite;
+  }
+  @keyframes scroll-hint-bob {
+    0%, 100% { transform: translateX(-50%) translateY(0); }
+    50% { transform: translateX(-50%) translateY(2px); }
+  }
+  .scroll-more-chevron { font-size: 0.85rem; line-height: 1; }
+
   .root {
     padding: 1rem 1.1rem;
     overflow-y: auto;
@@ -818,6 +862,7 @@
     flex-direction: column;
     gap: 1.1rem;
     min-height: 0;
+    flex: 1;
   }
   .loading, .error {
     padding: 2rem;

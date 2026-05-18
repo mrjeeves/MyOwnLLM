@@ -678,7 +678,7 @@ Launch the GUI by running `myownllm` with no arguments, or open the application 
 
 **Two MyOwnLLM instances with the same Network ID find each other, mutually authenticate, and share work peer-to-peer over WebRTC.** No MyOwnLLM-operated signaling server, no API key, no cloud round-trip. Every device becomes a window into the same mesh: phone audio in, desktop transcription out, a laptop's idle GPU answering prompts from the tablet on the kitchen counter.
 
-Cloud Mesh ships off by default. To turn it on, open **Settings → Cloud Mesh → Status** and follow the wizard — pick or generate a Network ID, lock it, and the mesh client comes up.
+Cloud Mesh ships off by default. To turn it on, open **Settings → Networks → Status** and follow the wizard — pick or generate a Network ID, lock it, and the mesh client comes up.
 
 ### Concepts
 
@@ -692,7 +692,7 @@ Cloud Mesh ships off by default. To turn it on, open **Settings → Cloud Mesh �
 
 ### Quick start
 
-1. **Device A:** open **Settings → Cloud Mesh → Status**. The wizard says "Pick a Network ID" — type a name (e.g. `home-mesh`) or click **Generate** for a random one. Click the lock to commit.
+1. **Device A:** open **Settings → Networks → Status**. The wizard says "Pick a Network ID" — type a name (e.g. `home-mesh`) or click **Generate** for a random one. Click the lock to commit.
 2. **Device B:** same tab. Type the **same** name. Click the lock.
 3. Within seconds the wizard on each device flips to "approval(s) waiting" with a card showing the request. The host side (lex-lesser pubkey) prompts first ("X wants to connect"). Compare the verification code shown to what the other person reads aloud; if they match, click **Approve**.
 4. The guest side gets a follow-up prompt ("X authorized you — confirm?"). Approve there too. Both sides flip to **Connected** and the peer joins the Ring on the **Connections** tab.
@@ -707,7 +707,7 @@ Cloud Mesh ships off by default. To turn it on, open **Settings → Cloud Mesh �
 | **Push a local conversation** | Right-click any local conversation in the sidebar → **Push to device → \<peer\>**. The sender's copy is deleted after the receiver acks; the receiver lands the conversation in the same folder it lived in on the source (creating intermediate folders if needed). Single-RTT today; tracked with a `moving…` pill on the catalog row across all peers while in flight. |
 | **Pull a remote conversation** | Right-click a remote conversation under any Network group → **← Pull from \<peer\>**. The remote peer drives the Move handshake with you as the destination; the conversation appears in your local sidebar in the same folder it lived in on the source. Source must be in your roster — strangers in the same Trystero room can't be pulled from. |
 | **Remote inference** | In the chat compose row, the **via:** picker lets you route a prompt to any peer that has an LLM advertised. The peer's local Ollama runs the request and streams tokens back over the data channel. Stop, cancel, and reasoning-mode all work the same as local. |
-| **Resource map** | Under **Cloud Mesh → Connections → Resources in use**, every in-flight inference (outbound + inbound) and Move shows as a live row: `→` = you using a peer's resources, `←` = a peer using yours. |
+| **Resource map** | Under **Networks → Connections → Resources in use**, every in-flight inference (outbound + inbound) and Move shows as a live row: `→` = you using a peer's resources, `←` = a peer using yours. |
 | **Capability badges** | Each peer's row shows what they can do — `LLM`, `ASR`, `mic`, `diarize`, plus a one-liner hardware summary (`Pi 5 · 4 GB RAM`). Sourced from each device's broadcast `capabilities_update`. |
 | **Accepting policy** | Per-device toggle on the Status tab (in the Activity block). `available` = take any work, `limited` = only if no better peer exists, `busy` = refuse incoming inference. Other peers see your choice in real time. |
 | **Ring + indirect peers** | The **Connections** tab splits peers into two groups. The **Ring** is the set the local selector is actively routing through — it auto-heals on every join / leave by re-running the deterministic ring selector. **Indirect** is peers we know about but aren't routing through right now — shelved (data channel open as heartbeat, parked because the mesh grew past the ring capacity) or offline rostered (approved before, not in the room right now). Keeps Pi-class devices from melting under N² connection counts on a 10-device mesh. |
@@ -720,7 +720,7 @@ The relay sees only the small WebRTC offer/answer envelopes during connection se
 
 ### Self-hosting a relay (LAN / office / air-gapped)
 
-For an office or home network where you don't want connection setup to traverse public relays, point Trystero at your own. **Settings → Cloud Mesh → Settings → Signaling relays** takes a list of WebSocket URLs; the disclosure under "Self-host a Nostr relay" gives you one-line Docker commands for `strfry` (lightweight C++, ~10 MB RAM) and `nostr-rs-relay` (Rust, persistent SQLite).
+For an office or home network where you don't want connection setup to traverse public relays, point Trystero at your own. **Settings → Networks → Settings → Signaling relays** takes a list of WebSocket URLs; the disclosure under "Self-host a Nostr relay" gives you one-line Docker commands for `strfry` (lightweight C++, ~10 MB RAM) and `nostr-rs-relay` (Rust, persistent SQLite).
 
 ```sh
 # Lightweight option
@@ -733,7 +733,7 @@ Two devices both pointed at the same private relay find each other through it wi
 
 ### NAT traversal: STUN + optional TURN
 
-WebRTC needs STUN to discover NAT mappings; the defaults are Google's public STUN pool, which works on ~95% of networks. The other 5% (symmetric NAT, both peers behind it) need a TURN relay — that's user-supplied because TURN consumes real bandwidth. Add TURN entries in **Settings → Cloud Mesh → Settings → TURN servers** with their URL + credentials.
+WebRTC needs STUN to discover NAT mappings; the defaults are Google's public STUN pool, which works on ~95% of networks. The other 5% (symmetric NAT, both peers behind it) need a TURN relay — that's user-supplied because TURN consumes real bandwidth. Add TURN entries in **Settings → Networks → Settings → TURN servers** with their URL + credentials.
 
 ### Activity log
 

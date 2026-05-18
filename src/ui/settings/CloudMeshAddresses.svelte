@@ -175,7 +175,7 @@
     <section class="block">
       <h3>Signaling relays</h3>
       <div class="block-hint">
-        Cloud Mesh uses <a href="https://trystero.dev" target="_blank" rel="noopener">Trystero</a>
+        Networks use <a href="https://trystero.dev" target="_blank" rel="noopener">Trystero</a>
         for peer discovery — currently over Nostr relays. By default
         Trystero picks from a built-in pool of public relays
         maintained by the Nostr community, so MyOwnLLM operates no

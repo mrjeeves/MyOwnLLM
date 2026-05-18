@@ -11,7 +11,6 @@
   } from "../config";
   import { settingsRoute } from "./settings-route.svelte";
   import type { CatalogEntry } from "../mesh-protocol";
-  import AddNetworkModal from "./settings/AddNetworkModal.svelte";
 
   /** Peers eligible as Move targets — active and authorized. The
    *  context-menu uses this directly; if the list is empty the
@@ -67,11 +66,10 @@
   let savedNetworks = $state<NetworkConfig[]>([]);
   let activeNetworkId = $state<string | null>(null);
   let networksCollapsed = $state<Set<string>>(new Set());
-  /** True when the AddNetwork modal is open. Mounted at the bottom of
-   *  the sidebar so it overlays the whole window. */
-  let addModalOpen = $state(false);
   /** Network the user is about to forget. Confirmation modal mounts
-   *  at the bottom of the file. */
+   *  at the bottom of the file. Adding networks is delegated to
+   *  Settings → Networks → Status (sidebar gear icon opens it),
+   *  so there's no Add modal in the sidebar itself. */
   let forgetModal = $state<NetworkConfig | null>(null);
   /** Sidebar-internal pull-in-flight toast for network-context
    *  actions (Forget). Separate from the conversation-level toasts
@@ -130,6 +128,17 @@
   }
 
   function openMeshSettingsForNetwork() {
+    closeMenu();
+    settingsRoute.open("cloud-mesh", { meshSubTab: "status" });
+  }
+
+  /** Sidebar Networks-section gear: route the user to Settings →
+   *  Networks → Status. From there they can use the "+ Add network"
+   *  button to add, the Switch / Forget controls on each row, or
+   *  the wizard to lock the active one. Centralizing all
+   *  network-management actions in one place keeps the sidebar
+   *  focused on showing networks, not managing them. */
+  function openMeshStatusSettings() {
     closeMenu();
     settingsRoute.open("cloud-mesh", { meshSubTab: "status" });
   }
@@ -981,20 +990,28 @@
          forget menu. -->
     <div class="network-divider" aria-hidden="true"></div>
     <div class="network-section-head">
-      <span class="group-label network-label">Network</span>
+      <span class="group-label network-label">Networks</span>
       <button
-        class="add-network"
-        onclick={() => (addModalOpen = true)}
-        title="Save a new mesh network"
-        aria-label="Add network"
+        class="network-settings-btn"
+        onclick={openMeshStatusSettings}
+        title="Open Networks settings — add, switch, or forget saved networks"
+        aria-label="Network settings"
       >
-        + Add
+        <!-- 14×14 cog. Rendered at 11×11 to match the surrounding
+             sidebar density. -->
+        <svg viewBox="0 0 24 24" width="11" height="11" aria-hidden="true">
+          <path
+            fill="currentColor"
+            d="M19.4 13a7.7 7.7 0 0 0 0-2l2.1-1.6a.5.5 0 0 0 .1-.6l-2-3.4a.5.5 0 0 0-.6-.2l-2.4 1a7.6 7.6 0 0 0-1.7-1L14.5 2.5a.5.5 0 0 0-.5-.4h-4a.5.5 0 0 0-.5.4l-.4 2.6a7.6 7.6 0 0 0-1.7 1l-2.4-1a.5.5 0 0 0-.6.2l-2 3.4a.5.5 0 0 0 .1.6L4.6 11a7.7 7.7 0 0 0 0 2l-2.1 1.6a.5.5 0 0 0-.1.6l2 3.4a.5.5 0 0 0 .6.2l2.4-1a7.6 7.6 0 0 0 1.7 1l.4 2.6a.5.5 0 0 0 .5.4h4a.5.5 0 0 0 .5-.4l.4-2.6a7.6 7.6 0 0 0 1.7-1l2.4 1a.5.5 0 0 0 .6-.2l2-3.4a.5.5 0 0 0-.1-.6L19.4 13ZM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"
+          />
+        </svg>
       </button>
     </div>
     {#if savedNetworks.length === 0}
       <div class="network-empty">
-        No saved networks. <button class="link" onclick={() => (addModalOpen = true)}>Add one</button>
-        to share conversations and resources with another device.
+        No saved networks. <button class="link" onclick={openMeshStatusSettings}>Open settings</button>
+        to add one and start sharing conversations and resources
+        with another device.
       </div>
     {/if}
     {#each savedNetworks as net (net.id)}
@@ -1383,7 +1400,7 @@
     {:else if menu.target.kind === "peer"}
       {@const target = menu.target}
       <div class="menu-section-label">{target.peer_label}</div>
-      <button onclick={openMeshConnectionsSettings} title="Open Cloud Mesh → Connections">
+      <button onclick={openMeshConnectionsSettings} title="Open Networks → Connections">
         Settings
       </button>
     {:else}
@@ -1395,7 +1412,7 @@
           Switch to this network
         </button>
       {/if}
-      <button onclick={openMeshSettingsForNetwork} title="Open Cloud Mesh → Status">
+      <button onclick={openMeshSettingsForNetwork} title="Open Networks → Status">
         Settings
       </button>
       <div class="menu-divider"></div>
@@ -1443,15 +1460,6 @@
     Pull failed: {pullError}
     <button onclick={() => (pullError = "")} class="dismiss">✕</button>
   </div>
-{/if}
-
-{#if addModalOpen}
-  <AddNetworkModal
-    onClose={async () => {
-      addModalOpen = false;
-      await reloadNetworks();
-    }}
-  />
 {/if}
 
 {#if forgetModal}
@@ -1633,17 +1641,19 @@
     color: #6a7a99;
     letter-spacing: .06em;
   }
-  .add-network {
+  .network-settings-btn {
     background: none;
-    border: 1px solid #2a2a3a;
-    color: #b9b9ee;
+    border: none;
+    color: #666;
     border-radius: 4px;
-    font-size: .65rem;
-    padding: .1rem .45rem;
+    padding: .2rem .35rem;
     cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    line-height: 0;
     transition: background .12s, color .12s;
   }
-  .add-network:hover { background: #1a1a2a; color: #cdeaff; }
+  .network-settings-btn:hover { background: #1a1a1a; color: #ccc; }
 
   .network-empty {
     padding: .35rem .65rem .35rem .65rem;

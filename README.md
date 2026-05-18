@@ -84,7 +84,7 @@ Both paths — chat and transcription — are designed to be available on the GU
 | **Manifests, not config** | A JSON file at a URL is the source of truth. `imports` compose merged catalogs across publishers — no coordination required. |
 | **Runs on a Pi 5** | Default manifest ships Gemma 4 edge variants (`e2b` / `e4b`), Apache-2.0, ~7.6 tok/s on a Pi 5. Same manifest gives a 4090 the 4090 tag. |
 | **Desktop GUI** | Tauri + Svelte 5. Two singleton slots (chat-model, transcription) with conversation folders, in-place rename, crash-recoverable state. |
-| **HTTP remote** | Open the GUI from your phone (or any HTTP client) on the same network. Single-user lock with kick-and-hide. (Lives under **Cloud Mesh → HTTP**.) |
+| **HTTP remote** | Open the GUI from your phone (or any HTTP client) on the same network. Single-user lock with kick-and-hide. (Lives under **Networks → HTTP**.) |
 | **Self-updating** | Stages quietly on launch, applies on next start. Last good manifest stays cached for offline runs. |
 | **Scriptable end-to-end** | Every CLI subcommand returns parseable text or `--json`. |
 

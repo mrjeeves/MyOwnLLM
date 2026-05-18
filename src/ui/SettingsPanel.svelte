@@ -63,7 +63,7 @@
     { id: "storage", label: "Storage" },
     { id: "hardware", label: "Hardware" },
     { id: "usage", label: "Usage" },
-    { id: "cloud-mesh", label: "Cloud Mesh" },
+    { id: "cloud-mesh", label: "Networks" },
     { id: "updates", label: "Updates" },
   ];
 

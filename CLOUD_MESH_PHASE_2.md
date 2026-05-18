@@ -119,7 +119,7 @@ changes. The snapshot is computed by `snapshotCapabilities` in
 `ollama_list_models`, `asr_models_list`, `diarize_models_list`,
 and `audio_input_devices`.
 
-- The Cloud Mesh → Status tab has an `accepting` dropdown in the
+- The Networks → Status tab has an `accepting` dropdown in the
   Activity block:
   `available` / `limited` / `busy`. Set to `busy`, the device
   refuses incoming `infer_request` messages and is filtered out
@@ -168,7 +168,7 @@ and it shows up under your own `Work/` folder, not in root.
 Right-click on a local conversation still shows the existing
 **Push to device → \<peer\>** submenu (renamed from "Move to
 device" for symmetry with Pull). Right-click on a peer name in
-the sidebar opens **Cloud Mesh → Connections** via the
+the sidebar opens **Networks → Connections** via the
 `settings-route.svelte.ts` shared store — Chat / TranscribeView
 both subscribe to the route signal and open their settings panel
 on the requested tab + sub-tab.
@@ -392,7 +392,7 @@ viewports.
 - **Don't ship a TURN server.** STUN handles ~95% of NAT
   cases; the remaining 5% (symmetric NAT, both peers behind
   it) is for the user to add their own TURN credentials in
-  Settings → Cloud Mesh → Settings. Running a TURN service
+  Settings → Networks → Settings. Running a TURN service
   costs real bandwidth and we're not on the hook for it.
 - **Don't bump `PROTOCOL_VERSION` for additive changes.** The
   version stays at 1 across all Phase 2 work because every
