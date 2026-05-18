@@ -24,17 +24,32 @@
     meshClient.peers.filter((p) => p.status === "active" && p.authorized),
   );
 
-  /** Connected peers we render as expandable sidebar groups, each
-   *  containing the conversations that peer hosts (from their
-   *  broadcast `catalog_announce`). Sorted by label then pubkey for
-   *  stable ordering. Shelved peers count too — their data channel
-   *  is still up, so we can still pull from them — but offline
-   *  rostered peers don't because there's nobody to ask. */
+  /** Peers we render as expandable sidebar groups, each containing
+   *  the conversations that peer hosts (from their broadcast
+   *  `catalog_announce`). Sorted by label then pubkey for stable
+   *  ordering.
+   *
+   *  We include:
+   *    - active / shelved peers — the data channel is up so we can
+   *      both display *and* pull from them
+   *    - offline rostered peers that have a cached catalog — the
+   *      mesh client preserves the last `catalog_announce` after a
+   *      drop, so we render the row dimmed with the previously-seen
+   *      conversations. Mirrors the "Claude on the web" feel: an
+   *      offline device's content stays visible instead of blinking
+   *      out every time the connection cycles. Right-click the
+   *      dimmed row → Refresh to attempt reconnect, or Forget to
+   *      drop the cache (it'll come back on next sight).
+   *
+   *  An offline peer with no cached catalog is left out — there's
+   *  nothing to show and they'd just be visual noise next to the
+   *  live peers. The Settings → Connections tab still lists them. */
   let peerGroups = $derived(
     meshClient.peers
       .filter(
         (p) =>
-          (p.status === "active" || p.status === "shelved") &&
+          ((p.status === "active" || p.status === "shelved") ||
+            (p.status === "offline" && p.catalog.length > 0)) &&
           p.authorized &&
           p.device_pubkey,
       )
@@ -390,9 +405,18 @@
         guid: string;
         title: string;
       }
-    /** A peer-group row in the sidebar. Lets the user jump straight
-     *  to the Cloud Mesh → Connections tab for that mesh. */
-    | { kind: "peer"; peer_id: string; peer_label: string }
+    /** A peer-group row in the sidebar. Carries device pubkey so
+     *  Forget can drop the catalog cache, and a `status` so the
+     *  menu can swap actions for offline-rostered peers (no
+     *  Send-file, since there's no live channel; gain Forget,
+     *  which clears the dimmed cached row). */
+    | {
+        kind: "peer";
+        peer_id: string;
+        peer_label: string;
+        device_pubkey: string;
+        status: "active" | "shelved" | "offline";
+      }
     /** A saved-network row in the sidebar's Network section. Menu
      *  exposes switch / forget / settings. */
     | { kind: "saved-network"; network: NetworkConfig };
@@ -458,11 +482,17 @@
     menu = { target: { kind: "remote-item", peer_id, peer_label, guid, title }, x, y };
   }
 
-  function openPeerMenu(e: MouseEvent | KeyboardEvent, peer_id: string, peer_label: string) {
+  function openPeerMenu(
+    e: MouseEvent | KeyboardEvent,
+    peer_id: string,
+    peer_label: string,
+    device_pubkey: string,
+    status: "active" | "shelved" | "offline",
+  ) {
     e.preventDefault();
     e.stopPropagation();
-    const { x, y } = menuAnchor(e, 200, 100);
-    menu = { target: { kind: "peer", peer_id, peer_label }, x, y };
+    const { x, y } = menuAnchor(e, 200, 160);
+    menu = { target: { kind: "peer", peer_id, peer_label, device_pubkey, status }, x, y };
   }
 
   function openSavedNetworkMenu(e: MouseEvent | KeyboardEvent, network: NetworkConfig) {
@@ -1145,9 +1175,17 @@
             <div
               class="peer-group"
               class:standby={peer.status === "shelved"}
+              class:offline={peer.status === "offline"}
               role="button"
               tabindex="0"
-              oncontextmenu={(e) => openPeerMenu(e, peer.peer_id, peer.label || peer.device_pubkey.slice(0, 8))}
+              oncontextmenu={(e) =>
+                openPeerMenu(
+                  e,
+                  peer.peer_id,
+                  peer.label || peer.device_pubkey.slice(0, 8),
+                  peer.device_pubkey,
+                  peer.status as "active" | "shelved" | "offline",
+                )}
               onclick={(e) => {
                 e.stopPropagation();
                 togglePeerCollapsed(peer.device_pubkey);
@@ -1157,10 +1195,16 @@
                   e.preventDefault();
                   togglePeerCollapsed(peer.device_pubkey);
                 } else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
-                  openPeerMenu(e, peer.peer_id, peer.label || peer.device_pubkey.slice(0, 8));
+                  openPeerMenu(
+                    e,
+                    peer.peer_id,
+                    peer.label || peer.device_pubkey.slice(0, 8),
+                    peer.device_pubkey,
+                    peer.status as "active" | "shelved" | "offline",
+                  );
                 }
               }}
-              title={`${peer.label || "Unnamed device"}${peer.device_suffix ? ` -${peer.device_suffix}` : ""}`}
+              title={`${peer.label || "Unnamed device"}${peer.device_suffix ? ` -${peer.device_suffix}` : ""}${peer.status === "offline" ? " (offline — cached view)" : ""}`}
             >
               <span class="folder-caret" aria-hidden="true">{isPeerCollapsed ? "▸" : "▾"}</span>
               <span class="peer-dot" data-status={peer.status} aria-hidden="true"></span>
@@ -1170,6 +1214,9 @@
               {/if}
               {#if peer.status === "shelved"}
                 <span class="peer-standby-pill">standby</span>
+              {/if}
+              {#if peer.status === "offline"}
+                <span class="peer-offline-pill">offline</span>
               {/if}
               {#if peer.capabilities.app_version && peer.capabilities.app_version !== APP_VERSION}
                 <!-- Version mismatch surfaced inline so the user
@@ -1478,17 +1525,46 @@
       </button>
     {:else if menu.target.kind === "peer"}
       {@const target = menu.target}
-      <div class="menu-section-label">{target.peer_label}</div>
+      <div class="menu-section-label">
+        {target.peer_label}
+        {#if target.status === "offline"}<span class="menu-section-tag">offline</span>{/if}
+      </div>
       <button
-        onclick={() => startFileSend(target.peer_id, target.peer_label)}
-        title="Pick a file from your computer to ship to this peer over the mesh"
+        onclick={() => {
+          closeMenu();
+          void meshClient.reconnectPeer(target.peer_id);
+        }}
+        title={target.status === "offline"
+          ? "Attempt to restore the connection by rejoining the mesh room"
+          : "Re-send hello to this peer right now (bypasses the re-handshake backoff)"}
       >
-        Send file…
+        Refresh
       </button>
+      {#if target.status !== "offline"}
+        <button
+          onclick={() => startFileSend(target.peer_id, target.peer_label)}
+          title="Pick a file from your computer to ship to this peer over the mesh"
+        >
+          Send file…
+        </button>
+      {/if}
       <div class="menu-divider"></div>
       <button onclick={openMeshConnectionsSettings} title="Open Networks → Connections">
         Settings
       </button>
+      {#if target.status === "offline"}
+        <div class="menu-divider"></div>
+        <button
+          class="danger"
+          onclick={() => {
+            closeMenu();
+            meshClient.forgetPeerCache(target.device_pubkey);
+          }}
+          title="Hide this offline peer's cached conversations until you see them again. Their actual data lives on their device — the cache rebuilds on next sight."
+        >
+          Forget cached view
+        </button>
+      {/if}
     {:else}
       {@const target = menu.target}
       {@const isActive = target.network.id === activeNetworkId}
@@ -1992,6 +2068,13 @@
   }
   .peer-group:hover { background: #161616; }
   .peer-group.standby { opacity: .75; }
+  /* Offline rostered peers render with a cached catalog snapshot so
+     the user keeps seeing the device's conversations across a
+     disconnect cycle. Dim hard enough that the row reads as
+     "this is stale" — distinguishes from active and shelved at a
+     glance without needing to look at the dot color. */
+  .peer-group.offline { opacity: .5; }
+  .peer-group.offline:hover { opacity: .7; }
   .peer-dot {
     width: 8px;
     height: 8px;
@@ -2003,6 +2086,10 @@
   .peer-dot[data-status="shelved"] {
     background: #b9c9ee;
     box-shadow: 0 0 5px rgba(185, 201, 238, 0.5);
+  }
+  .peer-dot[data-status="offline"] {
+    background: #555;
+    box-shadow: none;
   }
   .peer-group-name {
     overflow: hidden;
@@ -2025,6 +2112,16 @@
     letter-spacing: .06em;
     background: #1a1e2a;
     color: #b9c9ee;
+    border-radius: 3px;
+    padding: .05rem .3rem;
+    flex-shrink: 0;
+  }
+  .peer-offline-pill {
+    font-size: .55rem;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    background: #1e1e1e;
+    color: #888;
     border-radius: 3px;
     padding: .05rem .3rem;
     flex-shrink: 0;
@@ -2190,6 +2287,16 @@
     text-transform: uppercase;
     letter-spacing: 0.06em;
     padding: 0.3rem 0.6rem 0.15rem;
+  }
+  .menu-section-tag {
+    margin-left: 0.35rem;
+    font-size: 0.55rem;
+    background: #222;
+    color: #888;
+    border-radius: 3px;
+    padding: 0.05rem 0.3rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
   }
 
   .move-toast {
