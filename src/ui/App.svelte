@@ -7,6 +7,7 @@
   import Chat from "./Chat.svelte";
   import TranscribeView from "./TranscribeView.svelte";
   import Sidebar from "./Sidebar.svelte";
+  import PermissionPromptModal from "./PermissionPromptModal.svelte";
   import { loadConfig, updateConfig } from "../config";
   import { getActiveManifest } from "../providers";
   import { resolveModelEx, pickFamily, familyModes } from "../manifest";
@@ -1132,6 +1133,11 @@
       </div>
     </div>
   {/if}
+  <!-- Agent-tool permission prompts. Mounted once at App level so a
+       gated tool firing from either Chat or TranscribeView lands on
+       the same modal; the modal self-hides when the prompt queue
+       drains. -->
+  <PermissionPromptModal />
 </div>
 
 <style>

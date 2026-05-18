@@ -274,6 +274,41 @@ export interface AutoCleanupConfig {
   conversations: boolean;
 }
 
+/** Per-tool permission policy. `ask` (the default for any tool/device
+ *  pair the user hasn't acted on yet) shows a prompt on every call;
+ *  `accept_all` skips the prompt and approves every invocation;
+ *  `denied` skips the prompt and refuses every invocation (the user
+ *  has explicitly turned the tool off for this device). `always_accept`
+ *  is an allow-list of exact command strings (for shell) or absolute
+ *  paths (for write_file) that bypass the prompt regardless of mode —
+ *  populated from the modal's "Always accept this" button. */
+export interface ToolPermission {
+  mode: "ask" | "accept_all" | "denied";
+  always_accept: string[];
+}
+
+/** A device's full permission set. Today gates only the two destructive
+ *  tools (`shell` and `write_file`); read-only operations (`networks`,
+ *  `read_file`) intentionally aren't gated because they can't modify
+ *  the host. Keyed under `Config.agent_permissions` by the mesh device
+ *  ID — same scope as the identity card in Networks → Status — so each
+ *  machine the user logs into starts with a clean policy and the
+ *  Permissions tab can list "your devices" with their individual
+ *  policies. */
+export interface DevicePermissions {
+  shell: ToolPermission;
+  write_file: ToolPermission;
+}
+
+/** Agent-tool permissions, scoped per device. The mesh device ID is
+ *  the natural key — it's stable per machine, already surfaced in the
+ *  Networks tab, and gives the Permissions tab a useful display label
+ *  for cross-device review. Missing devices default to "ask" for every
+ *  tool. */
+export interface AgentPermissionsConfig {
+  by_device: Record<string, DevicePermissions>;
+}
+
 export interface Config {
   active_provider: string;
   active_family: string;
@@ -308,6 +343,10 @@ export interface Config {
   cloud_mesh: CloudMeshConfig;
   mic: MicConfig;
   providers: Provider[];
+  /** Per-device agent-tool permissions. Defaults to "ask" everywhere
+   *  on fresh installs so the user is always in the loop the first
+   *  time a tool fires. */
+  agent_permissions?: AgentPermissionsConfig;
 }
 
 export interface ModelStatus {

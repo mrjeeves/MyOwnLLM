@@ -9,6 +9,9 @@ import type {
   CloudMeshConfig,
   NetworkConfig,
   MicConfig,
+  AgentPermissionsConfig,
+  DevicePermissions,
+  ToolPermission,
 } from "./types";
 
 async function configPath(): Promise<string> {
@@ -119,6 +122,7 @@ const DEFAULT_CONFIG: Config = {
     active_network_id: null,
     diag_quiet: false,
   },
+  agent_permissions: { by_device: {} },
   mic: { ...DEFAULT_MIC },
   providers: [
     {
@@ -172,6 +176,9 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
     },
     cloud_mesh: mergeCloudMesh(
       (raw as { cloud_mesh?: Partial<CloudMeshConfig> }).cloud_mesh,
+    ),
+    agent_permissions: mergeAgentPermissions(
+      (raw as { agent_permissions?: Partial<AgentPermissionsConfig> }).agent_permissions,
     ),
     mic: {
       ...DEFAULT_MIC,
@@ -428,5 +435,88 @@ export async function setActiveNetwork(id: string | null): Promise<Config> {
   }
   return await updateConfig({
     cloud_mesh: { ...cfg.cloud_mesh, active_network_id: id },
+  });
+}
+
+// ---- agent permissions ---------------------------------------------------
+
+/** Default policy for a freshly-seen tool/device pair: prompt every
+ *  time, no entries on the allow-list. The first call surfaces the
+ *  modal where the user can promote to `always_accept` (per-call
+ *  literal) or `accept_all` (per-tool blanket). */
+function freshToolPermission(): ToolPermission {
+  return { mode: "ask", always_accept: [] };
+}
+
+/** Default policy for a freshly-seen device: every tool defaults to
+ *  "ask". Surfaced when the agent loop fires its first shell /
+ *  write_file call on a new install. */
+export function freshDevicePermissions(): DevicePermissions {
+  return {
+    shell: freshToolPermission(),
+    write_file: freshToolPermission(),
+  };
+}
+
+function coerceToolPermission(raw: unknown): ToolPermission {
+  if (!raw || typeof raw !== "object") return freshToolPermission();
+  const obj = raw as Partial<ToolPermission>;
+  const mode: ToolPermission["mode"] =
+    obj.mode === "accept_all" || obj.mode === "denied" ? obj.mode : "ask";
+  const allow = Array.isArray(obj.always_accept)
+    ? obj.always_accept.filter((s): s is string => typeof s === "string")
+    : [];
+  return { mode, always_accept: allow };
+}
+
+function coerceDevicePermissions(raw: unknown): DevicePermissions {
+  if (!raw || typeof raw !== "object") return freshDevicePermissions();
+  const obj = raw as Partial<DevicePermissions>;
+  return {
+    shell: coerceToolPermission(obj.shell),
+    write_file: coerceToolPermission(obj.write_file),
+  };
+}
+
+function mergeAgentPermissions(
+  raw: Partial<AgentPermissionsConfig> | undefined,
+): AgentPermissionsConfig {
+  if (!raw || typeof raw !== "object") return { by_device: {} };
+  const src = (raw.by_device ?? {}) as Record<string, unknown>;
+  const out: Record<string, DevicePermissions> = {};
+  for (const [id, perms] of Object.entries(src)) {
+    if (!id) continue;
+    out[id] = coerceDevicePermissions(perms);
+  }
+  return { by_device: out };
+}
+
+/** Read the permissions for `deviceId`, returning fresh defaults
+ *  (every tool = "ask") when the device hasn't been seen yet. Pure
+ *  read — does not persist the synthesised default; the next mutation
+ *  is what triggers the on-disk entry. */
+export function getDevicePermissions(
+  cfg: Config,
+  deviceId: string,
+): DevicePermissions {
+  const stored = cfg.agent_permissions?.by_device?.[deviceId];
+  return stored ? coerceDevicePermissions(stored) : freshDevicePermissions();
+}
+
+/** Mutate the permissions block for `deviceId` and persist. The
+ *  patcher is called with the current device permissions (fresh
+ *  defaults when none stored) and must return the updated record. */
+export async function updateDevicePermissions(
+  deviceId: string,
+  patcher: (current: DevicePermissions) => DevicePermissions,
+): Promise<Config> {
+  const cfg = await loadConfig();
+  const current = getDevicePermissions(cfg, deviceId);
+  const next = patcher(current);
+  const existing = cfg.agent_permissions ?? { by_device: {} };
+  return await updateConfig({
+    agent_permissions: {
+      by_device: { ...existing.by_device, [deviceId]: next },
+    },
   });
 }

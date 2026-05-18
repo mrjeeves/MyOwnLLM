@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent_io;
 mod api;
 mod api_models;
 mod asr;
@@ -812,6 +813,9 @@ fn main() {
             usage_live_snapshot,
             usage_stats,
             usage_record_chat_sent,
+            agent_io::agent_shell,
+            agent_io::agent_read_file,
+            agent_io::agent_write_file,
         ])
         .setup(|app| {
             // If the configured 800x600 window can't fit on this monitor —

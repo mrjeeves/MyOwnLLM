@@ -14,6 +14,7 @@
  * is asking the assistant to manage.
  */
 
+import { invoke } from "@tauri-apps/api/core";
 import {
   addNetwork,
   loadConfig,
@@ -24,6 +25,7 @@ import {
 } from "./config";
 import { generateNetworkId, getMeshIdentity, normalizeNetworkId } from "./mesh";
 import { meshClient } from "./mesh-client.svelte";
+import { agentPermissions } from "./agent-permissions.svelte";
 
 /** Ollama / OpenAI-compatible function-tool definition. Sent verbatim
  *  to the model in the `tools` field of `ollama_chat_stream`. */
@@ -396,10 +398,207 @@ export const NETWORKS_TOOL: Tool = {
   },
 };
 
+// ---------------------------------------------------------------------
+// Shell / file tools
+//
+// `shell` and `write_file` mutate the host, so they route through
+// `agentPermissions.request()` before invoking the Rust command —
+// every call either matches a stored allow-list entry, runs under an
+// `accept_all` policy, or surfaces the prompt modal for the user to
+// approve. `read_file` is non-destructive and bypasses the gate.
+// ---------------------------------------------------------------------
+
+interface ShellOutcome {
+  stdout: string;
+  stderr: string;
+  exit_code: number | null;
+  stdout_truncated: boolean;
+  stderr_truncated: boolean;
+  timed_out: boolean;
+}
+
+interface ReadFileOutcome {
+  content: string;
+  bytes_returned: number;
+  truncated: boolean;
+  total_bytes: number | null;
+}
+
+interface WriteFileOutcome {
+  path: string;
+  bytes_written: number;
+  created_dirs: boolean;
+}
+
+export const SHELL_TOOL: Tool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "shell",
+      description:
+        "Run a shell command on this device and return stdout / stderr / " +
+        "exit code. Uses `sh -c` on Unix and `cmd /C` on Windows so " +
+        "pipes, redirects, and `&&` work as written. Each call prompts " +
+        "the user for permission unless they've previously granted blanket " +
+        "or per-command trust on this device. Output is capped at 256 KiB " +
+        "per stream and timed-out after 60 s by default.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: {
+            type: "string",
+            description: "Shell-syntax command to run.",
+          },
+          cwd: {
+            type: "string",
+            description:
+              "Working directory for the command. Optional; defaults to the process CWD.",
+          },
+          timeout_ms: {
+            type: "integer",
+            description:
+              "Per-call timeout in milliseconds. Defaults 60000, capped at 600000.",
+          },
+        },
+        required: ["command"],
+      },
+    },
+  },
+  handler: async (args) => {
+    const command = asString(args, "command");
+    const cwd = optionalString(args, "cwd");
+    const timeout = typeof args.timeout_ms === "number" ? args.timeout_ms : undefined;
+    const decision = await agentPermissions.request({
+      tool: "shell",
+      literal: command,
+      summary: `Run: ${command}`,
+      detail: cwd ? { command, cwd } : { command },
+    });
+    if (decision.kind === "denied") {
+      return JSON.stringify({ error: `permission denied: ${decision.reason}` });
+    }
+    const outcome = await invoke<ShellOutcome>("agent_shell", {
+      command,
+      cwd: cwd ?? null,
+      timeoutMs: timeout ?? null,
+    });
+    return JSON.stringify(outcome);
+  },
+};
+
+export const READ_FILE_TOOL: Tool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "read_file",
+      description:
+        "Read a text file on this device and return its contents. Capped " +
+        "at 1 MiB by default (16 MiB hard ceiling). Non-destructive — " +
+        "doesn't prompt the user. Binary content is returned as UTF-8 " +
+        "lossy approximation; use `shell` with `file`/`xxd` for true " +
+        "binary inspection.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Absolute or relative filesystem path.",
+          },
+          max_bytes: {
+            type: "integer",
+            description:
+              "Cap on bytes returned. Defaults 1048576 (1 MiB), capped at 16777216 (16 MiB).",
+          },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  handler: async (args) => {
+    const path = asString(args, "path");
+    const max_bytes = typeof args.max_bytes === "number" ? args.max_bytes : undefined;
+    const outcome = await invoke<ReadFileOutcome>("agent_read_file", {
+      path,
+      maxBytes: max_bytes ?? null,
+    });
+    return JSON.stringify(outcome);
+  },
+};
+
+export const WRITE_FILE_TOOL: Tool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "write_file",
+      description:
+        "Write text content to a file on this device. Creates parent " +
+        "directories by default. Each call prompts the user for permission " +
+        "unless they've previously granted blanket or per-path trust on " +
+        "this device. Use `append: true` to append rather than overwrite.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Absolute or relative filesystem path to write.",
+          },
+          content: {
+            type: "string",
+            description: "Text payload to write. Newlines are preserved.",
+          },
+          create_dirs: {
+            type: "boolean",
+            description:
+              "If true (default), create missing parent directories before writing.",
+          },
+          append: {
+            type: "boolean",
+            description:
+              "If true, append to the file instead of overwriting. Defaults false.",
+          },
+        },
+        required: ["path", "content"],
+      },
+    },
+  },
+  handler: async (args) => {
+    const path = asString(args, "path");
+    const content = typeof args.content === "string" ? args.content : "";
+    const append = asBool(args, "append", false);
+    const create_dirs = asBool(args, "create_dirs", true);
+    const decision = await agentPermissions.request({
+      tool: "write_file",
+      literal: path,
+      summary: `${append ? "Append to" : "Write"}: ${path}`,
+      detail: {
+        path,
+        bytes: String(content.length),
+        mode: append ? "append" : "overwrite",
+      },
+    });
+    if (decision.kind === "denied") {
+      return JSON.stringify({ error: `permission denied: ${decision.reason}` });
+    }
+    const outcome = await invoke<WriteFileOutcome>("agent_write_file", {
+      path,
+      content,
+      createDirs: create_dirs,
+      append,
+    });
+    return JSON.stringify(outcome);
+  },
+};
+
 /** The tool roster the chat agent loop runs with. A single export so
  *  Chat.svelte doesn't have to assemble the list itself; future tools
- *  just get added here. */
-export const CHAT_TOOLS: Tool[] = [NETWORKS_TOOL];
+ *  just get added here. Order matters for system-prompt readability —
+ *  destructive tools surface later than the safe `read_file`. */
+export const CHAT_TOOLS: Tool[] = [
+  NETWORKS_TOOL,
+  READ_FILE_TOOL,
+  WRITE_FILE_TOOL,
+  SHELL_TOOL,
+];
 
 /** Map name → tool. Looked up by the agent loop after the model emits
  *  a `tool_call` so the dispatch is O(1) regardless of roster size. */
@@ -408,15 +607,18 @@ export const TOOLS_BY_NAME: Record<string, Tool> = Object.fromEntries(
 );
 
 /** System prompt prepended to every tool-enabled chat. Onboards the
- *  model as an IT-style helper that knows what the `networks` tool
- *  exposes and how to use it for diagnosis, so a user who says "I
- *  can't see my other device" gets a triage flow ("let me check the
- *  mesh status…") rather than a generic "have you tried restarting?"
- *  reply. */
+ *  model as a hands-on IT assistant with mesh-management and host
+ *  read/write/shell capabilities. */
 export const AGENT_SYSTEM_PROMPT =
-  "You are MyOwnLLM's built-in IT support assistant for the user's Cloud Mesh " +
-  "(also called \"Networks\"). You can call the `networks` tool to inspect and " +
-  "fix the mesh on this device.\n\n" +
+  "You are MyOwnLLM's built-in IT support assistant. You have hands-on " +
+  "tools for managing the user's Cloud Mesh (\"Networks\") and acting on " +
+  "the host filesystem and shell.\n\n" +
+  "Tools available:\n" +
+  "- `networks` — inspect / mutate Cloud Mesh state (status, peers, saved " +
+  "networks, accepting policy, diagnostic log).\n" +
+  "- `read_file` — read a text file (non-destructive, no prompt).\n" +
+  "- `write_file` — write or append text to a file (prompts the user).\n" +
+  "- `shell` — run a shell command (prompts the user).\n\n" +
   "How the mesh works:\n" +
   "- Devices that share a Network ID find each other through public Nostr relays " +
   "(or a self-hosted one) and connect peer-to-peer over WebRTC.\n" +
@@ -435,10 +637,14 @@ export const AGENT_SYSTEM_PROMPT =
   "4. If a peer is offline-rostered, `reconnect_peer` for that specific peer is " +
   "lighter than rediscovering the whole room.\n" +
   "5. Before changing anything destructive (forgetting a network, denying a " +
-  "pending request, switching active network mid-session), confirm with the user.\n\n" +
+  "pending request, switching active network mid-session, writing a file, " +
+  "running a shell command), confirm with the user. They'll see a permission " +
+  "prompt for shell / write_file, but a quick \"I'm about to run X — okay?\" " +
+  "in chat first is better UX than a surprise modal.\n\n" +
   "Style:\n" +
   "- Be direct. Quote tool results back to the user in plain English; don't dump JSON.\n" +
   "- When you take an action, say what you did and what the result was.\n" +
   "- If the user just wants information, answer the question and stop — don't " +
   "fire actions speculatively.\n" +
-  "- If a tool call fails, surface the error message and suggest the next step.";
+  "- If a tool call fails (including permission denials), surface the error " +
+  "message and suggest the next step.";
