@@ -175,17 +175,24 @@ const HANDSHAKE_HELLO_RETRY_INTERVAL_MS = 5_000;
 /** App-level keepalive on each active connection. We send a ping
  *  every interval and also use the tick to check whether we've
  *  heard from the peer recently enough; if not, we enter the
- *  re-handshake loop. 10s is the chosen poll cadence — tight
+ *  re-handshake loop. 30s is the chosen poll cadence — tight
  *  enough that Phase 2 ring routing has a recent liveness signal,
- *  loose enough not to noise up the data channel. */
-const HEARTBEAT_INTERVAL_MS = 10_000;
+ *  loose enough that a peer mid-model-load (the slowest user-visible
+ *  block on real hardware — Ollama mapping a multi-GB weights file
+ *  can stall the main thread for tens of seconds) doesn't trip
+ *  the staleness check just for being busy. The scheduler worker
+ *  keeps wake-detection honest under that load, but the per-peer
+ *  staleness comparison still runs against main-thread time so
+ *  the budget has to absorb a real model-load pause. */
+const HEARTBEAT_INTERVAL_MS = 30_000;
 /** Consider the channel stale (start re-handshaking) if no message
  *  has arrived in this window. ~2.5 missed pings of grace before
  *  we enter the reconnect loop; chosen to be tolerant of a brief
- *  network jitter without burying real stalls. Post-wake detection
- *  is much faster via WAKE_PROBE_DELAY_MS — this window only
- *  governs steady-state stalls. */
-const HEARTBEAT_TIMEOUT_MS = 25_000;
+ *  network jitter and the longest main-thread stalls we see in
+ *  practice (model load) without burying real stalls. Post-wake
+ *  detection is much faster via WAKE_PROBE_DELAY_MS — this window
+ *  only governs steady-state stalls. */
+const HEARTBEAT_TIMEOUT_MS = 75_000;
 /** When the gap between two heartbeat ticks is larger than this,
  *  assume the device just woke from sleep / suspend. setInterval
  *  pauses while the JS engine is frozen, so a gap much greater
