@@ -60,6 +60,14 @@ import {
  *  timeout, because verifying a code with a peer out-of-band can
  *  easily take more than 30s. */
 const HANDSHAKE_TIMEOUT_MS = 30_000;
+/** During the handshake window we re-send `hello` on this cadence.
+ *  Right after a Trystero room rejoin the data channel can be open
+ *  (so onPeerJoin fires) but not yet ready for an immediate send,
+ *  swallowing the very first hello and stranding both sides
+ *  waiting on auth_response. Repeating the hello a few times
+ *  across the window gives the channel time to settle without
+ *  bloating the timeout. */
+const HANDSHAKE_HELLO_RETRY_INTERVAL_MS = 5_000;
 /** App-level keepalive on each active connection. We send a ping
  *  every interval and also use the tick to check whether we've
  *  heard from the peer recently enough; if not, we enter the
@@ -196,6 +204,12 @@ interface ConnectionState {
    *  prompts the user / auto-approves and sends `approve`. */
   approver_role: boolean;
   handshake_timer: number | null;
+  /** setInterval handle for re-sending `hello` until the peer
+   *  responds with auth_response. Cleared on successful
+   *  authentication, on handshake timeout, and on drop. Separate
+   *  from handshake_timer (a one-shot timeout watchdog) so the
+   *  two roles stay legible. */
+  handshake_hello_retry_timer: number | null;
   /** Last time we received ANY message from this peer (ping,
    *  pong, protocol envelope). Used by the heartbeat tick to
    *  decide if the connection is still alive — catches the
@@ -448,6 +462,7 @@ class MeshClient {
     this.uninstallLifecycleHooks();
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
+      if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
       if (c.heartbeat_timer !== null) clearInterval(c.heartbeat_timer);
     }
     this.connections.clear();
@@ -628,7 +643,32 @@ class MeshClient {
     const conn = this.createConnState(peer_id);
     this.connections.set(peer_id, conn);
     this.sendHello(conn);
+    // Re-send hello on a tight interval until the peer
+    // reciprocates with auth_response. Right after a Trystero
+    // room rejoin the very first hello tends to be sent before
+    // the underlying data channel is fully ready and gets
+    // silently dropped — without a retry both sides sit on a
+    // dead handshake until the watchdog fires. Cleared in
+    // handleAuthResponse / handshake_timer / dropConnection.
+    conn.handshake_hello_retry_timer = window.setInterval(() => {
+      if (conn.peer_authenticated) {
+        if (conn.handshake_hello_retry_timer !== null) {
+          clearInterval(conn.handshake_hello_retry_timer);
+          conn.handshake_hello_retry_timer = null;
+        }
+        return;
+      }
+      this.logDiag(
+        "info",
+        `re-sending hello to ${peer_id.slice(0, 8)}… (no auth_response yet)`,
+      );
+      this.sendHello(conn);
+    }, HANDSHAKE_HELLO_RETRY_INTERVAL_MS);
     conn.handshake_timer = window.setTimeout(() => {
+      if (conn.handshake_hello_retry_timer !== null) {
+        clearInterval(conn.handshake_hello_retry_timer);
+        conn.handshake_hello_retry_timer = null;
+      }
       // Only fire if we never made it past the cryptographic
       // handshake. Once `peer_authenticated` is set the watchdog
       // is cleared explicitly in handleAuthResponse, so this
@@ -881,6 +921,7 @@ class MeshClient {
       heartbeat_timer: null,
       approver_role: false, // set in handleHello once we know both pubkeys
       handshake_timer: null,
+      handshake_hello_retry_timer: null,
       rehandshake_attempts: 0,
       rehandshake_backoff_until: 0,
       wake_at: 0,
@@ -1060,12 +1101,17 @@ class MeshClient {
       return;
     }
     conn.peer_authenticated = true;
-    // Cryptographic handshake is complete — kill the watchdog. The
-    // peer is now genuinely waiting on user approval (locally or
-    // remotely) and that can take as long as it takes.
+    // Cryptographic handshake is complete — kill the watchdog and
+    // the hello-retry interval. The peer is now genuinely waiting
+    // on user approval (locally or remotely) and that can take
+    // as long as it takes.
     if (conn.handshake_timer !== null) {
       clearTimeout(conn.handshake_timer);
       conn.handshake_timer = null;
+    }
+    if (conn.handshake_hello_retry_timer !== null) {
+      clearInterval(conn.handshake_hello_retry_timer);
+      conn.handshake_hello_retry_timer = null;
     }
     this.logDiag(
       "info",
@@ -1231,6 +1277,7 @@ class MeshClient {
     const c = this.connections.get(peer_id);
     if (!c) return;
     if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
+    if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
     if (c.heartbeat_timer !== null) clearInterval(c.heartbeat_timer);
     this.connections.delete(peer_id);
     for (const [guid, pending] of this.pending_moves_out) {
