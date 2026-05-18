@@ -7,7 +7,7 @@
     activeFamily,
     activeMode,
     kind,
-    viaPeerId,
+    viaDevicePubkey,
     onViaChange,
     disabled = false,
   } = $props<{
@@ -18,8 +18,9 @@
      *  through the LLM-peer pool. The talking-points bar passes
      *  "text" because TP runs the chat model on the receiving end. */
     kind: "text" | "transcribe";
-    viaPeerId: string | null;
-    onViaChange: (peerId: string | null) => void;
+    /** Stable pubkey of the routing target. Survives reconnects. */
+    viaDevicePubkey: string | null;
+    onViaChange: (devicePubkey: string | null) => void;
     disabled?: boolean;
   }>();
 </script>
@@ -30,7 +31,7 @@
     localModel={activeModel}
     family={activeFamily}
     mode={activeMode}
-    {viaPeerId}
+    {viaDevicePubkey}
     {onViaChange}
     {disabled}
   />

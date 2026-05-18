@@ -10,7 +10,7 @@
     contextSize,
     thinkingEnabled,
     thinkingAvailable,
-    viaPeerId,
+    viaDevicePubkey,
     onViaChange,
     onThinkingChange,
     streaming = false,
@@ -28,12 +28,13 @@
     /** Hide the brain toggle when the active mode doesn't think
      *  (transcribe doesn't think; non-text bars hide it). */
     thinkingAvailable: boolean;
-    /** Current routing pin — `null` runs locally, otherwise the
-     *  picked peer_id. The ModelSelector below collapses what used
-     *  to be the separate "via:" picker into the same surface as
-     *  the model name. */
-    viaPeerId: string | null;
-    onViaChange: (peerId: string | null) => void;
+    /** Current routing pin as a stable `device_pubkey`. `null` runs
+     *  locally. The ModelSelector below collapses what used to be the
+     *  separate "via:" picker into the same surface as the model
+     *  name, and remembers the pin across reconnects (peer_id would
+     *  regenerate per Trystero session). */
+    viaDevicePubkey: string | null;
+    onViaChange: (devicePubkey: string | null) => void;
     onThinkingChange: (next: boolean) => void;
     /** While a chat stream is in flight we lock the routing pin —
      *  switching mid-stream would orphan the in-flight response. */
@@ -68,7 +69,7 @@
     localModel={activeModel}
     family={activeFamily}
     mode={activeMode}
-    {viaPeerId}
+    {viaDevicePubkey}
     {onViaChange}
     disabled={streaming}
   />

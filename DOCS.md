@@ -676,7 +676,7 @@ Launch the GUI by running `myownllm` with no arguments, or open the application 
 
 ## Cloud Mesh
 
-**Two MyOwnLLM instances with the same Network ID find each other, mutually authenticate, and share work peer-to-peer over WebRTC.** No MyOwnLLM-operated signaling server, no API key, no cloud round-trip. Every device becomes a window into the same mesh: phone audio in, desktop transcription out, a laptop's idle GPU answering prompts from the tablet on the kitchen counter.
+**Distributed Intelligence.** Two (or ten) MyOwnLLM instances with the same Network ID find each other, mutually authenticate, and share work peer-to-peer over WebRTC. No MyOwnLLM-operated signaling server, no API key, no cloud round-trip. Every device becomes a window into the same mesh: phone audio in, desktop transcription out, a laptop's idle GPU answering prompts from the tablet on the kitchen counter — each device adds its powers to the whole, picked per-surface from the model selector at the bottom of each pane.
 
 Cloud Mesh ships off by default. To turn it on, open **Settings → Networks → Status** and follow the wizard — pick or generate a Network ID, lock it, and the mesh client comes up.
 
@@ -706,7 +706,12 @@ Cloud Mesh ships off by default. To turn it on, open **Settings → Networks →
 | **Saved networks** | The mesh is a single-active-network model: only one Trystero room joined at a time, but the user can save several (`home-mesh`, `office-mesh`, `camping-mesh`) and switch between them with one click. Each saved network keeps its own roster file (`~/.myownllm/mesh/rosters/{network_id}.json`) so switching back skips re-authentication for previously-approved peers. Per-network settings: accepting policy, signaling relays, STUN, TURN. **The Network ID is the display name** — there's no separate label field. The ID isn't secret either: anyone using the same handle lands in the same room and can knock (you'll see their request), but joining still requires approval. Pick something unique if you don't want to field knocks from strangers; click **Generate** for a 52-char hash that won't collide with anyone. |
 | **Push a local conversation** | Right-click any local conversation in the sidebar → **Push to device → \<peer\>**. The sender's copy is deleted after the receiver acks; the receiver lands the conversation in the same folder it lived in on the source (creating intermediate folders if needed). Single-RTT today; tracked with a `moving…` pill on the catalog row across all peers while in flight. |
 | **Pull a remote conversation** | Right-click a remote conversation under any Network group → **← Pull from \<peer\>**. The remote peer drives the Move handshake with you as the destination; the conversation appears in your local sidebar in the same folder it lived in on the source. Source must be in your roster — strangers in the same Trystero room can't be pulled from. |
-| **Remote inference** | In the chat compose row, the **via:** picker lets you route a prompt to any peer that has an LLM advertised. The peer's local Ollama runs the request and streams tokens back over the data channel. Stop, cancel, and reasoning-mode all work the same as local. |
+| **Per-surface model selector** | Each pane has a bar at the bottom with a model selector that doubles as a routing picker. Chat's TextBar selects the LLM and the host. Transcribe mode has two bars — one under the live transcript (ASR model + host), one under the talking points pane (chat model + host). A peer appears in the dropdown when its capabilities match the surface kind (`canServeInference` for text, `canServeTranscribe` for transcribe). Picking a peer routes the work; picking "this device" runs it locally. The selector is just a styled pill when no peer can serve the kind — no clutter until there's actually a choice to make. |
+| **Remote inference (chat + talking points)** | Chat routes via `infer_request` to the picked peer's local Ollama; tokens stream back over the data channel. Stop, cancel, and reasoning-mode all work the same as local. Talking Points uses the same path — pin a host on the TP bar and the cycle loop runs against that device's chat model instead of yours. |
+| **Remote transcribe (protocol surface)** | `transcribe_request` / `transcribe_audio_chunk` / `transcribe_segment` / `transcribe_done` / `transcribe_error` / `transcribe_cancel` are defined, advertised (`REMOTE_TRANSCRIBE` feature flag), and gate the transcribe ModelSelector. The Rust-side audio pipeline that the receiver feeds into its local ASR worker is the follow-up — picking a peer in the transcribe bar today surfaces an inline "staged, not wired — pick 'this device' to record locally" message instead of silently degrading. |
+| **Persistent pins, by device pubkey** | The model selector pin survives reloads, peer hops, and Trystero session changes — we persist the peer's stable `device_pubkey` in localStorage (`myownllm.viaPubkey.{text,transcribe,tp}`), not the per-session `peer_id`. Three pins, one per surface: chat, transcribe-side, talking-points-side. Switching between them is one click. |
+| **Pause-or-error on peer offline** | A pinned host going offline doesn't downgrade you to local. Chat refuses the next send with an inline "Pinned peer is offline" banner. Talking Points pauses its loop (`chatSlot.status === "paused"`) and resumes automatically when the peer reappears. Transcribe surfaces a matching inline error before any audio capture starts. Each path leaves the choice with you: wait, pick a different host, or fall back to this device. |
+| **Cached service availability** | We remember each peer's last-known capability advertisement keyed by pubkey, so an offline pinned host still renders in the selector as `{model} · {label} (offline)` rather than vanishing into an unlabelled entry. The cache fills on every `hello` / `capabilities_update` and clears explicitly via the sidebar's right-click → Forget on an offline peer. |
 | **Resource map** | Under **Networks → Connections → Resources in use**, every in-flight inference (outbound + inbound) and Move shows as a live row: `→` = you using a peer's resources, `←` = a peer using yours. |
 | **Capability badges** | Each peer's row shows what they can do — `LLM`, `ASR`, `mic`, `diarize`, plus a one-liner hardware summary (`Pi 5 · 4 GB RAM`). Sourced from each device's broadcast `capabilities_update`. |
 | **Accepting policy** | Per-network toggle on the Status tab, inline with the status pill. `available` = take any work, `limited` = only if no better peer exists, `busy` = refuse incoming inference. Each saved network has its own setting — you can be `available` at home and `busy` on an office mesh simultaneously. |
@@ -774,14 +779,26 @@ move_prepare / move_commit / move_abort
 # Pull (Phase 2 — requester asks source to push to them)
 move_request / move_request_decline
 
-# Remote inference
+# Remote inference (text + Talking Points)
 infer_request            messages + family/mode + think hint
 infer_chunk              one delta or thinking-delta per frame
 infer_done / infer_error
 infer_cancel             abort an in-flight inference
+
+# Remote transcribe (Phase 2.2 — protocol surface; receiver pipeline staged)
+transcribe_request       runtime + tier + diarize + sample_rate
+transcribe_audio_chunk   PCM int16 mono frames, base64
+transcribe_segment       text + speaker + overlap + start/end_ms
+transcribe_done / transcribe_error
+transcribe_cancel        abort an in-flight session
+
+# Arbitrary file transfer (Phase 2.1)
+file_offer / file_accept / file_decline
+file_chunk               base64 bytes + index + is_final
+file_complete / file_abort
 ```
 
-The protocol version is `1` and stays there across additive Phase 2 changes — v0.2.14 Phase 1 peers and Phase 2 peers can share a mesh, with the v1 side simply not seeing the ring shelving / remote inference / catalog niceties.
+The protocol version is `1` and stays there across additive Phase 2 changes — v0.2.14 Phase 1 peers and Phase 2 peers can share a mesh, with the v1 side simply not seeing the ring shelving / remote inference / catalog / file-transfer / remote-transcribe niceties. Capability advertisement (`Capabilities.features`) gates per-peer feature use so a Phase 2.0 peer that doesn't implement file transfer or remote transcribe doesn't get spammed with frames it would silently drop.
 
 ### Persistence
 

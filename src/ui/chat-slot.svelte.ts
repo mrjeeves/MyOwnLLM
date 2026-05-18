@@ -131,12 +131,13 @@ const TP_SILENCE_MS = 4_000;
 const TP_MAX_BULLETS = 50;
 
 let tpModel = "";
-/** Peer id to route TP cycles through, or null to run locally. Set
- *  from `startTalkingPoints` and consumed by `runTpCycle` to pick
- *  between the local ollama path and the mesh `infer_request` path.
- *  TP gets the same "this device or a peer" affordance the user has
- *  for chat — see TranscribeBar's ModelSelector. */
-let tpViaPeerId: string | null = null;
+/** Pinned device pubkey for mesh-routed TP cycles, or null to run
+ *  locally. Resolved to a current `peer_id` at each cycle (the
+ *  Trystero session id regenerates per reconnect, the pubkey is the
+ *  stable identity). When the pinned peer goes offline we PAUSE the
+ *  loop instead of falling back to local — the user picked a host
+ *  and we don't silently substitute the in-process LLM for it. */
+let tpViaDevicePubkey: string | null = null;
 /** The active family at TP start time, captured so mesh-routed
  *  cycles can include it in `infer_request` for the peer's resolver
  *  to match against its loaded models. */
@@ -174,13 +175,13 @@ interface ChatStreamFrame {
 
 /** Activate Talking Points against the conversation currently in the
  *  transcribe slot. Caller has already checked the chat slot is free.
- *  `viaPeerId` routes cycles through a Cloud Mesh peer; `null` runs
- *  locally against the in-process ollama. The peer's resolver picks
- *  the exact tag, so `model` is mostly a no-op when routed (kept
- *  on-call for the local path). */
+ *  `viaDevicePubkey` pins cycles to a Cloud Mesh peer (stable across
+ *  reconnects); `null` runs locally against the in-process ollama.
+ *  The peer's resolver picks the exact tag, so `model` is mostly a
+ *  no-op when routed (kept on-call for the local path). */
 export function startTalkingPoints(args: {
   model: string;
-  viaPeerId?: string | null;
+  viaDevicePubkey?: string | null;
   family?: string;
 }): void {
   const convId = transcribeUi.conversationId;
@@ -190,7 +191,7 @@ export function startTalkingPoints(args: {
   chatSlot.conversationTitle = "Talking Points";
   chatSlot.status = "running";
   tpModel = args.model;
-  tpViaPeerId = args.viaPeerId ?? null;
+  tpViaDevicePubkey = args.viaDevicePubkey ?? null;
   tpFamily = args.family ?? "";
   tpProcessedLen = 0;
   tpObservedLen = 0;
@@ -257,9 +258,24 @@ export async function stopTalkingPoints(): Promise<void> {
     } catch {}
     tpInFlightMeshCancel = null;
   }
-  tpViaPeerId = null;
+  tpViaDevicePubkey = null;
   tpFamily = "";
   resetSlot();
+}
+
+/** Resolve the routing pin to a currently-active peer entry, or null
+ *  when the pin isn't set / the peer isn't reachable. Used by the
+ *  cycle-tick to decide between running, pausing (peer pinned but
+ *  away), or going local (no pin set). */
+function resolveTpRoutedPeer():
+  | { peer_id: string; device_pubkey: string }
+  | null {
+  if (!tpViaDevicePubkey) return null;
+  const peer = meshClient.peers.find(
+    (p) => p.device_pubkey === tpViaDevicePubkey,
+  );
+  if (!peer || peer.status !== "active") return null;
+  return { peer_id: peer.peer_id, device_pubkey: peer.device_pubkey };
 }
 
 /** Tick handler: read the on-disk transcript, update growth bookkeeping,
@@ -269,6 +285,25 @@ export async function stopTalkingPoints(): Promise<void> {
 async function maybeRunTpCycle(): Promise<void> {
   if (chatSlot.kind !== "tp") return;
   if (tpInFlightStreamId) return;
+  // Pinned to a peer that's currently offline? Pause the loop — the
+  // user picked a host, we don't silently substitute the local LLM.
+  // The chat slot stays held with status="paused" so the UI surfaces
+  // the wait and the user can stop / pick a different host. As soon
+  // as the peer comes back, the next tick promotes back to running.
+  if (tpViaDevicePubkey && !resolveTpRoutedPeer()) {
+    if (chatSlot.status === "running") {
+      chatSlot.status = "paused";
+    }
+    return;
+  }
+  if (tpViaDevicePubkey && chatSlot.status === "paused") {
+    // Peer reappeared while we were paused on its account — resume.
+    // Realign startedAt so paused time doesn't poison the elapsed
+    // counter, same trick `resumeTalkingPoints` uses for user-driven
+    // resumes.
+    chatSlot.startedAt = Date.now() - chatSlot.elapsed * 1000;
+    chatSlot.status = "running";
+  }
   const convId = chatSlot.conversationId;
   if (!convId) return;
   let conv;
@@ -352,7 +387,16 @@ async function runTpCycle(): Promise<void> {
     },
   ];
   try {
-    if (tpViaPeerId) {
+    const routedPeer = resolveTpRoutedPeer();
+    if (tpViaDevicePubkey && !routedPeer) {
+      // Pin set but peer dropped between the tick check and now.
+      // Pause the slot so the user sees the wait, leave markers
+      // unchanged so the next tick retries the same slice.
+      chatSlot.status = "paused";
+      tpInFlightStreamId = null;
+      return;
+    }
+    if (routedPeer) {
       // Mesh-routed cycle. The peer's resolver picks the actual tag —
       // we just hand it the family/mode hint plus the messages. `think`
       // stays false for the same reasoning-model memory rationale that
@@ -360,7 +404,7 @@ async function runTpCycle(): Promise<void> {
       await new Promise<void>((resolve, reject) => {
         meshClient
           .sendInferRequest({
-            target_peer_id: tpViaPeerId!,
+            target_peer_id: routedPeer.peer_id,
             messages,
             family: tpFamily,
             mode: "text",
