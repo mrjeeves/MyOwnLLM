@@ -11,6 +11,7 @@
   } from "../config";
   import { settingsRoute } from "./settings-route.svelte";
   import type { CatalogEntry } from "../mesh-protocol";
+  import { FEATURES, peerSupportsFeature } from "../mesh-protocol";
   import {
     APP_VERSION,
     describePeerMissingFeatures,
@@ -274,6 +275,26 @@
     }
   }
 
+  /** Phase 3 click-to-open: opens a peer-hosted conversation in
+   *  Chat without copying it onto local disk. App.svelte wires
+   *  Chat into "remote session" mode against this peer; inference
+   *  for the open session routes through the host via
+   *  `infer_request`, and persists round-trip back through
+   *  `session_save_request`. */
+  function openRemoteConversation(
+    peer: (typeof peerGroups)[number],
+    entry: CatalogEntry,
+  ) {
+    closeMenu();
+    onSelectRemote({
+      peer_id: peer.peer_id,
+      peer_pubkey: peer.device_pubkey,
+      peer_label: peer.label || peer.device_pubkey.slice(0, 8),
+      guid: entry.guid,
+      mode: entry.mode === "transcribe" || entry.mode === "diarize" ? "transcribe" : "text",
+    });
+  }
+
   function openMeshConnectionsSettings() {
     closeMenu();
     settingsRoute.open("cloud-mesh", { meshSubTab: "connections" });
@@ -350,8 +371,10 @@
     items,
     folders,
     activeId,
+    activeRemote,
     mode,
     onSelect,
+    onSelectRemote,
     onNew,
     onRename,
     onDelete,
@@ -366,10 +389,27 @@
     items: ConversationMeta[];
     folders: FolderMeta[];
     activeId: string | null;
+    /** Phase 3 click-to-open: when set, a peer-hosted conversation
+     *  is currently open in Chat. Used to highlight the matching
+     *  remote row in the sidebar so the user has the same "this
+     *  one is active" affordance for remote conversations as they
+     *  do for local ones. */
+    activeRemote: { peer_pubkey: string; guid: string } | null;
     /** Active mode. Drives whether we say "chat" or "session" in the
      *  sidebar copy — same list, different metaphor. */
     mode: Mode;
     onSelect: (id: string) => void;
+    /** Phase 3 click-to-open: user clicked a remote conversation in
+     *  a peer-group. App.svelte switches Chat into remote-session
+     *  mode against this peer; inference will route through the
+     *  host that stores the conversation. */
+    onSelectRemote: (args: {
+      peer_id: string;
+      peer_pubkey: string;
+      peer_label: string;
+      guid: string;
+      mode?: Mode;
+    }) => void;
     onNew: () => void;
     onRename: (id: string, title: string) => void;
     onDelete: (id: string) => void;
@@ -1152,9 +1192,6 @@
         {#if isActive}
           <span class="net-row-active">active</span>
         {/if}
-        {#if !net.locked}
-          <span class="net-row-unlocked" title="Not locked yet — open Settings to commit">unlocked</span>
-        {/if}
       </div>
       {#if isActive && !isCollapsed}
         {#if peerGroups.length === 0}
@@ -1163,8 +1200,6 @@
               No peers yet. Share your Network ID with another device.
             {:else if meshClient.status === "starting"}
               Joining mesh…
-            {:else if !net.locked}
-              Lock this network on the Status tab to bring it online.
             {:else}
               {meshClient.error || "Mesh offline"}
             {/if}
@@ -1298,24 +1333,39 @@
 {/snippet}
 
 {#snippet remoteRow(entry: CatalogEntry, peer: (typeof peerGroups)[number], depth: number)}
+  {@const remoteOpenable = peer.status === "active" &&
+    peerSupportsFeature(peer.capabilities, FEATURES.SESSION_VIEW)}
+  {@const isActiveRemote = !!activeRemote &&
+    activeRemote.peer_pubkey === peer.device_pubkey &&
+    activeRemote.guid === entry.guid}
   <div
     class="row remote"
+    class:active={isActiveRemote}
     class:pending-move={entry.pending_move}
+    class:openable={remoteOpenable}
     style="--depth: {depth};"
     role="button"
     tabindex="0"
-    onclick={(e) => e.stopPropagation()}
+    onclick={(e) => {
+      e.stopPropagation();
+      if (remoteOpenable) {
+        openRemoteConversation(peer, entry);
+      }
+    }}
     onkeydown={(e) => {
-      // Keyboard equivalent of right-click: Enter / Space opens
-      // the Pull menu so the action is reachable without a mouse.
       if (e.key === "Enter" || e.key === " ") {
-        openRemoteItemMenu(
-          e,
-          peer.peer_id,
-          peer.label || peer.device_pubkey.slice(0, 8),
-          entry.guid,
-          entry.title,
-        );
+        e.preventDefault();
+        if (remoteOpenable) {
+          openRemoteConversation(peer, entry);
+        } else {
+          openRemoteItemMenu(
+            e,
+            peer.peer_id,
+            peer.label || peer.device_pubkey.slice(0, 8),
+            entry.guid,
+            entry.title,
+          );
+        }
       }
     }}
     oncontextmenu={(e) =>
@@ -1326,7 +1376,11 @@
         entry.guid,
         entry.title,
       )}
-    title="{entry.title} (hosted on {peer.label || 'this peer'})"
+    title={remoteOpenable
+      ? `${entry.title} — click to open, right-click to pull onto this device`
+      : peer.status === "offline"
+        ? `${entry.title} (hosted on ${peer.label || "this peer"}; host offline — right-click to pull when they're back)`
+        : `${entry.title} (hosted on ${peer.label || "this peer"}; right-click to pull)`}
   >
     {#if entry.mode === "transcribe" || entry.mode === "diarize"}
       <svg
@@ -1516,7 +1570,27 @@
       <button class="danger" onclick={() => deleteFolderWithConfirm(targetPath)}>Delete</button>
     {:else if menu.target.kind === "remote-item"}
       {@const target = menu.target}
+      {@const remotePeer = peerGroups.find((p) => p.peer_id === target.peer_id)}
+      {@const canOpen = !!remotePeer && remotePeer.status === "active" &&
+        peerSupportsFeature(remotePeer.capabilities, FEATURES.SESSION_VIEW)}
       <div class="menu-section-label">{target.title}</div>
+      {#if canOpen && remotePeer}
+        <button
+          onclick={() => {
+            const peer = remotePeer;
+            closeMenu();
+            onSelectRemote({
+              peer_id: peer.peer_id,
+              peer_pubkey: peer.device_pubkey,
+              peer_label: peer.label || peer.device_pubkey.slice(0, 8),
+              guid: target.guid,
+            });
+          }}
+          title="Open in chat — inference runs on {target.peer_label}, the conversation stays on their device"
+        >
+          Open on {target.peer_label}
+        </button>
+      {/if}
       <button
         onclick={() => startPull(target.guid, target.peer_id, target.peer_label, target.title)}
         title="Move this conversation from {target.peer_label} onto this device"
@@ -1990,17 +2064,6 @@
     border-radius: 3px;
     flex-shrink: 0;
   }
-  .net-row-unlocked {
-    font-size: .58rem;
-    text-transform: uppercase;
-    letter-spacing: .06em;
-    background: #2a220e;
-    color: #d6b25a;
-    padding: .05rem .35rem;
-    border-radius: 3px;
-    flex-shrink: 0;
-  }
-
   /* Forget-network modal — local to the sidebar so it sits above
      the sidebar without prop-drilling through App. Mirrors the
      delete-prompt modal styling already used by deleteFolderWithConfirm. */
@@ -2150,6 +2213,23 @@
   .row.remote { color: #ccc; }
   .row.remote:hover { background: #131820; }
   .row.remote.pending-move { opacity: .65; }
+  /* Phase 3 click-to-open: when the host advertises SESSION_VIEW and
+     is currently active, the row is openable — promote the cursor +
+     hover affordance so the user knows it does something on click,
+     not just on right-click. */
+  .row.remote.openable { cursor: pointer; }
+  .row.remote.openable:hover {
+    background: #1a2030;
+    color: #e8e8ff;
+  }
+  /* Mirror the local active-row highlight for the open remote
+     conversation so the user has the same "this is the open one"
+     affordance on both sides of the sidebar. */
+  .row.remote.active {
+    background: #2a1f55;
+    color: #fff;
+  }
+  .row.remote.active:hover { background: #322870; }
   /* Remote folders match the local folder styling so the peer's
      tree visually reads as "their version of the same sidebar." */
   .folder.remote-folder { color: #ccc; }

@@ -236,14 +236,14 @@ function cleanSignaling(raw: string[] | undefined): string[] {
  *  fields are present) and for the legacy single-network migration
  *  (where everything came from the old flat shape).
  *
- *  Legacy entries that carry a stray `label` field (from an
- *  earlier draft of this PR that briefly had per-network labels)
- *  are silently ignored — the Network ID is the display name. */
-function mergeNetwork(raw: Partial<NetworkConfig>): NetworkConfig {
+ *  Legacy entries that carry a stray `locked` flag (from the
+ *  pre-Phase-3 schema, where locking gated mesh start) are
+ *  silently dropped — saving is now the commit gesture and the
+ *  delete-network modal carries the confirmation guard. */
+function mergeNetwork(raw: Partial<NetworkConfig> & { locked?: boolean }): NetworkConfig {
   return {
     id: raw.id || newNetworkInternalId(),
     network_id: raw.network_id || "",
-    locked: raw.locked ?? false,
     signaling_servers: cleanSignaling(raw.signaling_servers),
     stun_servers: raw.stun_servers ?? [...DEFAULT_NETWORK_STUN],
     turn_servers: raw.turn_servers ?? [],
@@ -300,7 +300,6 @@ function mergeCloudMesh(raw: Partial<CloudMeshConfig> | undefined): CloudMeshCon
     }
     const migrated = mergeNetwork({
       network_id: legacyNetworkId,
-      locked: legacy["locked"] === true,
       signaling_servers: (legacy["signaling_servers"] as string[] | undefined) ?? undefined,
       stun_servers: (legacy["stun_servers"] as string[] | undefined) ?? undefined,
       turn_servers: (legacy["turn_servers"] as NetworkConfig["turn_servers"] | undefined) ?? undefined,
@@ -363,21 +362,16 @@ export function activeNetwork(cfg: Config): NetworkConfig | null {
 
 /** Append a new saved network and (optionally) set it active.
  *  Network ID doubles as the display name — there's no separate
- *  label field. Throws if a network with the same `network_id`
- *  is already saved (re-saving the same handle is a no-op the
- *  caller should treat as success). */
+ *  label field. Re-saving an existing `network_id` is a no-op
+ *  (or a switch when `activate: true`) so the AddNetwork modal
+ *  can be re-fired without spawning duplicates. */
 export async function addNetwork(
   init: { network_id: string },
-  options?: { activate?: boolean; locked?: boolean },
+  options?: { activate?: boolean },
 ): Promise<Config> {
   const cfg = await loadConfig();
   const existing = cfg.cloud_mesh.networks.find((n) => n.network_id === init.network_id);
   if (existing) {
-    // Caller already has a network with this handle — treat as
-    // "switch to it" when activate=true so the UX matches user
-    // intent ("add this network" really means "make sure I have
-    // this network and it's active"). Otherwise just return the
-    // current config unchanged.
     if (options?.activate && cfg.cloud_mesh.active_network_id !== existing.id) {
       return await setActiveNetwork(existing.id);
     }
@@ -385,7 +379,6 @@ export async function addNetwork(
   }
   const newNet: NetworkConfig = mergeNetwork({
     network_id: init.network_id,
-    locked: options?.locked ?? false,
   });
   const networks = [...cfg.cloud_mesh.networks, newNet];
   const active_network_id = options?.activate ? newNet.id : cfg.cloud_mesh.active_network_id;

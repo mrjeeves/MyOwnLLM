@@ -14,11 +14,10 @@
    *      Accepting is per-network and only enabled when an
    *      active network exists.
    *   3. **Saved networks** — list of networks the user has
-   *      saved. Active network has a lock toggle (lock = start
-   *      joining, unlock = drop the mesh). Inactive saved
-   *      networks have Switch + Forget. "+ Add network" at the
-   *      bottom of the list. This is the management surface;
-   *      the sidebar gear icon routes here.
+   *      saved. Inactive rows have a Switch button; every row
+   *      has Forget (delete-guarded by a confirmation modal).
+   *      "+ Add network" at the bottom of the list. This is the
+   *      management surface; the sidebar gear icon routes here.
    *   4. **Network requests** — pending approvals from peers
    *      currently knocking. Only rendered when there's at least
    *      one. Inline hint about picking a more unique Network ID
@@ -32,11 +31,9 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import {
-    activeNetwork,
     loadConfig,
     removeNetwork,
     setActiveNetwork,
-    updateNetwork,
   } from "../../config";
   import type { NetworkConfig } from "../../types";
   import { meshUi } from "../../mesh-state.svelte";
@@ -61,7 +58,6 @@ import { APP_VERSION } from "../../mesh-capabilities";
 
   let addModalOpen = $state(false);
   let forgetModal = $state<NetworkConfig | null>(null);
-  let unlockConfirm = $state<NetworkConfig | null>(null);
 
   let pendingRequests = $derived(
     meshClient.peers.filter((p) => p.status === "pending_approval"),
@@ -82,12 +78,6 @@ import { APP_VERSION } from "../../mesh-capabilities";
     }
     if (!active) {
       return { tone: "grey", text: "No active network — pick one below" };
-    }
-    if (!active.locked) {
-      return {
-        tone: "amber",
-        text: `${active.network_id} not locked — click 🔓 to start joining`,
-      };
     }
     if (meshClient.status === "starting" || meshClient.status === "off") {
       return { tone: "blue", text: `Joining ${active.network_id}…` };
@@ -121,16 +111,13 @@ import { APP_VERSION } from "../../mesh-capabilities";
   let coachmark = $derived.by<string>(() => {
     if (loading) return "";
     if (meshClient.status === "error") {
-      return "The mesh hit an error. Open the Activity tab for diagnostics, then unlock + re-lock the active network.";
+      return "The mesh hit an error. Open the Activity tab for diagnostics, then switch networks to retry.";
     }
     if (!active) {
       if (networks.length === 0) {
         return "Add a network below to start sharing across devices.";
       }
-      return "Pick a saved network below — click it to switch, then 🔒 to start joining.";
-    }
-    if (!active.locked) {
-      return `Click 🔒 next to "${active.network_id}" below to start joining the mesh.`;
+      return "Pick a saved network below — click Switch to join it.";
     }
     if (meshClient.status === "starting" || meshClient.status === "off") {
       return ""; // transient
@@ -140,7 +127,7 @@ import { APP_VERSION } from "../../mesh-capabilities";
     );
     if (activePeers.length === 0) {
       const handle = active.network_id;
-      return `Open the same network "${handle}" on another device. Once they lock it too, you'll see an approval request appear below.`;
+      return `Open the same network "${handle}" on another device. Once they switch to it, you'll see an approval request appear below.`;
     }
     return ""; // happy path — nothing to suggest
   });
@@ -203,35 +190,6 @@ import { APP_VERSION } from "../../mesh-capabilities";
     } finally {
       labelSaving = false;
     }
-  }
-
-  async function setLocked(net: NetworkConfig, lockedAfter: boolean) {
-    busy = true;
-    inlineError = "";
-    try {
-      await updateNetwork(net.id, { locked: lockedAfter });
-      await reloadFromConfig();
-      meshClient.reconcile().catch(() => {});
-    } catch (e) {
-      inlineError = String(e);
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function onLockClick(net: NetworkConfig) {
-    if (net.locked) {
-      unlockConfirm = net;
-    } else {
-      await setLocked(net, true);
-    }
-  }
-
-  async function confirmUnlock() {
-    const net = unlockConfirm;
-    unlockConfirm = null;
-    if (!net) return;
-    await setLocked(net, false);
   }
 
   async function switchToNetwork(id: string) {
@@ -358,11 +316,11 @@ import { APP_VERSION } from "../../mesh-capabilities";
       {/if}
     </section>
 
-    <!-- 3. Saved networks list. The active row gets a lock
-         toggle (lock to start joining, unlock to drop the mesh)
-         and a green left-border. Inactive rows get Switch +
-         Forget. + Add network at the bottom opens the
-         AddNetworkModal. -->
+    <!-- 3. Saved networks list. The active row gets a green
+         left-border. Inactive rows have a Switch button.
+         Every row carries Forget, which goes through a
+         confirmation modal before the delete lands. + Add
+         network at the bottom opens the AddNetworkModal. -->
     <section class="block">
       <div class="block-head">
         <h3>Saved networks</h3>
@@ -389,26 +347,12 @@ import { APP_VERSION } from "../../mesh-capabilities";
                 <div class="network-row-head">
                   {#if isActive}<span class="active-dot" title="Currently active"></span>{/if}
                   <span class="network-name">{net.network_id}</span>
-                  {#if net.locked}
-                    <span class="lock-pill" title="Locked — mesh client joins when this is active">🔒 locked</span>
-                  {:else}
-                    <span class="unlock-pill" title="Not locked — wouldn't join even if made active">🔓 not locked</span>
+                  {#if isActive}
+                    <span class="active-pill" title="Mesh client is joined to this network">active</span>
                   {/if}
                 </div>
               </div>
-              {#if isActive}
-                <button
-                  class="lock-btn"
-                  onclick={() => onLockClick(net)}
-                  disabled={busy}
-                  title={net.locked
-                    ? "Unlock — drops the mesh and stops joining (peer approvals are preserved)"
-                    : "Lock — start joining this network now"}
-                  aria-label={net.locked ? "Unlock network" : "Lock network"}
-                >
-                  {net.locked ? "🔒" : "🔓"}
-                </button>
-              {:else}
+              {#if !isActive}
                 <button
                   class="btn-small ghost"
                   onclick={() => switchToNetwork(net.id)}
@@ -507,23 +451,6 @@ import { APP_VERSION } from "../../mesh-capabilities";
       await reloadFromConfig();
     }}
   />
-{/if}
-
-{#if unlockConfirm}
-  {@const net = unlockConfirm}
-  <div class="modal-overlay" onclick={() => (unlockConfirm = null)} role="presentation"></div>
-  <div class="modal" role="dialog" aria-label="Unlock network">
-    <h3>Unlock "{net.network_id}"?</h3>
-    <p class="modal-body">
-      Drops the mesh connection — peers go offline and any in-flight
-      moves or remote inferences abort. The roster is preserved so
-      re-locking later picks up where you left off.
-    </p>
-    <div class="modal-actions">
-      <button class="cancel" onclick={() => (unlockConfirm = null)}>Cancel</button>
-      <button class="primary" onclick={confirmUnlock}>Unlock</button>
-    </div>
-  </div>
 {/if}
 
 {#if forgetModal}
@@ -837,43 +764,16 @@ import { APP_VERSION } from "../../mesh-capabilities";
     flex: 1;
     min-width: 0;
   }
-  .lock-pill {
+  .active-pill {
     font-size: 0.6rem;
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    background: #1a1a2a;
-    color: #b3b3ff;
+    background: #143a23;
+    color: #8ee0a6;
     border-radius: 3px;
     padding: 0.05rem 0.35rem;
     flex-shrink: 0;
   }
-  .unlock-pill {
-    font-size: 0.6rem;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    background: #2a220e;
-    color: #d6b25a;
-    border-radius: 3px;
-    padding: 0.05rem 0.35rem;
-    flex-shrink: 0;
-  }
-  .lock-btn {
-    background: #161616;
-    border: 1px solid #222;
-    color: #888;
-    font-size: 1.05rem;
-    cursor: pointer;
-    padding: 0.25rem 0.55rem;
-    border-radius: 5px;
-    line-height: 1;
-    flex-shrink: 0;
-  }
-  .lock-btn:hover:not(:disabled) {
-    background: #1c1c1c;
-    color: #ccc;
-    border-color: #333;
-  }
-  .lock-btn:disabled { opacity: 0.5; cursor: default; }
 
   .btn-small {
     background: #1a1a2a;

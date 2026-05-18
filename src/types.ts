@@ -193,11 +193,6 @@ export interface NetworkConfig {
    *  ID — and the only thing the user ever reads. Doubles as the
    *  per-network roster filename. */
   network_id: string;
-  /** True when the user has committed this network (i.e. should
-   *  be live when it's the active one). Per-network so switching
-   *  to a saved-but-unlocked network drops into the wizard's
-   *  "drafted" state. */
-  locked: boolean;
   /** Per-network signaling / NAT settings. Each network can point
    *  at a different relay pool — home / office / public mesh all
    *  configurable independently. Empty signaling = Trystero

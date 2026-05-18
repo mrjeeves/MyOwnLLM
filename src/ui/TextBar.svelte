@@ -14,6 +14,8 @@
     onViaChange,
     onThinkingChange,
     streaming = false,
+    routeLockedToRemote = false,
+    remoteHostLabel = "",
   } = $props<{
     activeModel: string;
     activeFamily: string;
@@ -39,6 +41,12 @@
     /** While a chat stream is in flight we lock the routing pin —
      *  switching mid-stream would orphan the in-flight response. */
     streaming?: boolean;
+    /** Phase 3: when true, the routing pin is forced to the remote
+     *  host that stores the open conversation. The picker is
+     *  disabled and we render a "on {host}" pill instead so the
+     *  user knows where their messages are going. */
+    routeLockedToRemote?: boolean;
+    remoteHostLabel?: string;
   }>();
 
   const ratio = $derived(contextSize > 0 ? Math.min(1, tokensUsed / contextSize) : 0);
@@ -71,8 +79,13 @@
     mode={activeMode}
     {viaDevicePubkey}
     {onViaChange}
-    disabled={streaming}
+    disabled={streaming || routeLockedToRemote}
   />
+  {#if routeLockedToRemote && remoteHostLabel}
+    <span class="remote-host-pill" title="This conversation is hosted on {remoteHostLabel}. Inference runs there by default.">
+      remote · {remoteHostLabel}
+    </span>
+  {/if}
 
   <div class="spacer"></div>
 
@@ -172,4 +185,22 @@
     border-color: #3a3a7a;
   }
   .brain-toggle.active:hover { background: #3a3a7a; }
+  .remote-host-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 0 .5rem;
+    height: 1.55rem;
+    border: 1px solid #4a3a7a;
+    background: #1a1730;
+    color: #d8d8ff;
+    border-radius: 999px;
+    font-size: .68rem;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    letter-spacing: .02em;
+    max-width: 12rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
 </style>
