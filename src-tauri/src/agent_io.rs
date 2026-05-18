@@ -323,6 +323,14 @@ mod tests {
         assert!(!out.timed_out);
     }
 
+    // The stderr-split and timeout tests use shell idioms that differ
+    // between POSIX sh and Windows cmd. Rather than write two parallel
+    // tests, gate the Unix-idiomatic ones to Unix CI — the shell capture
+    // pipeline is platform-independent (the cfg!(windows) branch in
+    // run_shell_inner just picks the launcher), so the
+    // `shell_captures_stdout_and_exit` test above still exercises the
+    // Windows path end-to-end.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_separates_stderr() {
         let out = run_shell_inner(
@@ -337,9 +345,42 @@ mod tests {
         assert_eq!(out.exit_code, Some(3));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_times_out() {
         let out = run_shell_inner("sleep 5".to_string(), None, Some(200))
+            .await
+            .unwrap();
+        assert!(out.timed_out);
+        assert!(out.exit_code.is_none());
+    }
+
+    // Windows-only variants of the two tests above so the timeout +
+    // stderr paths still get coverage on the Windows CI runner.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_separates_stderr_windows() {
+        // `&` chains commands in cmd; `1>&2` redirects stderr the same
+        // way; `exit /b 3` returns the desired exit code without
+        // closing the cmd window.
+        let out = run_shell_inner(
+            "echo out & echo err 1>&2 & exit /b 3".to_string(),
+            None,
+            Some(5_000),
+        )
+        .await
+        .unwrap();
+        assert!(out.stdout.contains("out"));
+        assert!(out.stderr.contains("err"));
+        assert_eq!(out.exit_code, Some(3));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_times_out_windows() {
+        // `timeout` is a cmd builtin; redirecting stdin via < NUL keeps
+        // it from complaining about non-interactive input.
+        let out = run_shell_inner("timeout /t 5 /nobreak > NUL".to_string(), None, Some(200))
             .await
             .unwrap();
         assert!(out.timed_out);

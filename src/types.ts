@@ -277,36 +277,37 @@ export interface AutoCleanupConfig {
 /** Per-tool permission policy. `ask` (the default for any tool/device
  *  pair the user hasn't acted on yet) shows a prompt on every call;
  *  `accept_all` skips the prompt and approves every invocation;
- *  `denied` skips the prompt and refuses every invocation (the user
- *  has explicitly turned the tool off for this device). `always_accept`
- *  is an allow-list of exact command strings (for shell) or absolute
- *  paths (for write_file) that bypass the prompt regardless of mode —
- *  populated from the modal's "Always accept this" button. */
+ *  `denied` skips the prompt and refuses every invocation. The
+ *  `always_accept` list is an allow-list of exact command strings (for
+ *  shell) or absolute paths (for write_file) that bypass the prompt
+ *  regardless of mode — populated from the modal's "Always accept this"
+ *  button.
+ *
+ *  `updated_at` is the unix-ms timestamp of when this record was last
+ *  mutated on any device in the mesh. The gossip layer broadcasts the
+ *  full record on every change; receivers adopt the incoming version
+ *  when its timestamp is strictly newer than their local one. No CRDT
+ *  machinery — three discrete modes plus a small allow-list means
+ *  last-write-wins converges cleanly. */
 export interface ToolPermission {
   mode: "ask" | "accept_all" | "denied";
   always_accept: string[];
+  updated_at: number;
 }
 
-/** A device's full permission set. Today gates only the two destructive
- *  tools (`shell` and `write_file`); read-only operations (`networks`,
- *  `read_file`) intentionally aren't gated because they can't modify
- *  the host. Keyed under `Config.agent_permissions` by the mesh device
- *  ID — same scope as the identity card in Networks → Status — so each
- *  machine the user logs into starts with a clean policy and the
- *  Permissions tab can list "your devices" with their individual
- *  policies. */
-export interface DevicePermissions {
+/** Agent-tool permissions for the whole mesh. Today gates only the two
+ *  destructive tools (`shell` and `write_file`); read-only operations
+ *  (`networks`, `read_file`) intentionally aren't gated because they
+ *  can't modify the host.
+ *
+ *  Stored network-wide rather than per-device: the user shouldn't have
+ *  to re-grant "always accept `ls /tmp`" on every machine on their
+ *  mesh. Devices broadcast this blob when they change anything and
+ *  when a peer becomes active; the highest `updated_at` per tool
+ *  wins on merge. Missing tools default to fresh (`mode: "ask"`). */
+export interface AgentPermissionsConfig {
   shell: ToolPermission;
   write_file: ToolPermission;
-}
-
-/** Agent-tool permissions, scoped per device. The mesh device ID is
- *  the natural key — it's stable per machine, already surfaced in the
- *  Networks tab, and gives the Permissions tab a useful display label
- *  for cross-device review. Missing devices default to "ask" for every
- *  tool. */
-export interface AgentPermissionsConfig {
-  by_device: Record<string, DevicePermissions>;
 }
 
 export interface Config {
