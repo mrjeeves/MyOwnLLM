@@ -98,6 +98,21 @@ const WAKE_PROBE_DELAY_MS = 1_500;
  *  the schedule's length stay at the final entry, so reconnection
  *  continues indefinitely but never faster than 30s per attempt. */
 const REHANDSHAKE_BACKOFF_MS_SCHEDULE = [2_000, 5_000, 10_000, 20_000, 30_000];
+/** After this many failed re-handshakes against a peer, escalate
+ *  from app-level retry to a Trystero room rejoin. App-level
+ *  hellos sit on top of the WebRTC datachannel; if that channel
+ *  is half-dead (typical post-suspend), the hellos go into the
+ *  void no matter how many we send. A fresh discovery cycle is
+ *  the only way to get a new datachannel. Throttled via
+ *  FORCE_REDISCOVERY_MIN_INTERVAL_MS so a flaky peer doesn't
+ *  drag every other connection through repeated rejoins. */
+const REHANDSHAKE_RESCUE_ATTEMPTS = 3;
+/** Minimum wall-clock gap between two forced room rejoins. Keeps
+ *  the rescue escalation from constantly tearing down healthy
+ *  peers when one peer is genuinely gone — after a rejoin we
+ *  give Trystero time to finish the new discovery pass before
+ *  declaring failure again. */
+const FORCE_REDISCOVERY_MIN_INTERVAL_MS = 60_000;
 const DIAG_MAX = 80;
 /** Globally-unique app identifier passed to Trystero so MyOwnLLM
  *  peers don't accidentally match peers from unrelated apps that
@@ -264,6 +279,12 @@ class MeshClient {
    *  our connections — they look stale only because real time
    *  advanced while we weren't running. */
   private last_global_tick_at = 0;
+  /** Wall-clock ms of the most recent forced Trystero room rejoin
+   *  (the rescue path triggered by failed wake probes or
+   *  unresponsive re-handshakes). Throttle gate for
+   *  maybeForceRediscovery() — keeps any number of stuck peers
+   *  from each triggering their own rejoin in quick succession. */
+  private last_force_rediscovery_at = 0;
   /** Bound lifecycle handlers, kept around so we can remove them
    *  in stop(). Each observable (visibility, focus, online,
    *  pageshow) is a hint that we may have just resumed from a
@@ -412,6 +433,12 @@ class MeshClient {
     this.status = "online";
     this.my_peer_id = `trystero/${room_id.slice(0, 8)}`;
     this.last_global_tick_at = 0;
+    // NB: last_force_rediscovery_at intentionally not reset here.
+    // forceRediscovery() runs stop()+reconcile()+start(); reseting
+    // the throttle on the post-rejoin start would let any peer
+    // that immediately hits the rescue threshold trigger another
+    // rejoin a few seconds later, defeating the throttle's whole
+    // purpose. The value survives across rejoin cycles by design.
     this.installLifecycleHooks();
     this.logDiag("info", `online — listening for peers in room ${room_id.slice(0, 12)}…`);
   }
@@ -553,7 +580,13 @@ class MeshClient {
    *  of it. */
   async forceRediscovery(): Promise<void> {
     if (this.status !== "online" || !this.identity) return;
-    this.logDiag("info", "user-triggered rediscovery — rejoining mesh room");
+    // Stamp the throttle so any auto-rediscovery (wake probe,
+    // rescue threshold) that fires in the next minute treats
+    // this as the recent rejoin and stays its hand. User clicks
+    // bypass the throttle check itself — that's intentional —
+    // but they should still inform the automatic path.
+    this.last_force_rediscovery_at = Date.now();
+    this.logDiag("info", "rediscovery — leaving and rejoining mesh room");
     await this.stop();
     await this.reconcile();
   }
@@ -654,14 +687,23 @@ class MeshClient {
       conn.wake_probe_pending &&
       conn.wake_at > 0 &&
       now - conn.wake_at >= WAKE_PROBE_DELAY_MS;
-    const stale = silence_ms > HEARTBEAT_TIMEOUT_MS || post_wake_silent;
+    // Two paths into re-handshake:
+    //   1. Already mid-reconnect (attempts > 0) — keep walking
+    //      the backoff schedule until the peer responds.
+    //   2. Fresh stall — silence exceeded the timeout, or wake
+    //      probe expired without a pong.
+    // Without (1), the very next regular tick after entering
+    // re-handshake would see silence_ms reset (it was reset on
+    // wake) and decide we're healthy, so the schedule would
+    // never advance past attempt 1 until silence_ms genuinely
+    // re-accumulates HEARTBEAT_TIMEOUT_MS.
+    const in_reconnect = conn.rehandshake_attempts > 0;
+    const newly_stale =
+      !in_reconnect && (silence_ms > HEARTBEAT_TIMEOUT_MS || post_wake_silent);
 
-    if (!stale) {
+    if (!in_reconnect && !newly_stale) {
       return;
     }
-    // Once we've entered the stale path, the wake-probe window is
-    // over — graduate to the regular re-handshake loop so
-    // subsequent ticks don't re-fire the short-window logic.
     conn.wake_probe_pending = false;
 
     if (now < conn.rehandshake_backoff_until) {
@@ -680,15 +722,47 @@ class MeshClient {
       Math.min(conn.rehandshake_attempts - 1, REHANDSHAKE_BACKOFF_MS_SCHEDULE.length - 1)
     ];
     conn.rehandshake_backoff_until = now + next_backoff_ms;
-    const reason = post_wake_silent
-      ? `no response within ${WAKE_PROBE_DELAY_MS / 1000}s of wake`
-      : `silent ${Math.round(silence_ms / 1000)}s`;
+    const reason = newly_stale
+      ? post_wake_silent
+        ? `no response within ${WAKE_PROBE_DELAY_MS / 1000}s of wake`
+        : `silent ${Math.round(silence_ms / 1000)}s`
+      : `still unresponsive`;
     this.logDiag(
       "warn",
       `peer ${conn.peer_id.slice(0, 8)}… ${reason} — re-handshake attempt ${conn.rehandshake_attempts} (next in ${next_backoff_ms / 1000}s)`,
     );
     this.sendHello(conn);
     this.republishPeers();
+
+    // App-level hellos can only reach a peer whose WebRTC channel
+    // is still alive at the Trystero layer. Once we've burned
+    // through several attempts with no response, escalate to a
+    // room rejoin — the underlying channel is likely dead and
+    // only a fresh discovery cycle can produce a new one.
+    if (conn.rehandshake_attempts === REHANDSHAKE_RESCUE_ATTEMPTS) {
+      this.maybeForceRediscovery(
+        `${conn.peer_id.slice(0, 8)}… unresponsive after ${REHANDSHAKE_RESCUE_ATTEMPTS} re-handshakes`,
+      );
+    }
+  }
+
+  /** Throttled wrapper around forceRediscovery. Multiple stuck
+   *  peers can call this in quick succession — the throttle
+   *  ensures only one rejoin actually happens per
+   *  FORCE_REDISCOVERY_MIN_INTERVAL_MS window. Logged either
+   *  way so the Activity panel shows what's been suppressed. */
+  private maybeForceRediscovery(reason: string): void {
+    const now = Date.now();
+    if (now - this.last_force_rediscovery_at < FORCE_REDISCOVERY_MIN_INTERVAL_MS) {
+      this.logDiag(
+        "info",
+        `rediscovery throttled (${reason}) — last rejoin ${Math.round((now - this.last_force_rediscovery_at) / 1000)}s ago`,
+      );
+      return;
+    }
+    this.last_force_rediscovery_at = now;
+    this.logDiag("info", `auto rediscovery — ${reason}`);
+    void this.forceRediscovery();
   }
 
   /** Treat every active connection as if it just resumed: clear
@@ -709,6 +783,26 @@ class MeshClient {
       this.send(conn, { kind: "ping", t: now });
     }
     window.setTimeout(() => {
+      // Count peers that didn't reply to the wake ping. If none
+      // responded the WebRTC channels are almost certainly dead
+      // (the laptop-slept-while-home-office-stayed-on case) and
+      // we need a fresh discovery pass — Trystero keeps the
+      // peer ids in its room state until it notices the
+      // half-closed datachannels itself, which can take minutes.
+      // Short-circuiting to a rejoin here gets us reconnected
+      // in seconds instead.
+      let unresponsive = 0;
+      let total = 0;
+      for (const conn of this.connections.values()) {
+        total++;
+        if (conn.wake_probe_pending) unresponsive++;
+      }
+      if (total > 0 && unresponsive === total) {
+        this.maybeForceRediscovery(
+          `wake probe: all ${total} peer(s) unresponsive`,
+        );
+        return;
+      }
       for (const conn of this.connections.values()) {
         this.heartbeatTick(conn);
       }
