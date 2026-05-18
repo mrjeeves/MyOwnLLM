@@ -112,15 +112,39 @@ const REHANDSHAKE_BACKOFF_MS_SCHEDULE = [2_000, 5_000, 10_000, 20_000, 30_000];
  *  is half-dead (typical post-suspend), the hellos go into the
  *  void no matter how many we send. A fresh discovery cycle is
  *  the only way to get a new datachannel. Throttled via
- *  FORCE_REDISCOVERY_MIN_INTERVAL_MS so a flaky peer doesn't
+ *  REDISCOVERY_BACKOFF_SCHEDULE_MS so a flaky peer doesn't
  *  drag every other connection through repeated rejoins. */
 const REHANDSHAKE_RESCUE_ATTEMPTS = 3;
-/** Minimum wall-clock gap between two forced room rejoins. Keeps
- *  the rescue escalation from constantly tearing down healthy
- *  peers when one peer is genuinely gone — after a rejoin we
- *  give Trystero time to finish the new discovery pass before
- *  declaring failure again. */
-const FORCE_REDISCOVERY_MIN_INTERVAL_MS = 60_000;
+/** Minimum wall-clock gap between two forced room rejoins,
+ *  indexed by consecutive_rediscovery_attempts. A peer that
+ *  genuinely is offline (other laptop shut down for the night)
+ *  shouldn't drag the rest of the mesh through a rejoin every
+ *  minute forever — the backoff stretches the cadence out the
+ *  longer they stay gone. The counter resets the moment any
+ *  peer successfully completes auth, so a peer that pops back
+ *  online gets the next outage's full reactivity. */
+const REDISCOVERY_BACKOFF_SCHEDULE_MS = [
+  60_000, // 1m  — first attempt after going offline
+  120_000, // 2m
+  300_000, // 5m
+  600_000, // 10m
+  1_800_000, // 30m  — final, repeated indefinitely
+];
+/** Cadence at which we check whether any rostered peer is offline
+ *  and, if so, ask for a rediscovery. Catches the asymmetric
+ *  case where one side rejoins after a sleep but the other side
+ *  has a stuck Trystero subscription that never produces an
+ *  onPeerJoin for the wake-side's new peer_id. The actual rejoin
+ *  is throttled by REDISCOVERY_BACKOFF_SCHEDULE_MS so this
+ *  check polls more often than rejoins fire. */
+const OFFLINE_ROSTERED_CHECK_INTERVAL_MS = 60_000;
+/** Delay between Trystero `leave()` and the new `joinRoom()` in
+ *  forceRediscovery. Without this gap the new join can race a
+ *  half-cleaned ICE/relay teardown and produce a "phantom"
+ *  connection that fires onPeerJoin without a working data
+ *  channel — exactly the symptom we hit, where both sides see
+ *  the peer join but neither's hello ever lands. */
+const REDISCOVERY_REJOIN_GAP_MS = 1_500;
 const DIAG_MAX = 80;
 /** Globally-unique app identifier passed to Trystero so MyOwnLLM
  *  peers don't accidentally match peers from unrelated apps that
@@ -294,11 +318,24 @@ class MeshClient {
    *  advanced while we weren't running. */
   private last_global_tick_at = 0;
   /** Wall-clock ms of the most recent forced Trystero room rejoin
-   *  (the rescue path triggered by failed wake probes or
-   *  unresponsive re-handshakes). Throttle gate for
+   *  (the rescue path triggered by failed wake probes,
+   *  unresponsive re-handshakes, or the periodic
+   *  offline-rostered-peer check). Throttle gate for
    *  maybeForceRediscovery() — keeps any number of stuck peers
    *  from each triggering their own rejoin in quick succession. */
   private last_force_rediscovery_at = 0;
+  /** How many rediscoveries have fired since the last successful
+   *  auth_response. Indexes into REDISCOVERY_BACKOFF_SCHEDULE_MS
+   *  to grow the throttle window the longer we've been
+   *  unsuccessfully trying. Reset in handleAuthResponse on any
+   *  successful authentication. */
+  private consecutive_rediscovery_attempts = 0;
+  /** setInterval handle for the offline-rostered-peer check.
+   *  Polls every OFFLINE_ROSTERED_CHECK_INTERVAL_MS so the
+   *  non-wake side of an asymmetric sleep still gets a chance
+   *  to refresh its Trystero subscription when a rostered peer
+   *  has been gone too long. */
+  private offline_check_timer: number | null = null;
   /** Bound lifecycle handlers, kept around so we can remove them
    *  in stop(). Each observable (visibility, focus, online,
    *  pageshow) is a hint that we may have just resumed from a
@@ -454,12 +491,19 @@ class MeshClient {
     // rejoin a few seconds later, defeating the throttle's whole
     // purpose. The value survives across rejoin cycles by design.
     this.installLifecycleHooks();
+    this.offline_check_timer = window.setInterval(() => {
+      this.offlineRosteredCheckTick();
+    }, OFFLINE_ROSTERED_CHECK_INTERVAL_MS);
     this.logDiag("info", `online — listening for peers in room ${room_id.slice(0, 12)}…`);
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
     this.uninstallLifecycleHooks();
+    if (this.offline_check_timer !== null) {
+      clearInterval(this.offline_check_timer);
+      this.offline_check_timer = null;
+    }
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
       if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
@@ -603,6 +647,11 @@ class MeshClient {
     this.last_force_rediscovery_at = Date.now();
     this.logDiag("info", "rediscovery — leaving and rejoining mesh room");
     await this.stop();
+    // Give Trystero's underlying transport a beat to fully tear
+    // down before the new join — see REDISCOVERY_REJOIN_GAP_MS.
+    await new Promise<void>((resolve) =>
+      window.setTimeout(resolve, REDISCOVERY_REJOIN_GAP_MS),
+    );
     await this.reconcile();
   }
 
@@ -789,20 +838,57 @@ class MeshClient {
   /** Throttled wrapper around forceRediscovery. Multiple stuck
    *  peers can call this in quick succession — the throttle
    *  ensures only one rejoin actually happens per
-   *  FORCE_REDISCOVERY_MIN_INTERVAL_MS window. Logged either
+   *  REDISCOVERY_BACKOFF_SCHEDULE_MS window. Logged either
    *  way so the Activity panel shows what's been suppressed. */
   private maybeForceRediscovery(reason: string): void {
     const now = Date.now();
-    if (now - this.last_force_rediscovery_at < FORCE_REDISCOVERY_MIN_INTERVAL_MS) {
+    const idx = Math.min(
+      this.consecutive_rediscovery_attempts,
+      REDISCOVERY_BACKOFF_SCHEDULE_MS.length - 1,
+    );
+    const min_interval = REDISCOVERY_BACKOFF_SCHEDULE_MS[idx];
+    if (now - this.last_force_rediscovery_at < min_interval) {
+      const wait_s = Math.ceil(
+        (min_interval - (now - this.last_force_rediscovery_at)) / 1000,
+      );
       this.logDiag(
         "info",
-        `rediscovery throttled (${reason}) — last rejoin ${Math.round((now - this.last_force_rediscovery_at) / 1000)}s ago`,
+        `rediscovery throttled (${reason}) — next rejoin allowed in ${wait_s}s`,
       );
       return;
     }
     this.last_force_rediscovery_at = now;
-    this.logDiag("info", `auto rediscovery — ${reason}`);
+    this.consecutive_rediscovery_attempts += 1;
+    this.logDiag(
+      "info",
+      `auto rediscovery #${this.consecutive_rediscovery_attempts} — ${reason}`,
+    );
     void this.forceRediscovery();
+  }
+
+  /** Periodic safety net: if any peer in our roster isn't currently
+   *  in our active connection set, ask for a rediscovery. Covers
+   *  the asymmetric-sleep case the heartbeat-rescue path can't
+   *  reach — once Trystero on this side has fired onPeerLeave for
+   *  the absent peer there's no per-peer heartbeat left to drive
+   *  a rejoin from, so we need a separate poll. The actual rejoin
+   *  is throttled by REDISCOVERY_BACKOFF_SCHEDULE_MS, so calling
+   *  every OFFLINE_ROSTERED_CHECK_INTERVAL_MS just keeps the
+   *  pressure on — only one rejoin per window actually fires. */
+  private offlineRosteredCheckTick(): void {
+    if (this.roster_pubkeys.size === 0) return;
+    const active_pubkeys = new Set<string>();
+    for (const conn of this.connections.values()) {
+      if (conn.device_pubkey) active_pubkeys.add(conn.device_pubkey);
+    }
+    let offline = 0;
+    for (const pk of this.roster_pubkeys) {
+      if (!active_pubkeys.has(pk)) offline += 1;
+    }
+    if (offline === 0) return;
+    this.maybeForceRediscovery(
+      `${offline} rostered peer(s) offline — refreshing Trystero discovery`,
+    );
   }
 
   /** Treat every active connection as if it just resumed: clear
@@ -1101,6 +1187,11 @@ class MeshClient {
       return;
     }
     conn.peer_authenticated = true;
+    // A successful auth means the mesh is fundamentally working —
+    // reset the rediscovery backoff counter so the next outage
+    // gets the fast first-rejoin window, not whatever stretched
+    // schedule we'd worked our way up to.
+    this.consecutive_rediscovery_attempts = 0;
     // Cryptographic handshake is complete — kill the watchdog and
     // the hello-retry interval. The peer is now genuinely waiting
     // on user approval (locally or remotely) and that can take
