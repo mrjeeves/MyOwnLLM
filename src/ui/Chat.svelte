@@ -1001,10 +1001,14 @@
     border-radius: 14px;
     font-size: .9rem;
     line-height: 1.5;
-    white-space: pre-wrap;
   }
   .user .bubble { background: #6e6ef7; color: #fff; border-bottom-right-radius: 4px; }
   .assistant .bubble { background: #1e1e1e; color: #e8e8e8; border-bottom-left-radius: 4px; }
+  /* `pre-wrap` lives on the content span (not the bubble) so model
+     output preserves user-typed newlines without the whitespace
+     between sibling elements (e.g. content → tool-calls div) also
+     rendering as a visible blank line. */
+  .bubble .content { white-space: pre-wrap; }
   .thinking-block {
     margin-bottom: .5rem;
     border-left: 2px solid #444;
@@ -1063,16 +1067,12 @@
   /* Tool-call pills surface what the IT-onboarded model is doing under
      the hood — calling `networks` with action=status, switching the active
      network, etc. Collapsed by default to keep the transcript readable;
-     the user expands one when they want to audit args / result.
-     The wrapper resets `white-space` so the pre-wrap on `.bubble`
-     doesn't render the markup whitespace between the content span and
-     this div as an actual blank line. */
+     the user expands one when they want to audit args / result. */
   .tool-calls {
     display: flex;
     flex-direction: column;
     gap: .3rem;
     margin-top: .55rem;
-    white-space: normal;
   }
   .tool-call {
     background: #181818;
