@@ -278,6 +278,13 @@ class MeshClient {
   my_peer_id = $state("");
   peers = $state<PeerEntry[]>([]);
   diag = $state<DiagEntry[]>([]);
+  /** True while forceRediscovery() is mid-flight (stop → wait →
+   *  reconcile). The Connections list reads this so offline cards
+   *  can show "rediscovering…" instead of a static "offline"
+   *  during the rejoin window — otherwise the card flickers from
+   *  live to gone to offline to handshaking to live with no
+   *  indication that the system is actively working on it. */
+  is_rediscovering = $state(false);
 
   private logDiag(level: DiagLevel, msg: string): void {
     const entry: DiagEntry = { ts: Date.now(), level, msg };
@@ -408,8 +415,13 @@ class MeshClient {
     this.error = "";
     this.identity = opts.identity;
     this.network_id = opts.networkId;
-    this.peers = [];
     this.connections.clear();
+    // Recompute peers immediately — with connections cleared, this
+    // collapses to just the offline-rostered entries from the
+    // existing in-memory roster. Critical during a rediscovery
+    // cycle: without this the Connections list would flash empty
+    // between stop() and the first onPeerJoin of the new room.
+    this.republishPeers();
 
     try {
       this.network_handle = await deriveNetworkHandle(opts.networkId);
@@ -421,6 +433,10 @@ class MeshClient {
     }
 
     await this.refreshRoster();
+    // Roster may have changed since the last run — resync the peer
+    // list so the offline-rostered entries reflect the on-disk
+    // truth before any onPeerJoin updates start landing.
+    this.republishPeers();
 
     const ice_servers = buildIceServers(opts.stunServers, opts.turnServers);
     const room_id = this.network_handle;
@@ -639,20 +655,32 @@ class MeshClient {
    *  of it. */
   async forceRediscovery(): Promise<void> {
     if (this.status !== "online" || !this.identity) return;
-    // Stamp the throttle so any auto-rediscovery (wake probe,
-    // rescue threshold) that fires in the next minute treats
-    // this as the recent rejoin and stays its hand. User clicks
-    // bypass the throttle check itself — that's intentional —
-    // but they should still inform the automatic path.
-    this.last_force_rediscovery_at = Date.now();
-    this.logDiag("info", "rediscovery — leaving and rejoining mesh room");
-    await this.stop();
-    // Give Trystero's underlying transport a beat to fully tear
-    // down before the new join — see REDISCOVERY_REJOIN_GAP_MS.
-    await new Promise<void>((resolve) =>
-      window.setTimeout(resolve, REDISCOVERY_REJOIN_GAP_MS),
-    );
-    await this.reconcile();
+    this.is_rediscovering = true;
+    try {
+      // Stamp the throttle so any auto-rediscovery (wake probe,
+      // rescue threshold) that fires in the next minute treats
+      // this as the recent rejoin and stays its hand. User clicks
+      // bypass the throttle check itself — that's intentional —
+      // but they should still inform the automatic path.
+      this.last_force_rediscovery_at = Date.now();
+      this.logDiag("info", "rediscovery — leaving and rejoining mesh room");
+      await this.stop();
+      // stop() blanks `this.peers` so a final-shutdown caller
+      // gets a clean UI; here we're going right back into a join,
+      // so immediately republish to show the offline-rostered
+      // view across the gap. Otherwise the connection card
+      // visibly disappears for a second or two, which is the
+      // exact UX confusion that prompted this change.
+      this.republishPeers();
+      // Give Trystero's underlying transport a beat to fully tear
+      // down before the new join — see REDISCOVERY_REJOIN_GAP_MS.
+      await new Promise<void>((resolve) =>
+        window.setTimeout(resolve, REDISCOVERY_REJOIN_GAP_MS),
+      );
+      await this.reconcile();
+    } finally {
+      this.is_rediscovering = false;
+    }
   }
 
   async moveConversation(guid: string, target_peer_id: string): Promise<void> {

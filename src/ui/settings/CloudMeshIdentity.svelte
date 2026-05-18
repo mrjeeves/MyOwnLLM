@@ -78,6 +78,18 @@
   }
 
   function statusLabel(p: { status: string; local_approved: boolean; remote_approved: boolean; approver_role: boolean }): string {
+    // While the client is mid-rediscovery (leaving + rejoining the
+    // Trystero room), offline-rostered peers are about to get a
+    // fresh discovery pass. Surface that so the card reads as
+    // "actively working on it" rather than going dark for the
+    // duration of the rejoin window.
+    if (
+      p.status === "offline" &&
+      meshClient.is_rediscovering &&
+      meshClient.status !== "off"
+    ) {
+      return "rediscovering…";
+    }
     switch (p.status) {
       case "connecting":
         return "connecting";
@@ -495,6 +507,7 @@
               class:awaiting={p.status === "pending_remote"}
               class:offline={p.status === "offline"}
               class:reconnecting={p.reconnect_attempts > 0}
+              class:rediscovering={p.status === "offline" && meshClient.is_rediscovering && meshClient.status !== "off"}
             >
               <div class="peer-main">
                 <div class="peer-label">
@@ -885,6 +898,22 @@
   .peer-row.offline .peer-name,
   .peer-row.offline .peer-suffix { color: #888; }
   .peer-row.offline .peer-pubkey { color: #555; }
+  /* Rediscovering peers override the muted offline look — the
+     client is actively rejoining the room to find them again, so
+     the row reads as "in flight" rather than "gone". */
+  .peer-row.rediscovering {
+    opacity: 1;
+    background: #131310;
+    border-color: #3a2f10;
+  }
+  .peer-row.rediscovering .peer-name,
+  .peer-row.rediscovering .peer-suffix { color: #ddd; }
+  .peer-row.rediscovering .peer-pubkey { color: #888; }
+  .peer-row.rediscovering .peer-status {
+    color: #d6b25a;
+    background: #2a220e;
+    animation: reconnect-pulse 1.6s ease-in-out infinite;
+  }
 
   .peer-name {
     font-size: 0.85rem;
