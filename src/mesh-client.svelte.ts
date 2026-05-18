@@ -73,6 +73,25 @@ const HEARTBEAT_INTERVAL_MS = 10_000;
  *  protocol message — anything) within this window. 25s gives us
  *  two missed pings of grace before we consider the peer dead. */
 const HEARTBEAT_TIMEOUT_MS = 25_000;
+/** When the gap between two heartbeat ticks is larger than this,
+ *  assume the device just woke from sleep / suspend. setInterval
+ *  pauses while the JS engine is frozen, so a gap much greater
+ *  than the configured interval is the most reliable wake signal
+ *  we have from inside the runtime — independent of whether the
+ *  OS fires a visibility / focus event for us. */
+const WAKE_DETECTION_THRESHOLD_MS = HEARTBEAT_INTERVAL_MS * 2;
+/** Backoff schedule for app-level re-handshake attempts when a
+ *  peer goes silent past HEARTBEAT_TIMEOUT_MS. Each attempt
+ *  re-sends `hello`; if the underlying WebRTC channel is still
+ *  warm but our app state went stale (typical post-suspend), the
+ *  peer answers and we recover without losing approval state.
+ *  Indexed by attempt count (1 → SCHEDULE[0]). */
+const REHANDSHAKE_BACKOFF_MS_SCHEDULE = [2_000, 5_000, 10_000, 20_000, 30_000];
+/** Give up after this many re-handshakes without a single message
+ *  back from the peer. At that point we drop and let Trystero's
+ *  own discovery loop produce a fresh `onPeerJoin` if the peer
+ *  comes back. */
+const MAX_REHANDSHAKE_ATTEMPTS = 5;
 const DIAG_MAX = 80;
 /** Globally-unique app identifier passed to Trystero so MyOwnLLM
  *  peers don't accidentally match peers from unrelated apps that
@@ -125,6 +144,17 @@ export interface PeerEntry {
   /** Six-char verification code the user reads to confirm the
    *  request is the one they expect. */
   verification_code: string;
+  /** Count of consecutive app-level re-handshake attempts since we
+   *  last heard from this peer. 0 means the connection is healthy
+   *  on the keepalive path. Surfaced on the connection card so
+   *  the user can see when we're working through a stall (typical
+   *  on wake from suspend) before giving up. */
+  reconnect_attempts: number;
+  /** Wall-clock ms when the next re-handshake attempt is allowed
+   *  to fire. Null when no re-handshake is pending. The card
+   *  renders a countdown so it's visible that we're throttling
+   *  rather than stuck. */
+  next_reconnect_at: number | null;
 }
 
 interface ConnectionState {
@@ -153,6 +183,15 @@ interface ConnectionState {
   /** setInterval handle for the keepalive ping. Active from the
    *  moment the connection state is created until it's dropped. */
   heartbeat_timer: number | null;
+  /** How many app-level re-handshake attempts we've fired since
+   *  the peer last sent us anything. Reset to 0 on any inbound
+   *  message. Capped at MAX_REHANDSHAKE_ATTEMPTS — beyond that
+   *  the connection is dropped. */
+  rehandshake_attempts: number;
+  /** Wall-clock ms before which the next re-handshake is
+   *  suppressed. 0 = no throttle pending. Updated each time we
+   *  send a fresh `hello` from the heartbeat tick. */
+  rehandshake_backoff_until: number;
 }
 
 class MeshClient {
@@ -197,6 +236,24 @@ class MeshClient {
     string,
     { target_peer_id: string; conversation: Conversation; on_complete?: (ok: boolean, err?: string) => void }
   >();
+  /** Wall-clock ms of the last heartbeat tick from ANY connection.
+   *  Used to detect OS sleep/suspend: if the gap between two ticks
+   *  is way larger than HEARTBEAT_INTERVAL_MS, the JS engine was
+   *  frozen and we shouldn't trust the silence windows on any of
+   *  our connections — they look stale only because real time
+   *  advanced while we weren't running. */
+  private last_global_tick_at = 0;
+  /** Bound lifecycle handlers, kept around so we can remove them
+   *  in stop(). Each observable (visibility, focus, online,
+   *  pageshow) is a hint that we may have just resumed from a
+   *  paused state; the handler converges them all on
+   *  handleWake(). */
+  private lifecycle_handlers: {
+    visibility: () => void;
+    online: () => void;
+    focus: () => void;
+    pageshow: () => void;
+  } | null = null;
 
   // ---- lifecycle -------------------------------------------------------
 
@@ -333,11 +390,14 @@ class MeshClient {
     // open/connect handshake to wait for like with peerjs.
     this.status = "online";
     this.my_peer_id = `trystero/${room_id.slice(0, 8)}`;
+    this.last_global_tick_at = 0;
+    this.installLifecycleHooks();
     this.logDiag("info", `online — listening for peers in room ${room_id.slice(0, 12)}…`);
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.uninstallLifecycleHooks();
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
       if (c.heartbeat_timer !== null) clearInterval(c.heartbeat_timer);
@@ -354,6 +414,7 @@ class MeshClient {
     this.my_peer_id = "";
     this.status = "off";
     this.error = "";
+    this.last_global_tick_at = 0;
     settingsAttention.set("cloud-mesh", null);
     this.logDiag("info", "stopped");
   }
@@ -487,15 +548,139 @@ class MeshClient {
 
   private heartbeatTick(conn: ConnectionState): void {
     const now = Date.now();
-    if (now - conn.last_recv_at > HEARTBEAT_TIMEOUT_MS) {
+
+    // Wake detection. setInterval pauses while the OS is suspended,
+    // so a tick-to-tick gap much larger than the configured
+    // interval is the most reliable signal that JS just resumed.
+    // Without this, the very first post-wake tick would compute
+    // (now - last_recv_at) against a pre-sleep timestamp, blow
+    // past HEARTBEAT_TIMEOUT_MS, and drop every peer at once —
+    // even though our channel state is fine and the peer is
+    // probably reachable. Run handleWake once per detected gap;
+    // subsequent ticks in the same wake see the freshly-reset
+    // timestamps and proceed normally.
+    if (
+      this.last_global_tick_at > 0 &&
+      now - this.last_global_tick_at > WAKE_DETECTION_THRESHOLD_MS
+    ) {
+      const gap_s = Math.round((now - this.last_global_tick_at) / 1000);
+      this.logDiag(
+        "info",
+        `wake detected (${gap_s}s gap since last tick) — resetting liveness windows and probing peers`,
+      );
+      this.handleWake(now);
+    }
+    this.last_global_tick_at = now;
+
+    const silence_ms = now - conn.last_recv_at;
+
+    // Always ping. Keeps the channel warm and gives a dead-WebRTC
+    // peer a chance to send us *anything* back; the send itself
+    // silently fails if the underlying data channel is gone.
+    this.send(conn, { kind: "ping", t: now });
+
+    if (silence_ms <= HEARTBEAT_TIMEOUT_MS) {
+      return;
+    }
+
+    // Peer is genuinely silent past the timeout. Before dropping,
+    // try to re-handshake: a fresh `hello` will let the peer
+    // restart from handleHello and send a new auth_response. This
+    // recovers the common case where our app-level state went
+    // stale (post-suspend, post-network-blip) but the trystero
+    // data channel itself is still usable.
+    if (conn.rehandshake_attempts >= MAX_REHANDSHAKE_ATTEMPTS) {
       this.logDiag(
         "warn",
-        `peer ${conn.peer_id.slice(0, 8)}… silent for ${Math.round((now - conn.last_recv_at) / 1000)}s — dropping`,
+        `peer ${conn.peer_id.slice(0, 8)}… silent ${Math.round(silence_ms / 1000)}s after ${MAX_REHANDSHAKE_ATTEMPTS} re-handshake attempts — dropping`,
       );
       this.dropConnection(conn.peer_id);
       return;
     }
-    this.send(conn, { kind: "ping", t: now });
+
+    if (now < conn.rehandshake_backoff_until) {
+      // Still throttled — the ping above already went out; just
+      // wait for the backoff window to pass.
+      return;
+    }
+
+    conn.rehandshake_attempts += 1;
+    const next_backoff_ms = REHANDSHAKE_BACKOFF_MS_SCHEDULE[
+      Math.min(conn.rehandshake_attempts - 1, REHANDSHAKE_BACKOFF_MS_SCHEDULE.length - 1)
+    ];
+    conn.rehandshake_backoff_until = now + next_backoff_ms;
+    this.logDiag(
+      "warn",
+      `peer ${conn.peer_id.slice(0, 8)}… silent ${Math.round(silence_ms / 1000)}s — re-handshake ${conn.rehandshake_attempts}/${MAX_REHANDSHAKE_ATTEMPTS} (next attempt in ${next_backoff_ms / 1000}s)`,
+    );
+    this.sendHello(conn);
+    this.republishPeers();
+  }
+
+  /** Treat every active connection as if it just resumed: clear
+   *  the silence window so a stale `last_recv_at` from before a
+   *  sleep doesn't trip the timeout, and send a fresh ping. If
+   *  the peer answers, handleMessage updates `last_recv_at` and
+   *  resets the re-handshake counter on the next inbound message;
+   *  if not, the next heartbeat ticks (10s, 20s, …) walk the
+   *  re-handshake backoff schedule the normal way. */
+  private handleWake(now: number): void {
+    for (const conn of this.connections.values()) {
+      conn.last_recv_at = now;
+      conn.rehandshake_backoff_until = 0;
+      this.send(conn, { kind: "ping", t: now });
+    }
+  }
+
+  /** Bind OS lifecycle observables that signal the JS runtime may
+   *  have just resumed from a paused state — laptop opened,
+   *  network came back, tab refocused. Each one funnels into
+   *  handleWake(), which gives stale-looking connections a chance
+   *  to prove they're still alive before we drop them. Multiple
+   *  hooks because no single event covers every platform: e.g.
+   *  Tauri webview doesn't always fire `visibilitychange` on lid
+   *  events, and `online` only fires on actual network toggles. */
+  private installLifecycleHooks(): void {
+    if (this.lifecycle_handlers !== null) return;
+    if (typeof window === "undefined") return;
+    const wake = () => {
+      // Reset the inter-tick clock so the heartbeat tick that
+      // runs immediately after doesn't also fire its own wake
+      // detection on the same event.
+      this.last_global_tick_at = Date.now();
+      this.handleWake(Date.now());
+    };
+    const handlers = {
+      visibility: () => {
+        if (typeof document !== "undefined" && document.visibilityState === "visible") {
+          wake();
+        }
+      },
+      online: wake,
+      focus: wake,
+      pageshow: wake,
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", handlers.visibility);
+    }
+    window.addEventListener("online", handlers.online);
+    window.addEventListener("focus", handlers.focus);
+    window.addEventListener("pageshow", handlers.pageshow);
+    this.lifecycle_handlers = handlers;
+  }
+
+  private uninstallLifecycleHooks(): void {
+    if (this.lifecycle_handlers === null) return;
+    const h = this.lifecycle_handlers;
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", h.visibility);
+    }
+    if (typeof window !== "undefined") {
+      window.removeEventListener("online", h.online);
+      window.removeEventListener("focus", h.focus);
+      window.removeEventListener("pageshow", h.pageshow);
+    }
+    this.lifecycle_handlers = null;
   }
 
   private handlePeerLeave(peer_id: string): void {
@@ -519,6 +704,8 @@ class MeshClient {
       heartbeat_timer: null,
       approver_role: false, // set in handleHello once we know both pubkeys
       handshake_timer: null,
+      rehandshake_attempts: 0,
+      rehandshake_backoff_until: 0,
     };
   }
 
@@ -556,7 +743,19 @@ class MeshClient {
 
   private async handleMessage(peer_id: string, msg: MeshMessage): Promise<void> {
     const conn = this.connections.get(peer_id);
-    if (conn) conn.last_recv_at = Date.now();
+    if (conn) {
+      conn.last_recv_at = Date.now();
+      // ANY inbound message is proof of life — clear the backoff
+      // immediately so the UI reverts the "reconnecting" badge
+      // and we stop sending re-handshake hellos. The conditional
+      // republish keeps the UI quiet for healthy traffic (which
+      // is the common case).
+      if (conn.rehandshake_attempts !== 0 || conn.rehandshake_backoff_until !== 0) {
+        conn.rehandshake_attempts = 0;
+        conn.rehandshake_backoff_until = 0;
+        this.republishPeers();
+      }
+    }
     if (!conn) {
       // Message from a peer we don't have state for — possible if
       // trystero delivers a message before onPeerJoin fires, or
@@ -897,6 +1096,8 @@ class MeshClient {
         local_approved: c.local_approved,
         remote_approved: c.remote_approved,
         verification_code: c.approver_role ? c.their_verification_code : c.our_verification_code,
+        reconnect_attempts: c.rehandshake_attempts,
+        next_reconnect_at: c.rehandshake_attempts > 0 ? c.rehandshake_backoff_until : null,
       };
     });
 
@@ -924,6 +1125,8 @@ class MeshClient {
         local_approved: false,
         remote_approved: false,
         verification_code: "",
+        reconnect_attempts: 0,
+        next_reconnect_at: null,
       });
     }
     return [...active, ...offline];

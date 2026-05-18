@@ -106,6 +106,37 @@
     return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
 
+  /** Live wall-clock used to render reconnection countdowns. Updates
+   *  once a second only while at least one connection is mid-
+   *  reconnect, so we don't burn a ticker when the mesh is idle. */
+  let now = $state(Date.now());
+  let reconnecting = $derived(
+    meshClient.peers.some((p) => p.reconnect_attempts > 0),
+  );
+  $effect(() => {
+    if (!reconnecting) return;
+    const h = window.setInterval(() => {
+      now = Date.now();
+    }, 1_000);
+    return () => window.clearInterval(h);
+  });
+
+  function reconnectLabel(p: {
+    reconnect_attempts: number;
+    next_reconnect_at: number | null;
+  }): string {
+    if (p.reconnect_attempts <= 0) return "";
+    const max = 5; // Mirrors MAX_REHANDSHAKE_ATTEMPTS in mesh-client.
+    if (p.next_reconnect_at === null) {
+      return `reconnecting ${p.reconnect_attempts}/${max}`;
+    }
+    const remaining = Math.max(0, p.next_reconnect_at - now);
+    if (remaining <= 0) {
+      return `reconnecting ${p.reconnect_attempts}/${max} · retrying…`;
+    }
+    return `reconnecting ${p.reconnect_attempts}/${max} · next in ${Math.ceil(remaining / 1000)}s`;
+  }
+
   onMount(async () => {
     await meshUi.ensureLoaded();
     try {
@@ -461,6 +492,7 @@
               class="peer-row"
               class:awaiting={p.status === "pending_remote"}
               class:offline={p.status === "offline"}
+              class:reconnecting={p.reconnect_attempts > 0}
             >
               <div class="peer-main">
                 <div class="peer-label">
@@ -469,6 +501,11 @@
                     <span class="peer-suffix" title="Stable display tag derived from this peer's pubkey">-{p.device_suffix}</span>
                   {/if}
                   {#if p.authorized && p.status !== "offline"}<span class="badge ok">approved</span>{/if}
+                  {#if p.reconnect_attempts > 0}
+                    <span class="badge reconnect" title="App-level re-handshake in progress — typical after waking from sleep or a brief network blip. Drops after 5 attempts without a response.">
+                      {reconnectLabel(p)}
+                    </span>
+                  {/if}
                 </div>
                 <code class="peer-pubkey" title={p.device_pubkey}>{shortPubkeyBody(p.device_pubkey)}</code>
                 {#if p.status === "pending_remote" && p.local_approved && p.verification_code}
@@ -1020,6 +1057,23 @@
   .badge.pending {
     color: #ffd166;
     background: #2a2210;
+  }
+  .badge.reconnect {
+    color: #d6b25a;
+    background: #2a220e;
+    text-transform: none;
+    letter-spacing: 0;
+    font-family: monospace;
+    /* Subtle pulse so the row reads as "actively working" rather
+       than "stuck" while the backoff window counts down. */
+    animation: reconnect-pulse 1.6s ease-in-out infinite;
+  }
+  .peer-row.reconnecting {
+    border-color: #3a2f10;
+  }
+  @keyframes reconnect-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
   }
   .btn-small.primary {
     background: #2a3a55;
