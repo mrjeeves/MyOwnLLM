@@ -23,6 +23,12 @@
     type EmittedSegment,
   } from "./transcribe-state.svelte";
   import { chatSlot } from "./chat-slot.svelte";
+  import { meshClient } from "../mesh-client.svelte";
+  import {
+    routingPins,
+    setTranscribePin,
+    setTpPin,
+  } from "./routing-pins.svelte";
   import { stickToBottom } from "./stick-to-bottom";
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
   import { loadConfig } from "../config";
@@ -98,9 +104,10 @@
     onRequestStartRecording: (start: () => Promise<void>) => void;
     /** Ask App to activate Talking Points — App owns the singleton
      *  check against the chat slot and forwards to the chat-slot
-     *  store. `viaPeerId` (optional) routes TP through a Cloud Mesh
-     *  peer; null runs locally. */
-    onRequestActivateTalkingPoints: (viaPeerId: string | null) => void;
+     *  store. `viaDevicePubkey` (optional) routes TP through a
+     *  Cloud Mesh peer; null runs locally. The App resolves the
+     *  pubkey to a current peer entry at cycle time. */
+    onRequestActivateTalkingPoints: (viaDevicePubkey: string | null) => void;
     /** Run a one-shot regenerate. App resolves the chat model + checks
      *  the slot; the returned promise resolves to `null` on success or
      *  an error message to surface inline. */
@@ -123,19 +130,32 @@
   let transcript = $state<TranscriptSegment[]>([]);
   let speakerLabels = $state<Record<number, string>>({});
   let diarizeEnabled = $state(true);
-  /** Routing pin for the transcription side — picked from the
-   *  TranscribeBar's ModelSelector. When set, the upcoming record /
-   *  upload will go through the named peer instead of running on this
-   *  device's ASR backend. The ModelSelector clears it automatically
-   *  if the peer drops. */
-  let transcribeViaPeerId = $state<string | null>(null);
-  /** Routing pin for the talking-points side — picked from the TP
-   *  bar's ModelSelector. When set, Talking Points routes its chat
-   *  cycles through the named peer via the mesh's `infer_request`
-   *  path. Captured separately from `transcribeViaPeerId` so the two
-   *  sides can offload to different peers (e.g. ASR to a GPU box,
-   *  TP to a phone keeping the LLM warm). */
-  let tpViaPeerId = $state<string | null>(null);
+  /** Routing pins for the two transcribe-mode bars. Stored as stable
+   *  `device_pubkey`s in localStorage (see `routing-pins.svelte.ts`)
+   *  so a reload or a peer hop doesn't clear them. Pause/error on
+   *  send-time rather than silently degrade — we want the user to
+   *  decide between waiting for the peer to come back, picking a
+   *  different host, or falling back to local. */
+  const transcribeViaDevicePubkey = $derived(routingPins.transcribe);
+  const tpViaDevicePubkey = $derived(routingPins.tp);
+  /** Resolved entries for the two pins. Used to check status before
+   *  starting work and to surface offline/unavailable inline. */
+  const transcribeRoutedPeer = $derived(
+    transcribeViaDevicePubkey
+      ? meshClient.peers.find((p) => p.device_pubkey === transcribeViaDevicePubkey) ?? null
+      : null,
+  );
+  const tpRoutedPeer = $derived(
+    tpViaDevicePubkey
+      ? meshClient.peers.find((p) => p.device_pubkey === tpViaDevicePubkey) ?? null
+      : null,
+  );
+  const transcribePinUnavailable = $derived(
+    !!transcribeViaDevicePubkey && transcribeRoutedPeer?.status !== "active",
+  );
+  const tpPinUnavailable = $derived(
+    !!tpViaDevicePubkey && tpRoutedPeer?.status !== "active",
+  );
   /** Set while we're pulling the diarize composite on first toggle-on.
    *  Drives the inline progress text on the toggle itself. */
   let diarizePullStatus = $state("");
@@ -491,19 +511,23 @@
         `Switch family in Settings to one with a transcribe ladder.`;
       return;
     }
-    if (transcribeViaPeerId) {
-      // The protocol surface for remote transcribe is in this build
-      // (capabilities, mesh kinds, sender + receiver bookkeeping),
-      // but the Rust-side audio-chunk → ASR pipeline that the
-      // receiver feeds lands in the follow-up PR. Today, the
-      // receiver replies with `transcribe_error` so a routed start
-      // would never produce segments — fail loudly instead of
-      // silently dropping back to local, so the user knows the pin
-      // they set is the reason nothing started.
-      transcribeError =
-        "Remote transcribe is wired on the sender but the receiver " +
-        "pipeline lands in a follow-up. Pick 'this device' in the " +
-        "bar below to record locally.";
+    if (transcribeViaDevicePubkey) {
+      // Routing pin is set. Distinguish the two failure modes the
+      // user might be in: peer-offline (pin valid but host away) vs
+      // receiver-not-yet-wired (Rust audio-chunk pipeline lands in
+      // a follow-up). Either way: pause-or-error, never silently
+      // run locally — the user picked a host and deserves to know
+      // why their pick isn't being used.
+      if (transcribePinUnavailable) {
+        transcribeError =
+          "Pinned peer is offline. Pick another host or 'this device' " +
+          "in the bar under this pane to record.";
+      } else {
+        transcribeError =
+          "Remote transcribe is wired on the sender but the receiver " +
+          "pipeline lands in a follow-up. Pick 'this device' in the " +
+          "bar under this pane to record locally.";
+      }
       return;
     }
     if (!(await ensureAsrReady(runtime, model))) {
@@ -603,13 +627,17 @@
         `Switch family in Settings to one with a transcribe ladder.`;
       return;
     }
-    if (transcribeViaPeerId) {
-      // See the matching block in `doStartRec` — same staged-vs-shipped
-      // gap on the receiver side.
-      transcribeError =
-        "Remote transcribe is wired on the sender but the receiver " +
-        "pipeline lands in a follow-up. Pick 'this device' in the " +
-        "bar below to upload locally.";
+    if (transcribeViaDevicePubkey) {
+      if (transcribePinUnavailable) {
+        transcribeError =
+          "Pinned peer is offline. Pick another host or 'this device' " +
+          "in the bar under this pane to upload.";
+      } else {
+        transcribeError =
+          "Remote transcribe is wired on the sender but the receiver " +
+          "pipeline lands in a follow-up. Pick 'this device' in the " +
+          "bar under this pane to upload locally.";
+      }
       return;
     }
     if (!(await ensureAsrReady(runtime, model))) return;
@@ -1074,8 +1102,15 @@
         activeFamily={activeFamily}
         activeMode={activeMode}
         kind="transcribe"
-        viaPeerId={transcribeViaPeerId}
-        onViaChange={(p) => (transcribeViaPeerId = p)}
+        viaDevicePubkey={transcribeViaDevicePubkey}
+        onViaChange={(p) => {
+          setTranscribePin(p);
+          // User reacted to an offline pin — drop the inline error
+          // so they see the slate clean while they decide what to do.
+          if (transcribeError && transcribeError.includes("Pinned peer is offline")) {
+            transcribeError = "";
+          }
+        }}
         disabled={transcribeUi.active}
       />
     </section>
@@ -1202,14 +1237,14 @@
           </ul>
           {#if isMyRecording && chatSlot.kind === null}
             <div class="tp-activate-row">
-              <button class="tp-activate" onclick={() => onRequestActivateTalkingPoints(tpViaPeerId)}>
+              <button class="tp-activate" onclick={() => onRequestActivateTalkingPoints(tpViaDevicePubkey)}>
                 Resume Talking Points
               </button>
             </div>
           {/if}
         {:else if isMyRecording && chatSlot.kind === null}
           <div class="tp-activate-shell">
-            <button class="tp-activate big" onclick={() => onRequestActivateTalkingPoints(tpViaPeerId)}>
+            <button class="tp-activate big" onclick={() => onRequestActivateTalkingPoints(tpViaDevicePubkey)}>
               <span class="tp-spark" aria-hidden="true">✦</span>
               Activate Talking Points
             </button>
@@ -1236,8 +1271,8 @@
         activeFamily={activeFamily}
         activeMode="text"
         kind="text"
-        viaPeerId={tpViaPeerId}
-        onViaChange={(p) => (tpViaPeerId = p)}
+        viaDevicePubkey={tpViaDevicePubkey}
+        onViaChange={(p) => setTpPin(p)}
         disabled={isMyTalkingPoints}
       />
     </section>

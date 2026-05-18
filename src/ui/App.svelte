@@ -749,17 +749,29 @@
 
   /** Activate Talking Points against the active transcribe session.
    *  Surfaces a conflict modal if the chat slot is already occupied.
-   *  `viaPeerId` (optional) routes TP cycles through a Cloud Mesh peer
+   *  `viaDevicePubkey` (optional) pins TP cycles to a Cloud Mesh peer
    *  via the `infer_request` path; null/undefined runs locally. The
    *  TranscribeBar's ModelSelector under the talking-points pane is
-   *  where that pin comes from. */
+   *  where that pin comes from. We refuse activation when the pin is
+   *  set but the peer is offline — pause-or-error rather than
+   *  silently degrade to the local LLM the user didn't pick. */
   async function requestActivateTalkingPoints(
-    viaPeerId: string | null = null,
+    viaDevicePubkey: string | null = null,
   ): Promise<void> {
     if (!transcribeUi.active) return;
     if (!hardware) {
       console.warn("TP: hardware not yet detected; aborting");
       return;
+    }
+    if (viaDevicePubkey) {
+      const peer = meshClient.peers.find((p) => p.device_pubkey === viaDevicePubkey);
+      if (!peer || peer.status !== "active") {
+        console.warn(
+          "TP: pinned peer is offline; refusing activation. pubkey=",
+          viaDevicePubkey,
+        );
+        return;
+      }
     }
     const [config, manifest] = await Promise.all([loadConfig(), getActiveManifest()]);
     const resolved = resolveModelEx(
@@ -775,7 +787,7 @@
     // tag against ITS loaded LLMs. We still call resolveModelEx so the
     // family hint we forward to the peer is consistent with what the
     // user picked locally; just relax the "must be ollama" check.
-    if (!viaPeerId && (resolved.runtime !== "ollama" || !resolved.model)) {
+    if (!viaDevicePubkey && (resolved.runtime !== "ollama" || !resolved.model)) {
       console.warn("TP: no chat model resolved for family", activeFamilyName);
       return;
     }
@@ -783,7 +795,7 @@
     const startTp = () =>
       startTalkingPoints({
         model: tpModel,
-        viaPeerId,
+        viaDevicePubkey,
         family: activeFamilyName,
       });
     if (!chatSlot.kind) {

@@ -23,6 +23,7 @@
   import { transcribeUi } from "./transcribe-state.svelte";
   import { stickToBottom } from "./stick-to-bottom";
   import { meshClient } from "../mesh-client.svelte";
+  import { routingPins, setTextPin } from "./routing-pins.svelte";
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
 
   let {
@@ -97,14 +98,31 @@
   let input = $state("");
   let streaming = $state(false);
   let activeStreamId = $state<string | null>(null);
-  /** When non-null, the next `send` routes the prompt to this peer
-   *  via the mesh instead of running locally. Value is the peer's
-   *  Trystero peer_id. Cleared automatically by the TextBar's
-   *  ModelSelector if the peer drops or shifts out of `active`. */
-  let routeViaPeerId = $state<string | null>(null);
   /** Cancel handle returned by `meshClient.sendInferRequest`. Used
    *  by the Stop button while a mesh-routed response is streaming. */
   let routeCancel: (() => void) | null = null;
+  /** Inline status when a send was blocked because the pinned peer
+   *  is offline. Cleared on next send or when the user changes the
+   *  pin. We pause-or-error rather than silently downgrade so the
+   *  user knows their pin is the reason nothing happened. */
+  let routeBlockedReason = $state("");
+  /** The active routing pin (resolved from `routingPins.text` on
+   *  every render so the picker, the send path, and any other
+   *  caller see the same value). */
+  const routeViaDevicePubkey = $derived(routingPins.text);
+  /** Resolved current peer entry for the pin, or null when not set
+   *  / not in `meshClient.peers`. */
+  const routedPeer = $derived(
+    routeViaDevicePubkey
+      ? meshClient.peers.find((p) => p.device_pubkey === routeViaDevicePubkey) ?? null
+      : null,
+  );
+  /** True when the pin is set but the peer isn't currently reachable
+   *  (offline, busy, dropped capability). Drives the route-blocked
+   *  status banner under the input and gates `send`. */
+  const routePinUnavailable = $derived(
+    !!routeViaDevicePubkey && routedPeer?.status !== "active",
+  );
   let settingsTab = $state<SettingsTab | null>(null);
   /** Deep-link state for the Settings panel's Families tab — carries
    *  the active family name so SettingsPanel opens straight into that
@@ -325,6 +343,15 @@
   function send() {
     const text = input.trim();
     if (!text || streaming) return;
+    // Refuse the send when the pinned peer is offline — surface why
+    // and let the user decide rather than silently fall back to local
+    // and route their message to a model they didn't pick.
+    if (routePinUnavailable) {
+      routeBlockedReason =
+        "Pinned peer is offline. Pick another host or 'this device' in the bar above to send.";
+      return;
+    }
+    routeBlockedReason = "";
     // Singleton: if the chat slot belongs to another conversation, route
     // through App so the conflict modal can prompt the user before we
     // mutate any local state.
@@ -395,18 +422,26 @@
       // the actual generation on stats bookkeeping.
       void invoke("usage_record_chat_sent").catch(() => {});
 
-      if (routeViaPeerId) {
-        // Phase 2: mesh-routed inference. The remote peer runs
-        // against its local ollama and streams chunks back over the
-        // data channel. We synthesize the same delta/thinking_delta
-        // events the local path would emit so the rest of the
-        // existing UI (bubble append, stop button, persist) works
-        // unchanged. `think` rides along so a remotely-served chat
-        // gets reasoning tokens too when the brain toggle is on.
+      if (routeViaDevicePubkey) {
+        // Mesh-routed inference. The pinned host runs against its
+        // local ollama and streams chunks back over the data channel.
+        // Resolve the pubkey to the current peer_id at send time
+        // (Trystero session ids regenerate per reconnect; pinning by
+        // pubkey is the stable identity). If the pin doesn't match
+        // an active peer we error explicitly instead of silently
+        // falling back to local — the user picked a host, the host
+        // is currently away, the right answer is to surface that and
+        // let them decide rather than misroute their request.
+        const target = routedPeer;
+        if (!target || target.status !== "active") {
+          throw new Error(
+            "Pinned peer is offline. Pick another host or 'this device' in the bar above and resend.",
+          );
+        }
         await new Promise<void>((resolve, reject) => {
           meshClient
             .sendInferRequest({
-              target_peer_id: routeViaPeerId!,
+              target_peer_id: target.peer_id,
               messages: history.map((m) => ({ role: m.role, content: m.content })),
               family: activeFamily,
               mode: activeMode,
@@ -671,25 +706,38 @@
     {contextSize}
     {thinkingEnabled}
     thinkingAvailable={activeMode === "text"}
-    viaPeerId={routeViaPeerId}
-    onViaChange={(p) => (routeViaPeerId = p)}
+    viaDevicePubkey={routeViaDevicePubkey}
+    onViaChange={(p) => {
+      setTextPin(p);
+      // Clearing or repinning resolves whatever was blocking — drop
+      // the inline banner so the user sees the slate as clean.
+      routeBlockedReason = "";
+    }}
     onThinkingChange={setThinkingEnabled}
     {streaming}
   />
 
   {#if !tpHoldsSlot}
+    {#if routePinUnavailable}
+      <div class="route-blocked" role="status">
+        Pinned peer is offline — pick another host or 'this device' in the bar
+        above to resume.
+      </div>
+    {:else if routeBlockedReason}
+      <div class="route-blocked" role="status">{routeBlockedReason}</div>
+    {/if}
     <div class="input-row">
       <textarea
         bind:value={input}
         onkeydown={onKeydown}
-        placeholder={textModelMissing && !routeViaPeerId ? "Download the text model to start chatting…" : "Message…"}
+        placeholder={textModelMissing && !routeViaDevicePubkey ? "Download the text model to start chatting…" : "Message…"}
         rows="1"
-        disabled={textModelMissing && !routeViaPeerId}
+        disabled={textModelMissing && !routeViaDevicePubkey}
       ></textarea>
       {#if streaming}
         <button class="stop" onclick={stop} title="Stop generating">Stop</button>
       {:else}
-        <button onclick={send} disabled={!input.trim() || (textModelMissing && !routeViaPeerId)}>Send</button>
+        <button onclick={send} disabled={!input.trim() || (textModelMissing && !routeViaDevicePubkey)}>Send</button>
       {/if}
     </div>
   {/if}
@@ -830,6 +878,18 @@
   .dots span:nth-child(2) { animation-delay: .2s; }
   .dots span:nth-child(3) { animation-delay: .4s; }
   @keyframes blink { 0%,80%,100% { opacity: .3; } 40% { opacity: 1; } }
+  /* Inline status banner for a blocked send. Sits between the
+     TextBar and the input row when the pinned peer is offline or
+     a send was refused for routing reasons. Amber palette to match
+     the offline state on the ModelSelector. */
+  .route-blocked {
+    padding: .4rem .85rem;
+    font-size: .75rem;
+    color: #f0c47a;
+    background: #2a1f0e;
+    border-top: 1px solid #5a4220;
+    line-height: 1.45;
+  }
   .input-row {
     display: flex;
     gap: .5rem;

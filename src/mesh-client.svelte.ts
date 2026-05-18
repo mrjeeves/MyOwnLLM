@@ -628,6 +628,18 @@ class MeshClient {
    *  memory only — a relaunch reseeds from the next live announce,
    *  which is what the user said they expect on next sight. */
   private catalog_cache = new Map<string, CatalogEntry[]>();
+  /** Last-known capability blob per authenticated rostered peer,
+   *  keyed by pubkey. Populated whenever we see a peer's `hello` or
+   *  `capabilities_update`, and read by `computePeers()` to seed
+   *  offline `PeerEntry`s with the LLM/ASR they LAST advertised.
+   *  Without this, a peer the user pinned in the Text / Transcribe
+   *  bar goes invisible the moment they drop — the selector loses
+   *  the model hint and the user can't tell whether their pin
+   *  still applies. With it, the selector renders "{model} ·
+   *  {label} (offline)" and the user can choose to wait, retry,
+   *  or pick a different host. Lives in memory; relaunch reseeds
+   *  on next hello. */
+  private capabilities_cache = new Map<string, Capabilities>();
   /** Queued requestAnimationFrame handle for batched file-resource
    *  UI refreshes. A multi-MB file transfer calls
    *  `scheduleRefreshFileResources` on every chunk; rAF coalesces
@@ -1860,6 +1872,12 @@ class MeshClient {
         break;
       case "capabilities_update":
         conn.capabilities = mergeCapabilities(msg.capabilities);
+        // Cache for offline replay — see `capabilities_cache` doc.
+        // Only worth caching for rostered peers so a stranger's
+        // advertisement doesn't grow the map unbounded.
+        if (conn.device_pubkey && this.roster_pubkeys.has(conn.device_pubkey)) {
+          this.capabilities_cache.set(conn.device_pubkey, conn.capabilities);
+        }
         this.logDiag(
           "info",
           `peer ${conn.peer_id.slice(0, 8)}… updated capabilities (accepting=${conn.capabilities.accepting})`,
@@ -2056,6 +2074,11 @@ class MeshClient {
     // to 3 connections" which is the same as a fresh ConnectionState.
     if (msg.capabilities) {
       conn.capabilities = mergeCapabilities(msg.capabilities);
+      // Seed the offline replay cache for rostered peers so the
+      // model selector can render their LLM/ASR even when they drop.
+      if (this.roster_pubkeys.has(msg.device_id)) {
+        this.capabilities_cache.set(msg.device_id, conn.capabilities);
+      }
     }
     if (typeof msg.max_connections === "number" && msg.max_connections > 0) {
       conn.max_connections = Math.max(RING_MIN_PREFERRED, msg.max_connections);
@@ -2588,6 +2611,12 @@ class MeshClient {
     for (const pubkey of this.roster_pubkeys) {
       if (active_pubkeys.has(pubkey)) continue;
       const suffix = this.suffix_cache.get(pubkey) ?? "";
+      // Replay the peer's last-known capabilities when we have them.
+      // The model selector uses these to render "{model} · {label}
+      // (offline)" rows so the user can see which host they pinned
+      // is currently away. EMPTY_CAPABILITIES otherwise — a peer
+      // we've never connected to (roster entry only) reads blank.
+      const cachedCap = this.capabilities_cache.get(pubkey);
       offline.push({
         peer_id: `offline:${pubkey}`,
         device_pubkey: pubkey,
@@ -2602,7 +2631,9 @@ class MeshClient {
         verification_code: "",
         reconnect_attempts: 0,
         next_reconnect_at: null,
-        capabilities: structuredClone(EMPTY_CAPABILITIES),
+        capabilities: cachedCap
+          ? structuredClone(cachedCap)
+          : structuredClone(EMPTY_CAPABILITIES),
         // Cached catalog from the peer's last `catalog_announce`.
         // Empty when we've never seen them with content; the
         // sidebar uses this to decide whether to render the
@@ -2621,7 +2652,9 @@ class MeshClient {
    *  `catalog_announce`, so this is non-destructive — it just hides
    *  the dimmed group from the sidebar until the peer comes back. */
   forgetPeerCache(pubkey: string): void {
-    if (this.catalog_cache.delete(pubkey)) {
+    const droppedCat = this.catalog_cache.delete(pubkey);
+    const droppedCap = this.capabilities_cache.delete(pubkey);
+    if (droppedCat || droppedCap) {
       this.republishPeers();
     }
   }
