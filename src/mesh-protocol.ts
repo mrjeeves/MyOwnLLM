@@ -135,6 +135,13 @@ export const FEATURES = {
    *  without this feature ignores the `tools` field, which gracefully
    *  degrades to a tool-less chat. */
   INFER_TOOLS: "infer_tools_v1",
+  /** Sender broadcasts `permissions_snapshot` on every local change
+   *  to the network-wide agent-tool permissions, and on becoming
+   *  active to a new peer. Receivers merge per-tool by `updated_at`
+   *  (highest wins). Peers without this feature don't get the
+   *  network-wide policy — they fall back to whatever's on their own
+   *  disk, which is the prior single-device behavior. */
+  AGENT_PERMISSIONS_GOSSIP: "agent_permissions_v1",
 } as const;
 
 /** The full set of feature ids this build advertises. Sent inside
@@ -154,6 +161,7 @@ export const ADVERTISED_FEATURES: string[] = [
   FEATURES.REMOTE_TRANSCRIBE,
   FEATURES.SESSION_VIEW,
   FEATURES.INFER_TOOLS,
+  FEATURES.AGENT_PERMISSIONS_GOSSIP,
 ];
 
 /** Features a Phase 2.0 peer would have implicitly supported even
@@ -272,7 +280,8 @@ export type MeshMessage =
   | SessionFetchRequestMessage
   | SessionFetchResponseMessage
   | SessionSaveRequestMessage
-  | SessionSaveResponseMessage;
+  | SessionSaveResponseMessage
+  | PermissionsSnapshotMessage;
 
 // ---- capabilities --------------------------------------------------------
 
@@ -1157,4 +1166,33 @@ export function selectRingNeighbors(args: {
     }
   }
   return preferred;
+}
+
+// ---- agent-permissions gossip (Phase 3.1) -------------------------------
+//
+// One message kind. Sent on every local mutation to the per-tool
+// permission policy, and again when a peer becomes `active` so a
+// newly-handshaked peer immediately picks up our view. The receiver
+// merges per-tool by `updated_at` (highest wins) so a stale snapshot
+// can't overwrite a fresher one.
+//
+// Forward-compat note: unknown tools in `tools` are silently dropped
+// by the receiver. New gated tools added in future builds will
+// therefore propagate to old peers as no-ops rather than parse errors.
+
+/** Wire shape for one tool's permission record. Mirror of
+ *  `ToolPermission` in `src/types.ts`; kept separate so the protocol
+ *  can move independently of the on-disk shape if they ever need to. */
+export interface ToolPermissionSnapshot {
+  mode: "ask" | "accept_all" | "denied";
+  always_accept: string[];
+  updated_at: number;
+}
+
+export interface PermissionsSnapshotMessage {
+  kind: "permissions_snapshot";
+  /** Per-tool records. Today carries `shell` and `write_file`; future
+   *  gated tools just get new keys. Receivers ignore keys they don't
+   *  recognise. */
+  tools: Record<string, ToolPermissionSnapshot>;
 }

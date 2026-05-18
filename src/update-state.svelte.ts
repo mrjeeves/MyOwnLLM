@@ -13,6 +13,7 @@ export type SettingsTab =
   | "storage"
   | "hardware"
   | "cloud-mesh"
+  | "permissions"
   | "transcription"
   | "updates";
 

@@ -7,6 +7,7 @@
   import UsageSection from "./settings/UsageSection.svelte";
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import CloudMeshSection from "./settings/CloudMeshSection.svelte";
+  import PermissionsSection from "./settings/PermissionsSection.svelte";
   import { updateUi } from "../update-state.svelte";
   import { settingsAttention } from "../settings-attention.svelte";
   import type { CloudMeshSubTab } from "./settings-route.svelte";
@@ -19,6 +20,7 @@
     | "hardware"
     | "usage"
     | "cloud-mesh"
+    | "permissions"
     | "updates"
     // Legacy values that still appear in old `initialTab` deep-links
     // from earlier code paths. We map them to current ids on entry so a
@@ -64,6 +66,7 @@
     { id: "hardware", label: "Hardware" },
     { id: "usage", label: "Usage" },
     { id: "cloud-mesh", label: "Networks" },
+    { id: "permissions", label: "Permissions" },
     { id: "updates", label: "Updates" },
   ];
 
@@ -127,6 +130,8 @@
         <UsageSection />
       {:else if active === "cloud-mesh"}
         <CloudMeshSection initialSubTab={initialMeshSubTab} />
+      {:else if active === "permissions"}
+        <PermissionsSection />
       {:else if active === "updates"}
         <UpdatesSection />
       {/if}

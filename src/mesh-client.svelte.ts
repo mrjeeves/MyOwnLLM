@@ -50,6 +50,7 @@ import type { MeshIdentity } from "./mesh";
 import type { TurnServer } from "./types";
 import { loadConfig, updateConfig, activeNetwork, updateNetwork } from "./config";
 import { settingsAttention } from "./settings-attention.svelte";
+import { agentPermissions } from "./agent-permissions.svelte";
 import {
   loadConversation,
   saveConversation,
@@ -2129,6 +2130,14 @@ class MeshClient {
       case "session_save_response":
         this.handleSessionSaveResponseInbound(msg.id, msg.ok, msg.error);
         break;
+      case "permissions_snapshot":
+        // Authorization: only honor snapshots from peers who've
+        // fully handshaked + been approved by both sides. A
+        // stranger in the same Trystero room shouldn't be able to
+        // overwrite our agent-tool policy.
+        if (this.peerStatus(conn) !== "active") break;
+        void this.handlePermissionsSnapshot(msg.tools);
+        break;
     }
   }
 
@@ -2516,6 +2525,12 @@ class MeshClient {
       // re-evaluate the ring now that a new peer has joined the
       // active set.
       this.sendCatalogTo(conn);
+      // Phase 3.1: ship our current agent-permissions snapshot so
+      // the peer's LWW merge picks it up immediately rather than
+      // waiting for a local mutation that might never come. Gated
+      // on `AGENT_PERMISSIONS_GOSSIP` — peers without it just see
+      // an unknown message kind and drop it.
+      this.sendPermissionsSnapshotTo(conn);
       this.reevaluateRing();
     }
     if (this.computePeers().every((p) => p.status !== "pending_approval")) {
@@ -3036,6 +3051,82 @@ class MeshClient {
       kind: "catalog_announce",
       conversations: this.my_catalog,
     });
+  }
+
+  /** Ship our current agent-permissions snapshot to one peer. Used
+   *  on `maybePromoteToActive` so a newly-handshaked peer immediately
+   *  picks up the network policy without waiting for a local
+   *  mutation. Gated on `AGENT_PERMISSIONS_GOSSIP` so older peers
+   *  don't get a message they'll just drop. */
+  private sendPermissionsSnapshotTo(conn: ConnectionState): void {
+    if (!peerSupportsFeature(conn.capabilities, FEATURES.AGENT_PERMISSIONS_GOSSIP))
+      return;
+    const snap = agentPermissions.snapshot();
+    this.send(conn, {
+      kind: "permissions_snapshot",
+      tools: { shell: snap.shell, write_file: snap.write_file },
+    });
+  }
+
+  /** Broadcast the current snapshot to every active peer. Called by
+   *  the broadcaster registered with `agentPermissions` every time
+   *  the user mutates policy locally (either through the modal or
+   *  the Settings → Permissions tab). */
+  private broadcastPermissionsSnapshot(snapshot: {
+    shell: { mode: "ask" | "accept_all" | "denied"; always_accept: string[]; updated_at: number };
+    write_file: { mode: "ask" | "accept_all" | "denied"; always_accept: string[]; updated_at: number };
+  }): void {
+    for (const conn of this.connections.values()) {
+      if (this.peerStatus(conn) !== "active") continue;
+      if (!peerSupportsFeature(conn.capabilities, FEATURES.AGENT_PERMISSIONS_GOSSIP))
+        continue;
+      this.send(conn, {
+        kind: "permissions_snapshot",
+        tools: { shell: snapshot.shell, write_file: snapshot.write_file },
+      });
+    }
+  }
+
+  /** Merge an inbound `permissions_snapshot` from `conn`. Delegates
+   *  to the in-process store, which decides per-tool LWW. Re-broadcast
+   *  isn't needed: every other active peer either also received this
+   *  snapshot directly (the sender broadcasts to all), or will pick
+   *  it up via its own gossip when they become active. */
+  private async handlePermissionsSnapshot(
+    tools: Record<string, { mode?: string; always_accept?: string[]; updated_at?: number }>,
+  ): Promise<void> {
+    const incoming: {
+      shell?: { mode: "ask" | "accept_all" | "denied"; always_accept: string[]; updated_at: number };
+      write_file?: {
+        mode: "ask" | "accept_all" | "denied";
+        always_accept: string[];
+        updated_at: number;
+      };
+    } = {};
+    for (const tool of ["shell", "write_file"] as const) {
+      const raw = tools[tool];
+      if (!raw || typeof raw !== "object") continue;
+      const mode =
+        raw.mode === "accept_all" || raw.mode === "denied" || raw.mode === "ask"
+          ? raw.mode
+          : "ask";
+      const allow = Array.isArray(raw.always_accept)
+        ? raw.always_accept.filter((s): s is string => typeof s === "string")
+        : [];
+      const ts =
+        typeof raw.updated_at === "number" && Number.isFinite(raw.updated_at)
+          ? Math.max(0, Math.floor(raw.updated_at))
+          : 0;
+      incoming[tool] = { mode, always_accept: allow, updated_at: ts };
+    }
+    try {
+      const changed = await agentPermissions.mergeIncoming(incoming);
+      if (changed) {
+        this.logDiag("info", "agent permissions updated from peer gossip");
+      }
+    } catch (e) {
+      this.logDiag("warn", `permissions merge failed: ${String(e)}`);
+    }
   }
 
   /** Update our cached copy of `conn`'s catalog so an entry's
@@ -4372,3 +4463,14 @@ function mergeCapabilities(raw: Partial<Capabilities>): Capabilities {
 }
 
 export const meshClient = new MeshClient();
+
+// Wire the agent-permissions store to the mesh so local mutations
+// gossip out to active peers. The bridge runs through a callback to
+// avoid pulling mesh-client into agent-permissions (which would
+// create an import cycle — meshClient already depends on agent-
+// permissions for the inbound merge path).
+agentPermissions.setBroadcaster((snap) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (meshClient as unknown as { broadcastPermissionsSnapshot: (s: typeof snap) => void })
+    .broadcastPermissionsSnapshot(snap);
+});

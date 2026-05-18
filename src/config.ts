@@ -9,6 +9,8 @@ import type {
   CloudMeshConfig,
   NetworkConfig,
   MicConfig,
+  AgentPermissionsConfig,
+  ToolPermission,
 } from "./types";
 
 async function configPath(): Promise<string> {
@@ -119,6 +121,7 @@ const DEFAULT_CONFIG: Config = {
     active_network_id: null,
     diag_quiet: false,
   },
+  agent_permissions: freshAgentPermissions(),
   mic: { ...DEFAULT_MIC },
   providers: [
     {
@@ -172,6 +175,9 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
     },
     cloud_mesh: mergeCloudMesh(
       (raw as { cloud_mesh?: Partial<CloudMeshConfig> }).cloud_mesh,
+    ),
+    agent_permissions: mergeAgentPermissions(
+      (raw as { agent_permissions?: Partial<AgentPermissionsConfig> }).agent_permissions,
     ),
     mic: {
       ...DEFAULT_MIC,
@@ -429,4 +435,93 @@ export async function setActiveNetwork(id: string | null): Promise<Config> {
   return await updateConfig({
     cloud_mesh: { ...cfg.cloud_mesh, active_network_id: id },
   });
+}
+
+// ---- agent permissions ---------------------------------------------------
+
+/** Default policy for a freshly-seen tool: prompt every time, no
+ *  allow-list entries. `updated_at: 0` ensures any real change (which
+ *  stamps a non-zero timestamp) wins on the next gossip exchange — so
+ *  a fresh device picks up the mesh's existing policy as soon as a
+ *  peer broadcasts. */
+export function freshToolPermission(): ToolPermission {
+  return { mode: "ask", always_accept: [], updated_at: 0 };
+}
+
+/** Default network-wide permission set. Every gated tool defaults to
+ *  "ask" so the user gets a prompt the first time the agent fires
+ *  before any policy has been gossiped from elsewhere. */
+export function freshAgentPermissions(): AgentPermissionsConfig {
+  return {
+    shell: freshToolPermission(),
+    write_file: freshToolPermission(),
+  };
+}
+
+function coerceToolPermission(raw: unknown): ToolPermission {
+  if (!raw || typeof raw !== "object") return freshToolPermission();
+  const obj = raw as Partial<ToolPermission>;
+  const mode: ToolPermission["mode"] =
+    obj.mode === "accept_all" || obj.mode === "denied" ? obj.mode : "ask";
+  const allow = Array.isArray(obj.always_accept)
+    ? obj.always_accept.filter((s): s is string => typeof s === "string")
+    : [];
+  const ts = typeof obj.updated_at === "number" && Number.isFinite(obj.updated_at)
+    ? Math.max(0, Math.floor(obj.updated_at))
+    : 0;
+  return { mode, always_accept: allow, updated_at: ts };
+}
+
+function mergeAgentPermissions(
+  raw: Partial<AgentPermissionsConfig> | undefined,
+): AgentPermissionsConfig {
+  if (!raw || typeof raw !== "object") return freshAgentPermissions();
+  // Legacy shape carried `by_device: { <id>: { shell, write_file } }`
+  // before gossip turned the policy network-wide. Salvage what we can:
+  // pick the most recently-touched per-tool record across all devices,
+  // dropping the device key entirely. The user's pre-gossip choices
+  // therefore migrate forward as the mesh's starting state.
+  const legacy = (raw as { by_device?: Record<string, unknown> }).by_device;
+  if (legacy && typeof legacy === "object") {
+    const out = freshAgentPermissions();
+    for (const perDevice of Object.values(legacy)) {
+      if (!perDevice || typeof perDevice !== "object") continue;
+      const obj = perDevice as Record<string, unknown>;
+      for (const tool of ["shell", "write_file"] as const) {
+        const merged = coerceToolPermission(obj[tool]);
+        // Legacy records have no `updated_at`; coerce gives 0. Use
+        // disk mtime indirectly by stamping `now` on migration so
+        // the migrated state is treated as the canonical baseline
+        // for the mesh until someone explicitly changes it.
+        if (merged.mode !== "ask" || merged.always_accept.length > 0) {
+          if (merged.updated_at === 0) merged.updated_at = Date.now();
+        }
+        if (merged.updated_at > out[tool].updated_at) out[tool] = merged;
+      }
+    }
+    return out;
+  }
+  return {
+    shell: coerceToolPermission((raw as { shell?: unknown }).shell),
+    write_file: coerceToolPermission((raw as { write_file?: unknown }).write_file),
+  };
+}
+
+/** Read the network-wide permissions, returning fresh defaults when
+ *  no record has been persisted yet. */
+export function getAgentPermissions(cfg: Config): AgentPermissionsConfig {
+  return cfg.agent_permissions ?? freshAgentPermissions();
+}
+
+/** Mutate the network-wide permissions and persist. The patcher
+ *  returns the updated record; callers are responsible for bumping
+ *  `updated_at` on tools they're actually changing (the gossip layer
+ *  decides whose record wins by that timestamp). */
+export async function updateAgentPermissions(
+  patcher: (current: AgentPermissionsConfig) => AgentPermissionsConfig,
+): Promise<Config> {
+  const cfg = await loadConfig();
+  const current = getAgentPermissions(cfg);
+  const next = patcher(current);
+  return await updateConfig({ agent_permissions: next });
 }
