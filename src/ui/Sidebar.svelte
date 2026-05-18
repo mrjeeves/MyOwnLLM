@@ -1,6 +1,39 @@
 <script lang="ts">
   import type { ConversationMeta, FolderMeta } from "../conversations";
   import type { Mode } from "../types";
+  import { meshClient } from "../mesh-client.svelte";
+
+  /** Peers eligible as Move targets — active and authorized. The
+   *  context-menu uses this directly; if the list is empty the
+   *  "Move to device…" submenu just shows a hint. */
+  let moveTargets = $derived(
+    meshClient.peers.filter((p) => p.status === "active" && p.authorized),
+  );
+
+  /** Tracks an in-flight outgoing Move so the context menu can show
+   *  a transient "Sending…" instead of letting the user fire and
+   *  forget without feedback. Cleared on completion (success or
+   *  failure). */
+  let moveInFlight = $state<{ guid: string; label: string } | null>(null);
+  let moveError = $state<string>("");
+
+  async function startMove(guid: string, target_tag: string, target_label: string) {
+    moveInFlight = { guid, label: target_label };
+    moveError = "";
+    closeMenu();
+    try {
+      await meshClient.moveConversation(guid, target_tag);
+    } catch (e) {
+      moveError = String(e);
+    } finally {
+      moveInFlight = null;
+    }
+  }
+
+  function shortPeerLabel(pubkey: string, label: string): string {
+    if (label.trim() !== "") return label;
+    return pubkey.slice(0, 8);
+  }
 
   let {
     open,
@@ -794,6 +827,19 @@
       {#if item && item.path}
         <button onclick={() => moveToRoot(targetId)}>Move to root</button>
       {/if}
+      {#if moveTargets.length > 0}
+        <div class="menu-divider"></div>
+        <div class="menu-section-label">Move to device</div>
+        {#each moveTargets as peer (peer.peer_id)}
+          <button
+            onclick={() => startMove(targetId, peer.peer_id, shortPeerLabel(peer.device_pubkey, peer.label))}
+            title="Transfer this conversation to {peer.label || peer.device_pubkey.slice(0, 12)}"
+          >
+            → {shortPeerLabel(peer.device_pubkey, peer.label)}
+          </button>
+        {/each}
+      {/if}
+      <div class="menu-divider"></div>
       <button class="danger" onclick={() => deleteItemWithConfirm(targetId)}>Delete</button>
     {:else}
       {@const targetPath = menu.target.path}
@@ -801,6 +847,22 @@
       <button onclick={() => startRenameFolder(targetPath)}>Rename</button>
       <button class="danger" onclick={() => deleteFolderWithConfirm(targetPath)}>Delete</button>
     {/if}
+  </div>
+{/if}
+
+{#if moveInFlight}
+  <!-- Transient toast while a Move is in flight. Source-side: the
+       conversation is read, shipped over the data channel, and the
+       local copy deleted on receiver-ack. Disappears when the
+       promise settles. -->
+  <div class="move-toast" role="status" aria-live="polite">
+    Moving to {moveInFlight.label}…
+  </div>
+{/if}
+{#if moveError}
+  <div class="move-toast error" role="alert">
+    Move failed: {moveError}
+    <button onclick={() => (moveError = "")} class="dismiss">✕</button>
   </div>
 {/if}
 
@@ -1047,6 +1109,51 @@
   .menu button:hover { background: #1f1f33; }
   .menu button.danger { color: #ff8b8b; }
   .menu button.danger:hover { background: #2a1818; }
+  .menu-divider {
+    height: 1px;
+    background: #2a2a3a;
+    margin: 0.25rem 0;
+  }
+  .menu-section-label {
+    font-size: 0.66rem;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.3rem 0.6rem 0.15rem;
+  }
+
+  .move-toast {
+    position: fixed;
+    bottom: 1rem;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 60;
+    background: #1a1a2a;
+    border: 1px solid #2a2a3a;
+    color: #b9b9ee;
+    padding: 0.5rem 0.85rem;
+    border-radius: 7px;
+    font-size: 0.82rem;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .move-toast.error {
+    background: #2a1a1a;
+    border-color: #5a2a2a;
+    color: #f88;
+  }
+  .move-toast .dismiss {
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 0.9rem;
+    cursor: pointer;
+    opacity: 0.7;
+    padding: 0 0.25rem;
+  }
+  .move-toast .dismiss:hover { opacity: 1; }
 
   /* Pointer-following ghost while dragging. Position is updated from the
    * pointermove handler; pointer-events:none keeps it from blocking

@@ -12,7 +12,7 @@ export type SettingsTab =
   | "models"
   | "storage"
   | "hardware"
-  | "remote"
+  | "cloud-mesh"
   | "transcription"
   | "updates";
 

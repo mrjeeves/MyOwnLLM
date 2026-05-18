@@ -6,6 +6,7 @@ import type {
   AutoUpdateConfig,
   AutoCleanupConfig,
   RemoteUiConfig,
+  CloudMeshConfig,
   MicConfig,
 } from "./types";
 
@@ -42,6 +43,35 @@ const DEFAULT_REMOTE_UI: RemoteUiConfig = {
   port: 1474,
 };
 
+// Signaling is handled by Trystero over Nostr relays. The default
+// `signaling_servers` list is empty so Trystero falls back to its
+// built-in public-relay pool — anyone who wants to point at a
+// self-hosted Nostr relay (or a private one for office/LAN use)
+// adds entries here from the Cloud Mesh → Addresses tab. STUN
+// servers default to Google's public pool, which is the de-facto
+// baseline.
+//
+// Legacy entries from earlier PeerJS-based commits get stripped
+// on load so testers don't end up pointing Trystero at a
+// peerjs-server URL it can't speak to.
+const LEGACY_PEERJS_SIGNALING_URLS = [
+  "wss://0.peerjs.com:443/",
+  "wss://0.peerjs.com:443/peerjs",
+  "wss://mesh.myownllm.net/signal",
+];
+
+const DEFAULT_CLOUD_MESH: CloudMeshConfig = {
+  enabled: false,
+  network_id: "",
+  locked: false,
+  signaling_servers: [],
+  stun_servers: [
+    "stun:stun.l.google.com:19302",
+    "stun:stun1.l.google.com:19302",
+  ],
+  turn_servers: [],
+};
+
 const DEFAULT_AUTO_CLEANUP: AutoCleanupConfig = {
   models: true,
   transcribe_buffer: true,
@@ -76,6 +106,12 @@ const DEFAULT_CONFIG: Config = {
   api: { ...DEFAULT_API },
   auto_update: { ...DEFAULT_AUTO_UPDATE },
   remote_ui: { ...DEFAULT_REMOTE_UI },
+  cloud_mesh: {
+    ...DEFAULT_CLOUD_MESH,
+    signaling_servers: [...DEFAULT_CLOUD_MESH.signaling_servers],
+    stun_servers: [...DEFAULT_CLOUD_MESH.stun_servers],
+    turn_servers: [...DEFAULT_CLOUD_MESH.turn_servers],
+  },
   mic: { ...DEFAULT_MIC },
   providers: [
     {
@@ -127,6 +163,9 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
       ...DEFAULT_REMOTE_UI,
       ...((raw as { remote_ui?: Partial<RemoteUiConfig> }).remote_ui ?? {}),
     },
+    cloud_mesh: mergeCloudMesh(
+      (raw as { cloud_mesh?: Partial<CloudMeshConfig> }).cloud_mesh,
+    ),
     mic: {
       ...DEFAULT_MIC,
       ...((raw as { mic?: Partial<MicConfig> & { whisper_model?: string } }).mic ?? {}),
@@ -164,6 +203,35 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
     merged.active_family = DEFAULT_CONFIG.active_family;
   }
   return merged;
+}
+
+/** Merge a partial cloud_mesh config from a saved file with defaults,
+ *  preserving array fields the user has customised. Empty arrays are
+ *  legitimate user choices for all of signaling, STUN, and TURN —
+ *  empty signaling means "let Trystero use its built-in default
+ *  Nostr relays," empty STUN/TURN means "I don't want any of those."
+ *  Legacy PeerJS URLs from earlier branch commits get stripped on
+ *  load. */
+function mergeCloudMesh(raw: Partial<CloudMeshConfig> | undefined): CloudMeshConfig {
+  if (!raw) {
+    return {
+      ...DEFAULT_CLOUD_MESH,
+      signaling_servers: [...DEFAULT_CLOUD_MESH.signaling_servers],
+      stun_servers: [...DEFAULT_CLOUD_MESH.stun_servers],
+      turn_servers: [...DEFAULT_CLOUD_MESH.turn_servers],
+    };
+  }
+  const signaling = (raw.signaling_servers ?? []).filter(
+    (s) => !LEGACY_PEERJS_SIGNALING_URLS.includes(s),
+  );
+  return {
+    enabled: raw.enabled ?? DEFAULT_CLOUD_MESH.enabled,
+    network_id: raw.network_id ?? DEFAULT_CLOUD_MESH.network_id,
+    locked: raw.locked ?? DEFAULT_CLOUD_MESH.locked,
+    signaling_servers: signaling,
+    stun_servers: raw.stun_servers ?? [...DEFAULT_CLOUD_MESH.stun_servers],
+    turn_servers: raw.turn_servers ?? [...DEFAULT_CLOUD_MESH.turn_servers],
+  };
 }
 
 export async function saveConfig(config: Config): Promise<void> {

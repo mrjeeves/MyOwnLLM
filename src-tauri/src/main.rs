@@ -9,6 +9,7 @@ mod conversations;
 mod diarize;
 mod frame_sink;
 mod hardware;
+mod mesh;
 mod models;
 mod ollama;
 mod ort_install;
@@ -717,6 +718,15 @@ fn main() {
             remote_ui_qr,
             remote_ui_local_heartbeat,
             remote_ui_kick,
+            mesh::commands::mesh_identity_get,
+            mesh::commands::mesh_identity_set_label,
+            mesh::commands::mesh_network_id_generate,
+            mesh::commands::mesh_network_id_normalize,
+            mesh::commands::mesh_sign,
+            mesh::commands::mesh_verify,
+            mesh::commands::mesh_roster_get,
+            mesh::commands::mesh_roster_add,
+            mesh::commands::mesh_roster_remove,
             transcribe_start,
             transcribe_stop,
             transcribe_pause,
