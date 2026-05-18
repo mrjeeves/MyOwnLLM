@@ -24,6 +24,7 @@
   import { stickToBottom } from "./stick-to-bottom";
   import { meshClient } from "../mesh-client.svelte";
   import { canServeInference } from "../mesh-capabilities";
+  import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
 
   let {
     activeModel,
@@ -133,6 +134,22 @@
    *  Un-switch) instead of the list. Cleared alongside `settingsTab`
    *  whenever the panel closes. */
   let settingsDetailFamily = $state<string | null>(null);
+  /** Cloud Mesh sub-tab to open into. Carried alongside settingsTab
+   *  so the per-peer "Settings" item in the Sidebar can land
+   *  directly on Connections. */
+  let settingsMeshSubTab = $state<CloudMeshSubTab | null>(null);
+
+  /** Observe the cross-component settings-open signal (used by
+   *  Sidebar for the per-peer "Settings" menu). The Status bar still
+   *  drives `settingsTab` directly via prop — both paths converge on
+   *  the same SettingsPanel mount below. */
+  $effect(() => {
+    const pending = settingsRoute.pendingTab;
+    if (pending === null) return;
+    settingsTab = pending;
+    settingsMeshSubTab = settingsRoute.pendingMeshSubTab;
+    settingsRoute.clear();
+  });
   let messagesEl = $state<HTMLElement | undefined>(undefined);
 
   /** Loaded conversation snapshot. We keep the full record (id + metadata)
@@ -684,9 +701,11 @@
     <SettingsPanel
       initialTab={settingsTab}
       initialDetailFamily={settingsDetailFamily}
+      initialMeshSubTab={settingsMeshSubTab}
       onClose={() => {
         settingsTab = null;
         settingsDetailFamily = null;
+        settingsMeshSubTab = null;
       }}
       onChanged={handleProviderChange}
     />

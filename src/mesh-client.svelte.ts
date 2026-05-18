@@ -549,6 +549,15 @@ class MeshClient {
     string,
     { peer_id: string; peer_pubkey: string; title: string }
   >();
+  /** Pulls (`move_request`) we've sent to peers, waiting on a
+   *  `move_request_decline` (failure) or the inbound `move_offer`
+   *  the source kicks off on success. Keyed by request id. The
+   *  resolver lets the Sidebar's "Pull from X" toast surface
+   *  failures without watching the wire. */
+  private pending_pulls_out = new Map<
+    string,
+    { guid: string; peer_id: string; on_settle: (ok: boolean, err?: string) => void }
+  >();
 
   // ---- lifecycle -------------------------------------------------------
 
@@ -757,6 +766,10 @@ class MeshClient {
     this.pending_infers_in.clear();
     this.pending_moves_in.clear();
     this.pending_move_guids.clear();
+    for (const [, pending] of this.pending_pulls_out) {
+      pending.on_settle(false, "mesh stopped");
+    }
+    this.pending_pulls_out.clear();
     this.refreshResources();
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
@@ -919,6 +932,37 @@ class MeshClient {
     } finally {
       this.is_rediscovering = false;
     }
+  }
+
+  /** Pull a remote conversation onto this device. Asks the source
+   *  peer to push `guid` to us; the source validates and then
+   *  drives the regular Move handshake with us as the destination.
+   *
+   *  The returned promise resolves once the source acknowledges
+   *  the request — either by starting the Move (success) or by
+   *  sending `move_request_decline` (failure with a reason).
+   *  Resolution does NOT wait for the full payload transfer; the
+   *  caller can watch `meshClient.resources.inbound_moves` to
+   *  observe progress, or just rely on the Sidebar refreshing its
+   *  catalog once the receiver-side `move_payload` lands and
+   *  `noteCatalogChanged` fires. */
+  async pullConversation(guid: string, source_peer_id: string): Promise<void> {
+    const conn = this.connections.get(source_peer_id);
+    if (!conn || this.peerStatus(conn) !== "active") {
+      throw new Error("source peer is not active");
+    }
+    const id = generateMeshId();
+    return await new Promise<void>((resolve, reject) => {
+      this.pending_pulls_out.set(id, {
+        guid,
+        peer_id: source_peer_id,
+        on_settle: (ok, err) => {
+          if (ok) resolve();
+          else reject(new Error(err ?? "pull failed"));
+        },
+      });
+      this.send(conn, { kind: "move_request", id, guid });
+    });
   }
 
   async moveConversation(guid: string, target_peer_id: string): Promise<void> {
@@ -1450,6 +1494,23 @@ class MeshClient {
         this.markCatalogPendingMove(conn, msg.guid, false);
         this.republishPeers();
         break;
+      case "move_request":
+        // Same gate as remote inference: only an active (rostered +
+        // authenticated) peer may pull a conversation from us. A
+        // stranger in the same Trystero room hits the early-return.
+        if (this.peerStatus(conn) !== "active") {
+          this.send(conn, {
+            kind: "move_request_decline",
+            id: msg.id,
+            reason: "peer not authorized",
+          });
+          break;
+        }
+        void this.handleMoveRequest(conn, msg);
+        break;
+      case "move_request_decline":
+        this.handleMoveRequestDecline(msg.id, msg.reason);
+        break;
       case "infer_request":
         // Authorization gate: only roster peers may issue inference
         // requests. Mesh discovery alone is not enough.
@@ -1701,12 +1762,18 @@ class MeshClient {
       // doesn't notify the mesh on its own.
       this.broadcastMoveCommit(msg.guid);
       void this.refreshLocalCatalog();
+      // If this incoming move was the answer to a Pull we kicked
+      // off, the pull promise resolves once the bytes have landed
+      // locally — that's when the user expects the "Pulling…"
+      // toast to disappear.
+      this.resolvePullByGuid(msg.guid, conn.peer_id, true);
     } catch (e) {
       this.send(conn, {
         kind: "move_decline",
         guid: msg.guid,
         reason: `write failed: ${String(e)}`,
       });
+      this.resolvePullByGuid(msg.guid, conn.peer_id, false, String(e));
     } finally {
       this.pending_moves_in.delete(msg.guid);
       this.refreshResources();
@@ -1751,6 +1818,77 @@ class MeshClient {
     this.pending_moves_out.delete(guid);
     this.refreshResources();
     pending.on_complete?.(ok, err);
+  }
+
+  /** Inbound `move_request` from a peer: they want us to push the
+   *  named conversation to them. We've already gated on the peer
+   *  being `active`; the remaining checks are: do we still have
+   *  the conversation, and isn't there already a move in flight
+   *  for it. Success path: resolve the requester's pending promise
+   *  immediately and call `moveConversation` to drive the regular
+   *  push handshake. */
+  private async handleMoveRequest(
+    conn: ConnectionState,
+    msg: MeshMessage & { kind: "move_request" },
+  ): Promise<void> {
+    const existing = await loadConversation(msg.guid).catch(() => null);
+    if (!existing) {
+      this.send(conn, {
+        kind: "move_request_decline",
+        id: msg.id,
+        reason: "conversation not found",
+      });
+      return;
+    }
+    if (this.pending_moves_out.has(msg.guid)) {
+      this.send(conn, {
+        kind: "move_request_decline",
+        id: msg.id,
+        reason: "a move for this conversation is already in flight",
+      });
+      return;
+    }
+    // moveConversation throws on the "target not active" / "already
+    // in flight" cases we just checked above — but a peer drop
+    // between the check and the call is possible, so guard. The
+    // requester's pending pull resolves the moment we KICK OFF the
+    // move (not when it finishes) — they'll see progress via the
+    // resource map and the eventual catalog refresh.
+    try {
+      void this.moveConversation(msg.guid, conn.peer_id);
+    } catch (e) {
+      this.send(conn, {
+        kind: "move_request_decline",
+        id: msg.id,
+        reason: String(e),
+      });
+    }
+  }
+
+  private handleMoveRequestDecline(id: string, reason: string): void {
+    const pending = this.pending_pulls_out.get(id);
+    if (!pending) return;
+    this.pending_pulls_out.delete(id);
+    pending.on_settle(false, reason);
+  }
+
+  /** Find a pending pull that matches the incoming Move's guid +
+   *  source peer and resolve it. No-op when the Move wasn't from a
+   *  Pull (it was a regular push). Used by both the success path
+   *  (payload landed) and the local-write failure path. */
+  private resolvePullByGuid(
+    guid: string,
+    peer_id: string,
+    ok: boolean,
+    err?: string,
+  ): void {
+    for (const [id, pending] of this.pending_pulls_out) {
+      if (pending.guid === guid && pending.peer_id === peer_id) {
+        this.pending_pulls_out.delete(id);
+        pending.on_settle(ok, err);
+        return;
+      }
+    }
   }
 
   // ---- helpers ---------------------------------------------------------
@@ -1823,6 +1961,13 @@ class MeshClient {
       if (served.requester_peer_id === peer_id) {
         void invoke("ollama_chat_cancel", { streamId: served.local_stream_id }).catch(() => {});
         this.pending_infers_in.delete(id);
+      }
+    }
+    // Pulls in flight against this peer never complete — fail them.
+    for (const [id, pending] of this.pending_pulls_out) {
+      if (pending.peer_id === peer_id) {
+        this.pending_pulls_out.delete(id);
+        pending.on_settle(false, "peer disconnected");
       }
     }
     this.refreshResources();

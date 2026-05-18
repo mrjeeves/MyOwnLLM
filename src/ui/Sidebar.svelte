@@ -2,6 +2,7 @@
   import type { ConversationMeta, FolderMeta } from "../conversations";
   import type { Mode } from "../types";
   import { meshClient } from "../mesh-client.svelte";
+  import { settingsRoute } from "./settings-route.svelte";
 
   /** Peers eligible as Move targets — active and authorized. The
    *  context-menu uses this directly; if the list is empty the
@@ -10,12 +11,49 @@
     meshClient.peers.filter((p) => p.status === "active" && p.authorized),
   );
 
+  /** Connected peers we render as expandable sidebar groups, each
+   *  containing the conversations that peer hosts (from their
+   *  broadcast `catalog_announce`). Sorted by label then pubkey for
+   *  stable ordering. Shelved peers count too — their data channel
+   *  is still up, so we can still pull from them — but offline
+   *  rostered peers don't because there's nobody to ask. */
+  let peerGroups = $derived(
+    meshClient.peers
+      .filter(
+        (p) =>
+          (p.status === "active" || p.status === "shelved") &&
+          p.authorized &&
+          p.device_pubkey,
+      )
+      .sort((a, b) => {
+        const al = (a.label || "").toLowerCase();
+        const bl = (b.label || "").toLowerCase();
+        if (al && bl && al !== bl) return al < bl ? -1 : 1;
+        return a.device_pubkey < b.device_pubkey ? -1 : 1;
+      }),
+  );
+
+  /** Per-peer-pubkey collapse state. Peers default to expanded so
+   *  the user sees what's there on first connect; toggling
+   *  persists for the session only. */
+  let peerCollapsed = $state<Set<string>>(new Set());
+
+  function togglePeerCollapsed(pubkey: string) {
+    peerCollapsed.has(pubkey) ? peerCollapsed.delete(pubkey) : peerCollapsed.add(pubkey);
+    peerCollapsed = new Set(peerCollapsed);
+  }
+
   /** Tracks an in-flight outgoing Move so the context menu can show
    *  a transient "Sending…" instead of letting the user fire and
    *  forget without feedback. Cleared on completion (success or
    *  failure). */
   let moveInFlight = $state<{ guid: string; label: string } | null>(null);
   let moveError = $state<string>("");
+  /** Same shape, in the opposite direction: a pull we've kicked off
+   *  against a remote peer. Stays until the source ack'd (and the
+   *  payload landed) or the source declined. */
+  let pullInFlight = $state<{ guid: string; label: string } | null>(null);
+  let pullError = $state<string>("");
 
   async function startMove(guid: string, target_tag: string, target_label: string) {
     moveInFlight = { guid, label: target_label };
@@ -28,6 +66,24 @@
     } finally {
       moveInFlight = null;
     }
+  }
+
+  async function startPull(guid: string, source_peer_id: string, source_label: string, title: string) {
+    pullInFlight = { guid, label: `${title} from ${source_label}` };
+    pullError = "";
+    closeMenu();
+    try {
+      await meshClient.pullConversation(guid, source_peer_id);
+    } catch (e) {
+      pullError = String(e);
+    } finally {
+      pullInFlight = null;
+    }
+  }
+
+  function openMeshConnectionsSettings() {
+    closeMenu();
+    settingsRoute.open("cloud-mesh", { meshSubTab: "connections" });
   }
 
   function shortPeerLabel(pubkey: string, label: string): string {
@@ -84,7 +140,20 @@
    *  so the bounding sidebar's overflow can't clip the menu. */
   type MenuTarget =
     | { kind: "item"; id: string }
-    | { kind: "folder"; path: string };
+    | { kind: "folder"; path: string }
+    /** Remote conversation hosted on a peer. The Pull action sends a
+     *  `move_request` over the data channel; the source side then
+     *  drives the regular Move handshake with us as destination. */
+    | {
+        kind: "remote-item";
+        peer_id: string;
+        peer_label: string;
+        guid: string;
+        title: string;
+      }
+    /** A peer-group row in the sidebar. Lets the user jump straight
+     *  to the Cloud Mesh → Connections tab for that mesh. */
+    | { kind: "peer"; peer_id: string; peer_label: string };
   let menu = $state<{ target: MenuTarget; x: number; y: number } | null>(null);
   let editingId = $state<string | null>(null);
   let editingFolder = $state<string | null>(null);
@@ -132,6 +201,52 @@
     const x = Math.min(e.clientX, window.innerWidth - 200);
     const y = Math.min(e.clientY, window.innerHeight - 170);
     menu = { target: { kind: "folder", path }, x, y };
+  }
+
+  function openRemoteItemMenu(
+    e: MouseEvent | KeyboardEvent,
+    peer_id: string,
+    peer_label: string,
+    guid: string,
+    title: string,
+  ) {
+    e.preventDefault();
+    e.stopPropagation();
+    const { x, y } = menuAnchor(e, 180, 120);
+    menu = { target: { kind: "remote-item", peer_id, peer_label, guid, title }, x, y };
+  }
+
+  function openPeerMenu(e: MouseEvent | KeyboardEvent, peer_id: string, peer_label: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    const { x, y } = menuAnchor(e, 200, 100);
+    menu = { target: { kind: "peer", peer_id, peer_label }, x, y };
+  }
+
+  /** Compute a viewport-pinned anchor for the context menu. Mouse
+   *  events anchor at the cursor; keyboard events fall back to the
+   *  currentTarget's bounding rect so Enter / Space on a focused
+   *  row pops the menu next to the row, not at (0,0). */
+  function menuAnchor(
+    e: MouseEvent | KeyboardEvent,
+    widthBudget: number,
+    heightBudget: number,
+  ): { x: number; y: number } {
+    if (e instanceof MouseEvent) {
+      return {
+        x: Math.min(e.clientX, window.innerWidth - widthBudget),
+        y: Math.min(e.clientY, window.innerHeight - heightBudget),
+      };
+    }
+    const target = e.currentTarget as HTMLElement | null;
+    if (target) {
+      const r = target.getBoundingClientRect();
+      return {
+        x: Math.min(r.left + 16, window.innerWidth - widthBudget),
+        y: Math.min(r.bottom + 4, window.innerHeight - heightBudget),
+      };
+    }
+    return { x: 16, y: 16 };
   }
 
   function closeMenu() {
@@ -678,6 +793,108 @@
     {#each tree.children as child (child.path)}
       {@render folder(child)}
     {/each}
+
+    {#if peerGroups.length > 0}
+      <!-- Network section. Each connected peer becomes an
+           expandable group containing their advertised catalog.
+           Right-click on a remote conversation → Pull. Right-click
+           on the peer name → opens Cloud Mesh → Connections. -->
+      <div class="network-divider" aria-hidden="true"></div>
+      <div class="group-label network-label">Network</div>
+      {#each peerGroups as peer (peer.peer_id)}
+        {@const isCollapsed = peerCollapsed.has(peer.device_pubkey)}
+        <div
+          class="peer-group"
+          class:standby={peer.status === "shelved"}
+          role="button"
+          tabindex="0"
+          oncontextmenu={(e) => openPeerMenu(e, peer.peer_id, peer.label || peer.device_pubkey.slice(0, 8))}
+          onclick={(e) => {
+            e.stopPropagation();
+            togglePeerCollapsed(peer.device_pubkey);
+          }}
+          onkeydown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              togglePeerCollapsed(peer.device_pubkey);
+            } else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+              // Keyboard equivalent of right-click for accessibility.
+              openPeerMenu(e, peer.peer_id, peer.label || peer.device_pubkey.slice(0, 8));
+            }
+          }}
+          title={`${peer.label || "Unnamed device"}${peer.device_suffix ? ` -${peer.device_suffix}` : ""}`}
+        >
+          <span class="folder-caret" aria-hidden="true">{isCollapsed ? "▸" : "▾"}</span>
+          <span class="peer-dot" data-status={peer.status} aria-hidden="true"></span>
+          <span class="peer-group-name">{peer.label || "Unnamed device"}</span>
+          {#if peer.device_suffix}
+            <span class="peer-group-suffix">-{peer.device_suffix}</span>
+          {/if}
+          {#if peer.status === "shelved"}
+            <span class="peer-standby-pill">standby</span>
+          {/if}
+        </div>
+        {#if !isCollapsed}
+          {#if peer.catalog.length === 0}
+            <div class="peer-empty">(no conversations)</div>
+          {:else}
+            {#each peer.catalog as entry (entry.guid)}
+              <div
+                class="row remote"
+                class:pending-move={entry.pending_move}
+                role="button"
+                tabindex="0"
+                onclick={(e) => e.stopPropagation()}
+                onkeydown={(e) => {
+                  // Keyboard equivalent of right-click: open the
+                  // context menu via Enter / Space so Pull is
+                  // reachable without a mouse. The opener anchors
+                  // the menu at the focused row's bounding rect
+                  // when handed a KeyboardEvent.
+                  if (e.key === "Enter" || e.key === " ") {
+                    openRemoteItemMenu(
+                      e,
+                      peer.peer_id,
+                      peer.label || peer.device_pubkey.slice(0, 8),
+                      entry.guid,
+                      entry.title,
+                    );
+                  }
+                }}
+                oncontextmenu={(e) =>
+                  openRemoteItemMenu(
+                    e,
+                    peer.peer_id,
+                    peer.label || peer.device_pubkey.slice(0, 8),
+                    entry.guid,
+                    entry.title,
+                  )}
+                title="{entry.title} (hosted on {peer.label || 'this peer'})"
+              >
+                {#if entry.mode === "transcribe" || entry.mode === "diarize"}
+                  <svg
+                    class="mode-icon"
+                    viewBox="0 0 24 24"
+                    width="11"
+                    height="11"
+                    aria-hidden="true"
+                  >
+                    <path
+                      fill="currentColor"
+                      d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"
+                    />
+                  </svg>
+                {/if}
+                <span class="title">{entry.title}</span>
+                {#if entry.pending_move}
+                  <span class="moving-pill">moving…</span>
+                {/if}
+              </div>
+            {/each}
+          {/if}
+        {/if}
+      {/each}
+    {/if}
   </div>
 </aside>
 
@@ -829,7 +1046,7 @@
       {/if}
       {#if moveTargets.length > 0}
         <div class="menu-divider"></div>
-        <div class="menu-section-label">Move to device</div>
+        <div class="menu-section-label">Push to device</div>
         {#each moveTargets as peer (peer.peer_id)}
           <button
             onclick={() => startMove(targetId, peer.peer_id, shortPeerLabel(peer.device_pubkey, peer.label))}
@@ -841,11 +1058,26 @@
       {/if}
       <div class="menu-divider"></div>
       <button class="danger" onclick={() => deleteItemWithConfirm(targetId)}>Delete</button>
-    {:else}
+    {:else if menu.target.kind === "folder"}
       {@const targetPath = menu.target.path}
       <button onclick={() => startCreateFolder(targetPath)}>New subfolder</button>
       <button onclick={() => startRenameFolder(targetPath)}>Rename</button>
       <button class="danger" onclick={() => deleteFolderWithConfirm(targetPath)}>Delete</button>
+    {:else if menu.target.kind === "remote-item"}
+      {@const target = menu.target}
+      <div class="menu-section-label">{target.title}</div>
+      <button
+        onclick={() => startPull(target.guid, target.peer_id, target.peer_label, target.title)}
+        title="Move this conversation from {target.peer_label} onto this device"
+      >
+        ← Pull from {target.peer_label}
+      </button>
+    {:else}
+      {@const target = menu.target}
+      <div class="menu-section-label">{target.peer_label}</div>
+      <button onclick={openMeshConnectionsSettings} title="Open Cloud Mesh → Connections">
+        Settings
+      </button>
     {/if}
   </div>
 {/if}
@@ -863,6 +1095,22 @@
   <div class="move-toast error" role="alert">
     Move failed: {moveError}
     <button onclick={() => (moveError = "")} class="dismiss">✕</button>
+  </div>
+{/if}
+
+{#if pullInFlight}
+  <!-- Pull-in-flight toast. The promise resolves once the payload
+       has landed locally (handlePullByGuid in mesh-client) — until
+       then, the conversation appears under the remote peer in the
+       sidebar with a "moving…" pill. -->
+  <div class="move-toast" role="status" aria-live="polite">
+    Pulling {pullInFlight.label}…
+  </div>
+{/if}
+{#if pullError}
+  <div class="move-toast error" role="alert">
+    Pull failed: {pullError}
+    <button onclick={() => (pullError = "")} class="dismiss">✕</button>
   </div>
 {/if}
 
@@ -997,6 +1245,94 @@
     letter-spacing: .04em;
     color: #555;
     padding: .55rem .65rem .25rem .65rem;
+  }
+
+  /* Network section — peer groups below the local conversation
+     tree. Each peer is a row that toggles a collapsed flag,
+     wrapping a list of remote conversations rendered as .row.remote
+     children. */
+  .network-divider {
+    margin: .55rem .45rem .15rem .45rem;
+    height: 1px;
+    background: #181818;
+  }
+  .group-label.network-label {
+    color: #6a7a99;
+    letter-spacing: .06em;
+  }
+  .peer-group {
+    display: flex;
+    align-items: center;
+    gap: .35rem;
+    padding: .35rem .45rem;
+    margin: 1px 0;
+    border-radius: 6px;
+    color: #ccc;
+    font-size: .8rem;
+    cursor: pointer;
+    transition: background .1s;
+  }
+  .peer-group:hover { background: #161616; }
+  .peer-group.standby { opacity: .75; }
+  .peer-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #6c6;
+    flex-shrink: 0;
+    box-shadow: 0 0 5px rgba(102, 204, 102, 0.5);
+  }
+  .peer-dot[data-status="shelved"] {
+    background: #b9c9ee;
+    box-shadow: 0 0 5px rgba(185, 201, 238, 0.5);
+  }
+  .peer-group-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+  .peer-group-suffix {
+    font-family: monospace;
+    font-size: .68rem;
+    font-weight: 700;
+    color: #b9c9ee;
+    letter-spacing: .04em;
+    flex-shrink: 0;
+  }
+  .peer-standby-pill {
+    font-size: .55rem;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    background: #1a1e2a;
+    color: #b9c9ee;
+    border-radius: 3px;
+    padding: .05rem .3rem;
+    flex-shrink: 0;
+  }
+  .peer-empty {
+    font-size: .72rem;
+    color: #555;
+    font-style: italic;
+    padding: .25rem .65rem .35rem 1.45rem;
+  }
+  .row.remote {
+    padding-left: calc(.45rem + .9rem);
+    color: #ccc;
+  }
+  .row.remote:hover { background: #131820; }
+  .row.remote.pending-move { opacity: .65; }
+  .moving-pill {
+    font-size: .58rem;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: #d6b25a;
+    background: #2a220e;
+    border-radius: 3px;
+    padding: .05rem .3rem;
+    margin-left: auto;
+    flex-shrink: 0;
   }
   .folder {
     display: flex;

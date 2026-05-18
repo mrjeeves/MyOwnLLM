@@ -702,10 +702,11 @@ Cloud Mesh ships off by default. To turn it on, open **Settings → Cloud Mesh �
 
 | Feature | Where it shows up |
 |---------|-------------------|
-| **Move a conversation between devices** | Right-click any conversation in the sidebar → **Move to device → \<peer\>**. The sender's copy is deleted after the receiver acks. Also reachable from the **Connections** tab's Catalog grid (click any "—" cell on a locally-hosted row). |
+| **Cross-device conversation list** | The main **sidebar** shows each connected peer as an expandable "Network" group below your local conversations. Their hosted chats and transcribe sessions appear directly under their peer-group row — same icons, same titles as your local list. Right-click a peer name to jump to **Cloud Mesh → Connections**. |
+| **Push a local conversation** | Right-click any local conversation in the sidebar → **Push to device → \<peer\>**. The sender's copy is deleted after the receiver acks. Single-RTT today; tracked with a `moving…` pill on the catalog row across all peers while in flight. |
+| **Pull a remote conversation** | Right-click a remote conversation under any Network group → **← Pull from \<peer\>**. The remote peer drives the Move handshake with you as the destination; the conversation appears in your local sidebar once the payload lands. Source must be in your roster — strangers in the same Trystero room can't be pulled from. |
 | **Remote inference** | In the chat compose row, the **via:** picker lets you route a prompt to any peer that has an LLM advertised. The peer's local Ollama runs the request and streams tokens back over the data channel. Stop, cancel, and reasoning-mode all work the same as local. |
-| **Catalog visibility** | The **Connections** tab's Catalog section renders a grid — rows are conversations, columns are devices. `host` = lives there, `—` = not there, `moving…` = mid-transfer. Click an `—` cell on a row hosted locally to Move that conversation to that peer. |
-| **Resource map** | Under **Connections → Resources in use**, every in-flight inference (outbound + inbound) and Move shows as a live row: `→` = you using a peer's resources, `←` = a peer using yours. |
+| **Resource map** | Under **Cloud Mesh → Connections → Resources in use**, every in-flight inference (outbound + inbound) and Move shows as a live row: `→` = you using a peer's resources, `←` = a peer using yours. |
 | **Capability badges** | Each peer's row shows what they can do — `LLM`, `ASR`, `mic`, `diarize`, plus a one-liner hardware summary (`Pi 5 · 4 GB RAM`). Sourced from each device's broadcast `capabilities_update`. |
 | **Accepting policy** | Per-device toggle on the Status tab (in the Activity block). `available` = take any work, `limited` = only if no better peer exists, `busy` = refuse incoming inference. Other peers see your choice in real time. |
 | **Ring + indirect peers** | The **Connections** tab splits peers into two groups. The **Ring** is the set the local selector is actively routing through — it auto-heals on every join / leave by re-running the deterministic ring selector. **Indirect** is peers we know about but aren't routing through right now — shelved (data channel open as heartbeat, parked because the mesh grew past the ring capacity) or offline rostered (approved before, not in the room right now). Keeps Pi-class devices from melting under N² connection counts on a 10-device mesh. |
@@ -768,6 +769,9 @@ move_offer / move_accept / move_decline / move_payload / move_complete
 
 # Move (2-phase visibility, Phase 2 — broadcast to everyone)
 move_prepare / move_commit / move_abort
+
+# Pull (Phase 2 — requester asks source to push to them)
+move_request / move_request_decline
 
 # Remote inference
 infer_request            messages + family/mode + think hint

@@ -19,23 +19,21 @@
    *   3. **Resources in use** — a live row per in-flight inference
    *      (outbound + inbound) and per in-flight Move. Lets the user
    *      see "what is the mesh actually doing right now."
-   *   4. **Catalog** — the cross-device conversation grid. Rows are
-   *      conversations, columns are devices (us first, peers after).
-   *      Click an "—" cell on a locally-hosted row to Move that
-   *      conversation to the peer in that column.
    *
-   *  The whole tab is read-only as far as the wire protocol is
-   *  concerned. The Move action goes through the existing
-   *  `meshClient.moveConversation` RPC. */
+   *  The cross-device conversation catalog lives in the main
+   *  sidebar — each connected peer becomes an expandable group
+   *  there, right-click → Pull / Push / Settings. The redundant
+   *  grid that used to live here was removed when the sidebar
+   *  picked up that role. */
 
   import { onMount } from "svelte";
   import { meshClient } from "../../mesh-client.svelte";
-  import { meshUi } from "../../mesh-state.svelte";
   import { capabilityBadges, summarizeCapabilities } from "../../mesh-capabilities";
 
   onMount(() => {
-    // Trigger a fresh catalog walk on first visit so the grid below
-    // has data even when no peer has connected this session yet.
+    // Trigger a fresh catalog walk on first visit so the resource
+    // map's "outbound moves" rows show the right titles even if we
+    // navigate here mid-transfer.
     void meshClient.refreshLocalCatalog();
   });
 
@@ -105,136 +103,6 @@
     return `${pk.slice(0, 12)}…`;
   }
 
-  // ---- catalog grid ----------------------------------------------------
-
-  interface Cell {
-    hosts: boolean;
-    pending: boolean;
-  }
-
-  interface UnifiedRow {
-    guid: string;
-    title: string;
-    mode: string;
-    updated_at: string;
-    cells: Record<string, Cell>;
-  }
-
-  let columns = $derived.by(() => {
-    const cols: Array<{ key: string; label: string; suffix: string; isSelf: boolean }> = [];
-    cols.push({
-      key: "",
-      label: meshUi.identity?.label || "This device",
-      suffix: localSuffix(meshUi.identity?.device_id),
-      isSelf: true,
-    });
-    const peers = meshClient.peers
-      .filter(
-        (p) => (p.status === "active" || p.status === "shelved") && p.authorized && p.device_pubkey,
-      )
-      .sort((a, b) => {
-        const al = (a.label || "").toLowerCase();
-        const bl = (b.label || "").toLowerCase();
-        if (al && bl && al !== bl) return al < bl ? -1 : 1;
-        return a.device_pubkey < b.device_pubkey ? -1 : 1;
-      });
-    for (const p of peers) {
-      cols.push({
-        key: p.device_pubkey,
-        label: p.label || `${p.device_pubkey.slice(0, 8)}…`,
-        suffix: p.device_suffix,
-        isSelf: false,
-      });
-    }
-    return cols;
-  });
-
-  function localSuffix(id: string | undefined): string {
-    if (!id) return "";
-    const dash = id.lastIndexOf("-");
-    if (dash === -1) return "";
-    const tail = id.slice(dash + 1);
-    return /^[0-9A-F]{5}$/.test(tail) ? tail : "";
-  }
-
-  let rows = $derived.by(() => {
-    const byGuid = new Map<string, UnifiedRow>();
-    const upsert = (
-      guid: string,
-      title: string,
-      mode: string,
-      updated_at: string,
-      peerKey: string,
-      pending: boolean,
-    ) => {
-      let row = byGuid.get(guid);
-      if (!row) {
-        row = { guid, title, mode, updated_at, cells: {} };
-        byGuid.set(guid, row);
-      } else if (updated_at > row.updated_at) {
-        row.title = title;
-        row.mode = mode;
-        row.updated_at = updated_at;
-      }
-      row.cells[peerKey] = { hosts: true, pending };
-    };
-    for (const entry of meshClient.my_catalog) {
-      upsert(entry.guid, entry.title, entry.mode, entry.updated_at, "", !!entry.pending_move);
-    }
-    for (const peer of meshClient.peers) {
-      if (peer.status !== "active" && peer.status !== "shelved") continue;
-      for (const entry of peer.catalog ?? []) {
-        upsert(
-          entry.guid,
-          entry.title,
-          entry.mode,
-          entry.updated_at,
-          peer.device_pubkey,
-          !!entry.pending_move,
-        );
-      }
-    }
-    return Array.from(byGuid.values()).sort((a, b) =>
-      a.updated_at < b.updated_at ? 1 : -1,
-    );
-  });
-
-  function isMoveable(row: UnifiedRow, targetKey: string): boolean {
-    if (!targetKey) return false;
-    const cell = row.cells[targetKey];
-    if (cell?.hosts) return false;
-    if (!row.cells[""]?.hosts) return false;
-    return true;
-  }
-
-  async function doMove(row: UnifiedRow, targetKey: string) {
-    if (!isMoveable(row, targetKey)) return;
-    const peer = meshClient.peers.find((p) => p.device_pubkey === targetKey);
-    if (!peer) return;
-    try {
-      await meshClient.moveConversation(row.guid, peer.peer_id);
-    } catch (e) {
-      console.warn("mesh move failed:", e);
-    }
-  }
-
-  function modeIcon(mode: string): string {
-    if (mode === "transcribe") return "🎙";
-    if (mode === "diarize") return "🎙";
-    return "💬";
-  }
-
-  function relativeTime(iso: string): string {
-    if (!iso) return "";
-    const t = Date.parse(iso);
-    if (Number.isNaN(t)) return "";
-    const d = Date.now() - t;
-    if (d < 60_000) return "just now";
-    if (d < 3_600_000) return `${Math.round(d / 60_000)}m ago`;
-    if (d < 86_400_000) return `${Math.round(d / 3_600_000)}h ago`;
-    return `${Math.round(d / 86_400_000)}d ago`;
-  }
-
   // ---- resources -------------------------------------------------------
 
   let hasAnyResources = $derived(
@@ -249,8 +117,9 @@
   {#if meshClient.status !== "online"}
     <div class="empty-state">
       Mesh is offline. Lock a Network ID on the Status tab to bring
-      the mesh up — connections, the catalog grid, and the in-use
-      resource map fill in as peers connect.
+      the mesh up — connections and the in-use resource map fill in
+      as peers connect. Their conversations show up directly in the
+      main sidebar under <strong>Network</strong>.
     </div>
   {:else}
     <!-- Ring -->
@@ -414,81 +283,10 @@
       {/if}
     </section>
 
-    <!-- Catalog grid -->
-    <section class="block">
-      <div class="block-head">
-        <h3>Catalog</h3>
-        <span class="block-meta">conversations × devices</span>
-      </div>
-      <div class="block-hint">
-        Each row is a conversation; each column is a device.
-        <strong>host</strong> = lives there. <strong>—</strong> = not there.
-        Click an "—" cell on a row hosted locally to Move that
-        conversation to that peer.
-      </div>
-      {#if columns.length === 1 && rows.length === 0}
-        <div class="empty-state subtle">
-          No conversations yet. Once you have a chat or transcription
-          saved locally, or a peer joins and announces its catalog,
-          the grid populates here.
-        </div>
-      {:else}
-        <div class="grid-wrap">
-          <table class="grid">
-            <thead>
-              <tr>
-                <th class="row-head">Conversation</th>
-                {#each columns as col (col.key)}
-                  <th class:self={col.isSelf} title={col.label + (col.suffix ? ` -${col.suffix}` : "")}>
-                    <div class="col-head">
-                      <span class="col-name">{col.label}</span>
-                      {#if col.suffix}<span class="col-suffix">{col.suffix}</span>{/if}
-                    </div>
-                  </th>
-                {/each}
-              </tr>
-            </thead>
-            <tbody>
-              {#each rows as row (row.guid)}
-                <tr>
-                  <td class="row-head">
-                    <div class="row-title">
-                      <span class="mode-icon" aria-hidden="true">{modeIcon(row.mode)}</span>
-                      <span class="title">{row.title}</span>
-                    </div>
-                    <div class="row-meta">{relativeTime(row.updated_at)}</div>
-                  </td>
-                  {#each columns as col (col.key)}
-                    {@const cell = row.cells[col.key]}
-                    <td
-                      class:host={cell?.hosts}
-                      class:pending={cell?.pending}
-                      class:empty={!cell?.hosts}
-                    >
-                      {#if cell?.pending}
-                        <span class="moving">moving…</span>
-                      {:else if cell?.hosts}
-                        <span class="host-pill">host</span>
-                      {:else if isMoveable(row, col.key)}
-                        <button
-                          class="move-btn"
-                          onclick={() => doMove(row, col.key)}
-                          title="Move {row.title} to {col.label}"
-                        >
-                          →
-                        </button>
-                      {:else}
-                        <span class="dash">—</span>
-                      {/if}
-                    </td>
-                  {/each}
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-      {/if}
-    </section>
+    <!-- Catalog lives in the main sidebar now: each connected peer
+         is an expandable group there with its hosted conversations,
+         right-click pull / push, and a Settings option that lands
+         here. -->
   {/if}
 </div>
 
@@ -521,12 +319,6 @@
     font-size: 0.7rem;
     color: #666;
     font-style: italic;
-  }
-  .block-hint {
-    font-size: 0.73rem;
-    color: #666;
-    line-height: 1.5;
-    max-width: 40rem;
   }
 
   /* Peer rows — ring and indirect share most of the styling but
@@ -728,98 +520,6 @@
     font-style: normal;
     margin-right: 0.25rem;
   }
-
-  /* Catalog grid */
-  .grid-wrap {
-    overflow-x: auto;
-    border-radius: 7px;
-    border: 1px solid #1e1e1e;
-    max-width: 100%;
-  }
-  .grid {
-    border-collapse: collapse;
-    width: 100%;
-    font-size: 0.78rem;
-  }
-  .grid th, .grid td {
-    padding: 0.4rem 0.55rem;
-    border-bottom: 1px solid #1a1a1a;
-    text-align: left;
-    vertical-align: middle;
-  }
-  .grid thead th {
-    background: #131313;
-    font-weight: 600;
-    font-size: 0.7rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: #888;
-    border-bottom: 1px solid #2a2a2a;
-    position: sticky;
-    top: 0;
-  }
-  .grid thead th.self {
-    color: #b9c9ee;
-  }
-  .col-head { display: flex; flex-direction: column; gap: 0.1rem; }
-  .col-name { color: inherit; }
-  .col-suffix {
-    font-family: monospace;
-    font-size: 0.65rem;
-    color: #6a7a99;
-    letter-spacing: 0.06em;
-  }
-  .row-head {
-    background: #0e0e0e;
-    min-width: 14rem;
-  }
-  .row-title {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-  }
-  .mode-icon { font-size: 0.85rem; flex-shrink: 0; }
-  .title {
-    color: #e8e8e8;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 22rem;
-  }
-  .row-meta {
-    font-size: 0.65rem;
-    color: #555;
-    margin-top: 0.15rem;
-  }
-  .grid td.host { background: #0f1812; }
-  .grid td.pending { background: #1e1a10; }
-  .grid td.empty { text-align: center; }
-  .host-pill {
-    font-size: 0.6rem;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    background: #122212;
-    color: #6c6;
-    padding: 0.1rem 0.4rem;
-    border-radius: 3px;
-  }
-  .moving {
-    font-size: 0.7rem;
-    color: #d6b25a;
-    font-style: italic;
-  }
-  .dash { color: #444; }
-  .move-btn {
-    background: #1a1a2a;
-    border: 1px solid #2a2a3a;
-    color: #b9b9ee;
-    padding: 0.2rem 0.55rem;
-    border-radius: 4px;
-    font-size: 0.85rem;
-    cursor: pointer;
-    line-height: 1;
-  }
-  .move-btn:hover { background: #22223a; color: #cdeaff; }
 
   .empty-state {
     padding: 0.75rem 1rem;

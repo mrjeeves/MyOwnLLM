@@ -132,9 +132,9 @@ and `audio_input_devices`.
   `limited` badge row under each active peer plus a one-line
   hardware summary (`Pi 5 · 4 GB RAM`, etc.).
 
-### ✅ Catalog gossip + Connections view
+### ✅ Catalog gossip + sidebar integration + Pull
 
-`catalog_announce` is now wired both ways. On every
+`catalog_announce` is wired both ways. On every
 `maybePromoteToActive` we send our current catalog to the
 just-active peer, and `App.svelte`'s `refreshConversations` calls
 `meshClient.noteCatalogChanged()` after each mutation — that
@@ -142,22 +142,37 @@ collapses into a debounced broadcast within `CATALOG_DEBOUNCE_MS`
 (1.5 s). A 60 s safety-net refresh catches out-of-band mutations
 that bypass the save path.
 
-The `CloudMeshConnections.svelte` sub-tab renders the catalog as
-a unified grid: rows are conversations, columns are devices (us
-first, peers after, sorted by label). Each cell is `host` /
-`moving…` / `—`. Click an `—` cell on a row hosted locally to
-Move that conversation to that peer; this is the same
-`moveConversation` RPC the Sidebar right-click menu uses.
+The catalog renders **directly in the main sidebar**: each
+connected peer becomes an expandable group under a "Network"
+divider with their hosted conversations as child rows. Right-click
+menu on a remote conversation → **← Pull from \<peer\>** which
+sends a `move_request` to the source. The source validates the
+requester is `active`-state (mutually authenticated + rostered),
+then drives the regular Move handshake (`move_offer` → `accept`
+→ `payload` → `complete`) with the requester as the destination.
+On failure (conversation not found, requester not authorized,
+move in flight) the source replies `move_request_decline`.
 
-The Connections tab also has a **Ring** section (active peers our
-local selector is routing through, auto-healed on every join /
-leave), an **Indirect** section (shelved + offline rostered
-peers), and a **Resources in use** map showing every in-flight
-inference (outbound + inbound) and Move as a live row with
-`→` / `←` direction markers. Each ring / indirect peer row
-surfaces a capability summary + badges so the user can see at a
-glance which peers can serve LLM / ASR / mic, what hardware
-they're running, and what their accepting policy is.
+Right-click on a local conversation still shows the existing
+**Push to device → \<peer\>** submenu (renamed from "Move to
+device" for symmetry with Pull). Right-click on a peer name in
+the sidebar opens **Cloud Mesh → Connections** via the
+`settings-route.svelte.ts` shared store — Chat / TranscribeView
+both subscribe to the route signal and open their settings panel
+on the requested tab + sub-tab.
+
+The `CloudMeshConnections.svelte` sub-tab no longer renders the
+catalog grid (that role moved to the sidebar). What remains:
+
+- **Ring** section — active peers our local selector is routing
+  through, auto-healed on every join / leave
+- **Indirect** section — shelved + offline rostered peers
+- **Resources in use** — live `→` outbound and `←` inbound rows
+  for every in-flight inference and Move
+
+Each ring / indirect peer row surfaces a capability summary +
+badges (LLM, ASR, mic, busy / limited) so the user can see at a
+glance what each peer can do.
 
 ### ✅ Remote inference (chat) over the mesh
 

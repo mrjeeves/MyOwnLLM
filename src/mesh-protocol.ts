@@ -72,6 +72,8 @@ export type MeshMessage =
   | MovePrepareMessage
   | MoveCommitMessage
   | MoveAbortMessage
+  | MoveRequestMessage
+  | MoveRequestDeclineMessage
   | InferRequestMessage
   | InferChunkMessage
   | InferDoneMessage
@@ -331,6 +333,33 @@ export interface MoveCommitMessage {
 export interface MoveAbortMessage {
   kind: "move_abort";
   guid: string;
+  reason: string;
+}
+
+/** "Pull" — requester asks the source peer to push `guid` to them.
+ *  The source validates (requester is an active rostered peer + the
+ *  conversation actually exists locally) and then drives the
+ *  regular `move_offer` → `move_accept` → `move_payload` →
+ *  `move_complete` handshake with the requester as the
+ *  destination. On failure, the source replies with
+ *  `move_request_decline` so the requester knows the pull didn't
+ *  start. Authorization: same gate as `infer_request` — only
+ *  active (mutually authenticated + rostered) peers may issue
+ *  pulls. */
+export interface MoveRequestMessage {
+  kind: "move_request";
+  /** Caller-assigned correlation id, echoed in
+   *  `move_request_decline` so concurrent pulls don't confuse the
+   *  caller. The subsequent move_offer / accept flow is keyed by
+   *  `guid` (a Move is per-conversation, not per-request), so no
+   *  echo is needed on the success path. */
+  id: string;
+  guid: string;
+}
+
+export interface MoveRequestDeclineMessage {
+  kind: "move_request_decline";
+  id: string;
   reason: string;
 }
 

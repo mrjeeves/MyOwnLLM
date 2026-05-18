@@ -24,6 +24,7 @@
   } from "./transcribe-state.svelte";
   import { chatSlot } from "./chat-slot.svelte";
   import { stickToBottom } from "./stick-to-bottom";
+  import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
   import { loadConfig } from "../config";
   import {
     loadConversation,
@@ -141,6 +142,22 @@
   let tpRegenBusy = $state(false);
   let sessionName = $state("");
   let settingsTab = $state<SettingsTab | null>(null);
+  /** Cloud Mesh sub-tab to open into when the Sidebar's per-peer
+   *  "Settings" item is invoked while the transcribe view is the
+   *  surface on screen. Mirrors the same plumbing in Chat. */
+  let settingsMeshSubTab = $state<CloudMeshSubTab | null>(null);
+
+  /** Observe the cross-component settings-open signal from
+   *  `settings-route.svelte.ts`. The Sidebar's per-peer "Settings"
+   *  menu writes here; whichever surface is mounted (Chat /
+   *  TranscribeView) routes it into its local settingsTab state. */
+  $effect(() => {
+    const pending = settingsRoute.pendingTab;
+    if (pending === null) return;
+    settingsTab = pending;
+    settingsMeshSubTab = settingsRoute.pendingMeshSubTab;
+    settingsRoute.clear();
+  });
   let transcribeError = $state("");
   /** Mirror async backend errors from `transcribeUi.error` (which the
    *  state listener populates on a final frame carrying `status`) into
@@ -1273,7 +1290,11 @@
   {#if settingsTab}
     <SettingsPanel
       initialTab={settingsTab}
-      onClose={() => (settingsTab = null)}
+      initialMeshSubTab={settingsMeshSubTab}
+      onClose={() => {
+        settingsTab = null;
+        settingsMeshSubTab = null;
+      }}
       onChanged={handleProviderChange}
     />
   {/if}

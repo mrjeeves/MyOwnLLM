@@ -3,6 +3,14 @@
   import CloudMeshConnections from "./CloudMeshConnections.svelte";
   import CloudMeshAddresses from "./CloudMeshAddresses.svelte";
   import RemoteSection from "./RemoteSection.svelte";
+  import type { CloudMeshSubTab } from "../settings-route.svelte";
+
+  let { initialSubTab = null } = $props<{
+    /** Deep-link target so the Sidebar's per-peer "Settings" menu
+     *  can land directly on Connections. Null = default (Status).
+     *  Read once on mount; further tab changes are user-driven. */
+    initialSubTab?: CloudMeshSubTab | null;
+  }>();
 
   /** Sub-tab strip mirrors the pattern Models uses.
    *
@@ -15,15 +23,19 @@
    *  - **Connections** lists the ring (currently routed peers,
    *    auto-healed on every join/leave), indirect peers we know
    *    about but aren't actively routing through (shelved or
-   *    offline rostered), an in-use resource map (inbound/outbound
-   *    inferences + moves), and the cross-device catalog grid.
+   *    offline rostered), and an in-use resource map
+   *    (inbound/outbound inferences + moves). The cross-device
+   *    catalog now lives directly in the main sidebar — each
+   *    connected peer is an expandable group there — so it's no
+   *    longer duplicated as a grid here.
    *  - **Settings** is set-once configuration (STUN, TURN, custom
    *    signaling relays).
    *  - **HTTP** (previously "LAN") is the local axum-served browser
    *    UI for phone/tablet access — renamed because "LAN" was
    *    misleading: the same surface is reachable from any HTTP
    *    client, mesh or no mesh. */
-  let tab = $state<"status" | "connections" | "settings" | "http">("status");
+  // svelte-ignore state_referenced_locally
+  let tab = $state<CloudMeshSubTab>(initialSubTab ?? "status");
 </script>
 
 <div class="section">
