@@ -5,8 +5,8 @@
     open as openDialog,
     save as saveDialog,
   } from "@tauri-apps/plugin-dialog";
-  import ModeBar from "./ModeBar.svelte";
-  import StatusBar from "./StatusBar.svelte";
+  import TopBar from "./TopBar.svelte";
+  import TranscribeBar from "./TranscribeBar.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import ConflictModal from "./ConflictModal.svelte";
   import DownloadOverlay from "./DownloadOverlay.svelte";
@@ -98,8 +98,9 @@
     onRequestStartRecording: (start: () => Promise<void>) => void;
     /** Ask App to activate Talking Points — App owns the singleton
      *  check against the chat slot and forwards to the chat-slot
-     *  store. */
-    onRequestActivateTalkingPoints: () => void;
+     *  store. `viaPeerId` (optional) routes TP through a Cloud Mesh
+     *  peer; null runs locally. */
+    onRequestActivateTalkingPoints: (viaPeerId: string | null) => void;
     /** Run a one-shot regenerate. App resolves the chat model + checks
      *  the slot; the returned promise resolves to `null` on success or
      *  an error message to surface inline. */
@@ -122,6 +123,19 @@
   let transcript = $state<TranscriptSegment[]>([]);
   let speakerLabels = $state<Record<number, string>>({});
   let diarizeEnabled = $state(true);
+  /** Routing pin for the transcription side — picked from the
+   *  TranscribeBar's ModelSelector. When set, the upcoming record /
+   *  upload will go through the named peer instead of running on this
+   *  device's ASR backend. The ModelSelector clears it automatically
+   *  if the peer drops. */
+  let transcribeViaPeerId = $state<string | null>(null);
+  /** Routing pin for the talking-points side — picked from the TP
+   *  bar's ModelSelector. When set, Talking Points routes its chat
+   *  cycles through the named peer via the mesh's `infer_request`
+   *  path. Captured separately from `transcribeViaPeerId` so the two
+   *  sides can offload to different peers (e.g. ASR to a GPU box,
+   *  TP to a phone keeping the LLM warm). */
+  let tpViaPeerId = $state<string | null>(null);
   /** Set while we're pulling the diarize composite on first toggle-on.
    *  Drives the inline progress text on the toggle itself. */
   let diarizePullStatus = $state("");
@@ -477,6 +491,21 @@
         `Switch family in Settings to one with a transcribe ladder.`;
       return;
     }
+    if (transcribeViaPeerId) {
+      // The protocol surface for remote transcribe is in this build
+      // (capabilities, mesh kinds, sender + receiver bookkeeping),
+      // but the Rust-side audio-chunk → ASR pipeline that the
+      // receiver feeds lands in the follow-up PR. Today, the
+      // receiver replies with `transcribe_error` so a routed start
+      // would never produce segments — fail loudly instead of
+      // silently dropping back to local, so the user knows the pin
+      // they set is the reason nothing started.
+      transcribeError =
+        "Remote transcribe is wired on the sender but the receiver " +
+        "pipeline lands in a follow-up. Pick 'this device' in the " +
+        "bar below to record locally.";
+      return;
+    }
     if (!(await ensureAsrReady(runtime, model))) {
       // ensureAsrReady set transcribeError; abort start.
       return;
@@ -572,6 +601,15 @@
       transcribeError =
         `Couldn't determine the ASR runtime for '${activeModel}'. ` +
         `Switch family in Settings to one with a transcribe ladder.`;
+      return;
+    }
+    if (transcribeViaPeerId) {
+      // See the matching block in `doStartRec` — same staged-vs-shipped
+      // gap on the receiver side.
+      transcribeError =
+        "Remote transcribe is wired on the sender but the receiver " +
+        "pipeline lands in a follow-up. Pick 'this device' in the " +
+        "bar below to upload locally.";
       return;
     }
     if (!(await ensureAsrReady(runtime, model))) return;
@@ -914,13 +952,15 @@
 </script>
 
 <div class="transcribe-shell">
-  <StatusBar
-    model={activeModel}
-    mode={activeMode}
-    family={activeFamily}
+  <TopBar
+    current={activeMode}
+    supported={supportedModes}
     {sidebarOpen}
     {onToggleSidebar}
+    onChange={handleModeChange}
     onOpenSettings={(tab) => (settingsTab = tab)}
+    onRequestStopTranscribe={() => onRequestStopTranscribe()}
+    onRequestStopChat={() => onRequestStopChat()}
   />
 
   <div class="split">
@@ -1029,6 +1069,15 @@
           </p>
         {/if}
       </div>
+      <TranscribeBar
+        activeModel={activeModel}
+        activeFamily={activeFamily}
+        activeMode={activeMode}
+        kind="transcribe"
+        viaPeerId={transcribeViaPeerId}
+        onViaChange={(p) => (transcribeViaPeerId = p)}
+        disabled={transcribeUi.active}
+      />
     </section>
 
     {#if isTpPaneCollapsed}
@@ -1153,14 +1202,14 @@
           </ul>
           {#if isMyRecording && chatSlot.kind === null}
             <div class="tp-activate-row">
-              <button class="tp-activate" onclick={onRequestActivateTalkingPoints}>
+              <button class="tp-activate" onclick={() => onRequestActivateTalkingPoints(tpViaPeerId)}>
                 Resume Talking Points
               </button>
             </div>
           {/if}
         {:else if isMyRecording && chatSlot.kind === null}
           <div class="tp-activate-shell">
-            <button class="tp-activate big" onclick={onRequestActivateTalkingPoints}>
+            <button class="tp-activate big" onclick={() => onRequestActivateTalkingPoints(tpViaPeerId)}>
               <span class="tp-spark" aria-hidden="true">✦</span>
               Activate Talking Points
             </button>
@@ -1182,22 +1231,18 @@
           </div>
         {/if}
       </div>
+      <TranscribeBar
+        activeModel={textModel || activeModel}
+        activeFamily={activeFamily}
+        activeMode="text"
+        kind="text"
+        viaPeerId={tpViaPeerId}
+        onViaChange={(p) => (tpViaPeerId = p)}
+        disabled={isMyTalkingPoints}
+      />
     </section>
     {/if}
   </div>
-
-  <ModeBar
-    current={activeMode}
-    supported={supportedModes}
-    tokensUsed={0}
-    contextSize={0}
-    thinkingEnabled={false}
-    thinkingAvailable={false}
-    onChange={handleModeChange}
-    onThinkingChange={() => {}}
-    onRequestStopTranscribe={() => onRequestStopTranscribe()}
-    onRequestStopChat={() => onRequestStopChat()}
-  />
 
   {#if asrPullStatus}
     <div class="mic-status">{asrPullStatus}</div>

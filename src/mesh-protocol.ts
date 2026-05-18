@@ -118,6 +118,10 @@ export const FEATURES = {
   /** Sender publishes `app_version` in capabilities so peers can
    *  surface a version pill in the connections card. Phase 2.1. */
   APP_VERSION: "app_version",
+  /** Sender can serve `transcribe_request` (audio chunks in,
+   *  `transcribe_segment` frames back) and the caller can stream
+   *  `transcribe_audio_chunk` against it. Phase 2.2. */
+  REMOTE_TRANSCRIBE: "transcribe_request",
 } as const;
 
 /** The full set of feature ids this build advertises. Sent inside
@@ -134,6 +138,7 @@ export const ADVERTISED_FEATURES: string[] = [
   FEATURES.RING_TOPOLOGY,
   FEATURES.FILE_TRANSFER,
   FEATURES.APP_VERSION,
+  FEATURES.REMOTE_TRANSCRIBE,
 ];
 
 /** Features a Phase 2.0 peer would have implicitly supported even
@@ -242,7 +247,13 @@ export type MeshMessage =
   | FileDeclineMessage
   | FileChunkMessage
   | FileCompleteMessage
-  | FileAbortMessage;
+  | FileAbortMessage
+  | TranscribeRequestMessage
+  | TranscribeAudioChunkMessage
+  | TranscribeSegmentMessage
+  | TranscribeDoneMessage
+  | TranscribeErrorMessage
+  | TranscribeCancelMessage;
 
 // ---- capabilities --------------------------------------------------------
 
@@ -722,6 +733,125 @@ export interface FileAbortMessage {
   kind: "file_abort";
   id: string;
   reason: string;
+}
+
+// ---- remote transcribe (Phase 2.2) --------------------------------------
+//
+// Audio frames in, transcript segments back. Same handshake shape as
+// `infer_request`: caller sends `transcribe_request` to open a
+// session, streams `transcribe_audio_chunk` frames against it (PCM
+// int16 mono at the negotiated sample rate, base64 in the JSON
+// envelope), and the peer streams `transcribe_segment` frames back
+// until a terminal `transcribe_done` or `transcribe_error`. Either
+// side can interrupt with `transcribe_cancel`.
+//
+// Audio framing: PCM int16 little-endian, mono, 16 kHz — what the
+// existing ASR backends (moonshine / parakeet) consume internally.
+// Chunks sized to ~1 s of audio (32 KB raw, ~43 KB base64) keep us
+// well under WebRTC SCTP message limits while letting the peer's
+// ASR backend run on its native 5 s frame cadence after a couple of
+// chunks land. The receiver buffers chunks until the backend's
+// frame size is reached.
+
+/** PCM sample rate for `transcribe_audio_chunk`. Locked to 16 kHz to
+ *  match what the on-device ASR pipeline already runs at — no need
+ *  to negotiate per-session yet. */
+export const TRANSCRIBE_SAMPLE_RATE = 16_000;
+
+/** Bytes per `transcribe_audio_chunk` raw payload (pre-base64).
+ *  Sized so a single chunk encodes to well under the FILE_CHUNK_BYTES
+ *  ceiling and so a single second of mic audio fits in one frame. */
+export const TRANSCRIBE_AUDIO_CHUNK_BYTES = 32 * 1024;
+
+/** Open a transcribe session on the peer. The peer reserves a
+ *  worker, kicks off its local pipeline against the negotiated
+ *  `runtime` + `model`, and waits for `transcribe_audio_chunk`
+ *  frames. Authorization mirrors `infer_request` — sender must
+ *  be active in the peer's roster, peer must advertise
+ *  `REMOTE_TRANSCRIBE`. */
+export interface TranscribeRequestMessage {
+  kind: "transcribe_request";
+  /** Caller-assigned id, echoed in every frame so multiple
+   *  concurrent transcribe sessions on the same data channel can't
+   *  cross. */
+  id: string;
+  /** Backend runtime ("moonshine" or "parakeet"). Sender's pick;
+   *  the peer may downgrade if the named tier isn't installed and
+   *  surface that via `transcribe_error`. */
+  runtime: string;
+  /** Tier name within the runtime — e.g. "small-q8" for moonshine.
+   *  The peer's own `asr_models_list` is the source of truth for
+   *  what's actually installed. */
+  model: string;
+  /** Diarize composite name when speaker labels are wanted, null
+   *  otherwise. The receiver pulls the composite if missing — same
+   *  semantics as the local toggle in TranscribeView. */
+  diarize_model?: string | null;
+  /** Sample rate of the audio chunks the sender will ship.
+   *  Negotiated upfront so the receiver can configure its decode
+   *  ring buffer. v1 always sends `TRANSCRIBE_SAMPLE_RATE` but the
+   *  field is on the wire so a future low-bandwidth peer can ask
+   *  for 8 kHz without breaking the framing. */
+  sample_rate: number;
+}
+
+/** One chunk of PCM audio, base64-encoded little-endian int16
+ *  samples at the session's `sample_rate`. `index` is the 0-based
+ *  ordinal so the receiver can detect drops; `is_final` flips true
+ *  when the sender has reached EOF (file upload) or the user
+ *  stopped the recording. */
+export interface TranscribeAudioChunkMessage {
+  kind: "transcribe_audio_chunk";
+  id: string;
+  index: number;
+  bytes_b64: string;
+  is_final: boolean;
+}
+
+/** Receiver streams transcribed segments back. Mirrors the
+ *  `TranscriptSegment` shape the GUI already renders so the caller
+ *  can append straight into the live transcript without translating
+ *  field names. */
+export interface TranscribeSegmentMessage {
+  kind: "transcribe_segment";
+  id: string;
+  /** Segment text — what the ASR backend emitted, already trimmed. */
+  text: string;
+  /** Speaker id when diarization is on; undefined when off or
+   *  unattributable. */
+  speaker?: number;
+  /** True when multiple speakers overlapped during this segment so
+   *  the GUI can flag it in the transcript view. */
+  overlap?: boolean;
+  /** Optional millisecond offsets so the upload-progress bar on the
+   *  sender can advance its "transcribed up to here" fill. */
+  start_ms?: number;
+  end_ms?: number;
+}
+
+/** Receiver terminated the stream — either naturally on EOF or
+ *  because it observed `transcribe_cancel`. Mirrors `InferDone`. */
+export interface TranscribeDoneMessage {
+  kind: "transcribe_done";
+  id: string;
+  cancelled?: boolean;
+}
+
+/** Receiver couldn't continue — bad model name, ASR worker panic,
+ *  diarize pull failure, etc. The sender surfaces this inline in
+ *  the transcribe error band and re-routes to local on the next
+ *  attempt. */
+export interface TranscribeErrorMessage {
+  kind: "transcribe_error";
+  id: string;
+  message: string;
+}
+
+/** Either side aborts. Sender uses this on Stop / mode switch /
+ *  conflict modal confirm; receiver uses it on shutdown. */
+export interface TranscribeCancelMessage {
+  kind: "transcribe_cancel";
+  id: string;
 }
 
 /** Compose the payload that a peer signs in response to a `hello`.

@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { Mode } from "../types";
+  import { updateUi } from "../update-state.svelte";
+  import type { SettingsTab } from "../update-state.svelte";
   import { transcribeUi, pauseRecording, resumeRecording } from "./transcribe-state.svelte";
   import {
     chatSlot,
@@ -11,85 +13,34 @@
   let {
     current,
     supported,
-    tokensUsed,
-    contextSize,
-    thinkingEnabled,
-    thinkingAvailable,
+    sidebarOpen,
+    onToggleSidebar,
     onChange,
-    onThinkingChange,
+    onOpenSettings,
     onRequestStopTranscribe,
     onRequestStopChat,
   } = $props<{
     current: Mode;
-    /** Modes the active manifest defines tiers for. Modes outside this set
-     *  render disabled with an "(unsupported)" hint. */
     supported: Set<Mode>;
-    /** Estimated tokens currently in context (history + draft). The bar
-     *  shows it as `used / total` with a small ring, no tooltips needed. */
-    tokensUsed: number;
-    /** Model's reported context window. 0 means "not yet known" — we hide
-     *  the saturation block in that case rather than render `0 / 0`. */
-    contextSize: number;
-    /** Whether the user has requested reasoning tokens for the active
-     *  conversation. Drives both the brain toggle's visual state and the
-     *  `think` flag we pass to local + remote inference. */
-    thinkingEnabled: boolean;
-    /** Render the brain toggle? Hidden when the current mode doesn't
-     *  involve generation (transcribe doesn't think). Chat.svelte
-     *  passes `current === "text"`. */
-    thinkingAvailable: boolean;
+    sidebarOpen: boolean;
+    onToggleSidebar: () => void;
     onChange: (mode: Mode) => void;
-    /** Toggle the thinking-requested flag for the active conversation.
-     *  Persisted by the caller (Chat.svelte writes through
-     *  saveConversation). */
-    onThinkingChange: (next: boolean) => void;
-    /** Stop transcription. Routed to the App-level confirm dialog so the
-     *  pending-chunks warning lives in one place. */
+    onOpenSettings: (tab: SettingsTab) => void;
     onRequestStopTranscribe: () => void;
-    /** Stop the chat-slot occupant — cancels an in-flight chat stream or
-     *  stops the Talking Points loop. */
     onRequestStopChat: () => void;
   }>();
 
-  // Trimmed to text + transcribe to match the redesigned mode bar — vision
-  // and code aren't surfaced in the GUI right now.
+  // Same mode set the redesigned bar surfaces. Trimmed to text +
+  // transcribe; vision/code aren't surfaced in the GUI yet.
   const modes: Array<{ id: Mode; label: string }> = [
     { id: "text", label: "Text" },
     { id: "transcribe", label: "Transcribe" },
   ];
 
-  const ratio = $derived(contextSize > 0 ? Math.min(1, tokensUsed / contextSize) : 0);
-
-  // SVG ring geometry: circumference = 2πr. r=6 on a 16x16 canvas keeps the
-  // stroke from clipping the bbox while leaving a 1px stroke ring readable.
-  const RADIUS = 6;
-  const CIRC = 2 * Math.PI * RADIUS;
-  const dash = $derived(CIRC * ratio);
-
-  /** Saturation-aware ring colour: green → amber → red as the context fills.
-   *  Same thresholds the macOS battery icon uses, for familiarity. */
-  const ringColor = $derived(
-    ratio < 0.6 ? "#4caf50" : ratio < 0.85 ? "#d49a3b" : "#e35a5a",
-  );
-
-  /** Compact display: 1234 → "1.2k". Keeps the bar a fixed-ish width so
-   *  the mode buttons don't shift as the conversation grows. */
-  function fmt(n: number): string {
-    if (n < 1000) return String(n);
-    if (n < 10_000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
-    return Math.round(n / 1000) + "k";
-  }
-
-  function fmtElapsed(sec: number): string {
-    const m = Math.floor(sec / 60).toString().padStart(2, "0");
-    const s = (sec % 60).toString().padStart(2, "0");
-    return `${m}:${s}`;
-  }
-
-  // Per-mode slot state pulled from the global stores so any mode's view
-  // renders the same indicator. The mode buttons don't care which
-  // conversation/session owns the slot — they just reflect "is this slot
-  // doing something right now".
+  // Per-mode slot state lifted from the global stores so any view's
+  // top bar reflects the same indicator regardless of which surface is
+  // mounted. The mode buttons don't care which conversation owns the
+  // slot — they just show "is this mode doing something right now".
   const textKind = $derived(chatSlot.kind);
   const textStatus = $derived(chatSlot.status);
   const textLabel = $derived(
@@ -112,14 +63,37 @@
       : "idle",
   );
 
-  /** A live chat stream pins the UI to its conversation — the messages list
-   *  lives on Chat.svelte, so unmounting that component (by switching modes)
-   *  orphans the deltas. We disable the other mode buttons until the stream
-   *  releases the slot, matching the "stop to switch" rule for transcribe. */
+  // Lockout: while a chat is streaming, switching modes would unmount
+  // Chat and orphan the stream. Same rule the old mode bar enforced.
   const chatRunning = $derived(chatSlot.kind === "chat");
+
+  function fmtElapsed(sec: number): string {
+    const m = Math.floor(sec / 60).toString().padStart(2, "0");
+    const s = (sec % 60).toString().padStart(2, "0");
+    return `${m}:${s}`;
+  }
+
+  function openSettings() {
+    onOpenSettings(updateUi.available ? "updates" : "providers");
+  }
 </script>
 
-<div class="mode-bar">
+<div class="top-bar">
+  <button
+    class="hamburger"
+    onclick={onToggleSidebar}
+    title={sidebarOpen ? "Hide conversations" : "Show conversations"}
+    aria-label="Toggle conversations"
+    aria-expanded={sidebarOpen}
+  >
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+      <path
+        fill="currentColor"
+        d="M3 6h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2z"
+      />
+    </svg>
+  </button>
+
   <div class="modes">
     {#each modes as m}
       {@const ok = supported.has(m.id)}
@@ -243,71 +217,76 @@
     {/each}
   </div>
 
-  {#if thinkingAvailable}
-    <!-- Thinking toggle: a brain icon that flips the `think` flag on
-         the active conversation. Persists per-conversation via
-         saveConversation so a chat set to "reason carefully" keeps
-         doing that across reloads. The local / remote send paths
-         both read this flag — toggling it once on either device
-         changes what the model is asked to do on the very next send. -->
-    <button
-      class="brain-toggle"
-      class:active={thinkingEnabled}
-      onclick={() => onThinkingChange(!thinkingEnabled)}
-      aria-pressed={thinkingEnabled}
-      title={thinkingEnabled
-        ? "Thinking on — model emits reasoning tokens before its answer (click to turn off)."
-        : "Thinking off — click to ask the model for reasoning tokens before answering."}
-      aria-label={thinkingEnabled ? "Disable thinking" : "Enable thinking"}
-    >
-      <!-- Minimal brain glyph. The outline matches the line weight
-           of the context-ring stroke so the two reads as a set. -->
-      <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
-        <path
-          fill="currentColor"
-          d="M9.5 3a3 3 0 0 0-2.83 2A3 3 0 0 0 4 8c0 .69.24 1.32.63 1.83A3 3 0 0 0 5 15a3 3 0 0 0 1.06 2.29A3 3 0 0 0 11 19V5a3 3 0 0 0-1.5-2zM15 19a3 3 0 0 0 2.94-2.71A3 3 0 0 0 19 15a3 3 0 0 0 .37-5.17C19.76 9.32 20 8.69 20 8a3 3 0 0 0-2.67-3 3 3 0 0 0-2.83-2A3 3 0 0 0 13 5v14a3 3 0 0 0 2-1z"
-        />
-      </svg>
-    </button>
-  {/if}
+  <div class="spacer"></div>
 
-  {#if contextSize > 0}
-    <div
-      class="ctx"
-      title="Context: {tokensUsed} / {contextSize} tokens"
-      aria-label="Context saturation: {tokensUsed} of {contextSize} tokens"
-    >
-      <svg class="ring" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-        <circle cx="8" cy="8" r={RADIUS} fill="none" stroke="#2a2a2a" stroke-width="2" />
-        <circle
-          cx="8"
-          cy="8"
-          r={RADIUS}
-          fill="none"
-          stroke={ringColor}
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-dasharray="{dash} {CIRC}"
-          transform="rotate(-90 8 8)"
-        />
-      </svg>
-      <span class="num">{fmt(tokensUsed)}</span>
-      <span class="sep">/</span>
-      <span class="den">{fmt(contextSize)}</span>
-    </div>
-  {/if}
+  <button
+    class="settings-btn"
+    onclick={openSettings}
+    title={updateUi.available
+      ? `Update ${updateUi.available.version} available`
+      : "Settings"}
+    aria-label="Settings"
+  >
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+      <path
+        fill="currentColor"
+        d="M19.43 12.98a7.7 7.7 0 0 0 0-1.96l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.5 7.5 0 0 0-1.7-.98l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54a7.5 7.5 0 0 0-1.7.98l-2.39-.96a.5.5 0 0 0-.6.22L2.8 8.8a.5.5 0 0 0 .12.64l2.03 1.58a7.7 7.7 0 0 0 0 1.96L2.92 14.56a.5.5 0 0 0-.12.64l1.92 3.32a.5.5 0 0 0 .6.22l2.39-.96a7.5 7.5 0 0 0 1.7.98l.36 2.54a.5.5 0 0 0 .5.42h3.84a.5.5 0 0 0 .5-.42l.36-2.54a7.5 7.5 0 0 0 1.7-.98l2.39.96a.5.5 0 0 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"
+      />
+    </svg>
+    {#if updateUi.available}
+      <span
+        class="update-dot"
+        aria-label="Update {updateUi.available.version} available"
+      ></span>
+    {/if}
+  </button>
 </div>
 
 <style>
-  .mode-bar {
+  .top-bar {
     display: flex;
     align-items: center;
+    padding: .4rem .75rem;
+    border-bottom: 1px solid #1a1a1a;
+    background: #0d0d0d;
     gap: .5rem;
-    padding: .45rem .75rem;
-    background: #0f0f0f;
-    border-top: 1px solid #1a1a1a;
   }
-  .modes { display: flex; gap: .5rem; flex: 1; min-width: 0; flex-wrap: wrap; }
+  .hamburger {
+    background: none;
+    border: none;
+    color: #777;
+    cursor: pointer;
+    padding: .25rem .35rem;
+    border-radius: 5px;
+    display: flex;
+    align-items: center;
+  }
+  .hamburger:hover { background: #1a1a1a; color: #ccc; }
+  .spacer { flex: 1; }
+  .settings-btn {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    background: none;
+    border: none;
+    color: #777;
+    cursor: pointer;
+    padding: .25rem .35rem;
+    border-radius: 5px;
+  }
+  .settings-btn:hover { background: #1a1a1a; color: #ccc; }
+  .update-dot {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #f59e0b;
+    box-shadow: 0 0 6px rgba(245, 158, 11, 0.7);
+  }
+
+  .modes { display: flex; gap: .5rem; min-width: 0; }
 
   .slot {
     display: inline-flex;
@@ -392,8 +371,6 @@
   }
   .slot.paused .status-backlog { background: #2a2410; color: #f0d8a8; }
   .slot.drain .status-backlog { background: #122030; color: #a8c8f0; }
-  /* Active mode (purple) overrides the per-status text colours so the
-     label stays readable against the purple fill. */
   .mode-btn.active .status-row { border-left-color: rgba(255, 255, 255, .35); }
   .mode-btn.active .status-text,
   .mode-btn.active .status-time { color: #fff; }
@@ -421,45 +398,4 @@
   .slot.drain .ctrl { color: #a4c4e8; }
   .slot.drain .ctrl:hover:not(:disabled) { background: #14202a; color: #fff; }
   .ctrl.stop:hover:not(:disabled) { color: #fff; background: #5a2424; }
-
-  .ctx {
-    display: inline-flex;
-    align-items: center;
-    gap: .3rem;
-    color: #777;
-    font-size: .72rem;
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    user-select: none;
-    flex-shrink: 0;
-  }
-  .ring { display: block; }
-  .num { color: #aaa; }
-  .sep { color: #444; }
-  .den { color: #666; }
-
-  /* Brain toggle — sits just before the context ring so the two
-     read as a pair ("how much we're using" + "how hard we're
-     thinking about it"). Inactive state matches the .ctx muted
-     palette; active state pops to the same purple as the chat
-     send button so a hot-toggle is unmistakable. */
-  .brain-toggle {
-    background: none;
-    border: 1px solid transparent;
-    color: #555;
-    border-radius: 5px;
-    padding: .2rem .35rem;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    line-height: 0;
-    flex-shrink: 0;
-    transition: color .12s, background .12s, border-color .12s;
-  }
-  .brain-toggle:hover { color: #aaa; background: #1a1a1a; }
-  .brain-toggle.active {
-    color: #d8d8ff;
-    background: #2a2a55;
-    border-color: #3a3a7a;
-  }
-  .brain-toggle.active:hover { background: #3a3a7a; }
 </style>

@@ -83,6 +83,8 @@ import {
   type FileOfferMessage,
   type InferRequestMessage,
   type MeshMessage,
+  type TranscribeRequestMessage,
+  TRANSCRIBE_SAMPLE_RATE,
 } from "./mesh-protocol";
 import { snapshotCapabilities } from "./mesh-capabilities";
 
@@ -683,6 +685,36 @@ class MeshClient {
     string,
     { requester_peer_id: string; local_stream_id: string }
   >();
+  /** Transcribe sessions we initiated and are waiting on
+   *  `transcribe_segment` frames for. Same shape as
+   *  `pending_infers_out` but tailored to the transcribe RPC: the
+   *  `on_segment` callback is fired for each segment the peer
+   *  emits; `on_done` / `on_error` fire on the terminal frame. */
+  private pending_transcribes_out = new Map<
+    string,
+    {
+      target_peer_id: string;
+      on_segment: (frame: {
+        text: string;
+        speaker?: number;
+        overlap?: boolean;
+        start_ms?: number;
+        end_ms?: number;
+      }) => void;
+      on_done: (cancelled: boolean) => void;
+      on_error: (message: string) => void;
+    }
+  >();
+  /** Transcribe sessions we're SERVING for remote peers. Tracks the
+   *  requester so an inbound `transcribe_cancel` can be matched to
+   *  the right local pipeline, and the runtime/model we resolved so
+   *  the (future) audio-chunk handler can route bytes to the right
+   *  worker. The local pipeline itself is wired in a follow-up Rust
+   *  PR — see `handleTranscribeRequest` for the current stub. */
+  private pending_transcribes_in = new Map<
+    string,
+    { requester_peer_id: string; runtime: string; model: string }
+  >();
   /** Debounce handle for catalog broadcasts. Multiple
    *  `noteCatalogChanged` calls within CATALOG_DEBOUNCE_MS coalesce
    *  into a single send. */
@@ -1107,6 +1139,11 @@ class MeshClient {
     }
     this.pending_infers_out.clear();
     this.pending_infers_in.clear();
+    for (const [, pending] of this.pending_transcribes_out) {
+      pending.on_error("mesh stopped");
+    }
+    this.pending_transcribes_out.clear();
+    this.pending_transcribes_in.clear();
     this.pending_moves_in.clear();
     this.pending_move_guids.clear();
     for (const [, pending] of this.pending_pulls_out) {
@@ -1965,6 +2002,39 @@ class MeshClient {
       case "file_abort":
         this.handleFileAbort(msg.id, msg.reason);
         break;
+      case "transcribe_request":
+        // Same active-peer gate as the rest of the RPC surface.
+        if (this.peerStatus(conn) !== "active") {
+          this.send(conn, {
+            kind: "transcribe_error",
+            id: msg.id,
+            message: "peer not authorized",
+          });
+          break;
+        }
+        void this.handleTranscribeRequest(conn, msg);
+        break;
+      case "transcribe_audio_chunk":
+        this.handleTranscribeAudioChunkInbound(conn, msg.id, msg);
+        break;
+      case "transcribe_segment":
+        this.handleTranscribeSegmentInbound(msg.id, {
+          text: msg.text,
+          speaker: msg.speaker,
+          overlap: msg.overlap,
+          start_ms: msg.start_ms,
+          end_ms: msg.end_ms,
+        });
+        break;
+      case "transcribe_done":
+        this.handleTranscribeDoneInbound(msg.id, !!msg.cancelled);
+        break;
+      case "transcribe_error":
+        this.handleTranscribeErrorInbound(msg.id, msg.message);
+        break;
+      case "transcribe_cancel":
+        this.handleTranscribeCancelInbound(conn, msg.id);
+        break;
     }
   }
 
@@ -2403,6 +2473,19 @@ class MeshClient {
       if (served.requester_peer_id === peer_id) {
         void invoke("ollama_chat_cancel", { streamId: served.local_stream_id }).catch(() => {});
         this.pending_infers_in.delete(id);
+      }
+    }
+    // Transcribe sessions either way against this peer — fail outbound
+    // callers and drop inbound bookkeeping.
+    for (const [id, pending] of this.pending_transcribes_out) {
+      if (pending.target_peer_id === peer_id) {
+        pending.on_error("peer disconnected mid-transcribe");
+        this.pending_transcribes_out.delete(id);
+      }
+    }
+    for (const [id, served] of this.pending_transcribes_in) {
+      if (served.requester_peer_id === peer_id) {
+        this.pending_transcribes_in.delete(id);
       }
     }
     // Pulls in flight against this peer never complete — fail them.
@@ -3100,6 +3183,210 @@ class MeshClient {
     } finally {
       unlisten?.();
     }
+  }
+
+  // ---- remote transcribe (Phase 2.2) ----------------------------------
+  //
+  // Open a transcribe session on a peer and stream PCM audio chunks at
+  // it. The peer runs its local ASR pipeline against the inbound bytes
+  // and streams `transcribe_segment` frames back. The shape mirrors the
+  // infer RPCs so the GUI layer can treat both as "stream out, frames
+  // back" without bespoke per-rpc plumbing.
+  //
+  // The audio-chunk handler on the receiver (`handleTranscribeAudioChunkInbound`)
+  // is the integration point with the Rust ASR pipeline. The first
+  // version below accepts chunks into a buffer but leaves the actual
+  // wiring to a follow-up Rust PR — the JS protocol surface stays
+  // forward-compatible with that work.
+
+  /** Open a transcribe session on `target_peer_id`. Returns a handle
+   *  the caller uses to ship audio chunks and to cancel. The peer
+   *  must be active, not busy, and advertise REMOTE_TRANSCRIBE. */
+  async sendTranscribeRequest(args: {
+    target_peer_id: string;
+    runtime: string;
+    model: string;
+    diarize_model?: string | null;
+    on_segment: (frame: {
+      text: string;
+      speaker?: number;
+      overlap?: boolean;
+      start_ms?: number;
+      end_ms?: number;
+    }) => void;
+    on_done: (cancelled: boolean) => void;
+    on_error: (message: string) => void;
+  }): Promise<{
+    id: string;
+    sendAudioChunk: (pcmBytes: Uint8Array, isFinal: boolean) => void;
+    cancel: () => void;
+  }> {
+    const conn = this.connections.get(args.target_peer_id);
+    if (!conn) throw new Error("target peer not connected");
+    if (this.peerStatus(conn) !== "active") {
+      throw new Error("target peer not in active state");
+    }
+    if (conn.capabilities.accepting === "busy") {
+      throw new Error("target peer is busy");
+    }
+    if (!peerSupportsFeature(conn.capabilities, FEATURES.REMOTE_TRANSCRIBE)) {
+      throw new Error(
+        "target peer doesn't advertise remote transcribe support — they may be on an older build",
+      );
+    }
+    const id = generateMeshId();
+    this.pending_transcribes_out.set(id, {
+      target_peer_id: args.target_peer_id,
+      on_segment: args.on_segment,
+      on_done: args.on_done,
+      on_error: args.on_error,
+    });
+    this.send(conn, {
+      kind: "transcribe_request",
+      id,
+      runtime: args.runtime,
+      model: args.model,
+      diarize_model: args.diarize_model ?? null,
+      sample_rate: TRANSCRIBE_SAMPLE_RATE,
+    });
+    let chunkIndex = 0;
+    const sendAudioChunk = (pcmBytes: Uint8Array, isFinal: boolean) => {
+      if (!this.pending_transcribes_out.has(id)) return;
+      const bytes_b64 = base64FromBytes(pcmBytes);
+      this.send(conn, {
+        kind: "transcribe_audio_chunk",
+        id,
+        index: chunkIndex++,
+        bytes_b64,
+        is_final: isFinal,
+      });
+    };
+    const cancel = () => {
+      this.send(conn, { kind: "transcribe_cancel", id });
+      const pending = this.pending_transcribes_out.get(id);
+      if (pending) {
+        this.pending_transcribes_out.delete(id);
+        pending.on_done(true);
+      }
+    };
+    return { id, sendAudioChunk, cancel };
+  }
+
+  private handleTranscribeSegmentInbound(
+    id: string,
+    frame: {
+      text: string;
+      speaker?: number;
+      overlap?: boolean;
+      start_ms?: number;
+      end_ms?: number;
+    },
+  ): void {
+    const pending = this.pending_transcribes_out.get(id);
+    if (!pending) return;
+    pending.on_segment(frame);
+  }
+
+  private handleTranscribeDoneInbound(id: string, cancelled: boolean): void {
+    const pending = this.pending_transcribes_out.get(id);
+    if (!pending) return;
+    this.pending_transcribes_out.delete(id);
+    pending.on_done(cancelled);
+  }
+
+  private handleTranscribeErrorInbound(id: string, message: string): void {
+    const pending = this.pending_transcribes_out.get(id);
+    if (!pending) return;
+    this.pending_transcribes_out.delete(id);
+    pending.on_error(message);
+  }
+
+  private handleTranscribeCancelInbound(
+    conn: ConnectionState,
+    id: string,
+  ): void {
+    const served = this.pending_transcribes_in.get(id);
+    if (!served || served.requester_peer_id !== conn.peer_id) return;
+    // Drop the bookkeeping; the actual ASR pipeline shutdown is the
+    // Rust-side integration that the follow-up PR wires up.
+    this.pending_transcribes_in.delete(id);
+  }
+
+  /** Serve an inbound `transcribe_request`. Resolves the requested
+   *  runtime + model against our local ASR registry, kicks off the
+   *  pipeline, and streams `transcribe_segment` frames back as the
+   *  ASR worker emits them.
+   *
+   *  Current implementation: validates the request and reserves the
+   *  bookkeeping slot, but responds with `transcribe_error` because
+   *  the audio-chunk → Rust ASR pipeline wiring lands in a follow-up
+   *  PR (the existing `transcribe_start_session` Rust command takes
+   *  mic / file input, not piped chunks). The protocol surface is
+   *  here so callers can detect support via capability gating today;
+   *  flipping the receiver from "decline" to "serve" doesn't require
+   *  protocol churn. */
+  private async handleTranscribeRequest(
+    conn: ConnectionState,
+    msg: TranscribeRequestMessage,
+  ): Promise<void> {
+    if (this.accepting === "busy") {
+      this.send(conn, {
+        kind: "transcribe_error",
+        id: msg.id,
+        message: "local accepting policy is busy",
+      });
+      return;
+    }
+    const cap = this.my_capabilities;
+    const runtime = msg.runtime;
+    const requestedTier = msg.model;
+    // Permissive match: exact tier wins, else any installed model on
+    // the same runtime, else any ASR backend at all.
+    const exact = cap.asr.find(
+      (m) => m.backend === runtime && m.tier === requestedTier,
+    );
+    const sameRuntime = cap.asr.find((m) => m.backend === runtime);
+    const anyAsr = cap.asr[0];
+    const picked = exact ?? sameRuntime ?? anyAsr;
+    if (!picked) {
+      this.send(conn, {
+        kind: "transcribe_error",
+        id: msg.id,
+        message: "no local ASR backend available to serve request",
+      });
+      return;
+    }
+    this.pending_transcribes_in.set(msg.id, {
+      requester_peer_id: conn.peer_id,
+      runtime: picked.backend,
+      model: `${picked.backend}-${picked.tier}`,
+    });
+    // The audio-chunk → ASR worker wiring lives in the Rust crate
+    // and is the follow-up to this PR. Surface the gap honestly so
+    // the caller can fall back to local transcription instead of
+    // hanging on a session that never produces segments.
+    this.send(conn, {
+      kind: "transcribe_error",
+      id: msg.id,
+      message:
+        "remote transcribe receiver is staged but the audio pipeline isn't wired yet — run locally for now",
+    });
+    this.pending_transcribes_in.delete(msg.id);
+  }
+
+  /** Inbound audio chunk for a session we're serving. The current
+   *  receiver responds to `transcribe_request` with an error before
+   *  any chunks would arrive; this handler is a no-op placeholder so
+   *  the dispatch switch in `handleMessageOn` stays exhaustive and
+   *  the follow-up Rust PR can hook directly into it without
+   *  touching this file. */
+  private handleTranscribeAudioChunkInbound(
+    _conn: ConnectionState,
+    id: string,
+    _msg: { index: number; bytes_b64: string; is_final: boolean },
+  ): void {
+    if (!this.pending_transcribes_in.has(id)) return;
+    // Intentional no-op until the Rust-side piped-input pipeline lands.
   }
 
   // ---- file transfer (Phase 2.1) --------------------------------------
