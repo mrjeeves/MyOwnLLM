@@ -702,7 +702,8 @@ Cloud Mesh ships off by default. To turn it on, open **Settings → Cloud Mesh �
 
 | Feature | Where it shows up |
 |---------|-------------------|
-| **Cross-device conversation list** | The main **sidebar** shows each connected peer as an expandable "Network" group below your local conversations. Their hosted chats and transcribe sessions appear directly under their peer-group row, **organized into the same folder tree the peer uses on-host** — so `Work/Projects/Q4 planning` on the source shows up as nested expandable folders on every connected device, not as a flat list. Right-click a peer name to jump to **Cloud Mesh → Connections**. |
+| **Cross-device conversation list** | The main **sidebar** has an always-visible **Network** section at the bottom with one row per saved network and a **+ Add** button. Click a saved network to switch to it; the active network is highlighted and expanded with its connected peers as nested groups. Peer conversations appear under each peer-group row, **organized into the same folder tree the peer uses on-host** — so `Work/Projects/Q4 planning` on the source shows up as nested expandable folders on every device, not as a flat list. Right-click a network → switch / settings / forget. Right-click a peer → settings. |
+| **Saved networks** | The mesh is a single-active-network model: only one Trystero room joined at a time, but the user can save several (`home-mesh`, `office-mesh`, `camping-mesh`) and switch between them with one click. Each saved network keeps its own roster file (`~/.myownllm/mesh/rosters/{network_id}.json`) so switching back skips re-authentication for previously-approved peers. Per-network settings: accepting policy, signaling relays, STUN, TURN. |
 | **Push a local conversation** | Right-click any local conversation in the sidebar → **Push to device → \<peer\>**. The sender's copy is deleted after the receiver acks; the receiver lands the conversation in the same folder it lived in on the source (creating intermediate folders if needed). Single-RTT today; tracked with a `moving…` pill on the catalog row across all peers while in flight. |
 | **Pull a remote conversation** | Right-click a remote conversation under any Network group → **← Pull from \<peer\>**. The remote peer drives the Move handshake with you as the destination; the conversation appears in your local sidebar in the same folder it lived in on the source. Source must be in your roster — strangers in the same Trystero room can't be pulled from. |
 | **Remote inference** | In the chat compose row, the **via:** picker lets you route a prompt to any peer that has an LLM advertised. The peer's local Ollama runs the request and streams tokens back over the data channel. Stop, cancel, and reasoning-mode all work the same as local. |
@@ -789,10 +790,18 @@ The protocol version is `1` and stays there across additive Phase 2 changes — 
 ├── .secrets/
 │   └── identity.json    (ed25519 keypair; 0600 on Unix)
 └── mesh/
-    └── roster.json      (per-Network-ID approved peers; 0600 on Unix)
+    └── rosters/
+        ├── home-mesh.json      (per-network approved peers; 0600 on Unix)
+        ├── acme-office.json
+        └── ...
 ```
 
-Both files are local-only. Identity carries across Network ID changes; the roster does not.
+Identity is one keypair across every network you join. Rosters are
+per-network — each saved network gets its own file under
+`~/.myownllm/mesh/rosters/{network_id}.json`, so switching between
+saved networks preserves their rosters independently. A legacy
+pre-multi-network `~/.myownllm/mesh/roster.json` is migrated into its
+per-network home automatically on first roster load.
 
 ---
 
@@ -1218,16 +1227,33 @@ The `manifests/` cache stores one entry per URL. When a manifest reached via an 
   },
   "cloud_mesh": {
     "enabled": false,
-    "network_id": "",                // canonical form; empty until the user locks one
-    "locked": false,                 // true = field is committed and mesh client should run
-    "signaling_servers": [],         // empty = Trystero's built-in Nostr relays; populate to override
-    "stun_servers": [
-      "stun:stun.l.google.com:19302",
-      "stun:stun1.l.google.com:19302"
-    ],
-    "turn_servers": [],              // [{ "url": "turn:host:port", "username": "...", "credential": "..." }, ...]
-    "accepting": "available",        // "available" | "limited" | "busy" — Phase 2
-    "diag_quiet": false              // when true, info events suppressed in Activity log — Phase 2
+    "active_network_id": "net-abc123",  // id of the currently-active saved network, or null
+    "diag_quiet": false,                // suppress info events in Activity log — Phase 2
+    "networks": [                       // saved networks; one is active at a time
+      {
+        "id": "net-abc123",             // stable internal id, generated on save
+        "label": "home-mesh",           // user-picked display name
+        "network_id": "home-mesh",      // canonical Network ID — doubles as roster filename
+        "locked": true,                 // true = mesh client joins when this is active
+        "signaling_servers": [],        // per-network; empty = Trystero defaults
+        "stun_servers": [
+          "stun:stun.l.google.com:19302",
+          "stun:stun1.l.google.com:19302"
+        ],
+        "turn_servers": [],
+        "accepting": "available"        // per-network: "available" | "limited" | "busy"
+      },
+      {
+        "id": "net-def456",
+        "label": "office",
+        "network_id": "acme-office",
+        "locked": true,
+        "signaling_servers": ["wss://relay.internal.acme:7777"],
+        "stun_servers": ["stun:stun.l.google.com:19302"],
+        "turn_servers": [],
+        "accepting": "limited"
+      }
+    ]
   },
   "providers": [
     { "name": "MyOwnLLM Default", "url": "https://raw.githubusercontent.com/mrjeeves/MyOwnLLM/main/manifests/default.json" },

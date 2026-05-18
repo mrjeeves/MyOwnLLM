@@ -143,3 +143,11 @@ pub fn mesh_roster_remove(network_id: String, device_id: String) -> Result<Roste
         .map(RosterView::from)
         .map_err(|e| format!("{e:#}"))
 }
+
+/// Delete the entire roster file for a Network ID. Used by the
+/// "Forget Network" UX so removing a saved network from the
+/// config also wipes its peer approvals on disk. Idempotent.
+#[tauri::command]
+pub fn mesh_roster_delete(network_id: String) -> Result<(), String> {
+    roster::delete(&network_id).map_err(|e| format!("{e:#}"))
+}

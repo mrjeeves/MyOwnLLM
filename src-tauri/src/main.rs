@@ -727,6 +727,7 @@ fn main() {
             mesh::commands::mesh_roster_get,
             mesh::commands::mesh_roster_add,
             mesh::commands::mesh_roster_remove,
+            mesh::commands::mesh_roster_delete,
             transcribe_start,
             transcribe_stop,
             transcribe_pause,

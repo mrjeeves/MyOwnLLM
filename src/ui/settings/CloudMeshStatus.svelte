@@ -19,7 +19,15 @@
    *  Connections / catalog / resource map live on the Connections tab. */
 
   import { onMount } from "svelte";
-  import { loadConfig, updateConfig } from "../../config";
+  import { invoke } from "@tauri-apps/api/core";
+  import {
+    activeNetwork,
+    loadConfig,
+    removeNetwork,
+    setActiveNetwork,
+    updateNetwork,
+  } from "../../config";
+  import type { Config, NetworkConfig } from "../../types";
   import { meshUi } from "../../mesh-state.svelte";
   import { meshClient } from "../../mesh-client.svelte";
   import { scrollAffordance } from "../scroll-affordance";
@@ -28,15 +36,30 @@
     normalizeNetworkId,
     setMeshIdentityLabel,
   } from "../../mesh";
+  import AddNetworkModal from "./AddNetworkModal.svelte";
 
-  // ---- network id state -----------------------------------------------
+  // ---- multi-network state -------------------------------------------
 
-  let savedNetworkId = $state("");
+  /** Saved networks list — drives both the wizard (operates on the
+   *  active one) and the Saved networks block (switch / forget /
+   *  add). Reloaded after every mutation via `reloadFromConfig`. */
+  let networks = $state<NetworkConfig[]>([]);
+  /** id of the currently-active network, or null. The wizard scopes
+   *  everything to whichever network this points at. */
+  let activeId = $state<string | null>(null);
+  /** Derived "the active network's view of itself" — easier than
+   *  threading the active object through every callsite. */
+  let active = $derived(networks.find((n) => n.id === activeId) ?? null);
+
+  /** Draft buffer for the wizard's Network ID input. Diverges from
+   *  the active network's persisted `network_id` while the user is
+   *  editing an unlocked field. */
   let draftNetworkId = $state("");
-  let locked = $state(false);
   let loading = $state(true);
   let saving = $state(false);
   let inlineError = $state("");
+  let addModalOpen = $state(false);
+  let forgetModal = $state<NetworkConfig | null>(null);
 
   /** When non-null, a confirmation popup is open. Type discriminates
    *  the copy and the action that runs on confirm. */
@@ -67,11 +90,12 @@
 
   // ---- wizard derivation ----------------------------------------------
 
-  /** Logical wizard step from the union of (config state, mesh-client
-   *  status, peer roster). One value drives the entire card render —
-   *  copy, controls, tone — so the rendered UI never lies about what
-   *  step we're really on. */
+  /** Logical wizard step from the union of (active-network state,
+   *  mesh-client status, peer roster). One value drives the entire
+   *  card render — copy, controls, tone — so the rendered UI never
+   *  lies about what step we're really on. */
   let wizardStep = $derived.by<
+    | "no-network"
     | "idle"
     | "drafted"
     | "saving"
@@ -82,9 +106,10 @@
     | "online"
   >(() => {
     if (loading) return "idle";
+    if (!active) return "no-network";
     if (meshClient.status === "error") return "error";
     if (saving) return "saving";
-    if (!locked || !savedNetworkId) {
+    if (!active.locked || !active.network_id) {
       return draftNetworkId.trim() !== "" ? "drafted" : "idle";
     }
     if (meshClient.status === "starting" || meshClient.status === "off") {
@@ -122,6 +147,8 @@
 
   let stepTitle = $derived.by(() => {
     switch (wizardStep) {
+      case "no-network":
+        return "No active network";
       case "idle":
         return "Pick a Network ID";
       case "drafted":
@@ -172,23 +199,32 @@
 
   // ---- lifecycle ------------------------------------------------------
 
-  onMount(async () => {
-    await meshUi.ensureLoaded();
+  /** Refresh the saved-networks list + active pointer + the wizard
+   *  draft from disk. Called on mount and after every mutation
+   *  (add / forget / switch / lock / unlock). The draft mirrors
+   *  the active network's `network_id` so a fresh visit lands on
+   *  the right state without an extra typing step. */
+  async function reloadFromConfig() {
     try {
-      const cfg = await loadConfig();
-      savedNetworkId = cfg.cloud_mesh.network_id;
-      draftNetworkId = cfg.cloud_mesh.network_id;
-      locked = cfg.cloud_mesh.locked && cfg.cloud_mesh.network_id !== "";
+      const cfg: Config = await loadConfig();
+      networks = cfg.cloud_mesh.networks;
+      activeId = cfg.cloud_mesh.active_network_id;
+      const a = networks.find((n) => n.id === activeId) ?? null;
+      draftNetworkId = a?.network_id ?? "";
     } catch (e) {
       inlineError = String(e);
-    } finally {
-      loading = false;
     }
+  }
+
+  onMount(async () => {
+    await meshUi.ensureLoaded();
+    await reloadFromConfig();
+    loading = false;
     if (meshUi.identity) labelDraft = meshUi.identity.label;
   });
 
-  let editable = $derived(!locked);
-  let dirty = $derived(draftNetworkId !== savedNetworkId);
+  let editable = $derived(active !== null && !active.locked);
+  let dirty = $derived(active !== null && draftNetworkId !== (active.network_id ?? ""));
 
   // ---- wizard actions -------------------------------------------------
 
@@ -203,7 +239,8 @@
   }
 
   async function onLockToggle() {
-    if (locked) {
+    if (!active) return;
+    if (active.locked) {
       confirm = { kind: "unlock" };
       return;
     }
@@ -220,7 +257,7 @@
       inlineError = String(e);
       return;
     }
-    if (normalized === savedNetworkId) {
+    if (normalized === active.network_id) {
       await persistLock(normalized, true);
       return;
     }
@@ -229,9 +266,9 @@
 
   async function confirmUnlock() {
     confirm = null;
-    locked = false;
+    if (!active) return;
     try {
-      await persistLock(savedNetworkId, false);
+      await persistLock(active.network_id, false);
     } catch (e) {
       inlineError = String(e);
     }
@@ -250,21 +287,52 @@
   }
 
   async function persistLock(networkId: string, lockedAfter: boolean) {
+    if (!active) return;
     saving = true;
     try {
-      const cfg = await loadConfig();
-      await updateConfig({
-        cloud_mesh: {
-          ...cfg.cloud_mesh,
-          network_id: networkId,
-          locked: lockedAfter,
-        },
+      await updateNetwork(active.id, {
+        network_id: networkId,
+        locked: lockedAfter,
       });
-      savedNetworkId = networkId;
-      locked = lockedAfter;
+      await reloadFromConfig();
       meshClient.reconcile().catch(() => {});
     } finally {
       saving = false;
+    }
+  }
+
+  /** Switch the active network. Routes through `setActiveNetwork`
+   *  + a meshClient reconcile so the Trystero room actually swaps,
+   *  not just the config pointer. */
+  async function switchToNetwork(id: string) {
+    if (id === activeId) return;
+    try {
+      await setActiveNetwork(id);
+      await reloadFromConfig();
+      meshClient.reconcile().catch(() => {});
+    } catch (e) {
+      inlineError = String(e);
+    }
+  }
+
+  /** Forget a saved network. Removes it from the saved list AND
+   *  deletes its roster file on disk so peer approvals don't
+   *  linger after the user has decided they're done with that
+   *  mesh. If it was active, the mesh client stops on the next
+   *  reconcile. */
+  async function forgetNetwork(net: NetworkConfig) {
+    forgetModal = null;
+    try {
+      const wasActive = activeId === net.id;
+      await removeNetwork(net.id);
+      // Best-effort delete of the on-disk roster — a failure
+      // here just leaves an orphan file behind; the next Add of
+      // a network with the same `network_id` would inherit it.
+      await invoke("mesh_roster_delete", { networkId: net.network_id }).catch(() => {});
+      await reloadFromConfig();
+      if (wasActive) meshClient.reconcile().catch(() => {});
+    } catch (e) {
+      inlineError = String(e);
     }
   }
 
@@ -327,10 +395,10 @@
       >
         <span class="status-dot" data-tone={stepDotClass}></span>
         <span class="step-title">{stepTitle}</span>
-        {#if savedNetworkId && locked}
+        {#if active && active.locked}
           <span class="net-pill" title="Current Network ID">
             <span class="net-pill-label">network</span>
-            <span class="net-pill-value">{savedNetworkId}</span>
+            <span class="net-pill-value">{active.label || active.network_id}</span>
           </span>
         {/if}
         <span class="status-meta">
@@ -345,7 +413,15 @@
 
       {#if cardExpanded}
         <div class="wizard-body">
-          {#if wizardStep === "idle"}
+          {#if wizardStep === "no-network"}
+            <p class="wizard-help">
+              No active network. Pick one from the saved list below,
+              or add a new one with the <strong>+ Add network</strong>
+              button. Each network keeps its own roster of approved
+              peers, so switching back to a previously-used network
+              skips re-authentication.
+            </p>
+          {:else if wizardStep === "idle"}
             <p class="wizard-help">
               Same name on two devices = same mesh. The mesh client
               starts as soon as you lock a Network ID.
@@ -420,69 +496,75 @@
             </div>
           </div>
 
-          <div class="id-row">
-            <label class="micro-label" for="net-id">network</label>
-            <div class="id-row-content">
-              <input
-                id="net-id"
-                class="text-input mono"
-                type="text"
-                bind:value={draftNetworkId}
-                disabled={!editable || saving}
-                placeholder="e.g. office-mesh, or click Generate"
-                spellcheck="false"
-                autocomplete="off"
-                maxlength="64"
-              />
-              <button
-                class="lock-btn"
-                class:locked
-                class:dirty={!locked && dirty && draftNetworkId.trim() !== ""}
-                onclick={onLockToggle}
-                disabled={saving}
-                title={locked
-                  ? "Locked — click to unlock and change (also resets the mesh connection)"
-                  : dirty
-                    ? "Lock to commit this Network ID"
-                    : "Lock"}
-                aria-label={locked ? "Unlock Network ID" : "Lock Network ID"}
-              >
-                {locked ? "🔒" : "🔓"}
-              </button>
-              {#if editable}
+          {#if active}
+            <div class="id-row">
+              <label class="micro-label" for="net-id">network</label>
+              <div class="id-row-content">
+                <input
+                  id="net-id"
+                  class="text-input mono"
+                  type="text"
+                  bind:value={draftNetworkId}
+                  disabled={!editable || saving}
+                  placeholder="e.g. office-mesh, or click Generate"
+                  spellcheck="false"
+                  autocomplete="off"
+                  maxlength="64"
+                />
+                <button
+                  class="lock-btn"
+                  class:locked={active.locked}
+                  class:dirty={!active.locked && dirty && draftNetworkId.trim() !== ""}
+                  onclick={onLockToggle}
+                  disabled={saving}
+                  title={active.locked
+                    ? "Locked — click to unlock and change (also resets the mesh connection)"
+                    : dirty
+                      ? "Lock to commit this Network ID"
+                      : "Lock"}
+                  aria-label={active.locked ? "Unlock Network ID" : "Lock Network ID"}
+                >
+                  {active.locked ? "🔒" : "🔓"}
+                </button>
+                {#if editable}
+                  <button
+                    class="btn-small"
+                    onclick={onGenerate}
+                    disabled={saving}
+                    title="Generate a short random Network ID"
+                  >
+                    Generate
+                  </button>
+                {/if}
                 <button
                   class="btn-small"
-                  onclick={onGenerate}
-                  disabled={saving}
-                  title="Generate a short random Network ID"
+                  onclick={copyNetworkId}
+                  disabled={draftNetworkId.trim() === ""}
+                  title="Copy Network ID to share with another device"
                 >
-                  Generate
+                  Copy
                 </button>
-              {/if}
-              <button
-                class="btn-small"
-                onclick={copyNetworkId}
-                disabled={draftNetworkId.trim() === ""}
-                title="Copy Network ID to share with another device"
-              >
-                Copy
-              </button>
+              </div>
             </div>
-          </div>
+          {/if}
 
           {#if inlineError}
             <div class="card-hint error">{inlineError}</div>
-          {:else if savedNetworkId === ""}
+          {:else if !active}
+            <div class="card-hint">
+              No active network — saved networks list is below.
+            </div>
+          {:else if active.network_id === ""}
             <div class="card-hint">
               No Network ID yet. Type one, generate one, or pick the
               name you've already used elsewhere.
             </div>
-          {:else if !locked && dirty}
+          {:else if !active.locked && dirty}
             <div class="card-hint warn">
               Pending change — lock to commit. The current network
               stays active until you do.
             </div>
-          {:else if locked}
+          {:else if active.locked}
             <div class="card-hint">
               Locked. Unlock and re-lock to <strong>reset</strong> the
               mesh connection — tears down everything, rejoins the
@@ -494,6 +576,56 @@
         </div>
       {/if}
     </div>
+
+    <!-- Saved networks. Always visible so the "+ Add network" entry
+         is one click away — that's the same affordance the sidebar
+         Network section's button surfaces, mirrored here for the
+         settings-driven user. -->
+    <section class="block">
+      <div class="block-head">
+        <h3>Saved networks</h3>
+        <button class="btn-small" onclick={() => (addModalOpen = true)} title="Add a new saved network">
+          + Add network
+        </button>
+      </div>
+      {#if networks.length === 0}
+        <div class="empty-state">
+          No saved networks yet. Click <strong>+ Add network</strong>
+          to create one — same name on two devices means same mesh,
+          and you can save multiple networks (home, office, etc.) and
+          switch between them with one click.
+        </div>
+      {:else}
+        <div class="network-list">
+          {#each networks as net (net.id)}
+            <div class="network-row" class:active-row={net.id === activeId}>
+              <div class="network-main">
+                <div class="network-label-row">
+                  {#if net.id === activeId}
+                    <span class="active-dot" title="Currently active"></span>
+                  {/if}
+                  <span class="network-label">{net.label || net.network_id}</span>
+                  {#if net.locked}
+                    <span class="lock-pill" title="Locked = the mesh client joins this network when it's active">🔒 locked</span>
+                  {/if}
+                </div>
+                {#if net.network_id !== net.label}
+                  <code class="network-id" title={net.network_id}>{net.network_id}</code>
+                {/if}
+              </div>
+              {#if net.id !== activeId}
+                <button class="btn-small ghost" onclick={() => switchToNetwork(net.id)} title="Stop the current mesh and join this one">
+                  Switch to
+                </button>
+              {/if}
+              <button class="btn-small ghost" onclick={() => (forgetModal = net)} title="Remove from saved list (deletes its roster too)">
+                Forget
+              </button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
 
     {#if pendingRequests.length > 0}
       <!-- Action-item surface. Stays on the Status tab even when the
@@ -551,12 +683,21 @@
     <section class="block">
       <div class="block-head">
         <h3>Activity</h3>
-        <label class="accepting-toggle" title="When set to busy, peers won't route inference / transcription jobs to this device. Limited = only if no better peer exists.">
+        <label
+          class="accepting-toggle"
+          class:dimmed={!active}
+          title={active
+            ? "Per-network: when set to busy, peers on this network won't route inference / transcription jobs to this device. Limited = only if no better peer exists."
+            : "No active network — switch to one first."}
+        >
           accepting
           <select
-            value={meshClient.accepting}
-            onchange={(e) =>
-              meshClient.setAccepting((e.target as HTMLSelectElement).value as "available" | "limited" | "busy")}
+            value={active?.accepting ?? "available"}
+            disabled={!active}
+            onchange={async (e) => {
+              await meshClient.setAccepting((e.target as HTMLSelectElement).value as "available" | "limited" | "busy");
+              await reloadFromConfig();
+            }}
           >
             <option value="available">available</option>
             <option value="limited">limited</option>
@@ -630,6 +771,38 @@
         <button class="primary" onclick={confirmRelock}>Replace and lock</button>
       </div>
     {/if}
+  </div>
+{/if}
+
+{#if addModalOpen}
+  <AddNetworkModal
+    onClose={async () => {
+      addModalOpen = false;
+      await reloadFromConfig();
+    }}
+  />
+{/if}
+
+{#if forgetModal}
+  {@const target = forgetModal}
+  <div class="modal-overlay" onclick={() => (forgetModal = null)} role="presentation"></div>
+  <div class="modal" role="dialog" aria-label="Forget network">
+    <h3>Forget "{target.label || target.network_id}"?</h3>
+    <p class="modal-body">
+      Removes this network from your saved list and deletes its
+      roster file. Re-adding the same Network ID later starts fresh
+      — no auto-allow for the previously-approved peers.
+    </p>
+    {#if target.id === activeId}
+      <p class="modal-body soft">
+        This is the currently active network. Forgetting it will
+        stop the mesh client.
+      </p>
+    {/if}
+    <div class="modal-actions">
+      <button class="cancel" onclick={() => (forgetModal = null)}>Cancel</button>
+      <button class="primary" onclick={() => forgetNetwork(target)}>Forget</button>
+    </div>
   </div>
 {/if}
 
@@ -929,6 +1102,7 @@
     letter-spacing: 0.04em;
     cursor: pointer;
   }
+  .accepting-toggle.dimmed { opacity: 0.5; cursor: default; }
   .accepting-toggle select {
     background: #131313;
     color: #ccc;
@@ -944,6 +1118,61 @@
   }
 
   .peer-list { display: flex; flex-direction: column; gap: 0.3rem; }
+
+  /* Saved networks list — same row metaphor as connections, with
+     the active one tinted green to mirror the wizard's green dot.
+     Switch + Forget buttons surface the two non-active actions
+     directly; Edit-in-place isn't here (you'd unlock + relock the
+     active network for that). */
+  .network-list { display: flex; flex-direction: column; gap: 0.3rem; }
+  .network-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.7rem;
+    background: #131313;
+    border: 1px solid #1e1e1e;
+    border-radius: 6px;
+  }
+  .network-row.active-row {
+    background: #0f1812;
+    border-color: #1e3a24;
+  }
+  .network-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+  }
+  .network-label-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .network-label { font-size: 0.85rem; color: #e8e8e8; }
+  .network-id {
+    font-family: monospace;
+    font-size: 0.68rem;
+    color: #555;
+    user-select: all;
+  }
+  .active-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #6c6;
+    box-shadow: 0 0 5px rgba(102, 204, 102, 0.6);
+  }
+  .lock-pill {
+    font-size: 0.6rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    background: #1a1a2a;
+    color: #b3b3ff;
+    border-radius: 3px;
+    padding: 0.05rem 0.35rem;
+  }
   .peer-row {
     display: flex;
     align-items: center;

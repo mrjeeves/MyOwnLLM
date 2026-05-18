@@ -1,9 +1,17 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
   import type { ConversationMeta, FolderMeta } from "../conversations";
-  import type { Mode } from "../types";
+  import type { Mode, NetworkConfig } from "../types";
   import { meshClient } from "../mesh-client.svelte";
+  import {
+    loadConfig,
+    removeNetwork,
+    setActiveNetwork,
+  } from "../config";
   import { settingsRoute } from "./settings-route.svelte";
   import type { CatalogEntry } from "../mesh-protocol";
+  import AddNetworkModal from "./settings/AddNetworkModal.svelte";
 
   /** Peers eligible as Move targets — active and authorized. The
    *  context-menu uses this directly; if the list is empty the
@@ -42,6 +50,88 @@
   function togglePeerCollapsed(pubkey: string) {
     peerCollapsed.has(pubkey) ? peerCollapsed.delete(pubkey) : peerCollapsed.add(pubkey);
     peerCollapsed = new Set(peerCollapsed);
+  }
+
+  // ---- saved networks --------------------------------------------------
+  //
+  // The sidebar always renders a "Network" section at the bottom, even
+  // when zero networks are saved — that's where the "+ Add network"
+  // button lives. Saved networks each render as their own collapsible
+  // group: the active one expanded with its peers + catalogs, inactive
+  // ones collapsed and clickable to switch.
+  //
+  // Reload on mount and refresh whenever the mesh-client's status
+  // settles — switching networks or completing a reconcile updates the
+  // active pointer, and that's the cue to re-pull from disk.
+
+  let savedNetworks = $state<NetworkConfig[]>([]);
+  let activeNetworkId = $state<string | null>(null);
+  let networksCollapsed = $state<Set<string>>(new Set());
+  /** True when the AddNetwork modal is open. Mounted at the bottom of
+   *  the sidebar so it overlays the whole window. */
+  let addModalOpen = $state(false);
+  /** Network the user is about to forget. Confirmation modal mounts
+   *  at the bottom of the file. */
+  let forgetModal = $state<NetworkConfig | null>(null);
+  /** Sidebar-internal pull-in-flight toast for network-context
+   *  actions (Forget). Separate from the conversation-level toasts
+   *  above so the wording can be different. */
+  let networkActionError = $state<string>("");
+
+  async function reloadNetworks() {
+    try {
+      const cfg = await loadConfig();
+      savedNetworks = cfg.cloud_mesh.networks;
+      activeNetworkId = cfg.cloud_mesh.active_network_id;
+    } catch {
+      // Quiet failure — sidebar still renders, just without networks.
+    }
+  }
+
+  onMount(() => {
+    void reloadNetworks();
+  });
+
+  /** Re-pull from disk whenever the mesh-client status changes
+   *  (off → starting → online, etc.). This is the cue that a
+   *  network switch or first-time join just completed. */
+  $effect(() => {
+    void meshClient.status;
+    void reloadNetworks();
+  });
+
+  function toggleNetworkCollapsed(id: string) {
+    networksCollapsed.has(id) ? networksCollapsed.delete(id) : networksCollapsed.add(id);
+    networksCollapsed = new Set(networksCollapsed);
+  }
+
+  async function switchToNetwork(id: string) {
+    if (id === activeNetworkId) return;
+    try {
+      await setActiveNetwork(id);
+      meshClient.reconcile().catch(() => {});
+      await reloadNetworks();
+    } catch (e) {
+      networkActionError = String(e);
+    }
+  }
+
+  async function forgetNetwork(net: NetworkConfig) {
+    forgetModal = null;
+    try {
+      const wasActive = activeNetworkId === net.id;
+      await removeNetwork(net.id);
+      await invoke("mesh_roster_delete", { networkId: net.network_id }).catch(() => {});
+      await reloadNetworks();
+      if (wasActive) meshClient.reconcile().catch(() => {});
+    } catch (e) {
+      networkActionError = String(e);
+    }
+  }
+
+  function openMeshSettingsForNetwork() {
+    closeMenu();
+    settingsRoute.open("cloud-mesh", { meshSubTab: "status" });
   }
 
   /** Build a folder tree from a peer's catalog so we render their
@@ -227,7 +317,10 @@
       }
     /** A peer-group row in the sidebar. Lets the user jump straight
      *  to the Cloud Mesh → Connections tab for that mesh. */
-    | { kind: "peer"; peer_id: string; peer_label: string };
+    | { kind: "peer"; peer_id: string; peer_label: string }
+    /** A saved-network row in the sidebar's Network section. Menu
+     *  exposes switch / forget / settings. */
+    | { kind: "saved-network"; network: NetworkConfig };
   let menu = $state<{ target: MenuTarget; x: number; y: number } | null>(null);
   let editingId = $state<string | null>(null);
   let editingFolder = $state<string | null>(null);
@@ -295,6 +388,13 @@
     e.stopPropagation();
     const { x, y } = menuAnchor(e, 200, 100);
     menu = { target: { kind: "peer", peer_id, peer_label }, x, y };
+  }
+
+  function openSavedNetworkMenu(e: MouseEvent | KeyboardEvent, network: NetworkConfig) {
+    e.preventDefault();
+    e.stopPropagation();
+    const { x, y } = menuAnchor(e, 200, 160);
+    menu = { target: { kind: "saved-network", network }, x, y };
   }
 
   /** Compute a viewport-pinned anchor for the context menu. Mouse
@@ -868,68 +968,149 @@
       {@render folder(child)}
     {/each}
 
-    {#if peerGroups.length > 0}
-      <!-- Network section. Each connected peer becomes an
-           expandable group containing their advertised catalog.
-           Right-click on a remote conversation → Pull. Right-click
-           on the peer name → opens Cloud Mesh → Connections. -->
-      <div class="network-divider" aria-hidden="true"></div>
-      <div class="group-label network-label">Network</div>
-      {#each peerGroups as peer (peer.peer_id)}
-        {@const isCollapsed = peerCollapsed.has(peer.device_pubkey)}
-        <div
-          class="peer-group"
-          class:standby={peer.status === "shelved"}
-          role="button"
-          tabindex="0"
-          oncontextmenu={(e) => openPeerMenu(e, peer.peer_id, peer.label || peer.device_pubkey.slice(0, 8))}
-          onclick={(e) => {
-            e.stopPropagation();
-            togglePeerCollapsed(peer.device_pubkey);
-          }}
-          onkeydown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              togglePeerCollapsed(peer.device_pubkey);
-            } else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
-              // Keyboard equivalent of right-click for accessibility.
-              openPeerMenu(e, peer.peer_id, peer.label || peer.device_pubkey.slice(0, 8));
-            }
-          }}
-          title={`${peer.label || "Unnamed device"}${peer.device_suffix ? ` -${peer.device_suffix}` : ""}`}
-        >
-          <span class="folder-caret" aria-hidden="true">{isCollapsed ? "▸" : "▾"}</span>
-          <span class="peer-dot" data-status={peer.status} aria-hidden="true"></span>
-          <span class="peer-group-name">{peer.label || "Unnamed device"}</span>
-          {#if peer.device_suffix}
-            <span class="peer-group-suffix">-{peer.device_suffix}</span>
-          {/if}
-          {#if peer.status === "shelved"}
-            <span class="peer-standby-pill">standby</span>
-          {/if}
-        </div>
-        {#if !isCollapsed}
-          {@const node = remoteTrees.get(peer.device_pubkey)}
-          {#if !node || (node.items.length === 0 && node.children.length === 0)}
-            <div class="peer-empty">(no conversations)</div>
-          {:else}
-            <!-- Root-level conversations under this peer (depth 1 so
-                 they indent under the peer-group header, matching the
-                 way local root conversations sit under the sidebar
-                 head). -->
-            {#each node.items as entry (entry.guid)}
-              {@render remoteRow(entry, peer, 1)}
-            {/each}
-            <!-- Folders and their nested contents — same recursive
-                 shape as the local sidebar tree, so the host's
-                 organization shows up here exactly as it does on
-                 their device. -->
-            {#each node.children as child (child.path)}
-              {@render remoteFolder(child, peer)}
-            {/each}
-          {/if}
+    <!-- Network section. Always rendered at the bottom of the
+         sidebar so the "+ Add network" button is reliably one
+         click away regardless of mesh state. Each saved network
+         is its own collapsible group:
+           - Active network: expanded by default, with its
+             connected peers as nested expandable sub-groups
+             (each containing the peer's folder tree).
+           - Inactive saved networks: collapsed, click the header
+             (or right-click → Switch to this network) to switch.
+         Right-click on a network header → switch / settings /
+         forget menu. -->
+    <div class="network-divider" aria-hidden="true"></div>
+    <div class="network-section-head">
+      <span class="group-label network-label">Network</span>
+      <button
+        class="add-network"
+        onclick={() => (addModalOpen = true)}
+        title="Save a new mesh network"
+        aria-label="Add network"
+      >
+        + Add
+      </button>
+    </div>
+    {#if savedNetworks.length === 0}
+      <div class="network-empty">
+        No saved networks. <button class="link" onclick={() => (addModalOpen = true)}>Add one</button>
+        to share conversations and resources with another device.
+      </div>
+    {/if}
+    {#each savedNetworks as net (net.id)}
+      {@const isActive = net.id === activeNetworkId}
+      {@const isCollapsed = networksCollapsed.has(net.id)}
+      <div
+        class="network-group"
+        class:active-network={isActive}
+        role="button"
+        tabindex="0"
+        oncontextmenu={(e) => openSavedNetworkMenu(e, net)}
+        onclick={(e) => {
+          e.stopPropagation();
+          if (isActive) {
+            toggleNetworkCollapsed(net.id);
+          } else {
+            // Inactive networks: clicking the header switches to
+            // them. The user almost never wants to "collapse" an
+            // inactive network (it's already nothing to look at);
+            // they want one click to make it active. Right-click
+            // for the full menu.
+            void switchToNetwork(net.id);
+          }
+        }}
+        onkeydown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            if (isActive) toggleNetworkCollapsed(net.id);
+            else void switchToNetwork(net.id);
+          } else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+            openSavedNetworkMenu(e, net);
+          }
+        }}
+        title={isActive
+          ? `${net.label || net.network_id} (active — click to ${isCollapsed ? "expand" : "collapse"})`
+          : `${net.label || net.network_id} (click to switch)`}
+      >
+        <span class="folder-caret" aria-hidden="true">
+          {#if isActive}{isCollapsed ? "▸" : "▾"}{:else}○{/if}
+        </span>
+        <span class="net-row-name">{net.label || net.network_id}</span>
+        {#if isActive}
+          <span class="net-row-active">active</span>
         {/if}
-      {/each}
+        {#if !net.locked}
+          <span class="net-row-unlocked" title="Not locked yet — open Settings to commit">unlocked</span>
+        {/if}
+      </div>
+      {#if isActive && !isCollapsed}
+        {#if peerGroups.length === 0}
+          <div class="network-empty network-empty-active">
+            {#if meshClient.status === "online"}
+              No peers yet. Share your Network ID with another device.
+            {:else if meshClient.status === "starting"}
+              Joining mesh…
+            {:else if !net.locked}
+              Lock this network on the Status tab to bring it online.
+            {:else}
+              {meshClient.error || "Mesh offline"}
+            {/if}
+          </div>
+        {:else}
+          {#each peerGroups as peer (peer.peer_id)}
+            {@const isPeerCollapsed = peerCollapsed.has(peer.device_pubkey)}
+            <div
+              class="peer-group"
+              class:standby={peer.status === "shelved"}
+              role="button"
+              tabindex="0"
+              oncontextmenu={(e) => openPeerMenu(e, peer.peer_id, peer.label || peer.device_pubkey.slice(0, 8))}
+              onclick={(e) => {
+                e.stopPropagation();
+                togglePeerCollapsed(peer.device_pubkey);
+              }}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  togglePeerCollapsed(peer.device_pubkey);
+                } else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+                  openPeerMenu(e, peer.peer_id, peer.label || peer.device_pubkey.slice(0, 8));
+                }
+              }}
+              title={`${peer.label || "Unnamed device"}${peer.device_suffix ? ` -${peer.device_suffix}` : ""}`}
+            >
+              <span class="folder-caret" aria-hidden="true">{isPeerCollapsed ? "▸" : "▾"}</span>
+              <span class="peer-dot" data-status={peer.status} aria-hidden="true"></span>
+              <span class="peer-group-name">{peer.label || "Unnamed device"}</span>
+              {#if peer.device_suffix}
+                <span class="peer-group-suffix">-{peer.device_suffix}</span>
+              {/if}
+              {#if peer.status === "shelved"}
+                <span class="peer-standby-pill">standby</span>
+              {/if}
+            </div>
+            {#if !isPeerCollapsed}
+              {@const node = remoteTrees.get(peer.device_pubkey)}
+              {#if !node || (node.items.length === 0 && node.children.length === 0)}
+                <div class="peer-empty">(no conversations)</div>
+              {:else}
+                {#each node.items as entry (entry.guid)}
+                  {@render remoteRow(entry, peer, 2)}
+                {/each}
+                {#each node.children as child (child.path)}
+                  {@render remoteFolder(child, peer)}
+                {/each}
+              {/if}
+            {/if}
+          {/each}
+        {/if}
+      {/if}
+    {/each}
+    {#if networkActionError}
+      <div class="network-error">
+        {networkActionError}
+        <button class="dismiss" onclick={() => (networkActionError = "")} aria-label="Dismiss">✕</button>
+      </div>
     {/if}
   </div>
 </aside>
@@ -1199,11 +1380,34 @@
       >
         ← Pull from {target.peer_label}
       </button>
-    {:else}
+    {:else if menu.target.kind === "peer"}
       {@const target = menu.target}
       <div class="menu-section-label">{target.peer_label}</div>
       <button onclick={openMeshConnectionsSettings} title="Open Cloud Mesh → Connections">
         Settings
+      </button>
+    {:else}
+      {@const target = menu.target}
+      {@const isActive = target.network.id === activeNetworkId}
+      <div class="menu-section-label">{target.network.label || target.network.network_id}</div>
+      {#if !isActive}
+        <button onclick={() => switchToNetwork(target.network.id)} title="Stop the current mesh and join this one">
+          Switch to this network
+        </button>
+      {/if}
+      <button onclick={openMeshSettingsForNetwork} title="Open Cloud Mesh → Status">
+        Settings
+      </button>
+      <div class="menu-divider"></div>
+      <button
+        class="danger"
+        onclick={() => {
+          closeMenu();
+          forgetModal = target.network;
+        }}
+        title="Remove from saved list and delete this network's roster"
+      >
+        Forget
       </button>
     {/if}
   </div>
@@ -1238,6 +1442,38 @@
   <div class="move-toast error" role="alert">
     Pull failed: {pullError}
     <button onclick={() => (pullError = "")} class="dismiss">✕</button>
+  </div>
+{/if}
+
+{#if addModalOpen}
+  <AddNetworkModal
+    onClose={async () => {
+      addModalOpen = false;
+      await reloadNetworks();
+    }}
+  />
+{/if}
+
+{#if forgetModal}
+  {@const target = forgetModal}
+  <div class="forget-overlay" onclick={() => (forgetModal = null)} role="presentation"></div>
+  <div class="forget-modal" role="dialog" aria-label="Forget network">
+    <h3>Forget "{target.label || target.network_id}"?</h3>
+    <p>
+      Removes this network from your saved list and deletes its
+      roster file. Re-adding the same Network ID later starts fresh
+      — no auto-allow for previously-approved peers.
+    </p>
+    {#if target.id === activeNetworkId}
+      <p class="soft">
+        This is the currently active network. Forgetting it will
+        stop the mesh client.
+      </p>
+    {/if}
+    <div class="forget-actions">
+      <button class="cancel" onclick={() => (forgetModal = null)}>Cancel</button>
+      <button class="delete" onclick={() => forgetNetwork(target)}>Forget</button>
+    </div>
   </div>
 {/if}
 
@@ -1383,10 +1619,176 @@
     height: 1px;
     background: #181818;
   }
+  /* Network-section header: label on the left, "+ Add" button on
+     the right. Always visible — even with zero saved networks the
+     button is present so the empty-state guidance has somewhere
+     to point. */
+  .network-section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-right: .55rem;
+  }
   .group-label.network-label {
     color: #6a7a99;
     letter-spacing: .06em;
   }
+  .add-network {
+    background: none;
+    border: 1px solid #2a2a3a;
+    color: #b9b9ee;
+    border-radius: 4px;
+    font-size: .65rem;
+    padding: .1rem .45rem;
+    cursor: pointer;
+    transition: background .12s, color .12s;
+  }
+  .add-network:hover { background: #1a1a2a; color: #cdeaff; }
+
+  .network-empty {
+    padding: .35rem .65rem .35rem .65rem;
+    font-size: .72rem;
+    color: #666;
+    line-height: 1.5;
+  }
+  .network-empty .link {
+    background: none;
+    border: none;
+    color: #b9c9ee;
+    padding: 0;
+    font-size: inherit;
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  .network-empty.network-empty-active {
+    padding-left: 1.35rem;
+    font-style: italic;
+  }
+  .network-error {
+    margin: .35rem .55rem;
+    padding: .35rem .55rem;
+    background: #2a1818;
+    border: 1px solid #4a2424;
+    color: #f88;
+    border-radius: 5px;
+    font-size: .72rem;
+    display: flex;
+    align-items: center;
+    gap: .35rem;
+  }
+  .network-error .dismiss {
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    padding: 0 .25rem;
+    opacity: .75;
+  }
+  .network-error .dismiss:hover { opacity: 1; }
+
+  /* Network-row (one per saved network). Active gets a green left
+     border + brighter text; inactive is muted with a hover hint so
+     it reads as "click to switch." */
+  .network-group {
+    display: flex;
+    align-items: center;
+    gap: .35rem;
+    padding: .35rem .45rem;
+    margin: 1px 0;
+    border-radius: 6px;
+    color: #aaa;
+    font-size: .8rem;
+    cursor: pointer;
+    transition: background .1s;
+  }
+  .network-group:hover { background: #161616; color: #ccc; }
+  .network-group.active-network {
+    color: #e8e8e8;
+    border-left: 2px solid #2c8e4e;
+    padding-left: calc(.45rem - 2px);
+  }
+  .net-row-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+  .net-row-active {
+    font-size: .58rem;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    background: #122212;
+    color: #6c6;
+    padding: .05rem .35rem;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+  .net-row-unlocked {
+    font-size: .58rem;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    background: #2a220e;
+    color: #d6b25a;
+    padding: .05rem .35rem;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+
+  /* Forget-network modal — local to the sidebar so it sits above
+     the sidebar without prop-drilling through App. Mirrors the
+     delete-prompt modal styling already used by deleteFolderWithConfirm. */
+  .forget-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.65);
+    z-index: 50;
+  }
+  .forget-modal {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(420px, 90vw);
+    background: #161616;
+    border: 1px solid #2a2a2a;
+    border-radius: 10px;
+    padding: 1.1rem 1.2rem;
+    z-index: 51;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+  }
+  .forget-modal h3 {
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin: 0 0 0.6rem 0;
+    color: #fff;
+  }
+  .forget-modal p {
+    font-size: 0.82rem;
+    color: #ccc;
+    line-height: 1.55;
+    margin: 0 0 0.5rem 0;
+  }
+  .forget-modal p.soft { color: #888; font-size: 0.78rem; }
+  .forget-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.85rem;
+  }
+  .forget-actions button {
+    padding: 0.4rem 0.9rem;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .forget-actions .cancel { background: #1e1e1e; color: #ccc; border-color: #2a2a2a; }
+  .forget-actions .cancel:hover { background: #252525; }
+  .forget-actions .delete { background: #5a2424; color: #fee; border-color: #6a3030; }
+  .forget-actions .delete:hover { background: #6a2c2c; }
+
   .peer-group {
     display: flex;
     align-items: center;

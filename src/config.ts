@@ -7,6 +7,7 @@ import type {
   AutoCleanupConfig,
   RemoteUiConfig,
   CloudMeshConfig,
+  NetworkConfig,
   MicConfig,
 } from "./types";
 
@@ -60,16 +61,22 @@ const LEGACY_PEERJS_SIGNALING_URLS = [
   "wss://mesh.myownllm.net/signal",
 ];
 
+/** Defaults for newly-added networks. Empty signaling = Trystero's
+ *  public Nostr relays; Google's STUN pool for NAT helpers; empty
+ *  TURN by default (user supplies their own credentials if they
+ *  need one). Applied by `createNetwork` and by the legacy-config
+ *  migration so a pre-multi-network install lands with sane
+ *  per-network defaults. */
+export const DEFAULT_NETWORK_SIGNALING: string[] = [];
+export const DEFAULT_NETWORK_STUN: string[] = [
+  "stun:stun.l.google.com:19302",
+  "stun:stun1.l.google.com:19302",
+];
+
 const DEFAULT_CLOUD_MESH: CloudMeshConfig = {
   enabled: false,
-  network_id: "",
-  locked: false,
-  signaling_servers: [],
-  stun_servers: [
-    "stun:stun.l.google.com:19302",
-    "stun:stun1.l.google.com:19302",
-  ],
-  turn_servers: [],
+  networks: [],
+  active_network_id: null,
 };
 
 const DEFAULT_AUTO_CLEANUP: AutoCleanupConfig = {
@@ -107,10 +114,10 @@ const DEFAULT_CONFIG: Config = {
   auto_update: { ...DEFAULT_AUTO_UPDATE },
   remote_ui: { ...DEFAULT_REMOTE_UI },
   cloud_mesh: {
-    ...DEFAULT_CLOUD_MESH,
-    signaling_servers: [...DEFAULT_CLOUD_MESH.signaling_servers],
-    stun_servers: [...DEFAULT_CLOUD_MESH.stun_servers],
-    turn_servers: [...DEFAULT_CLOUD_MESH.turn_servers],
+    enabled: DEFAULT_CLOUD_MESH.enabled,
+    networks: [],
+    active_network_id: null,
+    diag_quiet: false,
   },
   mic: { ...DEFAULT_MIC },
   providers: [
@@ -205,43 +212,119 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
   return merged;
 }
 
-/** Merge a partial cloud_mesh config from a saved file with defaults,
- *  preserving array fields the user has customised. Empty arrays are
- *  legitimate user choices for all of signaling, STUN, and TURN —
- *  empty signaling means "let Trystero use its built-in default
- *  Nostr relays," empty STUN/TURN means "I don't want any of those."
- *  Legacy PeerJS URLs from earlier branch commits get stripped on
- *  load. */
+/** Generate a stable internal id for a saved network. Independent
+ *  of `network_id` so renaming the user-facing handle is allowed
+ *  without breaking the `active_network_id` pointer. Crockford-ish
+ *  base36, prefixed so it doesn't collide with conversation ids. */
+export function newNetworkInternalId(): string {
+  return "net-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+}
+
+/** Coerce a raw value into a valid AcceptingPolicy with default. */
+function coerceAccepting(raw: unknown): NetworkConfig["accepting"] {
+  return raw === "available" || raw === "limited" || raw === "busy" ? raw : "available";
+}
+
+/** Strip legacy PeerJS signaling URLs that may linger in old
+ *  configs from a pre-Trystero branch commit. */
+function cleanSignaling(raw: string[] | undefined): string[] {
+  return (raw ?? []).filter((s) => !LEGACY_PEERJS_SIGNALING_URLS.includes(s));
+}
+
+/** Build a `NetworkConfig` from a partial saved entry, filling
+ *  per-network defaults. Used both for normal loads (where most
+ *  fields are present) and for the legacy single-network migration
+ *  (where everything came from the old flat shape). */
+function mergeNetwork(raw: Partial<NetworkConfig>): NetworkConfig {
+  return {
+    id: raw.id || newNetworkInternalId(),
+    label: raw.label || raw.network_id || "",
+    network_id: raw.network_id || "",
+    locked: raw.locked ?? false,
+    signaling_servers: cleanSignaling(raw.signaling_servers),
+    stun_servers: raw.stun_servers ?? [...DEFAULT_NETWORK_STUN],
+    turn_servers: raw.turn_servers ?? [],
+    accepting: coerceAccepting(raw.accepting),
+  };
+}
+
+/** Merge a partial cloud_mesh config from a saved file with
+ *  defaults. Two input shapes are supported:
+ *
+ *   1. New multi-network shape: `{ networks: [...],
+ *      active_network_id, diag_quiet, enabled }`.
+ *   2. Legacy pre-multi-network shape: `{ network_id, locked,
+ *      signaling_servers, stun_servers, turn_servers, accepting,
+ *      diag_quiet, enabled }`. Migrated by lifting the flat fields
+ *      into a single-element `networks[]` and pointing
+ *      `active_network_id` at it. The user's previous network
+ *      stays active across the upgrade, and the matching roster
+ *      file gets migrated lazily on first Rust-side load.
+ *
+ *  Empty / unconfigured input yields an empty network list (the
+ *  sidebar still renders the Network section with just an "+ Add
+ *  Network" button). */
 function mergeCloudMesh(raw: Partial<CloudMeshConfig> | undefined): CloudMeshConfig {
   if (!raw) {
     return {
-      ...DEFAULT_CLOUD_MESH,
-      signaling_servers: [...DEFAULT_CLOUD_MESH.signaling_servers],
-      stun_servers: [...DEFAULT_CLOUD_MESH.stun_servers],
-      turn_servers: [...DEFAULT_CLOUD_MESH.turn_servers],
+      enabled: DEFAULT_CLOUD_MESH.enabled,
+      networks: [],
+      active_network_id: null,
+      diag_quiet: false,
     };
   }
-  const signaling = (raw.signaling_servers ?? []).filter(
-    (s) => !LEGACY_PEERJS_SIGNALING_URLS.includes(s),
-  );
-  // Phase 2 fields are optional in both the persisted shape and the
-  // runtime defaults — older configs that predate them just stay on
-  // the implicit defaults (`available` accepting, `diag_quiet` off).
-  const accepting =
-    raw.accepting === "available" || raw.accepting === "limited" || raw.accepting === "busy"
-      ? raw.accepting
-      : "available";
+
   const diag_quiet = typeof raw.diag_quiet === "boolean" ? raw.diag_quiet : false;
-  return {
-    enabled: raw.enabled ?? DEFAULT_CLOUD_MESH.enabled,
-    network_id: raw.network_id ?? DEFAULT_CLOUD_MESH.network_id,
-    locked: raw.locked ?? DEFAULT_CLOUD_MESH.locked,
-    signaling_servers: signaling,
-    stun_servers: raw.stun_servers ?? [...DEFAULT_CLOUD_MESH.stun_servers],
-    turn_servers: raw.turn_servers ?? [...DEFAULT_CLOUD_MESH.turn_servers],
-    accepting,
-    diag_quiet,
-  };
+  const enabled = raw.enabled ?? DEFAULT_CLOUD_MESH.enabled;
+
+  // Detect the legacy flat shape. The marker is presence of any
+  // pre-multi-network field — `network_id` (string), `locked`, or
+  // the top-level signaling / stun / turn / accepting arrays.
+  const legacy = raw as unknown as Record<string, unknown>;
+  const looksLegacy =
+    typeof legacy["network_id"] === "string" ||
+    typeof legacy["locked"] === "boolean" ||
+    Array.isArray(legacy["signaling_servers"]) ||
+    Array.isArray(legacy["stun_servers"]) ||
+    Array.isArray(legacy["turn_servers"]) ||
+    typeof legacy["accepting"] === "string";
+
+  if (!Array.isArray(raw.networks) && looksLegacy) {
+    const legacyNetworkId = String(legacy["network_id"] ?? "");
+    if (legacyNetworkId === "") {
+      // Nothing to migrate; just return an empty multi-network config.
+      return { enabled, networks: [], active_network_id: null, diag_quiet };
+    }
+    const migrated = mergeNetwork({
+      network_id: legacyNetworkId,
+      label: legacyNetworkId,
+      locked: legacy["locked"] === true,
+      signaling_servers: (legacy["signaling_servers"] as string[] | undefined) ?? undefined,
+      stun_servers: (legacy["stun_servers"] as string[] | undefined) ?? undefined,
+      turn_servers: (legacy["turn_servers"] as NetworkConfig["turn_servers"] | undefined) ?? undefined,
+      accepting: legacy["accepting"] as NetworkConfig["accepting"] | undefined,
+    });
+    return {
+      enabled,
+      networks: [migrated],
+      // Keep the previously-active network live across the upgrade.
+      active_network_id: migrated.id,
+      diag_quiet,
+    };
+  }
+
+  // New shape (or empty). Coerce each entry through mergeNetwork
+  // so any saved-with-an-old-build entries get the same defaults
+  // applied as if they were freshly added.
+  const networks = (raw.networks ?? []).map((n) => mergeNetwork(n));
+  // Defensive: drop `active_network_id` if it points at a network
+  // that's no longer in the list (manual config edit, etc.).
+  const active =
+    raw.active_network_id && networks.some((n) => n.id === raw.active_network_id)
+      ? raw.active_network_id
+      : null;
+
+  return { enabled, networks, active_network_id: active, diag_quiet };
 }
 
 export async function saveConfig(config: Config): Promise<void> {
@@ -261,4 +344,79 @@ export async function updateConfig(patch: Partial<Config>): Promise<Config> {
 
 export function invalidateConfigCache(): void {
   _cached = null;
+}
+
+// ---- multi-network helpers ----------------------------------------------
+//
+// Tiny wrappers around `updateConfig` so callers don't have to
+// hand-clone the whole cloud_mesh slice each time they touch a
+// single network. Each returns the updated Config so the caller
+// can grab the new active network without re-reading.
+
+/** Get the currently-active network, or null if none is active. */
+export function activeNetwork(cfg: Config): NetworkConfig | null {
+  if (!cfg.cloud_mesh.active_network_id) return null;
+  return cfg.cloud_mesh.networks.find((n) => n.id === cfg.cloud_mesh.active_network_id) ?? null;
+}
+
+/** Append a new saved network and (optionally) set it active. */
+export async function addNetwork(
+  init: { network_id: string; label?: string },
+  options?: { activate?: boolean; locked?: boolean },
+): Promise<Config> {
+  const cfg = await loadConfig();
+  const newNet: NetworkConfig = mergeNetwork({
+    network_id: init.network_id,
+    label: init.label || init.network_id,
+    locked: options?.locked ?? false,
+  });
+  const networks = [...cfg.cloud_mesh.networks, newNet];
+  const active_network_id = options?.activate ? newNet.id : cfg.cloud_mesh.active_network_id;
+  return await updateConfig({
+    cloud_mesh: { ...cfg.cloud_mesh, networks, active_network_id },
+  });
+}
+
+/** Mutate one saved network in place. The patch is shallow-merged
+ *  over the existing network. Throws if the id doesn't exist. */
+export async function updateNetwork(
+  id: string,
+  patch: Partial<Omit<NetworkConfig, "id">>,
+): Promise<Config> {
+  const cfg = await loadConfig();
+  const networks = cfg.cloud_mesh.networks.map((n) =>
+    n.id === id ? { ...n, ...patch } : n,
+  );
+  if (!networks.some((n) => n.id === id)) {
+    throw new Error(`unknown network id: ${id}`);
+  }
+  return await updateConfig({ cloud_mesh: { ...cfg.cloud_mesh, networks } });
+}
+
+/** Remove a saved network. If it was active, clears the active
+ *  pointer so the mesh client stops on the next reconcile. The
+ *  on-disk roster file for that network is deleted separately
+ *  via `mesh_roster_delete` — keeping the wiring split lets the
+ *  Rust side own all FS access. */
+export async function removeNetwork(id: string): Promise<Config> {
+  const cfg = await loadConfig();
+  const networks = cfg.cloud_mesh.networks.filter((n) => n.id !== id);
+  const active_network_id =
+    cfg.cloud_mesh.active_network_id === id ? null : cfg.cloud_mesh.active_network_id;
+  return await updateConfig({
+    cloud_mesh: { ...cfg.cloud_mesh, networks, active_network_id },
+  });
+}
+
+/** Set the active network. Pass null to deactivate (mesh client
+ *  stops on next reconcile). Throws if the id isn't in the saved
+ *  list. */
+export async function setActiveNetwork(id: string | null): Promise<Config> {
+  const cfg = await loadConfig();
+  if (id !== null && !cfg.cloud_mesh.networks.some((n) => n.id === id)) {
+    throw new Error(`unknown network id: ${id}`);
+  }
+  return await updateConfig({
+    cloud_mesh: { ...cfg.cloud_mesh, active_network_id: id },
+  });
 }

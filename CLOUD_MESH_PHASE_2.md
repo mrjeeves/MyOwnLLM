@@ -226,6 +226,79 @@ before sending the offer; `handleMoveComplete` calls
 successful write. Both sides clear the flag and broadcast
 `move_abort` on failure paths.
 
+### ✅ Saved networks + always-visible sidebar Network section
+
+The mesh model is "one active network at a time" but the user can
+save several (`home-mesh`, `office-mesh`, `camping-mesh`) and swap
+which is active with one click. Each saved network keeps its own
+roster file + per-network settings (signaling, STUN, TURN,
+accepting policy) so switching back to a previously-used network
+skips re-authentication and reuses the chosen relay set. This sets
+up the foundation for automatic resource allocation, which depends
+on a well-defined "current network" surface.
+
+**Config shape (`cloud_mesh`):**
+- `networks: NetworkConfig[]` — saved entries, each with a stable
+  internal `id`, user-picked `label`, canonical `network_id`,
+  `locked` flag, per-network signaling / STUN / TURN, and per-
+  network `accepting` policy.
+- `active_network_id: string | null` — id of the currently-joined
+  network. Null = mesh client stays off.
+- `diag_quiet` stays global (it's a UI preference, not a per-
+  network policy).
+
+The legacy single-network shape is migrated on load: a `network_id`
++ `locked` + signaling/STUN/TURN at the top level becomes a single-
+element `networks: []` array with the same fields, and
+`active_network_id` is pointed at it so the user's previous network
+stays live across the upgrade.
+
+**Roster files (`src-tauri/src/mesh/roster.rs`):**
+Per-network at `~/.myownllm/mesh/rosters/{network_id}.json`.
+`load`, `save`, `add_peer`, `remove_peer` all operate on a single
+network's file; new `delete(network_id)` wipes one. The legacy
+single `roster.json` is migrated on first read of any network ID,
+keyed by its self-reported `network_id` field, then removed. New
+`mesh_roster_delete` Tauri command exposes the deletion to the UI's
+"Forget network" flow.
+
+**mesh-client:**
+- `reconcile` reads the active network instead of top-level fields
+  and joins (or stops) accordingly. Switching the active network
+  triggers an automatic stop + start.
+- `setAccepting` persists onto the active network only (no-op
+  when none active).
+- `start` snapshots accepting from the active network so the very
+  first `hello` carries the right value.
+
+**Config helpers (`src/config.ts`):**
+`activeNetwork(cfg)`, `addNetwork(init, opts)`,
+`updateNetwork(id, patch)`, `removeNetwork(id)`,
+`setActiveNetwork(id)`. Each persists through `updateConfig` and
+returns the updated `Config`.
+
+**UI:**
+- **Sidebar** always renders a "Network" section at the bottom with
+  the saved networks list + an "+ Add" button. The active network
+  is highlighted with a green left-border and expanded to show its
+  connected peers (and their conversation trees). Inactive networks
+  are collapsed; click the header to switch. Right-click → switch /
+  settings / forget. Right-click peer → settings.
+- **Status tab** wizard scopes to the active network. When no
+  active network is set, the wizard reads "No active network" and
+  points the user at the saved-networks list below + the + Add
+  Network button. Per-saved-network row: Switch + Forget.
+- **Settings tab** (Addresses) gets a network picker so the user
+  can edit a non-active network's signaling/STUN/TURN without
+  switching to it first.
+
+**Add Network modal (`AddNetworkModal.svelte`):**
+Shared between the Sidebar's "+ Add" and the Status tab's "+ Add
+network" buttons. Label + Network ID inputs (Generate button),
+three save modes: Save (don't activate), Save & activate
+(activate, don't lock), Save & start (activate + lock = start
+joining immediately, ⌘/Ctrl + Enter shortcut).
+
 ### ✅ Diagnostics off button
 
 The Activity panel has a `quiet logs` checkbox next to the

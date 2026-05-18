@@ -32,7 +32,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { MeshIdentity } from "./mesh";
 import type { TurnServer } from "./types";
-import { loadConfig, updateConfig } from "./config";
+import { loadConfig, updateConfig, activeNetwork, updateNetwork } from "./config";
 import { settingsAttention } from "./settings-attention.svelte";
 import {
   loadConversation,
@@ -417,8 +417,9 @@ class MeshClient {
 
   /** Toggle the Quiet-logs preference and persist it under
    *  `cloud_mesh.diag_quiet` so a relaunch retains the choice.
-   *  Safe to call before config is loaded — the persist is
-   *  fire-and-forget. */
+   *  Stays global because it's a UI preference, not a per-network
+   *  policy. Safe to call before config is loaded — the persist
+   *  is fire-and-forget. */
   async setDiagQuiet(quiet: boolean): Promise<void> {
     this.diag_quiet = quiet;
     try {
@@ -431,16 +432,16 @@ class MeshClient {
     }
   }
 
-  /** Update accepting policy. Triggers a capability re-broadcast
-   *  so peers see the change without having to wait for the
-   *  periodic snapshot. */
+  /** Update accepting policy for the currently-active network.
+   *  Triggers a capability re-broadcast so peers see the change
+   *  without having to wait for the periodic snapshot. No-op when
+   *  no network is active. */
   async setAccepting(next: AcceptingPolicy): Promise<void> {
     this.accepting = next;
     try {
       const cfg = await loadConfig();
-      await updateConfig({
-        cloud_mesh: { ...cfg.cloud_mesh, accepting: next },
-      });
+      const active = activeNetwork(cfg);
+      if (active) await updateNetwork(active.id, { accepting: next });
     } catch {
       // Persist failure is non-fatal — value still in memory.
     }
@@ -581,10 +582,15 @@ class MeshClient {
       return;
     }
 
-    const should_run = cfg.cloud_mesh.locked && cfg.cloud_mesh.network_id !== "";
+    // Pick the active network from the multi-network catalog. The
+    // mesh client joins exactly one Trystero room at a time; the
+    // user's other saved networks live on disk with their rosters
+    // intact, ready for a fast switch via `setActiveNetwork`.
+    const active = activeNetwork(cfg);
+    const should_run = !!active && active.locked && active.network_id !== "";
     if (!should_run) {
       if (this.room) {
-        this.logDiag("info", "reconcile: should_run=false → stopping");
+        this.logDiag("info", "reconcile: no active locked network → stopping");
         await this.stop();
       }
       return;
@@ -594,23 +600,23 @@ class MeshClient {
     // No-op.
     if (
       this.room &&
-      this.network_id === cfg.cloud_mesh.network_id &&
+      this.network_id === active.network_id &&
       this.identity?.device_id === identity.device_id
     ) {
       return;
     }
 
     if (this.room) {
-      this.logDiag("info", "reconcile: config changed → restarting");
+      this.logDiag("info", "reconcile: active network changed → restarting");
       await this.stop();
     }
-    this.logDiag("info", `reconcile: joining mesh for "${cfg.cloud_mesh.network_id}"`);
+    this.logDiag("info", `reconcile: joining mesh for "${active.network_id}"`);
     await this.start({
       identity,
-      networkId: cfg.cloud_mesh.network_id,
-      relayUrls: cfg.cloud_mesh.signaling_servers,
-      stunServers: cfg.cloud_mesh.stun_servers,
-      turnServers: cfg.cloud_mesh.turn_servers,
+      networkId: active.network_id,
+      relayUrls: active.signaling_servers,
+      stunServers: active.stun_servers,
+      turnServers: active.turn_servers,
     });
   }
 
@@ -629,18 +635,17 @@ class MeshClient {
     this.identity = opts.identity;
     this.network_id = opts.networkId;
     this.connections.clear();
-    // Snapshot capabilities and load persisted accepting/quiet
-    // preferences before any peer talks to us — the very first
-    // hello we send to a freshly-joined peer should carry the right
-    // accepting policy + capability set rather than an empty one
-    // followed by an immediate capabilities_update.
+    // Snapshot capabilities + persisted preferences (per-network
+    // accepting, global diag_quiet) before any peer talks to us —
+    // the very first hello we send to a freshly-joined peer should
+    // carry the right accepting policy + capability set rather
+    // than an empty one followed by an immediate
+    // capabilities_update.
     try {
       const cfg = await loadConfig();
-      const persistedAccepting = (cfg.cloud_mesh as { accepting?: AcceptingPolicy }).accepting;
-      if (persistedAccepting === "available" || persistedAccepting === "limited" || persistedAccepting === "busy") {
-        this.accepting = persistedAccepting;
-      }
-      const persistedQuiet = (cfg.cloud_mesh as { diag_quiet?: boolean }).diag_quiet;
+      const active = activeNetwork(cfg);
+      if (active) this.accepting = active.accepting;
+      const persistedQuiet = cfg.cloud_mesh.diag_quiet;
       if (typeof persistedQuiet === "boolean") this.diag_quiet = persistedQuiet;
     } catch {
       // Config unavailable — defaults are fine.
