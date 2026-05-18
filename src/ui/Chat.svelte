@@ -1063,22 +1063,26 @@
   /* Tool-call pills surface what the IT-onboarded model is doing under
      the hood — calling `networks` with action=status, switching the active
      network, etc. Collapsed by default to keep the transcript readable;
-     the user expands one when they want to audit args / result. */
+     the user expands one when they want to audit args / result.
+     The wrapper resets `white-space` so the pre-wrap on `.bubble`
+     doesn't render the markup whitespace between the content span and
+     this div as an actual blank line. */
   .tool-calls {
     display: flex;
     flex-direction: column;
     gap: .3rem;
     margin-top: .55rem;
+    white-space: normal;
   }
   .tool-call {
-    background: #161a26;
-    border: 1px solid #2a3147;
+    background: #181818;
+    border: 1px solid #2a2a2a;
     border-radius: 6px;
     font-size: .75rem;
   }
   .tool-call.running {
-    background: #1a1d2e;
-    border-color: #3a4366;
+    background: #1c1c24;
+    border-color: #3a3a55;
   }
   .tool-call summary {
     display: flex;
@@ -1086,14 +1090,14 @@
     gap: .45rem;
     padding: .35rem .6rem;
     cursor: pointer;
-    color: #b9c4e0;
+    color: #aaa;
     list-style: none;
     user-select: none;
   }
   .tool-call summary::-webkit-details-marker { display: none; }
   .tool-call summary::before {
     content: "▸";
-    color: #6a7395;
+    color: #666;
     font-size: .7rem;
     width: .8em;
   }
@@ -1102,15 +1106,15 @@
     display: inline-block;
     width: 1em;
     text-align: center;
-    color: #6a7395;
+    color: #888;
   }
-  .tool-call.running .tool-icon { color: #9aa7d6; animation: blink 1.4s infinite; }
+  .tool-call.running .tool-icon { color: #b9b9ee; animation: blink 1.4s infinite; }
   .tool-name {
     font-family: monospace;
-    color: #cdd5ee;
+    color: #6e6ef7;
   }
   .tool-action {
-    color: #7e88b0;
+    color: #888;
     font-family: monospace;
     font-size: .72rem;
   }
@@ -1119,7 +1123,7 @@
     display: flex;
     flex-direction: column;
     gap: .45rem;
-    border-top: 1px solid #232a40;
+    border-top: 1px solid #2a2a2a;
   }
   .tool-field {
     display: flex;
@@ -1127,7 +1131,7 @@
     gap: .2rem;
   }
   .tool-field-label {
-    color: #6a7395;
+    color: #666;
     font-size: .62rem;
     text-transform: uppercase;
     letter-spacing: .08em;
@@ -1135,10 +1139,10 @@
   .tool-detail pre {
     margin: 0;
     padding: .35rem .5rem;
-    background: #0f1320;
-    border: 1px solid #1f2538;
+    background: #0f0f0f;
+    border: 1px solid #1e1e1e;
     border-radius: 4px;
-    color: #b9c4e0;
+    color: #ccc;
     font-family: monospace;
     font-size: .72rem;
     line-height: 1.45;
@@ -1148,7 +1152,7 @@
     word-break: break-word;
   }
   .tool-pending {
-    color: #9aa7d6;
+    color: #888;
     font-style: italic;
     font-size: .72rem;
   }
