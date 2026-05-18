@@ -26,7 +26,12 @@
   import { routingPins, setTextPin } from "./routing-pins.svelte";
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
   import { runAgent, type AgentEvent } from "../agent-loop";
-  import { AGENT_SYSTEM_PROMPT, CHAT_TOOLS } from "../agent-tools";
+  import {
+    buildAgentSystemPrompt,
+    buildChatTools,
+    getAgentHostInfo,
+    type AgentHostInfo,
+  } from "../agent-tools";
 
   let {
     activeModel,
@@ -454,20 +459,38 @@
     input = "";
     const wasFreshChat = messages.length === 0;
 
+    // Host info gates which shell + system prompt the agent loop
+    // gets. Fetched per send so a conversation migrated between
+    // devices picks up the new host's idioms on the next user
+    // turn rather than carrying the prior machine's prompt.
+    let hostInfo: AgentHostInfo;
+    try {
+      hostInfo = await getAgentHostInfo();
+    } catch (e) {
+      console.warn("agent_host_info failed; falling back to unix:", e);
+      hostInfo = {
+        os: "unknown",
+        arch: "unknown",
+        family: "unix",
+        shell: "sh",
+        path_separator: "/",
+      };
+    }
+
     // `working` is the agent loop's source-of-truth array. The loop
     // appends assistant turns (with any tool_calls), tool results, and
     // continuation turns to it as it runs. We mirror it into `messages`
     // on each event so Svelte paints the transcript incrementally.
     //
-    // The system prompt onboards the model as an IT helper for the
-    // Networks system. Prepended only when there isn't already a
-    // system turn at the top — reloaded conversations replay the
-    // existing turns, so we don't want to duplicate the prompt every
-    // send (which would balloon the prompt over time).
-    const working: Message[] = messages.map((m) => ({ ...m }));
-    if (working.length === 0 || working[0].role !== "system") {
-      working.unshift({ role: "system", content: AGENT_SYSTEM_PROMPT });
-    }
+    // The system prompt is rebuilt per send so the live host info
+    // (OS, shell, path separator) always reflects the current
+    // device. If a previous send left a system turn at index 0 we
+    // overwrite it rather than stacking — keeps the prompt single,
+    // current, and not ballooning.
+    const working: Message[] = messages
+      .filter((m) => m.role !== "system")
+      .map((m) => ({ ...m }));
+    working.unshift({ role: "system", content: buildAgentSystemPrompt(hostInfo) });
     working.push({ role: "user", content: text });
     syncFromWorking(working);
     streaming = true;
@@ -509,7 +532,7 @@
     try {
       await runAgent({
         messages: working,
-        tools: CHAT_TOOLS,
+        tools: buildChatTools(hostInfo),
         model: activeModel,
         family: activeFamily,
         mode: activeMode,

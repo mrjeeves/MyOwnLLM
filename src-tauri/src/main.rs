@@ -816,6 +816,7 @@ fn main() {
             agent_io::agent_shell,
             agent_io::agent_read_file,
             agent_io::agent_write_file,
+            agent_io::agent_host_info,
         ])
         .setup(|app| {
             // If the configured 800x600 window can't fit on this monitor —

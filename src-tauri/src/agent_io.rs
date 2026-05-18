@@ -34,6 +34,52 @@ const MAX_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const DEFAULT_READ_BYTES: u64 = 1024 * 1024;
 const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Compile-time host context the agent loop reads at startup so the
+/// system prompt + shell tool description can tell the model exactly
+/// which shell / path conventions it's running against. Cheap enough
+/// to recompute per call — no caching needed.
+#[derive(Debug, Serialize)]
+pub struct AgentHostInfo {
+    /// "linux" / "macos" / "windows" / etc. — Rust's `std::env::consts::OS`.
+    pub os: String,
+    /// "x86_64" / "aarch64" / etc. — Rust's `std::env::consts::ARCH`.
+    pub arch: String,
+    /// Family hint the agent loop can switch its prompt on without
+    /// having to know every `OS` variant. "unix" for Linux/macOS/BSDs
+    /// (which all run `sh`), "windows" for Windows (`cmd`).
+    pub family: String,
+    /// Which shell the `shell` tool will invoke. Reported verbatim
+    /// so the model can pick the right syntax. "sh" on Unix, "cmd"
+    /// on Windows.
+    pub shell: String,
+    /// Path separator the host uses. Useful for the model when
+    /// composing file paths for `read_file` / `write_file`.
+    pub path_separator: String,
+}
+
+/// Snapshot of the host environment the agent's tools will execute
+/// against. Called once per chat send so the latest info is always
+/// reflected — there's no caching needed since the call is a
+/// constant-time read of compiled-in env consts.
+#[tauri::command]
+pub fn agent_host_info() -> AgentHostInfo {
+    let os = std::env::consts::OS.to_string();
+    let arch = std::env::consts::ARCH.to_string();
+    let (family, shell) = if cfg!(windows) {
+        ("windows".to_string(), "cmd".to_string())
+    } else {
+        ("unix".to_string(), "sh".to_string())
+    };
+    let path_separator = std::path::MAIN_SEPARATOR.to_string();
+    AgentHostInfo {
+        os,
+        arch,
+        family,
+        shell,
+        path_separator,
+    }
+}
+
 /// Outcome of one shell invocation. Mirrored to TS via serde so the
 /// agent's tool result is shaped sensibly for the model.
 #[derive(Debug, Serialize)]
