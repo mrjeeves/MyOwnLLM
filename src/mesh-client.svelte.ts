@@ -279,14 +279,33 @@ async function loadJoinRoom(): Promise<typeof JoinRoomType> {
  *  timeout, because verifying a code with a peer out-of-band can
  *  easily take more than 30s. */
 const HANDSHAKE_TIMEOUT_MS = 30_000;
-/** During the handshake window we re-send `hello` on this cadence.
- *  Right after a Trystero room rejoin the data channel can be open
- *  (so onPeerJoin fires) but not yet ready for an immediate send,
- *  swallowing the very first hello and stranding both sides
- *  waiting on auth_response. Repeating the hello a few times
- *  across the window gives the channel time to settle without
- *  bloating the timeout. */
-const HANDSHAKE_HELLO_RETRY_INTERVAL_MS = 5_000;
+/** During the handshake window we re-send `hello` on this growing
+ *  schedule. The first retry is tight because right after a Trystero
+ *  room rejoin the data channel can be open (so onPeerJoin fires) but
+ *  not yet ready for an immediate send — that initial hello can be
+ *  swallowed by a still-settling channel. Subsequent retries grow
+ *  because if 5s wasn't enough to wake the peer, neither will 5s
+ *  later be; spacing them out cuts presence-relay pressure on
+ *  genuinely-dead peers while still covering the settle-race. Total
+ *  4 sends (initial + 3 retries) inside the 30s watchdog window. */
+const HANDSHAKE_HELLO_RETRY_SCHEDULE_MS = [5_000, 7_000, 10_000];
+/** Per-peer re-handshake jitter, applied as ±this fraction of the
+ *  scheduled backoff. When N peers go silent together (router
+ *  reboot, VPN reconnect, mass-wake from suspend) their backoff
+ *  schedules align without jitter and they all retry on the same
+ *  ticks — a thundering herd that hits relay anti-spam budgets and
+ *  drives the very rate-limiting we're trying to avoid. ±20% is
+ *  enough to desync 10-20 peers across each window without slowing
+ *  the median recovery noticeably. */
+const REHANDSHAKE_JITTER_FRACTION = 0.2;
+/** Coalescing window for OS lifecycle wake events. A single tab
+ *  switch or lid event on Tauri can fire visibilitychange + focus +
+ *  pageshow within ~50-100ms. Without coalescing, each fires its
+ *  own `handleWake`, which broadcasts a ping to every peer — a
+ *  visible burst on the wire (and a flood on the Activity log) for
+ *  what the user did once. 2s is well below any human-perceptible
+ *  reaction window but comfortably above the OS event clump. */
+const WAKE_COALESCE_MS = 2_000;
 /** App-level keepalive on each active connection. We send a ping
  *  every interval and also use the tick to check whether we've
  *  heard from the peer recently enough; if not, we enter the
@@ -581,11 +600,13 @@ interface ConnectionState {
    *  prompts the user / auto-approves and sends `approve`. */
   approver_role: boolean;
   handshake_timer: number | null;
-  /** setInterval handle for re-sending `hello` until the peer
-   *  responds with auth_response. Cleared on successful
-   *  authentication, on handshake timeout, and on drop. Separate
-   *  from handshake_timer (a one-shot timeout watchdog) so the
-   *  two roles stay legible. */
+  /** setTimeout handle for the next scheduled `hello` re-send while
+   *  we wait on auth_response. The retry loop self-reschedules
+   *  along HANDSHAKE_HELLO_RETRY_SCHEDULE_MS — the handle here
+   *  refers only to the NEXT pending fire, not the whole series.
+   *  Cleared on successful authentication, on handshake timeout,
+   *  and on drop. Separate from handshake_timer (a one-shot timeout
+   *  watchdog) so the two roles stay legible. */
   handshake_hello_retry_timer: number | null;
   /** Last time we received ANY message from this peer (ping,
    *  pong, protocol envelope). Used by the heartbeat tick to
@@ -816,6 +837,20 @@ class MeshClient {
   private identity: MeshIdentity | null = null;
   private network_id = "";
   private network_handle = "";
+  /** Transport config currently baked into the live Trystero room.
+   *  Recorded in `start()` after we resolve the active network's
+   *  address fields, and compared by `reconcile()` to detect when a
+   *  STUN / TURN / signaling edit warrants a stop+start cycle. Empty
+   *  arrays while no room is joined.
+   *
+   *  Without this snapshot, `reconcile()` only knew to restart when
+   *  the active *network* changed — STUN/TURN edits on the same
+   *  network silently fell through, leaving the iceServers from the
+   *  old config baked into Trystero's RTCPeerConnections until the
+   *  user manually relaunched the app. */
+  private applied_signaling: string[] = [];
+  private applied_stun: string[] = [];
+  private applied_turn: TurnServer[] = [];
   private connections = new Map<string, ConnectionState>();
   private roster_pubkeys = new Set<string>();
   /** Pubkey → friendly label, sourced from the roster file. Used to
@@ -922,6 +957,15 @@ class MeshClient {
     focus: () => void;
     pageshow: () => void;
   } | null = null;
+  /** Wall-clock ms of the most recent lifecycle-driven wake call.
+   *  A single tab switch on Tauri can fire visibility + focus +
+   *  pageshow within ~50ms; the coalescing gate in
+   *  installLifecycleHooks reads this so only the first event
+   *  inside WAKE_COALESCE_MS triggers a ping broadcast. Heartbeat-
+   *  tick-detected wake (the real OS-suspend signal) does NOT go
+   *  through this gate — that path is rate-limited by the tick
+   *  interval itself. */
+  private last_lifecycle_wake_at = 0;
   /** Pending remote inferences we initiated and are waiting on
    *  chunks for. Keyed by infer-id; values carry the per-chunk
    *  + done + error callbacks the caller registered. Cleared on
@@ -1153,16 +1197,30 @@ class MeshClient {
     }
 
     // Already running on the right network with the right identity?
-    // No-op.
-    if (
+    // One more thing to check: the transport address fields (relay
+    // list, STUN, TURN) live inside the same NetworkConfig as the
+    // network_id, so an in-place edit (the Settings → Networks →
+    // Settings panel persists then calls reconcile) keeps the same
+    // network_id but produces a meaningfully-different mesh. Without
+    // the address comparison here, those edits silently no-op until
+    // the user relaunches the app — the exact "set the relay, see it
+    // take effect" failure mode the UI promises against.
+    const same_identity =
       this.room &&
       this.network_id === active.network_id &&
-      this.identity?.device_id === identity.device_id
-    ) {
-      return;
-    }
-
-    if (this.room) {
+      this.identity?.device_id === identity.device_id;
+    if (same_identity) {
+      const transport_unchanged =
+        sameStringList(this.applied_signaling, active.signaling_servers) &&
+        sameStringList(this.applied_stun, active.stun_servers) &&
+        sameTurnList(this.applied_turn, active.turn_servers);
+      if (transport_unchanged) return;
+      this.logDiag(
+        "info",
+        "reconcile: transport config changed → restarting room with new STUN/TURN/relays",
+      );
+      await this.stop();
+    } else if (this.room) {
       this.logDiag("info", "reconcile: active network changed → restarting");
       await this.stop();
     }
@@ -1244,6 +1302,14 @@ class MeshClient {
     const ice_servers = buildIceServers(opts.stunServers, opts.turnServers);
     const room_id = this.network_handle;
     const custom_relays = opts.relayUrls.filter((r) => r.trim() !== "");
+    // Snapshot the transport config as applied — reconcile() compares
+    // against this on its next run to detect STUN/TURN/relay edits
+    // that warrant a stop+start cycle. Clone so a later mutation of
+    // the underlying NetworkConfig array doesn't retroactively make
+    // these look "unchanged".
+    this.applied_signaling = [...opts.relayUrls];
+    this.applied_stun = [...opts.stunServers];
+    this.applied_turn = opts.turnServers.map((t) => ({ ...t }));
 
     this.logDiag(
       "info",
@@ -1515,7 +1581,7 @@ class MeshClient {
     this.refreshResources();
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
-      if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
+      if (c.handshake_hello_retry_timer !== null) clearTimeout(c.handshake_hello_retry_timer);
     }
     this.connections.clear();
     if (this.room) {
@@ -1532,6 +1598,13 @@ class MeshClient {
     this.last_global_tick_at = 0;
     this.recent_ice_failure_at = 0;
     this.last_open_relay_count = 0;
+    this.last_lifecycle_wake_at = 0;
+    // Clear the applied-transport snapshot so the next start() with
+    // any config is treated as a fresh apply, not a "no change since
+    // last time" no-op.
+    this.applied_signaling = [];
+    this.applied_stun = [];
+    this.applied_turn = [];
     this.updatePhase();
     settingsAttention.set("cloud-mesh", null);
     this.logDiag("info", "stopped");
@@ -1628,11 +1701,14 @@ class MeshClient {
       );
       this.sendHello(conn);
       // Counts as an attempt for UI purposes — clamps the user's
-      // ability to hammer the button into a tight loop.
+      // ability to hammer the button into a tight loop. Jittered
+      // for the same reason the auto path is: if the user has
+      // several offline peers and clicks reconnect on each in
+      // quick succession, we don't want their backoffs to align.
       conn.rehandshake_attempts += 1;
-      const backoff_ms = REHANDSHAKE_BACKOFF_MS_SCHEDULE[
+      const backoff_ms = jitterBackoff(REHANDSHAKE_BACKOFF_MS_SCHEDULE[
         Math.min(conn.rehandshake_attempts - 1, REHANDSHAKE_BACKOFF_MS_SCHEDULE.length - 1)
-      ];
+      ]);
       conn.rehandshake_backoff_until = Date.now() + backoff_ms;
       this.republishPeers();
       return;
@@ -1793,30 +1869,39 @@ class MeshClient {
     const conn = this.createConnState(peer_id);
     this.connections.set(peer_id, conn);
     this.sendHello(conn);
-    // Re-send hello on a tight interval until the peer
-    // reciprocates with auth_response. Right after a Trystero
-    // room rejoin the very first hello tends to be sent before
-    // the underlying data channel is fully ready and gets
-    // silently dropped — without a retry both sides sit on a
-    // dead handshake until the watchdog fires. Cleared in
-    // handleAuthResponse / handshake_timer / dropConnection.
-    conn.handshake_hello_retry_timer = window.setInterval(() => {
-      if (conn.peer_authenticated) {
-        if (conn.handshake_hello_retry_timer !== null) {
-          clearInterval(conn.handshake_hello_retry_timer);
-          conn.handshake_hello_retry_timer = null;
-        }
-        return;
-      }
-      this.logDiag(
-        "info",
-        `re-sending hello to ${peer_id.slice(0, 8)}… (no auth_response yet)`,
-      );
-      this.sendHello(conn);
-    }, HANDSHAKE_HELLO_RETRY_INTERVAL_MS);
+    // Re-send hello on a growing schedule until the peer reciprocates
+    // with auth_response. Right after a Trystero room rejoin the very
+    // first hello tends to be sent before the underlying data channel
+    // is fully ready and gets silently dropped — without a retry both
+    // sides sit on a dead handshake until the watchdog fires.
+    //
+    // We use self-rescheduling setTimeouts instead of a fixed
+    // setInterval so the cadence can grow (5s, 7s, 10s = 4 sends
+    // total inside the 30s window) — a peer that's genuinely dead
+    // doesn't deserve a hello every 5s burning relay budgets on
+    // every signaling hop. Cleared in handleAuthResponse /
+    // handshake_timer / dropConnection.
+    let retry_index = 0;
+    const scheduleNextHelloRetry = () => {
+      if (conn.peer_authenticated) return;
+      if (retry_index >= HANDSHAKE_HELLO_RETRY_SCHEDULE_MS.length) return;
+      const delay = HANDSHAKE_HELLO_RETRY_SCHEDULE_MS[retry_index];
+      retry_index += 1;
+      conn.handshake_hello_retry_timer = window.setTimeout(() => {
+        conn.handshake_hello_retry_timer = null;
+        if (conn.peer_authenticated) return;
+        this.logDiag(
+          "info",
+          `re-sending hello to ${peer_id.slice(0, 8)}… (no auth_response yet, attempt ${retry_index})`,
+        );
+        this.sendHello(conn);
+        scheduleNextHelloRetry();
+      }, delay);
+    };
+    scheduleNextHelloRetry();
     conn.handshake_timer = window.setTimeout(() => {
       if (conn.handshake_hello_retry_timer !== null) {
-        clearInterval(conn.handshake_hello_retry_timer);
+        clearTimeout(conn.handshake_hello_retry_timer);
         conn.handshake_hello_retry_timer = null;
       }
       // Only fire if we never made it past the cryptographic
@@ -1913,10 +1998,13 @@ class MeshClient {
     // so we never re-handshake faster than the 30s cap but also
     // never give up — Phase 2 routing needs the loop to keep
     // running so a peer that wakes back up an hour later still
-    // recovers without manual intervention.
-    const next_backoff_ms = REHANDSHAKE_BACKOFF_MS_SCHEDULE[
+    // recovers without manual intervention. Jittered so N peers
+    // that went silent together don't all retry on identical ticks
+    // — that synchronized burst is what tipped relay anti-spam
+    // limits in the original report.
+    const next_backoff_ms = jitterBackoff(REHANDSHAKE_BACKOFF_MS_SCHEDULE[
       Math.min(conn.rehandshake_attempts - 1, REHANDSHAKE_BACKOFF_MS_SCHEDULE.length - 1)
-    ];
+    ]);
     conn.rehandshake_backoff_until = now + next_backoff_ms;
     const reason = newly_stale
       ? post_wake_silent
@@ -2080,11 +2168,22 @@ class MeshClient {
     if (this.lifecycle_handlers !== null) return;
     if (typeof window === "undefined") return;
     const wake = () => {
+      // Coalesce the wake-event clump that Tauri can emit on a
+      // single tab switch — visibilitychange + focus + pageshow
+      // routinely fire within ~50ms of each other. Without the
+      // gate, each one broadcasts a ping to every peer, which is
+      // both a small wire burst and a noisy Activity log for what
+      // the user did once. Heartbeat-tick wake detection (which
+      // sees a real OS suspend) does NOT go through this gate —
+      // the tick interval already paces it.
+      const now = Date.now();
+      if (now - this.last_lifecycle_wake_at < WAKE_COALESCE_MS) return;
+      this.last_lifecycle_wake_at = now;
       // Reset the inter-tick clock so the heartbeat tick that
       // runs immediately after doesn't also fire its own wake
       // detection on the same event.
-      this.last_global_tick_at = Date.now();
-      this.handleWake(Date.now());
+      this.last_global_tick_at = now;
+      this.handleWake(now);
     };
     const handlers = {
       visibility: () => {
@@ -2462,7 +2561,18 @@ class MeshClient {
   }
 
   private watchPeerIce(peerId: string, pc: RTCPeerConnection): void {
-    const onChange = () => {
+    // `is_initial=true` runs once synchronously below to catch peers
+    // that already passed through the state transition by the time
+    // we attached. The flag exists to suppress the "clear banner on
+    // success" side effect during that initial inspection — we don't
+    // know whether the connected state we're observing is fresh (so
+    // clearing makes sense) or has been the steady state for minutes
+    // while a different peer was failing. Letting the synchronous
+    // call clear the banner would cause it to flicker every poll
+    // tick as new peers came into the watch set. Real transitions
+    // come through the listener with is_initial=false and update
+    // both directions cleanly.
+    const onChange = (is_initial: boolean) => {
       const state = pc.iceConnectionState;
       if (state === "failed") {
         // The actionable case: ICE candidates never reached a
@@ -2479,10 +2589,13 @@ class MeshClient {
         this.recent_ice_failure_at = Date.now();
         this.updatePhase();
       } else if (state === "connected" || state === "completed") {
-        // A successful candidate pair clears the banner — either the
-        // user has fixed their TURN config or the offending peer is
-        // no longer the active one.
+        // A successful candidate pair clears the banner — but only
+        // on a real transition we observed live. The initial
+        // synchronous read sees a snapshot that may have been
+        // "connected" for minutes; another peer that failed in the
+        // meantime is the one we'd be wrongly silencing here.
         this.updatePhase();
+        if (is_initial) return;
         if (this.recent_ice_failure_at !== 0) {
           this.logDiag(
             "info",
@@ -2495,7 +2608,7 @@ class MeshClient {
       // log. If it ages into `failed`, the next event lands above.
     };
     try {
-      pc.addEventListener("iceconnectionstatechange", onChange);
+      pc.addEventListener("iceconnectionstatechange", () => onChange(false));
     } catch {
       // Some test doubles for RTCPeerConnection don't expose
       // addEventListener; ignore so the watcher doesn't crash the
@@ -2503,9 +2616,11 @@ class MeshClient {
     }
     // If the peer was already past the transition by the time we
     // attached (likely — `getPeers()` only surfaces connected
-    // peers in steady state), run the handler once synchronously
-    // so a freshly-connected peer still clears any prior banner.
-    onChange();
+    // peers in steady state), inspect synchronously so a freshly-
+    // failed peer still flags the banner. The is_initial guard
+    // inside onChange suppresses the "clear on success" side of
+    // this — see the comment there.
+    onChange(true);
   }
 
   private handlePeerLeave(peer_id: string): void {
@@ -2949,7 +3064,7 @@ class MeshClient {
       conn.handshake_timer = null;
     }
     if (conn.handshake_hello_retry_timer !== null) {
-      clearInterval(conn.handshake_hello_retry_timer);
+      clearTimeout(conn.handshake_hello_retry_timer);
       conn.handshake_hello_retry_timer = null;
     }
     this.logDiag(
@@ -3253,7 +3368,7 @@ class MeshClient {
     const c = this.connections.get(peer_id);
     if (!c) return;
     if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
-    if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
+    if (c.handshake_hello_retry_timer !== null) clearTimeout(c.handshake_hello_retry_timer);
     // Preserve the catalog from this connection so the offline
     // sidebar render still shows the peer's conversations dimmed
     // instead of going blank. Only worth caching for peers we'd
@@ -5034,6 +5149,38 @@ function buildIceServers(
         credential: t.credential,
       })),
   ];
+}
+
+/** Apply ±REHANDSHAKE_JITTER_FRACTION to a backoff value so peers
+ *  that went silent together don't all retry on the same tick.
+ *  Pure function — caller decides where to apply jitter. */
+function jitterBackoff(ms: number): number {
+  const span = ms * REHANDSHAKE_JITTER_FRACTION;
+  const offset = (Math.random() * 2 - 1) * span;
+  return Math.max(0, Math.round(ms + offset));
+}
+
+/** True when two transport-config arrays describe the same set
+ *  (same length, same elements in the same order). Order matters
+ *  for STUN/relay lists because Trystero / WebRTC try them in
+ *  declared order — a reorder is a meaningful user change. */
+function sameStringList(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** Same as `sameStringList` for the TURN array. Compares url +
+ *  username + credential because changing any of them is a real
+ *  change the user expects to take effect. */
+function sameTurnList(a: TurnServer[], b: TurnServer[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].url !== b[i].url) return false;
+    if ((a[i].username ?? "") !== (b[i].username ?? "")) return false;
+    if ((a[i].credential ?? "") !== (b[i].credential ?? "")) return false;
+  }
+  return true;
 }
 
 function shortLabel(label: string, pubkey: string): string {
