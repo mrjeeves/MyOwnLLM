@@ -1493,19 +1493,38 @@ class MeshClient {
     this.status = "starting";
     this.error = "";
     this.identity = opts.identity;
+    // Detect whether THIS start follows a network-change stop, or a
+    // same-network restart (the rediscovery stop+start cycle). The
+    // pubkey-keyed caches are network-scoped: cached catalogs and
+    // capability blobs from peers in a different network shouldn't
+    // leak in. But on a same-network restart they should SURVIVE —
+    // every doc invariant about "anything keyed by device_pubkey
+    // survives a peer-id reissue" implicitly relies on this, and
+    // before this gate the engine wiped them on every rediscovery,
+    // flashing offline-rostered sidebar peers to blank for the
+    // duration of the rejoin. `recent_disconnects` also gets the
+    // preserve treatment so the "reconnecting" grace markers
+    // survive a rediscovery — otherwise a peer that dropped JUST
+    // before the rejoin would skip straight to "offline" instead of
+    // showing as "reconnecting".
+    //
+    // `network_id === ""` means this is the very first start since
+    // module load, so the caches are already empty and clearing is
+    // a no-op — we treat that as "no network change" to keep the
+    // branch logic uniform.
+    const network_changed =
+      this.network_id !== "" && this.network_id !== opts.networkId;
     this.network_id = opts.networkId;
     this.connections.clear();
     this.last_open_relay_count = 0;
     this.updatePhase();
-    // Network-scoped caches: a different active network means a
-    // different roster, so the cached catalogs and capability blobs
-    // from peers in the old network shouldn't leak into the sidebar
-    // here. refreshRoster() will reseed roster_pubkeys / labels from
-    // disk below.
-    this.catalog_cache.clear();
-    this.capabilities_cache.clear();
-    this.roster_pubkeys.clear();
-    this.roster_labels.clear();
+    if (network_changed) {
+      this.catalog_cache.clear();
+      this.capabilities_cache.clear();
+      this.roster_pubkeys.clear();
+      this.roster_labels.clear();
+      this.recent_disconnects.clear();
+    }
     // Snapshot capabilities + persisted preferences (per-network
     // accepting, global diag_quiet) before any peer talks to us —
     // the very first hello we send to a freshly-joined peer should
@@ -1848,11 +1867,17 @@ class MeshClient {
       clearInterval(this.reconnect_prune_timer);
       this.reconnect_prune_timer = null;
     }
-    // Clear the reconnecting-bucket: stop() means the user is
-    // shutting the mesh down or switching networks. Any pending
-    // "give them a sec to come back" timers are irrelevant — the
-    // mesh-level identity is going away.
-    this.recent_disconnects.clear();
+    // NB: `recent_disconnects` intentionally not cleared here —
+    // a same-network rediscovery does stop+start, and clearing
+    // the bucket on stop would destroy the "reconnecting" grace
+    // markers for peers that dropped just before the rejoin. The
+    // markers stay live across the cycle so the UI shows
+    // `reconnecting…` continuously rather than flashing
+    // through `offline`. The cross-network branch in `start()`
+    // does clear it (different roster = different identities, no
+    // sense preserving). If `stop()` is called and `start()` is
+    // never called again, the next process restart wipes the
+    // in-memory state anyway.
     // Resolve every in-flight remote inference as failed so callers
     // unblock cleanly instead of hanging on a promise that will
     // never resolve.
