@@ -119,6 +119,89 @@ let cachedJoinRoom: typeof JoinRoomType | null = null;
  *  the signaling-diagnostic poll no-ops on other strategies. */
 let cachedGetRelaySockets: (() => Record<string, WebSocket>) | null = null;
 
+/** Module-level WebRTC instrumentation state. The
+ *  `installRTCPeerConnectionDiag()` wrapper writes to these counters
+ *  as Trystero creates RTCPeerConnections and gathers ICE
+ *  candidates; `pollSignalingRelays()` reads them and folds the
+ *  numbers into the Activity-log summary. Module-scoped because
+ *  the wrapper itself is global (we only install it once for the
+ *  whole app), and it doesn't have easy access to the MeshClient
+ *  instance to write fields on. */
+let webrtcDiagInstalled = false;
+const webrtcDiagState = {
+  pcCount: 0,
+  candidateTypes: {} as Record<string, number>,
+  candidateErrors: [] as string[],
+  iceStateChanges: [] as string[],
+};
+
+function installRTCPeerConnectionDiag(): void {
+  if (webrtcDiagInstalled) return;
+  if (typeof window === "undefined") return;
+  const Original = window.RTCPeerConnection;
+  if (typeof Original !== "function") return;
+  webrtcDiagInstalled = true;
+
+  // Wrap, don't replace — we still need every method and property
+  // on the prototype to behave identically for Trystero. Extending
+  // the original class is the path of least surprise: instanceof
+  // checks keep working, the prototype chain is intact, and
+  // Trystero never touches our subclass directly.
+  class WrappedRTCPeerConnection extends Original {
+    constructor(...args: ConstructorParameters<typeof RTCPeerConnection>) {
+      super(...args);
+      webrtcDiagState.pcCount += 1;
+      const myIndex = webrtcDiagState.pcCount;
+      this.addEventListener("icecandidate", (ev) => {
+        const c = ev.candidate;
+        if (!c) return;
+        // `candidate.type` is the candidate kind: "host", "srflx"
+        // (server-reflexive — via STUN), "prflx" (peer-reflexive),
+        // "relay" (via TURN). The presence/absence of "relay" is
+        // the smoking gun for a busted TURN config: zero relay
+        // candidates AND symmetric NAT = guaranteed ICE failure.
+        const type = c.type ?? "unknown";
+        webrtcDiagState.candidateTypes[type] =
+          (webrtcDiagState.candidateTypes[type] ?? 0) + 1;
+      });
+      // Browsers expose `icecandidateerror` as a proper event on
+      // RTCPeerConnection; STUN/TURN allocation failures land
+      // here with a 4xx/5xx-style code from the relay's response.
+      this.addEventListener("icecandidateerror", (ev) => {
+        const e = ev as RTCPeerConnectionIceErrorEvent;
+        const url = e.url || "?";
+        const code = e.errorCode ?? 0;
+        const text = e.errorText || "";
+        const entry = `pc${myIndex}: ${url} → ${code} ${text}`;
+        // Keep the last 8 errors so the diag log doesn't grow
+        // unbounded across a long session of TURN auth failures.
+        webrtcDiagState.candidateErrors.push(entry);
+        if (webrtcDiagState.candidateErrors.length > 8) {
+          webrtcDiagState.candidateErrors.shift();
+        }
+      });
+      this.addEventListener("iceconnectionstatechange", () => {
+        const state = this.iceConnectionState;
+        const entry = `pc${myIndex}:${state}`;
+        webrtcDiagState.iceStateChanges.push(entry);
+        if (webrtcDiagState.iceStateChanges.length > 16) {
+          webrtcDiagState.iceStateChanges.shift();
+        }
+      });
+    }
+  }
+
+  (window as unknown as { RTCPeerConnection: typeof RTCPeerConnection }).RTCPeerConnection =
+    WrappedRTCPeerConnection as unknown as typeof RTCPeerConnection;
+}
+
+// Install once at module load — the wrapper is a strict superset
+// of the native RTCPeerConnection (extends it, doesn't change
+// behavior), so it's safe to run even before any mesh code
+// touches it. Doing it at module init guarantees Trystero's first
+// `new RTCPeerConnection(...)` already goes through our subclass.
+installRTCPeerConnectionDiag();
+
 /** Resolve the Nostr strategy's `getRelaySockets` so we can peek at
  *  per-relay WebSocket readyState for diagnostics. Best-effort —
  *  returns null when the strategy isn't Nostr or the export is
@@ -2089,11 +2172,29 @@ class MeshClient {
           `via (${per_relay.join(", ")})`
         : `; inbound EVENTs: 0 — no peer traffic seen yet`;
 
+    // WebRTC-level state, captured by the global RTCPeerConnection
+    // wrapper. If signaling looks healthy ("from 2 authors") but
+    // peer joined never fires, this is the next place to look:
+    // empty candidate types → ICE never gathered; "relay" missing
+    // + symmetric NAT → TURN allocation failed; ICE state stuck at
+    // "checking" or transitioning straight to "failed".
+    const cand_types = Object.entries(webrtcDiagState.candidateTypes)
+      .map(([t, n]) => `${t}=${n}`)
+      .join(", ");
+    const ice_changes = webrtcDiagState.iceStateChanges.slice(-6).join(" → ");
+    const cand_errs = webrtcDiagState.candidateErrors.slice(-3).join(" | ");
+    const webrtc_summary =
+      webrtcDiagState.pcCount === 0
+        ? "; webrtc: no peer connections created yet"
+        : `; webrtc: ${webrtcDiagState.pcCount} pc(s), candidates [${cand_types || "none"}]` +
+          (ice_changes ? `, ice [${ice_changes}]` : "") +
+          (cand_errs ? `, errors [${cand_errs}]` : "");
+
     if (open.length === 0) {
       const dead = [...connecting, ...closing, ...closed].join(", ");
       this.logDiag(
         "warn",
-        `signaling: ${summary}. Zero open relays — presence publishes are being dropped. Dead/pending: ${dead}${events_suffix}`,
+        `signaling: ${summary}. Zero open relays — presence publishes are being dropped. Dead/pending: ${dead}${events_suffix}${webrtc_summary}`,
       );
     } else {
       const openList = open.join(", ");
@@ -2103,7 +2204,7 @@ class MeshClient {
           : "";
       this.logDiag(
         "info",
-        `signaling: ${summary}. Open: ${openList}${deadList}${events_suffix}`,
+        `signaling: ${summary}. Open: ${openList}${deadList}${events_suffix}${webrtc_summary}`,
       );
     }
   }
