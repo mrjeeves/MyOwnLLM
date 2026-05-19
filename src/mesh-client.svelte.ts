@@ -308,28 +308,20 @@ const CATALOG_DEBOUNCE_MS = 1_500;
  *  uses internally per candidate pair, so we never miss the
  *  transition into `failed`. */
 const ICE_POLL_INTERVAL_MS = 3_000;
-/** Default Nostr signaling relay pool, used when the user hasn't
- *  added their own under Settings → Networks → Settings →
- *  Signaling relays. Hand-picked from Trystero's broader default
- *  list to skip `relay.damus.io` (which aggressively rate-limits
- *  the presence-announce publishes our rediscovery cycle produces
- *  — symptom: `Trystero: relay failure from wss://relay.damus.io/
- *  - rate-limited: you are noting too much` spamming the console)
- *  and to favor relays known to accept anonymous publishes
- *  without aggressive throttling. Eight entries gives plenty of
- *  redundancy: a peer announce needs to land on at least one
- *  relay both sides share, and with 8 the odds of all of them
- *  being simultaneously down are negligible. */
-const DEFAULT_SIGNALING_RELAYS: ReadonlyArray<string> = [
-  "wss://nos.lol",
-  "wss://relay.mostr.pub",
-  "wss://purplerelay.com",
-  "wss://relay.nostr.place",
-  "wss://relay.angor.io",
-  "wss://relay.binaryrobot.com",
-  "wss://relay.froth.zone",
-  "wss://strfry.shock.network",
-];
+/** Number of Nostr signaling relays Trystero connects to in parallel
+ *  when the user hasn't supplied their own. Trystero's built-in
+ *  default is 5; we ask for 8 to give us extra slack so that a
+ *  single misbehaving relay (notably `relay.damus.io`, which sits
+ *  in Trystero's deterministic top-5 for our app id and rate-limits
+ *  presence-announce publishes with "you are noting too much") only
+ *  costs us 1/8 of our signaling capacity instead of 1/5.
+ *
+ *  Crucially, Trystero's relay list is sliced with `redundancy` from
+ *  the SAME deterministic shuffle for every client running against
+ *  the same `appId`, so a peer on an older build that picked the
+ *  first 5 still overlaps fully with a peer on this build that
+ *  picked the first 8 — no flag-day for the mesh. */
+const DEFAULT_SIGNALING_REDUNDANCY = 8;
 /** Globally-unique app identifier passed to Trystero so MyOwnLLM
  *  peers don't accidentally match peers from unrelated apps that
  *  happen to use the same `roomId`. Bump the suffix if we ever
@@ -1065,7 +1057,7 @@ class MeshClient {
       `joining mesh room ${room_id.slice(0, 12)}… (trystero/${TRYSTERO_STRATEGY}, app=${TRYSTERO_APP_ID}` +
         (custom_relays.length > 0
           ? `, ${custom_relays.length} custom relay${custom_relays.length === 1 ? "" : "s"})`
-          : `, ${DEFAULT_SIGNALING_RELAYS.length} curated default relays)`),
+          : `, trystero defaults ×${DEFAULT_SIGNALING_REDUNDANCY})`),
     );
 
     // Resolve the build-time-selected `joinRoom` once per session.
@@ -1086,21 +1078,30 @@ class MeshClient {
         appId: TRYSTERO_APP_ID,
         rtcConfig: { iceServers: ice_servers },
       };
-      // Pin the signaling relay set. Trystero reads the override
-      // from `relayConfig.urls` (NOT a top-level `relayUrls` — a
-      // prior typo here silently fell through to Trystero's
-      // shuffled default pool of 52 relays, which deterministically
-      // included `wss://relay.damus.io/` for our app id and that
-      // relay aggressively rate-limits the presence announces we
-      // publish on every rediscovery). When the user has custom
-      // relays configured those win; otherwise we substitute our
-      // own curated 8-relay set so every MyOwnLLM client lands on
-      // the same well-behaved signaling pool.
-      const relay_urls =
-        custom_relays.length > 0 ? custom_relays : [...DEFAULT_SIGNALING_RELAYS];
-      (room_config as Record<string, unknown>).relayConfig = {
-        urls: relay_urls,
-      };
+      // Plumb the signaling relay set into Trystero. Both fields go
+      // under `relayConfig` (NOT a top-level `relayUrls` — a prior
+      // typo here silently fell through to Trystero's built-in
+      // defaults, so any URLs the user added in Settings were
+      // effectively ignored). When the user has custom relays we
+      // pass them as `urls`, which replaces Trystero's defaults
+      // entirely. Otherwise we leave `urls` unset and just bump
+      // `redundancy` from Trystero's default 5 to 8, which (a)
+      // keeps every existing peer compatible because Trystero's
+      // `redundancy` slices off the front of its deterministic
+      // appId-derived shuffle (the first 5 entries are identical
+      // either way) and (b) dilutes the impact of a single
+      // misbehaving relay in that top-N — most notably
+      // `relay.damus.io`, which sits in our top-5 and rate-limits
+      // presence-announce publishes with "you are noting too much".
+      if (custom_relays.length > 0) {
+        (room_config as Record<string, unknown>).relayConfig = {
+          urls: custom_relays,
+        };
+      } else {
+        (room_config as Record<string, unknown>).relayConfig = {
+          redundancy: DEFAULT_SIGNALING_REDUNDANCY,
+        };
+      }
       // `onJoinError` fires when a pending peer's handshake fails or
       // times out (10s default). It's the primary signal for the
       // hotspot / symmetric-NAT case — Trystero hides peers from

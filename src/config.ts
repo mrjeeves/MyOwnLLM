@@ -48,13 +48,13 @@ const DEFAULT_REMOTE_UI: RemoteUiConfig = {
 
 // Signaling is handled by Trystero over Nostr relays. The default
 // per-network `signaling_servers` list is empty so the mesh client
-// substitutes its curated public-relay pool at connect time (see
-// `DEFAULT_SIGNALING_RELAYS` in mesh-client.svelte.ts). Anyone who
-// wants to point at a self-hosted Nostr relay (or a private one
-// for office/LAN use) adds entries from the Cloud Mesh →
-// Addresses tab and those take full precedence over the defaults.
-// STUN servers default to Google's public pool, which is the
-// de-facto baseline.
+// uses Trystero's built-in 52-relay public pool, bumped to
+// redundancy 8 at connect time (see `DEFAULT_SIGNALING_REDUNDANCY`
+// in mesh-client.svelte.ts). Anyone who wants to point at a
+// self-hosted Nostr relay (or a private one for office/LAN use)
+// adds entries from the Cloud Mesh → Addresses tab and those
+// replace the default pool entirely. STUN servers default to
+// Google's public pool, which is the de-facto baseline.
 //
 // Legacy entries from earlier PeerJS-based commits get stripped
 // on load so testers don't end up pointing Trystero at a
