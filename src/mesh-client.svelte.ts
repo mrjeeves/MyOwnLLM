@@ -196,6 +196,73 @@ function installRTCPeerConnectionDiag(): void {
 // `new RTCPeerConnection(...)` already goes through our subclass.
 installRTCPeerConnectionDiag();
 
+/** Mirror Trystero's `strToNum` (sum-of-charCodes mod limit) so we
+ *  can compute the same shuffle seed it does from our `appId`.
+ *  Trystero exports `strToNum` from its core but we replicate it
+ *  inline to keep this self-contained — the algorithm is trivial
+ *  and won't drift, and we'd otherwise need a runtime import path
+ *  just for one helper. */
+function trysteroStrToNum(str: string): number {
+  let sum = 0;
+  for (let i = 0; i < str.length; i++) sum += str.charCodeAt(i);
+  return sum % Number.MAX_SAFE_INTEGER;
+}
+
+/** Mirror Trystero's seeded Fisher-Yates shuffle (the one used by
+ *  `getRelays` to pick a deterministic top-N from the default relay
+ *  list). Same PRNG (`sin(seed) * 1e4`, fractional part), same swap
+ *  order, so the output for any (xs, seed) pair matches Trystero's
+ *  byte-for-byte. We use this in `pickFilteredSignalingRelays` to
+ *  reproduce the deterministic order EXCEPT with denylisted relays
+ *  removed before the slice. */
+function trysteroShuffle<T>(xs: readonly T[], seed: number): T[] {
+  const a = [...xs];
+  let s = seed;
+  const rand = () => {
+    const x = Math.sin(s++) * 1e4;
+    return x - Math.floor(x);
+  };
+  let i = a.length;
+  while (i) {
+    const j = Math.floor(rand() * i--);
+    const tmp = a[i];
+    a[i] = a[j];
+    a[j] = tmp;
+  }
+  return a;
+}
+
+/** Pick the signaling relay set Trystero would have picked (top-N
+ *  of the appId-deterministic shuffle of its `defaultRelayUrls`),
+ *  with `SIGNALING_RELAY_DENYLIST` entries removed BEFORE the slice
+ *  so the count we return is N quiet relays — not N-minus-the-noisy-
+ *  ones. Returns null when `defaultRelayUrls` can't be loaded (non-
+ *  Nostr strategy, missing export, dynamic import error); callers
+ *  should fall back to Trystero's own `redundancy` slice in that
+ *  case so the mesh still starts. */
+async function pickFilteredSignalingRelays(
+  appId: string,
+  denylist: readonly string[],
+  count: number,
+): Promise<string[] | null> {
+  if (TRYSTERO_STRATEGY !== "nostr") return null;
+  try {
+    const mod = (await import("trystero/nostr")) as {
+      defaultRelayUrls?: readonly string[];
+    };
+    const defaults = mod.defaultRelayUrls;
+    if (!Array.isArray(defaults) || defaults.length === 0) return null;
+    const seed = trysteroStrToNum(appId);
+    const shuffled = trysteroShuffle(defaults, seed);
+    const filtered = shuffled.filter(
+      (url) => !denylist.some((deny) => url.includes(deny)),
+    );
+    return filtered.slice(0, count);
+  } catch {
+    return null;
+  }
+}
+
 /** Resolve the Nostr strategy's `getRelaySockets` so we can peek at
  *  per-relay WebSocket readyState for diagnostics. Best-effort —
  *  returns null when the strategy isn't Nostr or the export is
@@ -493,12 +560,45 @@ const SIGNALING_DIAG_INTERVAL_MS = 10_000;
  *  presence-announce publishes with "you are noting too much") only
  *  costs us 1/8 of our signaling capacity instead of 1/5.
  *
+/** Default count of Trystero relays we attach when the user hasn't
+ *  set a custom signaling list. Matches Trystero's own out-of-the-
+ *  box redundancy (5). We used to run with 8 to dilute the impact
+ *  of any single misbehaving relay in the top-N, but that strategy
+ *  scaled the warmup-burst event load by 60% without actually
+ *  removing the misbehavers — `relay.damus.io` and `chorus.pjv.me`
+ *  still rate-limited us inside their top-5 slots. The targeted
+ *  fix is `SIGNALING_RELAY_DENYLIST` below: we skip the known-noisy
+ *  hosts in the deterministic shuffle entirely, so 5 relays is now
+ *  5 quiet relays.
+ *
  *  Crucially, Trystero's relay list is sliced with `redundancy` from
  *  the SAME deterministic shuffle for every client running against
  *  the same `appId`, so a peer on an older build that picked the
  *  first 5 still overlaps fully with a peer on this build that
  *  picked the first 8 — no flag-day for the mesh. */
-const DEFAULT_SIGNALING_REDUNDANCY = 8;
+const DEFAULT_SIGNALING_REDUNDANCY = 5;
+/** Hosts we always skip in the Trystero deterministic-shuffle slice,
+ *  identified by substring (each `defaultRelayUrls` entry is
+ *  `"wss://<host>[/path]"`, so the host suffices). These relays
+ *  rate-limit aggressively in the steady-state announce loop:
+ *
+ *   - `relay.damus.io` returns NOTICE "rate-limited: you are noting
+ *     too much" within seconds of the warmup burst. Free pubkeys
+ *     are throttled at ~1 EVENT/sec; our 8-relay × 4-warmup pattern
+ *     bursts way past that.
+ *   - `chorus.pjv.me` 429s the WebSocket handshake on reconnect
+ *     whenever it sees us in a rejoin loop.
+ *
+ *  Removing them is safe for mesh interoperability — they sit at
+ *  shuffle indices 2 and 3 in our app's deterministic order, and
+ *  the next-N relays we pick (schnorr.me, relay.nostrdice.com,
+ *  x.kojira.io, relay-can.zombi.cloudrodion.com) are also in the
+ *  old build's top-8, so old and new peers continue to overlap on
+ *  five common relays. */
+const SIGNALING_RELAY_DENYLIST = [
+  "relay.damus.io",
+  "chorus.pjv.me",
+];
 /** Globally-unique app identifier passed to Trystero so MyOwnLLM
  *  peers don't accidentally match peers from unrelated apps that
  *  happen to use the same `roomId`. Bump the suffix if we ever
@@ -1427,13 +1527,63 @@ class MeshClient {
     this.applied_stun = [...opts.stunServers];
     this.applied_turn = opts.turnServers.map((t) => ({ ...t }));
 
+    // When the user hasn't provided a custom relay list, pre-compute
+    // our own deny-filtered slice of Trystero's default shuffle. We
+    // pass it via `relayConfig.urls` so Trystero uses exactly these
+    // hosts (no internal slicing), which lets us skip the known-
+    // noisy relays entirely. Null = couldn't load the defaults
+    // (non-Nostr strategy or import error); fallback path further
+    // down uses Trystero's redundancy slice instead.
+    let chosen_default_relays: string[] | null = null;
+    if (custom_relays.length === 0) {
+      chosen_default_relays = await pickFilteredSignalingRelays(
+        TRYSTERO_APP_ID,
+        SIGNALING_RELAY_DENYLIST,
+        DEFAULT_SIGNALING_REDUNDANCY,
+      );
+    }
+
     this.logDiag(
       "info",
       `joining mesh room ${room_id.slice(0, 12)}… (trystero/${TRYSTERO_STRATEGY}, app=${TRYSTERO_APP_ID}` +
         (custom_relays.length > 0
           ? `, ${custom_relays.length} custom relay${custom_relays.length === 1 ? "" : "s"})`
-          : `, trystero defaults ×${DEFAULT_SIGNALING_REDUNDANCY})`),
+          : chosen_default_relays
+            ? `, trystero defaults ×${chosen_default_relays.length} after deny-filter)`
+            : `, trystero defaults ×${DEFAULT_SIGNALING_REDUNDANCY})`),
     );
+    // Surface the actual STUN/TURN URLs we're handing to WebRTC so
+    // a misconfigured or unreachable server is visible at a glance.
+    // Without this, "ICE failed" leaves you guessing which TURN host
+    // even got tried. Credentials are intentionally omitted from
+    // the URL display but the username is shown so you can confirm
+    // the config landed; password length only as a sanity bit.
+    const stun_summary = opts.stunServers.length === 0
+      ? "STUN: (none — relying on browser defaults if any)"
+      : `STUN: ${opts.stunServers.join(", ")}`;
+    const turn_summary = opts.turnServers.length === 0
+      ? "TURN: (none — direct only; symmetric NAT on either side will fail)"
+      : `TURN: ${opts.turnServers
+          .map((t) => {
+            const auth = t.username
+              ? ` (user=${t.username}, cred=${t.credential ? `${t.credential.length}ch` : "empty"})`
+              : "";
+            return `${t.url}${auth}`;
+          })
+          .join(", ")}`;
+    this.logDiag("info", `${stun_summary}; ${turn_summary}`);
+    if (chosen_default_relays && chosen_default_relays.length > 0) {
+      // Print the actual relay hosts so a denylist tweak or a
+      // changed Trystero default list is visible. Strip the
+      // wss:// prefix; all entries have it and it's just clutter.
+      const relay_hosts = chosen_default_relays.map((u) =>
+        u.replace(/^wss?:\/\//, ""),
+      );
+      this.logDiag(
+        "info",
+        `signaling relays: ${relay_hosts.join(", ")}`,
+      );
+    }
 
     // Resolve the build-time-selected `joinRoom` once per session.
     // Awaited here so a missing / failed strategy bundle surfaces
@@ -1454,24 +1604,24 @@ class MeshClient {
         appId: TRYSTERO_APP_ID,
         rtcConfig: { iceServers: ice_servers },
       };
-      // Plumb the signaling relay set into Trystero. Both fields go
-      // under `relayConfig` (NOT a top-level `relayUrls` — a prior
-      // typo here silently fell through to Trystero's built-in
-      // defaults, so any URLs the user added in Settings were
-      // effectively ignored). When the user has custom relays we
-      // pass them as `urls`, which replaces Trystero's defaults
-      // entirely. Otherwise we leave `urls` unset and just bump
-      // `redundancy` from Trystero's default 5 to 8, which (a)
-      // keeps every existing peer compatible because Trystero's
-      // `redundancy` slices off the front of its deterministic
-      // appId-derived shuffle (the first 5 entries are identical
-      // either way) and (b) dilutes the impact of a single
-      // misbehaving relay in that top-N — most notably
-      // `relay.damus.io`, which sits in our top-5 and rate-limits
-      // presence-announce publishes with "you are noting too much".
+      // Plumb the signaling relay set into Trystero. `relayConfig.urls`
+      // wholly replaces Trystero's default selection — when set, every
+      // entry is used and `redundancy` is ignored. Three branches:
+      //
+      //   1. User has custom relays → pass those exactly.
+      //   2. We loaded the default list and computed a deny-filtered
+      //      slice → pass that, so the chosen N are quiet hosts.
+      //   3. We couldn't load defaultRelayUrls (non-Nostr strategy /
+      //      import error) → fall back to `redundancy`, which lets
+      //      Trystero pick its own top-N. Won't filter the noisy
+      //      hosts but at least keeps the mesh alive.
       if (custom_relays.length > 0) {
         (room_config as Record<string, unknown>).relayConfig = {
           urls: custom_relays,
+        };
+      } else if (chosen_default_relays && chosen_default_relays.length > 0) {
+        (room_config as Record<string, unknown>).relayConfig = {
+          urls: chosen_default_relays,
         };
       } else {
         (room_config as Record<string, unknown>).relayConfig = {
