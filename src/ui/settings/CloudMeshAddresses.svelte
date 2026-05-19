@@ -10,6 +10,7 @@
    *  to edit any saved network's transport config without
    *  affecting which network is live. */
   let networks = $state<NetworkConfig[]>([]);
+  let activeNetworkId = $state<string | null>(null);
   let editingId = $state<string | null>(null);
   let editing = $derived(networks.find((n) => n.id === editingId) ?? null);
 
@@ -20,6 +21,7 @@
   let signalingRelays = $state<string[]>([]);
   let stunServers = $state<string[]>([]);
   let turnServers = $state<TurnServer[]>([]);
+  let usePublicTurnFallback = $state(true);
 
   let loading = $state(true);
   let saving = $state(false);
@@ -35,6 +37,7 @@
     try {
       const cfg = await loadConfig();
       networks = cfg.cloud_mesh.networks;
+      activeNetworkId = cfg.cloud_mesh.active_network_id;
       const active = activeNetwork(cfg);
       // Pick the edit target: preserve the user's current choice
       // when possible; fall back to active; fall back to first
@@ -49,10 +52,12 @@
         signalingRelays = [...next.signaling_servers];
         stunServers = [...next.stun_servers];
         turnServers = next.turn_servers.map((t) => ({ ...t }));
+        usePublicTurnFallback = next.use_public_turn_fallback;
       } else {
         signalingRelays = [];
         stunServers = [];
         turnServers = [];
+        usePublicTurnFallback = true;
       }
     } catch (e) {
       error = String(e);
@@ -71,6 +76,7 @@
       signalingRelays = [...net.signaling_servers];
       stunServers = [...net.stun_servers];
       turnServers = net.turn_servers.map((t) => ({ ...t }));
+      usePublicTurnFallback = net.use_public_turn_fallback;
     }
   }
 
@@ -83,6 +89,7 @@
         signaling_servers: signalingRelays.filter((s) => s.trim() !== ""),
         stun_servers: stunServers.filter((s) => s.trim() !== ""),
         turn_servers: turnServers.filter((t) => t.url.trim() !== ""),
+        use_public_turn_fallback: usePublicTurnFallback,
       });
       // If we just edited the active network, restart the mesh
       // client so it picks up the new relay set on its next
@@ -139,6 +146,25 @@
     turnServers = turnServers.filter((_, idx) => idx !== i);
     void persist();
   }
+
+  function toggleTurnFallback(next: boolean) {
+    usePublicTurnFallback = next;
+    void persist();
+  }
+
+  /** True when the mesh client has logged a recent ICE failure and
+   *  the user is currently editing the active network. Drives the
+   *  inline NAT banner in the TURN section — symmetric NAT (phone
+   *  hotspot, CGNAT) is the dominant cause and the banner points
+   *  the user at the two practical fixes: enable the public
+   *  fallback or add their own TURN entry. Scoped to the active
+   *  network because failures on the live mesh aren't attributable
+   *  to a different saved network's config. */
+  let showIceBanner = $derived(
+    meshClient.recent_ice_failure_at > 0 &&
+      editingId !== null &&
+      editingId === activeNetworkId,
+  );
 </script>
 
 <div class="root">
@@ -295,10 +321,45 @@
       <h3>TURN servers</h3>
       <div class="block-hint">
         Relay servers used when direct peer connections can't be
-        established. Optional — most home networks don't need one.
-        TURN typically requires credentials and consumes bandwidth, so
-        plan accordingly.
+        established. Optional — most home networks don't need one,
+        but a phone hotspot, carrier-grade NAT, or restrictive Wi-Fi
+        often does because their symmetric NAT defeats STUN-only
+        hole-punching. TURN typically requires credentials and
+        consumes bandwidth, so plan accordingly.
       </div>
+
+      {#if showIceBanner}
+        <div class="ice-banner" role="alert">
+          <strong>Peers couldn't connect directly.</strong>
+          The last connection attempt's WebRTC ICE check failed —
+          usually a sign that one or both sides are behind symmetric
+          NAT (phone hotspot, CGNAT, restrictive carrier). Either
+          turn on the public TURN fallback below, or add a TURN
+          server entry. Switching one or both devices back to a
+          regular Wi-Fi connection also works.
+        </div>
+      {/if}
+
+      <label class="fallback-toggle">
+        <input
+          type="checkbox"
+          checked={usePublicTurnFallback}
+          onchange={(e) => toggleTurnFallback((e.target as HTMLInputElement).checked)}
+        />
+        <span class="fallback-label">
+          <strong>Use built-in public TURN fallback</strong>
+          <span class="fallback-detail">
+            Adds Open Relay Project's public TURN relays to the ICE
+            candidate list so peers behind symmetric NAT (phone
+            hotspots, CGNAT) can still reach each other. The data
+            channel stays end-to-end encrypted by DTLS — the relay
+            sees only encrypted bytes — but routing depends on a
+            third-party service not operated by MyOwnLLM. Turn off
+            to keep all traffic off third-party infrastructure.
+          </span>
+        </span>
+      </label>
+
       <div class="list">
         {#each turnServers as t, i (i)}
           <div class="turn-row">
@@ -404,6 +465,34 @@
     line-height: 1.5;
     max-width: 36rem;
   }
+
+  .ice-banner {
+    padding: 0.6rem 0.8rem;
+    border-radius: 6px;
+    background: #2a1f10;
+    border: 1px solid #5a3f1a;
+    color: #e0bb78;
+    font-size: 0.74rem;
+    line-height: 1.5;
+    max-width: 36rem;
+  }
+  .ice-banner strong { color: #f0d28b; display: block; margin-bottom: 0.15rem; }
+
+  .fallback-toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.55rem;
+    padding: 0.5rem 0.7rem;
+    border-radius: 6px;
+    background: #131318;
+    border: 1px solid #1e1e25;
+    max-width: 36rem;
+    cursor: pointer;
+  }
+  .fallback-toggle input { margin-top: 0.15rem; cursor: pointer; }
+  .fallback-label { display: flex; flex-direction: column; gap: 0.25rem; }
+  .fallback-label strong { color: #ccc; font-size: 0.78rem; font-weight: 500; }
+  .fallback-detail { color: #666; font-size: 0.72rem; line-height: 1.5; }
 
   .list { display: flex; flex-direction: column; gap: 0.3rem; }
 

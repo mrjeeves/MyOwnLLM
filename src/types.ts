@@ -201,6 +201,15 @@ export interface NetworkConfig {
   signaling_servers: string[];
   stun_servers: string[];
   turn_servers: TurnServer[];
+  /** When true, the client appends a built-in public TURN pool to
+   *  the user's `turn_servers` list at connect time, so peers behind
+   *  symmetric NAT (phone hotspots, CGNAT) can still reach each
+   *  other without the user having to register for a TURN provider
+   *  first. The fallback is third-party best-effort infrastructure;
+   *  the toggle is exposed in the Networks → Settings UI for users
+   *  who'd rather keep traffic off it. Defaults to true on existing
+   *  configs that pre-date the field. */
+  use_public_turn_fallback: boolean;
   /** Self-reported willingness to take jobs from this network's
    *  peers. Per-network so you can be "available" at home and
    *  "busy" on a shared office mesh simultaneously. */

@@ -48,7 +48,13 @@ import MeshSchedulerWorker from "./mesh-scheduler-worker.ts?worker";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import type { MeshIdentity } from "./mesh";
 import type { TurnServer } from "./types";
-import { loadConfig, updateConfig, activeNetwork, updateNetwork } from "./config";
+import {
+  DEFAULT_PUBLIC_TURN,
+  loadConfig,
+  updateConfig,
+  activeNetwork,
+  updateNetwork,
+} from "./config";
 import { settingsAttention } from "./settings-attention.svelte";
 import { agentPermissions } from "./agent-permissions.svelte";
 import {
@@ -291,6 +297,14 @@ const CATALOG_REFRESH_INTERVAL_MS = 60_000;
  *  this window collapse into a single send so a rapid-fire rename
  *  loop doesn't spam connected peers. */
 const CATALOG_DEBOUNCE_MS = 1_500;
+/** Cadence for `pollIceStates()`. Walks Trystero's
+ *  RTCPeerConnection map to attach `iceconnectionstatechange`
+ *  listeners to newly-arrived peers. The listener fires
+ *  synchronously on transition, so the poll only races the initial
+ *  appearance — 3s is much shorter than the multi-second timers ICE
+ *  uses internally per candidate pair, so we never miss the
+ *  transition into `failed`. */
+const ICE_POLL_INTERVAL_MS = 3_000;
 /** Globally-unique app identifier passed to Trystero so MyOwnLLM
  *  peers don't accidentally match peers from unrelated apps that
  *  happen to use the same `roomId`. Bump the suffix if we ever
@@ -496,6 +510,16 @@ class MeshClient {
    *  a spinner instead of letting the user fire a second request
    *  on top. */
   remote_infer_in_flight = $state(false);
+  /** Wall-clock ms of the most recent observed ICE failure on a
+   *  WebRTC peer connection. Driven by the per-peer
+   *  `iceconnectionstatechange` listener (`watchPeerIce`). The
+   *  Networks → Settings panel reads this to surface a banner that
+   *  points the user at the TURN section when peers are unreachable
+   *  — the typical phone-hotspot / CGNAT case where STUN can't
+   *  punch a hole. Reset to 0 when the next peer connects
+   *  successfully so the banner clears once the user has either
+   *  added a working TURN entry or moved off the symmetric NAT. */
+  recent_ice_failure_at = $state(0);
   /** Reactive snapshot of active resources for the Connections tab's
    *  "Resources in use" panel. Updated whenever a resource enters
    *  or leaves the pending maps below.
@@ -567,6 +591,14 @@ class MeshClient {
   // ---- internal --------------------------------------------------------
 
   private room: Room | null = null;
+  /** Peer ids we've already attached an `iceconnectionstatechange`
+   *  listener to. Trystero exposes the underlying RTCPeerConnection
+   *  via `room.getPeers()`, but only after signaling has produced
+   *  one — so we poll on a short interval (`ice_poll_timer`) to
+   *  pick up new entries and wire them once. Cleared on stop()
+   *  along with the polling timer. */
+  private ice_watched_peers = new Set<string>();
+  private ice_poll_timer: number | null = null;
   private sendMesh: ((data: unknown, target?: string | string[] | null) => Promise<unknown>) | null = null;
   private identity: MeshIdentity | null = null;
   private network_id = "";
@@ -928,6 +960,7 @@ class MeshClient {
       relayUrls: active.signaling_servers,
       stunServers: active.stun_servers,
       turnServers: active.turn_servers,
+      usePublicTurnFallback: active.use_public_turn_fallback,
     });
   }
 
@@ -937,6 +970,7 @@ class MeshClient {
     relayUrls: string[];
     stunServers: string[];
     turnServers: TurnServer[];
+    usePublicTurnFallback: boolean;
   }): Promise<void> {
     if (this.room) return;
 
@@ -993,7 +1027,11 @@ class MeshClient {
     // truth before any onPeerJoin updates start landing.
     this.republishPeers();
 
-    const ice_servers = buildIceServers(opts.stunServers, opts.turnServers);
+    const ice_servers = buildIceServers(
+      opts.stunServers,
+      opts.turnServers,
+      opts.usePublicTurnFallback,
+    );
     const room_id = this.network_handle;
     const custom_relays = opts.relayUrls.filter((r) => r.trim() !== "");
 
@@ -1029,7 +1067,17 @@ class MeshClient {
         // the strategy's built-in defaults apply.
         (room_config as Record<string, unknown>).relayUrls = custom_relays;
       }
-      this.room = joinRoomFn(room_config, room_id);
+      // `onJoinError` fires when a pending peer's handshake fails or
+      // times out (10s default). It's the primary signal for the
+      // hotspot / symmetric-NAT case — Trystero hides peers from
+      // `getPeers()` while they're pending, so the only way to know
+      // ICE never completed is to listen for the timeout here. After
+      // a peer has connected at least once, the per-peer
+      // `iceconnectionstatechange` listener in `watchPeerIce` picks
+      // up subsequent failures.
+      this.room = joinRoomFn(room_config, room_id, {
+        onJoinError: (details) => this.handleJoinError(details),
+      });
     } catch (e) {
       this.status = "error";
       this.error = `trystero init: ${String(e)}`;
@@ -1075,6 +1123,12 @@ class MeshClient {
     // rejoin a few seconds later, defeating the throttle's whole
     // purpose. The value survives across rejoin cycles by design.
     this.installLifecycleHooks();
+    // ICE-state polling lives outside the scheduler worker because
+    // it needs DOM-side access to the RTCPeerConnection objects
+    // Trystero hands out — those can't ride across the worker
+    // postMessage boundary.
+    this.recent_ice_failure_at = 0;
+    this.startIcePolling();
     // Spin up the scheduler worker. All three periodic ticks live
     // there — the worker's own event loop is what keeps them from
     // drifting under heavy main-thread load (the bug that turned
@@ -1161,6 +1215,7 @@ class MeshClient {
   async stop(): Promise<void> {
     this.stopping = true;
     this.uninstallLifecycleHooks();
+    this.stopIcePolling();
     this.stopScheduler();
     if (this.rAF_handle !== null) {
       cancelAnimationFrame(this.rAF_handle);
@@ -1237,6 +1292,7 @@ class MeshClient {
     this.status = "off";
     this.error = "";
     this.last_global_tick_at = 0;
+    this.recent_ice_failure_at = 0;
     settingsAttention.set("cloud-mesh", null);
     this.logDiag("info", "stopped");
   }
@@ -1795,6 +1851,129 @@ class MeshClient {
       window.removeEventListener("pageshow", h.pageshow);
     }
     this.lifecycle_handlers = null;
+  }
+
+  /** Periodic walk of Trystero's RTCPeerConnection map. We attach
+   *  an `iceconnectionstatechange` listener exactly once per peer
+   *  so the Activity log carries an actionable message when a
+   *  peer's ICE drops AFTER having reached `connected` — e.g. the
+   *  user's hotspot reassigns the carrier-NAT mapping, or Wi-Fi
+   *  flaps and ICE doesn't recover.
+   *
+   *  Pending peers (still in handshake) are NOT in `getPeers()` —
+   *  that's the failure mode `onJoinError` covers. This poll
+   *  handles the post-connect case where a peer entry exists but
+   *  loses its ICE pair. Together they cover both classes of
+   *  hotspot/NAT pain.
+   *
+   *  Polling at 3s is plenty: ICE state changes are slow (multi-
+   *  second timers per candidate pair) and the listener itself
+   *  fires synchronously on transition, so the poll only races
+   *  the initial appearance of each peer in the map. */
+  private startIcePolling(): void {
+    if (this.ice_poll_timer !== null) return;
+    if (typeof window === "undefined") return;
+    this.ice_poll_timer = window.setInterval(() => {
+      this.pollIceStates();
+    }, ICE_POLL_INTERVAL_MS);
+  }
+
+  private stopIcePolling(): void {
+    if (this.ice_poll_timer !== null) {
+      clearInterval(this.ice_poll_timer);
+      this.ice_poll_timer = null;
+    }
+    this.ice_watched_peers.clear();
+  }
+
+  private pollIceStates(): void {
+    const room = this.room;
+    if (!room) return;
+    let peers: Record<string, RTCPeerConnection>;
+    try {
+      peers = room.getPeers() as Record<string, RTCPeerConnection>;
+    } catch {
+      // Older Trystero builds or a torn-down room — nothing to do.
+      return;
+    }
+    for (const [peerId, pc] of Object.entries(peers)) {
+      if (this.ice_watched_peers.has(peerId)) continue;
+      this.ice_watched_peers.add(peerId);
+      this.watchPeerIce(peerId, pc);
+    }
+    // Garbage-collect entries for peers Trystero has dropped so a
+    // peer that rejoins the room later gets a fresh listener.
+    for (const peerId of [...this.ice_watched_peers]) {
+      if (!(peerId in peers)) {
+        this.ice_watched_peers.delete(peerId);
+      }
+    }
+  }
+
+  /** Trystero's `onJoinError` handler — fires when a pending peer's
+   *  handshake fails or times out. The most common cause when peers
+   *  are present in the room but never become active is ICE never
+   *  reaching a working candidate pair (symmetric NAT / CGNAT /
+   *  blocked UDP). Surface this as a warn diag + flip the banner
+   *  flag so the Settings UI lights up.
+   *
+   *  The `details.error` string is informational only; we don't
+   *  parse it because Trystero may change the exact wording. */
+  private handleJoinError(details: { error: string; peerId: string }): void {
+    this.logDiag(
+      "warn",
+      `peer ${details.peerId.slice(0, 8)}… handshake failed: ${details.error}. ` +
+        `Most often: symmetric NAT (phone hotspot, CGNAT, restrictive carrier) ` +
+        `on one or both sides — STUN can't punch through and there's no TURN ` +
+        `relay configured to fall back on. Add a TURN server in Settings → ` +
+        `Networks → Settings, or enable the built-in public TURN fallback.`,
+    );
+    this.recent_ice_failure_at = Date.now();
+  }
+
+  private watchPeerIce(peerId: string, pc: RTCPeerConnection): void {
+    const onChange = () => {
+      const state = pc.iceConnectionState;
+      if (state === "failed") {
+        // The actionable case: ICE candidates never reached a
+        // working pair. Surface as warn (always visible, even with
+        // Quiet logs) and stamp `recent_ice_failure_at` so the
+        // Settings UI banner can light up.
+        this.logDiag(
+          "warn",
+          `ICE failed for ${peerId.slice(0, 8)}… — direct WebRTC didn't connect. ` +
+            `Most often: symmetric NAT (phone hotspot, CGNAT, restrictive carrier) on one ` +
+            `or both sides. Add a TURN server in Settings → Networks → Settings, or enable ` +
+            `the built-in public TURN fallback.`,
+        );
+        this.recent_ice_failure_at = Date.now();
+      } else if (state === "connected" || state === "completed") {
+        // A successful candidate pair clears the banner — either the
+        // user has fixed their TURN config or the offending peer is
+        // no longer the active one.
+        if (this.recent_ice_failure_at !== 0) {
+          this.logDiag(
+            "info",
+            `ICE connected for ${peerId.slice(0, 8)}… — clearing failure banner`,
+          );
+        }
+        this.recent_ice_failure_at = 0;
+      }
+      // `disconnected` is transient (ICE consult-and-retry) — no
+      // log. If it ages into `failed`, the next event lands above.
+    };
+    try {
+      pc.addEventListener("iceconnectionstatechange", onChange);
+    } catch {
+      // Some test doubles for RTCPeerConnection don't expose
+      // addEventListener; ignore so the watcher doesn't crash the
+      // poll loop.
+    }
+    // If the peer was already past the transition by the time we
+    // attached (likely — `getPeers()` only surfaces connected
+    // peers in steady state), run the handler once synchronously
+    // so a freshly-connected peer still clears any prior banner.
+    onChange();
   }
 
   private handlePeerLeave(peer_id: string): void {
@@ -4307,7 +4486,14 @@ class MeshClient {
 function buildIceServers(
   stun: string[],
   turn: TurnServer[],
+  usePublicTurnFallback: boolean,
 ): Array<RTCIceServer> {
+  // User-supplied TURN entries take precedence — they go in before
+  // the fallback so the browser tries them first and only reaches
+  // the public pool if those don't yield a working candidate. The
+  // fallback pool is appended (not merged) so users who deliberately
+  // empty their TURN list while keeping the toggle on still get
+  // hotspot coverage.
   return [
     ...stun.filter((s) => s.trim() !== "").map((urls) => ({ urls })),
     ...turn
@@ -4317,6 +4503,13 @@ function buildIceServers(
         username: t.username,
         credential: t.credential,
       })),
+    ...(usePublicTurnFallback
+      ? DEFAULT_PUBLIC_TURN.map((t) => ({
+          urls: t.url,
+          username: t.username,
+          credential: t.credential,
+        }))
+      : []),
   ];
 }
 
