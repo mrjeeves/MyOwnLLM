@@ -244,18 +244,21 @@ const REHANDSHAKE_RESCUE_ATTEMPTS = 3;
  *  peer successfully completes auth, so a peer that pops back
  *  online gets the next outage's full reactivity. */
 const REDISCOVERY_BACKOFF_SCHEDULE_MS = [
-  60_000, // 1m  — first attempt after going offline
-  120_000, // 2m
+  90_000, // 1.5m — first attempt after going offline
   180_000, // 3m
-  300_000, // 5m — final, repeated indefinitely
-  // Capped at 5m (was 30m). The previous tail made the network
-  // feel "broken forever" when a bad stretch pushed us to the
-  // back of the schedule — a peer that came back during the
-  // 30-min wait stayed invisible until the wait elapsed.
-  // 5m is a tolerable polling cadence for a peer that's
-  // genuinely off, and `consecutive_rediscovery_attempts` now
-  // resets on any onPeerJoin so the schedule unwinds the moment
-  // signaling recovers anyway.
+  300_000, // 5m
+  600_000, // 10m — final, repeated indefinitely
+  // Bumped from the prior [60s, 120s, 180s, 300s]: each forced
+  // rejoin publishes a fresh presence announce to every signaling
+  // relay, and on a flaky hotspot connection (where connections
+  // drop every couple of minutes) the old 60s first interval was
+  // tight enough that Nostr relays with anti-spam limits — Damus
+  // especially — would start rate-limiting us, which then makes
+  // the recovery worse, not better. 90s gives the channel a real
+  // window to recover on its own before we churn signaling. The
+  // 10m tail remains tolerable because
+  // `consecutive_rediscovery_attempts` resets on any onPeerJoin,
+  // so the schedule unwinds the moment a peer reappears.
 ];
 /** Cadence at which we check whether any rostered peer is offline
  *  and, if so, ask for a rediscovery. Catches the asymmetric
@@ -305,6 +308,28 @@ const CATALOG_DEBOUNCE_MS = 1_500;
  *  uses internally per candidate pair, so we never miss the
  *  transition into `failed`. */
 const ICE_POLL_INTERVAL_MS = 3_000;
+/** Default Nostr signaling relay pool, used when the user hasn't
+ *  added their own under Settings → Networks → Settings →
+ *  Signaling relays. Hand-picked from Trystero's broader default
+ *  list to skip `relay.damus.io` (which aggressively rate-limits
+ *  the presence-announce publishes our rediscovery cycle produces
+ *  — symptom: `Trystero: relay failure from wss://relay.damus.io/
+ *  - rate-limited: you are noting too much` spamming the console)
+ *  and to favor relays known to accept anonymous publishes
+ *  without aggressive throttling. Eight entries gives plenty of
+ *  redundancy: a peer announce needs to land on at least one
+ *  relay both sides share, and with 8 the odds of all of them
+ *  being simultaneously down are negligible. */
+const DEFAULT_SIGNALING_RELAYS: ReadonlyArray<string> = [
+  "wss://nos.lol",
+  "wss://relay.mostr.pub",
+  "wss://purplerelay.com",
+  "wss://relay.nostr.place",
+  "wss://relay.angor.io",
+  "wss://relay.binaryrobot.com",
+  "wss://relay.froth.zone",
+  "wss://strfry.shock.network",
+];
 /** Globally-unique app identifier passed to Trystero so MyOwnLLM
  *  peers don't accidentally match peers from unrelated apps that
  *  happen to use the same `roomId`. Bump the suffix if we ever
@@ -1040,7 +1065,7 @@ class MeshClient {
       `joining mesh room ${room_id.slice(0, 12)}… (trystero/${TRYSTERO_STRATEGY}, app=${TRYSTERO_APP_ID}` +
         (custom_relays.length > 0
           ? `, ${custom_relays.length} custom relay${custom_relays.length === 1 ? "" : "s"})`
-          : `, default relays)`),
+          : `, ${DEFAULT_SIGNALING_RELAYS.length} curated default relays)`),
     );
 
     // Resolve the build-time-selected `joinRoom` once per session.
@@ -1061,12 +1086,21 @@ class MeshClient {
         appId: TRYSTERO_APP_ID,
         rtcConfig: { iceServers: ice_servers },
       };
-      if (custom_relays.length > 0) {
-        // Trystero accepts a `relayUrls` override for the current
-        // strategy. When set, only these relays are used; when not,
-        // the strategy's built-in defaults apply.
-        (room_config as Record<string, unknown>).relayUrls = custom_relays;
-      }
+      // Pin the signaling relay set. Trystero reads the override
+      // from `relayConfig.urls` (NOT a top-level `relayUrls` — a
+      // prior typo here silently fell through to Trystero's
+      // shuffled default pool of 52 relays, which deterministically
+      // included `wss://relay.damus.io/` for our app id and that
+      // relay aggressively rate-limits the presence announces we
+      // publish on every rediscovery). When the user has custom
+      // relays configured those win; otherwise we substitute our
+      // own curated 8-relay set so every MyOwnLLM client lands on
+      // the same well-behaved signaling pool.
+      const relay_urls =
+        custom_relays.length > 0 ? custom_relays : [...DEFAULT_SIGNALING_RELAYS];
+      (room_config as Record<string, unknown>).relayConfig = {
+        urls: relay_urls,
+      };
       // `onJoinError` fires when a pending peer's handshake fails or
       // times out (10s default). It's the primary signal for the
       // hotspot / symmetric-NAT case — Trystero hides peers from

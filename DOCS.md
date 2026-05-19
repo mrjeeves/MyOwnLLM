@@ -719,7 +719,7 @@ Cloud Mesh ships off by default. To turn it on, open **Settings → Networks →
 
 ### Transport: Trystero over Nostr (default)
 
-Discovery and WebRTC connection setup go through [Trystero](https://trystero.dev), which proxies signed signaling messages through decentralized infrastructure (Nostr relays by default, with BitTorrent / MQTT / IPFS available as compile-time alternatives). **MyOwnLLM operates none of these.** The default is the community-run public Nostr relay pool.
+Discovery and WebRTC connection setup go through [Trystero](https://trystero.dev), which proxies signed signaling messages through decentralized infrastructure (Nostr relays by default, with BitTorrent / MQTT / IPFS available as compile-time alternatives). **MyOwnLLM operates none of these.** When no custom signaling relays are configured, the client substitutes a curated eight-relay public Nostr pool (defined as `DEFAULT_SIGNALING_RELAYS` in `mesh-client.svelte.ts`) at connect time — picked to avoid the few public relays that aggressively rate-limit the presence-announce traffic Trystero's rediscovery cycle produces. Anyone who'd rather see exactly which relays handle their signaling can add their own in **Settings → Networks → Settings → Signaling relays**, and those take full precedence over the curated set.
 
 The relay sees only the small WebRTC offer/answer envelopes during connection setup — never the mesh's actual traffic. Once peers connect, the data channel is direct and end-to-end.
 
@@ -770,7 +770,7 @@ Connect → handshake → approve → re-handshake → catalog announce — ever
 
 ### Resilience (post-sleep, network blips)
 
-The mesh client watches for OS sleep / network drop via four signals (`visibilitychange`, `focus`, `online`, `pageshow`) plus a heartbeat-tick clock-gap detector. On wake it pings every peer with a tight 1.5 s probe; if any peer doesn't pong it enters a backoff schedule of re-handshakes (2 s, 5 s, 10 s, 20 s, 30 s, then capped) before escalating to a forced Trystero room rejoin. Rejoins are throttled (1m → 2m → 5m → 10m → 30m) so a peer that's genuinely offline doesn't drag the rest of the mesh through a churn loop.
+The mesh client watches for OS sleep / network drop via four signals (`visibilitychange`, `focus`, `online`, `pageshow`) plus a heartbeat-tick clock-gap detector. On wake it pings every peer with a tight 1.5 s probe; if any peer doesn't pong it enters a backoff schedule of re-handshakes (2 s, 5 s, 10 s, 20 s, 30 s, then capped) before escalating to a forced Trystero room rejoin. Rejoins are throttled (1.5m → 3m → 5m → 10m, capped) so a peer that's genuinely offline doesn't drag the rest of the mesh through a churn loop and the per-rejoin presence-announce doesn't starve us out of our signaling relays' anti-spam budgets.
 
 You can force-reconnect a peer manually from its row in the Connections list.
 
@@ -1275,7 +1275,7 @@ The `manifests/` cache stores one entry per URL. When a manifest reached via an 
         "id": "net-abc123",             // stable internal id, generated on save
         "network_id": "home-mesh",      // canonical Network ID — display name + roster filename
         "locked": true,                 // true = mesh client joins when this is active
-        "signaling_servers": [],        // per-network; empty = Trystero defaults
+        "signaling_servers": [],        // per-network; empty = MyOwnLLM's curated default Nostr relay pool
         "stun_servers": [
           "stun:stun.l.google.com:19302",
           "stun:stun1.l.google.com:19302"
