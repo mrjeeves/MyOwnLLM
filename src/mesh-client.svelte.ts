@@ -1200,6 +1200,21 @@ class MeshClient {
    *  to refresh its Trystero subscription when a rostered peer
    *  has been gone too long. */
   private offline_check_timer: number | null = null;
+  /** setInterval handle for the main-thread heartbeat tick in the
+   *  worker-spawn-failure fallback path. The scheduler worker is the
+   *  authoritative wake clock (see `last_global_tick_at` discussion);
+   *  this only runs when `new MeshSchedulerWorker()` throws — rare
+   *  enough that we noted it as a `warn` diag but real enough that
+   *  the fallback can't omit the heartbeat (the previous fallback
+   *  set up offline_check / catalog_refresh / reconnect_prune but
+   *  forgot heartbeat, which silently disabled wake detection,
+   *  rehandshake, and the whole per-peer liveness path in worker-
+   *  less environments). When this timer fires we pass
+   *  `performance.now()` as the tick stamp — main-thread time is
+   *  less reliable for the wake-gap math than the worker's clock,
+   *  but it's all we have when the worker is unavailable. Null
+   *  while the worker is alive. */
+  private heartbeat_timer: number | null = null;
   /** Bound lifecycle handlers, kept around so we can remove them
    *  in stop(). Each observable (visibility, focus, online,
    *  pageshow) is a hint that we may have just resumed from a
@@ -1786,7 +1801,14 @@ class MeshClient {
       // Fallback: the old setInterval shape, kept so a worker-less
       // environment (rare — Tauri 2 / Chrome 105+ have full Worker
       // support) still gets liveness, just without the busy-main-
-      // thread immunity.
+      // thread immunity. The heartbeat timer fires the same
+      // `runHeartbeatTick` the worker would, passing
+      // `performance.now()` as the tick stamp — without this the
+      // engine had wake detection / rehandshake / per-peer
+      // liveness completely disabled in worker-less environments.
+      this.heartbeat_timer = window.setInterval(() => {
+        this.runHeartbeatTick(performance.now());
+      }, HEARTBEAT_INTERVAL_MS);
       this.offline_check_timer = window.setInterval(() => {
         this.offlineRosteredCheckTick();
       }, OFFLINE_ROSTERED_CHECK_INTERVAL_MS);
@@ -1859,6 +1881,10 @@ class MeshClient {
     }
     // Fallback-path timers — only set when the worker spawn failed.
     // The worker path tears down via stopScheduler() above.
+    if (this.heartbeat_timer !== null) {
+      clearInterval(this.heartbeat_timer);
+      this.heartbeat_timer = null;
+    }
     if (this.offline_check_timer !== null) {
       clearInterval(this.offline_check_timer);
       this.offline_check_timer = null;
@@ -2498,6 +2524,14 @@ class MeshClient {
       this.send(conn, { kind: "ping", t: now });
     }
     window.setTimeout(() => {
+      // Bail if the mesh was stopped while we were waiting. Without
+      // this guard the rest of the callback iterates a cleared
+      // `connections` map (no-op), but then it can also fire
+      // `maybeForceRediscovery` which schedules a rejoin AGAINST a
+      // freshly-stopped engine, and the nested setTimeout below
+      // can call `heartbeatTickConn` on stale references. Cheaper
+      // to short-circuit at the top.
+      if (this.status === "off" || !this.room) return;
       // Count peers that didn't reply to the wake ping. If none
       // responded the WebRTC channels are almost certainly dead
       // (the laptop-slept-while-home-office-stayed-on case, OR
@@ -2544,6 +2578,10 @@ class MeshClient {
             this.send(conn, { kind: "ping", t: reping_t });
           }
           window.setTimeout(() => {
+            // Same post-stop guard as the outer setTimeout: if the
+            // mesh was torn down during the ICE-restart recovery
+            // window, none of the followup actions make sense.
+            if (this.status === "off" || !this.room) return;
             let still_silent = 0;
             let still_total = 0;
             for (const conn of this.connections.values()) {
