@@ -663,6 +663,28 @@ interface ConnectionState {
   local_shelved: boolean;
   /** Has the peer shelved us? True on receive of their `shelve`. */
   remote_shelved: boolean;
+  /** Last `iceConnectionState` value observed for this peer's
+   *  RTCPeerConnection, recorded by `watchPeerIce`. Lets
+   *  `handlePeerLeave` log the cause-of-death — "ICE was
+   *  `failed` 8s before the leave" implicates the network /
+   *  TURN path, "ICE was `connected` right up until leave"
+   *  implicates the datachannel or the peer's app process.
+   *  Empty until the first observed transition. */
+  last_ice_state: string;
+  /** Wall-clock ms of the last `iceConnectionState` transition.
+   *  Paired with `last_ice_state` for the leave-cause log. */
+  last_ice_state_at: number;
+  /** Wall-clock ms the peer first reached the app-level `active`
+   *  status (auth done + both sides approved). Used to report
+   *  "lived for N minutes before drop" in the leave log.
+   *  0 if the peer never reached active. */
+  first_active_at: number;
+  /** Short tag for the most recently observed selected ICE
+   *  candidate pair (e.g. "host↔srflx", "relay↔relay"). Filled
+   *  by `recordSelectedCandidatePair` after each ICE transition
+   *  to `connected`/`completed`. Empty while we've never had a
+   *  working pair, or if `getStats()` failed. */
+  selected_candidate_summary: string;
 }
 
 class MeshClient {
@@ -2724,6 +2746,17 @@ class MeshClient {
     // both directions cleanly.
     const onChange = (is_initial: boolean) => {
       const state = pc.iceConnectionState;
+      // Record the transition on the per-peer ConnectionState so
+      // `handlePeerLeave` can log a cause-of-death summary later.
+      // The leave callback fires AFTER Trystero has closed the PC
+      // (datachannel onclose), so by then `pc.iceConnectionState`
+      // and `pc.getStats()` are no longer useful — we have to
+      // capture the live state here while it's still observable.
+      const conn = this.connections.get(peerId);
+      if (conn && !is_initial) {
+        conn.last_ice_state = state;
+        conn.last_ice_state_at = Date.now();
+      }
       if (state === "failed") {
         // The actionable case: ICE candidates never reached a
         // working pair. Surface as warn (always visible, even with
@@ -2745,6 +2778,12 @@ class MeshClient {
         // "connected" for minutes; another peer that failed in the
         // meantime is the one we'd be wrongly silencing here.
         this.updatePhase();
+        // Inspect getStats to capture which candidate pair Chrome
+        // picked. Async — we don't block the state listener, and
+        // we don't care if the answer arrives a beat late; it
+        // just needs to land before the eventual leave so the
+        // diagnostic log has something useful to print.
+        void this.recordSelectedCandidatePair(peerId, pc);
         if (is_initial) return;
         if (this.recent_ice_failure_at !== 0) {
           this.logDiag(
@@ -2773,8 +2812,123 @@ class MeshClient {
     onChange(true);
   }
 
+  /** Walks getStats() for a peer's PC to figure out which candidate
+   *  pair Chrome actually selected, and records a short tag on the
+   *  ConnectionState (e.g. "host↔srflx", "relay↔relay"). The tag
+   *  surfaces in the leave-cause log so we can see whether drops
+   *  cluster around TURN-relayed paths (TURN server flakiness) vs.
+   *  direct paths (network swap / app sleep / NAT pinhole expiry).
+   *
+   *  This is observability only — no behavior change. getStats() is
+   *  expensive enough that we don't call it per-poll; we only run it
+   *  when ICE transitions to `connected`/`completed`, which fires at
+   *  most a handful of times per peer over the lifetime of a
+   *  connection. Failures are silent — getStats() can race against
+   *  PC teardown and throw, and that's fine: the leave log just
+   *  prints whatever tag we last had (or empty). */
+  private async recordSelectedCandidatePair(
+    peer_id: string,
+    pc: RTCPeerConnection,
+  ): Promise<void> {
+    let stats: RTCStatsReport;
+    try {
+      stats = await pc.getStats();
+    } catch {
+      return;
+    }
+    const conn = this.connections.get(peer_id);
+    if (!conn) return; // peer left while we were awaiting
+    type CandidateStats = {
+      id?: string;
+      candidateType?: string;
+      type?: string;
+    };
+    type PairStats = {
+      id?: string;
+      type?: string;
+      state?: string;
+      nominated?: boolean;
+      selected?: boolean;
+      localCandidateId?: string;
+      remoteCandidateId?: string;
+    };
+    const pairs: PairStats[] = [];
+    const candidates = new Map<string, CandidateStats>();
+    stats.forEach((report: unknown) => {
+      const r = report as PairStats & CandidateStats;
+      if (r.type === "candidate-pair") {
+        pairs.push(r as PairStats);
+      } else if (
+        r.type === "local-candidate" ||
+        r.type === "remote-candidate"
+      ) {
+        if (typeof r.id === "string") candidates.set(r.id, r as CandidateStats);
+      }
+    });
+    // Browsers expose the "active" pair differently — Chromium sets
+    // `nominated` + state="succeeded", Firefox sets `selected` on the
+    // pair. Accept either.
+    const active = pairs.find(
+      (p) =>
+        (p.nominated && p.state === "succeeded") ||
+        p.selected === true,
+    );
+    if (!active || !active.localCandidateId || !active.remoteCandidateId)
+      return;
+    const local = candidates.get(active.localCandidateId);
+    const remote = candidates.get(active.remoteCandidateId);
+    const local_tag = local?.candidateType ?? "?";
+    const remote_tag = remote?.candidateType ?? "?";
+    conn.selected_candidate_summary = `${local_tag}↔${remote_tag}`;
+  }
+
   private handlePeerLeave(peer_id: string): void {
-    this.logDiag("info", `peer left: ${peer_id.slice(0, 8)}…`);
+    // Cause-of-death log. Build a compact "what was happening at the
+    // moment of leave" summary so we can tell apart the leave modes
+    // that look identical from the outside:
+    //
+    //   "ICE was `failed` 8s ago" → network / TURN path broke
+    //   "ICE was `connected` right up until leave" → datachannel
+    //       died independently (most often: peer app process killed,
+    //       browser/Tauri crashed, asymmetric NAT pinhole expired)
+    //   "ICE was `disconnected`" → typical mid-transition; Trystero
+    //       gave up before the consult-and-retry could rescue it
+    //
+    // Paired with the selected-candidate tag (host/srflx/relay) so
+    // a leave through TURN points at the TURN server, a leave on a
+    // direct host pair points at the OS/network, etc.
+    const c = this.connections.get(peer_id);
+    if (c && (c.peer_authenticated || c.last_ice_state)) {
+      const now = Date.now();
+      const parts: string[] = [];
+      if (c.last_ice_state) {
+        const age_ms = c.last_ice_state_at ? now - c.last_ice_state_at : 0;
+        const age_s = Math.round(age_ms / 1000);
+        parts.push(`ICE=${c.last_ice_state}${age_s > 0 ? ` (${age_s}s ago)` : ""}`);
+      }
+      if (c.selected_candidate_summary) {
+        parts.push(`pair=${c.selected_candidate_summary}`);
+      }
+      if (c.first_active_at) {
+        const lived_ms = now - c.first_active_at;
+        // For sub-minute connections show seconds; otherwise minutes.
+        // The boundary matters: <60s suggests a connection that never
+        // really stabilized, ≥60s suggests a connection that broke
+        // mid-conversation.
+        const lived = lived_ms < 60_000
+          ? `${Math.round(lived_ms / 1000)}s`
+          : `${Math.round(lived_ms / 60_000)}m`;
+        parts.push(`lived=${lived}`);
+      } else if (c.peer_authenticated) {
+        // Authenticated but never reached active — peer disconnected
+        // mid-handshake, before approve roundtrip. Worth flagging.
+        parts.push(`never-active`);
+      }
+      const summary = parts.length ? ` — ${parts.join(", ")}` : "";
+      this.logDiag("info", `peer left: ${peer_id.slice(0, 8)}…${summary}`);
+    } else {
+      this.logDiag("info", `peer left: ${peer_id.slice(0, 8)}…`);
+    }
     this.dropConnection(peer_id);
   }
 
@@ -2803,6 +2957,10 @@ class MeshClient {
       catalog: [],
       local_shelved: false,
       remote_shelved: false,
+      last_ice_state: "",
+      last_ice_state_at: 0,
+      first_active_at: 0,
+      selected_candidate_summary: "",
     };
   }
 
@@ -3494,6 +3652,12 @@ class MeshClient {
       if (conn.handshake_timer !== null) {
         clearTimeout(conn.handshake_timer);
         conn.handshake_timer = null;
+      }
+      // Stamp once. Stays set across heartbeats / shelve cycles so
+      // handlePeerLeave can report a true "lived for N minutes"
+      // even if the peer was briefly shelved by the ring selector.
+      if (conn.first_active_at === 0) {
+        conn.first_active_at = Date.now();
       }
       this.logDiag("info", `peer active: ${conn.device_pubkey.slice(0, 8)}…`);
       // Phase 2: send our current catalog so the peer can render it
