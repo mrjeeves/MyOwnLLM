@@ -744,25 +744,27 @@ WebRTC needs STUN to discover NAT mappings; the defaults are Google's public STU
 
 Phone hotspots are the dominant symmetric-NAT case for laptops. Most carriers run the hotspot itself behind carrier-grade NAT (CGNAT — a second NAT layer on top of whatever the hotspot does), so STUN reports a mapping that's useless to anyone trying to reach you back. Other common cases: guest Wi-Fi on enterprise networks, some 4G/5G modems, and any network that explicitly hardens against P2P traffic.
 
-The symptom is consistent: peer connections work fine on the same LAN, and stop working the moment one device moves to the hotspot. The Activity panel logs `ICE failed for <peer>… — direct WebRTC didn't connect` and the **TURN servers** panel surfaces a banner pointing here.
+The symptom is consistent: peer connections work fine on the same LAN, and stop working the moment one device moves to the hotspot. The Activity panel surfaces this via the signaling diagnostic: `webrtc: N pc(s), candidates [host=X, srflx=Y, relay=0]` plus `ice [pc1:checking → pc1:failed]` is the unambiguous fingerprint — zero `relay` candidates gathered means no working TURN means symmetric NAT cannot establish a candidate pair.
 
-#### Built-in public TURN fallback (default on)
+#### Why there's no built-in TURN
 
-To make hotspot connections work out of the box, the client appends a public TURN pool (Open Relay Project) to each network's ICE candidate list at connect time. The data channel stays end-to-end encrypted by DTLS — the relay only sees encrypted bytes flowing through — but routing depends on third-party best-effort infrastructure that MyOwnLLM doesn't operate. The toggle for it lives at **Settings → Networks → Settings → TURN servers → Use built-in public TURN fallback**. Turn it off to keep all traffic off third-party relays; you'll then need a STUN-friendly network on both sides or your own TURN server.
+A working TURN relay consumes real bandwidth (every byte the peers exchange flows through it), and any free public service that gets noticed by enough users gets shut down within months — historically `openrelay.metered.ca` was the community option, but its free tier no longer allocates in 2026 (`701 TURN allocate request timed out`). MyOwnLLM therefore ships **no default TURN**: peers behind symmetric NAT need to point the client at a TURN server they control or pay for. Two recommended paths:
 
-#### Your own TURN server
+#### Cloudflare Calls (free tier, account required)
 
-Open Relay's public pool is best-effort with no SLA. For production setups, self-host a TURN server or use a managed one. Add entries in **Settings → Networks → Settings → TURN servers** with URL + credentials.
+Cloudflare's Realtime Calls product includes a TURN service on a generous free tier (1,000 GB/month, no card on file). Create a Cloudflare account, follow the [TURN service setup](https://developers.cloudflare.com/calls/turn/), and you get a `urls`, `username`, `credential` triple to paste into **Settings → Networks → Settings → TURN servers**. Credentials rotate; the setup page documents how to refresh them.
+
+#### Self-hosted Coturn (free, your own VM)
 
 ```bash
-# Coturn in Docker — five minutes, free, on your own VM:
+# Coturn in Docker — five minutes, free, on any small cloud VM:
 docker run -d --network=host coturn/coturn \
   -n --lt-cred-mech \
   --user=meshuser:meshpass \
   --realm=mesh.example.com
 ```
 
-Then add `turn:your-host:3478` with username `meshuser` / credential `meshpass` to the network's TURN list. The user-supplied entries are tried before the public fallback pool, so your relay takes precedence.
+Then add `turn:your-host:3478` with username `meshuser` / credential `meshpass` to the network's TURN list on every device that needs to connect through it (both ends — TURN works by both peers relaying through the same server, so both have to be able to authenticate to it).
 
 ### Activity log
 
@@ -1281,7 +1283,6 @@ The `manifests/` cache stores one entry per URL. When a manifest reached via an 
           "stun:stun1.l.google.com:19302"
         ],
         "turn_servers": [],
-        "use_public_turn_fallback": true, // append Open Relay public TURN at connect time (default on)
         "accepting": "available"        // per-network: "available" | "limited" | "busy"
       },
       {
@@ -1291,7 +1292,6 @@ The `manifests/` cache stores one entry per URL. When a manifest reached via an 
         "signaling_servers": ["wss://relay.internal.acme:7777"],
         "stun_servers": ["stun:stun.l.google.com:19302"],
         "turn_servers": [],
-        "use_public_turn_fallback": false, // office mesh keeps traffic on internal infra only
         "accepting": "limited"
       }
     ]

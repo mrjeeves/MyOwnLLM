@@ -48,13 +48,7 @@ import MeshSchedulerWorker from "./mesh-scheduler-worker.ts?worker";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import type { MeshIdentity } from "./mesh";
 import type { TurnServer } from "./types";
-import {
-  DEFAULT_PUBLIC_TURN,
-  loadConfig,
-  updateConfig,
-  activeNetwork,
-  updateNetwork,
-} from "./config";
+import { loadConfig, updateConfig, activeNetwork, updateNetwork } from "./config";
 import { settingsAttention } from "./settings-attention.svelte";
 import { agentPermissions } from "./agent-permissions.svelte";
 import {
@@ -1125,7 +1119,6 @@ class MeshClient {
       relayUrls: active.signaling_servers,
       stunServers: active.stun_servers,
       turnServers: active.turn_servers,
-      usePublicTurnFallback: active.use_public_turn_fallback,
     });
   }
 
@@ -1135,7 +1128,6 @@ class MeshClient {
     relayUrls: string[];
     stunServers: string[];
     turnServers: TurnServer[];
-    usePublicTurnFallback: boolean;
   }): Promise<void> {
     if (this.room) return;
 
@@ -1192,11 +1184,7 @@ class MeshClient {
     // truth before any onPeerJoin updates start landing.
     this.republishPeers();
 
-    const ice_servers = buildIceServers(
-      opts.stunServers,
-      opts.turnServers,
-      opts.usePublicTurnFallback,
-    );
+    const ice_servers = buildIceServers(opts.stunServers, opts.turnServers);
     const room_id = this.network_handle;
     const custom_relays = opts.relayUrls.filter((r) => r.trim() !== "");
 
@@ -4845,14 +4833,7 @@ class MeshClient {
 function buildIceServers(
   stun: string[],
   turn: TurnServer[],
-  usePublicTurnFallback: boolean,
 ): Array<RTCIceServer> {
-  // User-supplied TURN entries take precedence — they go in before
-  // the fallback so the browser tries them first and only reaches
-  // the public pool if those don't yield a working candidate. The
-  // fallback pool is appended (not merged) so users who deliberately
-  // empty their TURN list while keeping the toggle on still get
-  // hotspot coverage.
   return [
     ...stun.filter((s) => s.trim() !== "").map((urls) => ({ urls })),
     ...turn
@@ -4862,13 +4843,6 @@ function buildIceServers(
         username: t.username,
         credential: t.credential,
       })),
-    ...(usePublicTurnFallback
-      ? DEFAULT_PUBLIC_TURN.map((t) => ({
-          urls: t.url,
-          username: t.username,
-          credential: t.credential,
-        }))
-      : []),
   ];
 }
 

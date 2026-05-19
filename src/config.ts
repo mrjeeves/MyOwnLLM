@@ -67,51 +67,13 @@ const LEGACY_PEERJS_SIGNALING_URLS = [
 
 /** Defaults for newly-added networks. Empty signaling = Trystero's
  *  public Nostr relays; Google's STUN pool for NAT helpers; empty
- *  per-network TURN by default (the public-fallback pool below is
- *  layered on at connect time, not stored). Applied by
- *  `createNetwork` and by the legacy-config migration so a
- *  pre-multi-network install lands with sane per-network defaults. */
+ *  per-network TURN by default. Applied by `createNetwork` and by
+ *  the legacy-config migration so a pre-multi-network install
+ *  lands with sane per-network defaults. */
 export const DEFAULT_NETWORK_SIGNALING: string[] = [];
 export const DEFAULT_NETWORK_STUN: string[] = [
   "stun:stun.l.google.com:19302",
   "stun:stun1.l.google.com:19302",
-];
-
-/** Best-effort public TURN pool layered onto the user's per-network
- *  TURN list at connect time when `use_public_turn_fallback` is true
- *  (the default). The entries here are Open Relay Project's
- *  long-standing public relay — the de-facto community TURN
- *  available without signup. Two URL forms cover the two scenarios
- *  that break direct WebRTC:
- *
- *  - `:80` UDP for vanilla symmetric NAT (phone hotspots), where
- *    STUN can't punch through but a UDP relay can.
- *  - `:443?transport=tcp` for networks that block outbound UDP
- *    entirely — common on guest Wi-Fi and on a few carriers'
- *    mobile networks.
- *
- *  Both URLs share the public `openrelayproject` credentials; that's
- *  the deal Open Relay publishes for unauthenticated use. Disabling
- *  the fallback is a per-network toggle in Settings → Networks →
- *  Settings; users who want their own TURN add it to `turn_servers`
- *  alongside (or instead). The TURN data channel is still
- *  end-to-end encrypted by DTLS — the relay only sees the
- *  encrypted bytes flowing through. */
-export const DEFAULT_PUBLIC_TURN: ReadonlyArray<{
-  url: string;
-  username: string;
-  credential: string;
-}> = [
-  {
-    url: "turn:openrelay.metered.ca:80",
-    username: "openrelayproject",
-    credential: "openrelayproject",
-  },
-  {
-    url: "turn:openrelay.metered.ca:443?transport=tcp",
-    username: "openrelayproject",
-    credential: "openrelayproject",
-  },
 ];
 
 const DEFAULT_CLOUD_MESH: CloudMeshConfig = {
@@ -285,22 +247,24 @@ function cleanSignaling(raw: string[] | undefined): string[] {
  *  pre-Phase-3 schema, where locking gated mesh start) are
  *  silently dropped — saving is now the commit gesture and the
  *  delete-network modal carries the confirmation guard. */
-function mergeNetwork(raw: Partial<NetworkConfig> & { locked?: boolean }): NetworkConfig {
+function mergeNetwork(
+  raw: Partial<NetworkConfig> & { locked?: boolean; use_public_turn_fallback?: boolean },
+): NetworkConfig {
+  // `use_public_turn_fallback` was a brief experiment that shipped a
+  // hard-coded Open Relay TURN URL pair as a fallback. Open Relay's
+  // free service no longer allocates ("701 TURN allocate request
+  // timed out"), so the fallback added latency and noisy errors
+  // without ever connecting a peer. The field is silently dropped
+  // on load — any existing config retains its `turn_servers` list
+  // as-is, and users who need TURN now point at a working server
+  // (Cloudflare Calls, self-hosted Coturn) via the UI.
+  void raw.use_public_turn_fallback;
   return {
     id: raw.id || newNetworkInternalId(),
     network_id: raw.network_id || "",
     signaling_servers: cleanSignaling(raw.signaling_servers),
     stun_servers: raw.stun_servers ?? [...DEFAULT_NETWORK_STUN],
     turn_servers: raw.turn_servers ?? [],
-    // Default-on for existing networks that pre-date the field, so
-    // a user on a phone hotspot lands on a working mesh after
-    // upgrade without having to dig into Settings. Privacy-conscious
-    // users can flip it off per-network in the UI; the boolean
-    // survives unchanged when set explicitly.
-    use_public_turn_fallback:
-      typeof raw.use_public_turn_fallback === "boolean"
-        ? raw.use_public_turn_fallback
-        : true,
     accepting: coerceAccepting(raw.accepting),
   };
 }

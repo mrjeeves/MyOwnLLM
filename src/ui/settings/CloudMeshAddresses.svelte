@@ -21,7 +21,6 @@
   let signalingRelays = $state<string[]>([]);
   let stunServers = $state<string[]>([]);
   let turnServers = $state<TurnServer[]>([]);
-  let usePublicTurnFallback = $state(true);
 
   let loading = $state(true);
   let saving = $state(false);
@@ -52,12 +51,10 @@
         signalingRelays = [...next.signaling_servers];
         stunServers = [...next.stun_servers];
         turnServers = next.turn_servers.map((t) => ({ ...t }));
-        usePublicTurnFallback = next.use_public_turn_fallback;
       } else {
         signalingRelays = [];
         stunServers = [];
         turnServers = [];
-        usePublicTurnFallback = true;
       }
     } catch (e) {
       error = String(e);
@@ -76,7 +73,6 @@
       signalingRelays = [...net.signaling_servers];
       stunServers = [...net.stun_servers];
       turnServers = net.turn_servers.map((t) => ({ ...t }));
-      usePublicTurnFallback = net.use_public_turn_fallback;
     }
   }
 
@@ -89,7 +85,6 @@
         signaling_servers: signalingRelays.filter((s) => s.trim() !== ""),
         stun_servers: stunServers.filter((s) => s.trim() !== ""),
         turn_servers: turnServers.filter((t) => t.url.trim() !== ""),
-        use_public_turn_fallback: usePublicTurnFallback,
       });
       // If we just edited the active network, restart the mesh
       // client so it picks up the new relay set on its next
@@ -144,11 +139,6 @@
   }
   function removeTurn(i: number) {
     turnServers = turnServers.filter((_, idx) => idx !== i);
-    void persist();
-  }
-
-  function toggleTurnFallback(next: boolean) {
-    usePublicTurnFallback = next;
     void persist();
   }
 
@@ -321,44 +311,36 @@
       <h3>TURN servers</h3>
       <div class="block-hint">
         Relay servers used when direct peer connections can't be
-        established. Optional — most home networks don't need one,
-        but a phone hotspot, carrier-grade NAT, or restrictive Wi-Fi
-        often does because their symmetric NAT defeats STUN-only
-        hole-punching. TURN typically requires credentials and
-        consumes bandwidth, so plan accordingly.
+        established. Required for peers behind symmetric NAT (phone
+        hotspots, carrier-grade NAT, restrictive corporate or guest
+        Wi-Fi) because STUN-only hole-punching can't traverse those.
+        TURN consumes real bandwidth, so there's no free
+        no-signup public service that reliably stays up. Use one of:
       </div>
+      <ul class="turn-options">
+        <li>
+          <strong>Cloudflare Calls</strong> — free tier with 1,000
+          GB/month, requires a Cloudflare account.
+          <a href="https://developers.cloudflare.com/calls/turn/" target="_blank" rel="noopener">Setup guide →</a>
+        </li>
+        <li>
+          <strong>Self-hosted Coturn</strong> — five-minute Docker
+          deploy on any VM you control. See the
+          <code>NAT traversal</code> section of DOCS.md for the
+          recipe.
+        </li>
+      </ul>
 
       {#if showIceBanner}
         <div class="ice-banner" role="alert">
           <strong>Peers couldn't connect directly.</strong>
-          The last connection attempt's WebRTC ICE check failed —
-          usually a sign that one or both sides are behind symmetric
-          NAT (phone hotspot, CGNAT, restrictive carrier). Either
-          turn on the public TURN fallback below, or add a TURN
-          server entry. Switching one or both devices back to a
-          regular Wi-Fi connection also works.
+          The last connection attempt's WebRTC ICE check failed.
+          Both sides need at least one TURN server they can reach;
+          a phone hotspot or CGNAT on either end makes a TURN
+          relay mandatory. Add one above, on both devices, then
+          retry.
         </div>
       {/if}
-
-      <label class="fallback-toggle">
-        <input
-          type="checkbox"
-          checked={usePublicTurnFallback}
-          onchange={(e) => toggleTurnFallback((e.target as HTMLInputElement).checked)}
-        />
-        <span class="fallback-label">
-          <strong>Use built-in public TURN fallback</strong>
-          <span class="fallback-detail">
-            Adds Open Relay Project's public TURN relays to the ICE
-            candidate list so peers behind symmetric NAT (phone
-            hotspots, CGNAT) can still reach each other. The data
-            channel stays end-to-end encrypted by DTLS — the relay
-            sees only encrypted bytes — but routing depends on a
-            third-party service not operated by MyOwnLLM. Turn off
-            to keep all traffic off third-party infrastructure.
-          </span>
-        </span>
-      </label>
 
       <div class="list">
         {#each turnServers as t, i (i)}
@@ -478,21 +460,24 @@
   }
   .ice-banner strong { color: #f0d28b; display: block; margin-bottom: 0.15rem; }
 
-  .fallback-toggle {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.55rem;
-    padding: 0.5rem 0.7rem;
-    border-radius: 6px;
-    background: #131318;
-    border: 1px solid #1e1e25;
+  .turn-options {
+    margin: 0;
+    padding-left: 1.1rem;
     max-width: 36rem;
-    cursor: pointer;
+    font-size: 0.74rem;
+    color: #888;
+    line-height: 1.6;
   }
-  .fallback-toggle input { margin-top: 0.15rem; cursor: pointer; }
-  .fallback-label { display: flex; flex-direction: column; gap: 0.25rem; }
-  .fallback-label strong { color: #ccc; font-size: 0.78rem; font-weight: 500; }
-  .fallback-detail { color: #666; font-size: 0.72rem; line-height: 1.5; }
+  .turn-options strong { color: #ccc; font-weight: 500; }
+  .turn-options a { color: #6f9aff; text-decoration: none; }
+  .turn-options a:hover { text-decoration: underline; }
+  .turn-options code {
+    font-size: 0.72rem;
+    background: #1a1a20;
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+    color: #c0c0c0;
+  }
 
   .list { display: flex; flex-direction: column; gap: 0.3rem; }
 
