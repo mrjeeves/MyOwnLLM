@@ -324,6 +324,12 @@
           <a href="https://developers.cloudflare.com/calls/turn/" target="_blank" rel="noopener">Setup guide →</a>
         </li>
         <li>
+          <strong>Open Relay Project (Metered.ca)</strong> — 50 GB/month
+          free, requires signup; rotating credentials are scoped to
+          your account.
+          <a href="https://www.metered.ca/tools/openrelay/" target="_blank" rel="noopener">Sign up →</a>
+        </li>
+        <li>
           <strong>Self-hosted Coturn</strong> — five-minute Docker
           deploy on any VM you control. See the
           <code>NAT traversal</code> section of DOCS.md for the

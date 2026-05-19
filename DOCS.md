@@ -748,11 +748,15 @@ The symptom is consistent: peer connections work fine on the same LAN, and stop 
 
 #### Why there's no built-in TURN
 
-A working TURN relay consumes real bandwidth (every byte the peers exchange flows through it), and any free public service that gets noticed by enough users gets shut down within months — historically `openrelay.metered.ca` was the community option, but its free tier no longer allocates in 2026 (`701 TURN allocate request timed out`). MyOwnLLM therefore ships **no default TURN**: peers behind symmetric NAT need to point the client at a TURN server they control or pay for. Two recommended paths:
+A working TURN relay consumes real bandwidth (every byte the peers exchange flows through it), and there's no anonymous public TURN service that reliably stays up. The historical `openrelay.metered.ca` anonymous endpoint stopped allocating in 2026 (`701 TURN allocate request timed out`) — Metered now requires signup. MyOwnLLM therefore ships **no default TURN**: peers behind symmetric NAT need to point the client at a TURN server they control or have an account on. Three recommended paths, in increasing order of "you operate it yourself":
 
 #### Cloudflare Calls (free tier, account required)
 
 Cloudflare's Realtime Calls product includes a TURN service on a generous free tier (1,000 GB/month, no card on file). Create a Cloudflare account, follow the [TURN service setup](https://developers.cloudflare.com/calls/turn/), and you get a `urls`, `username`, `credential` triple to paste into **Settings → Networks → Settings → TURN servers**. Credentials rotate; the setup page documents how to refresh them.
+
+#### Open Relay Project / Metered.ca (free tier, account required)
+
+Same provider that historically ran the anonymous `openrelay.metered.ca` endpoint, now with mandatory signup. The free tier is smaller (50 GB/month) but the credentials are static once issued, so you paste them once and they keep working. [Sign up](https://www.metered.ca/tools/openrelay/) and you're given a per-account TURN URL set.
 
 #### Self-hosted Coturn (free, your own VM)
 
