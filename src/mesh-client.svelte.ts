@@ -660,11 +660,18 @@ export interface DiagEntry {
  *    inbound, so the other peer's presence announces are
  *    arriving. WebRTC's offer/answer is in progress; ICE is
  *    checking candidate pairs.
- *  - `ice-failed-needs-turn` — ICE has reached `failed` at least
- *    once AND zero `relay` candidates were ever gathered. The
- *    unambiguous "TURN is missing or broken" state. Terminal
- *    until the user adds a working TURN server (which triggers
- *    `reconcile()` → Trystero rejoin → fresh ICE config).
+ *  - `ice-failed-no-turn` — ICE reached `failed` AND zero `relay`
+ *    candidates AND the user has NO TURN servers configured. The
+ *    actionable diagnosis is "you need a TURN server" — Settings
+ *    UI surfaces the fix link and the Add-TURN flow.
+ *  - `ice-failed-turn-unreachable` — ICE reached `failed` AND zero
+ *    `relay` candidates BUT the user does have TURN configured.
+ *    The actionable diagnosis is "your configured TURN server
+ *    isn't reachable" — either the URL/host is wrong, the
+ *    credentials are wrong, or the provider's having an outage.
+ *    Different fix from `ice-failed-no-turn` (look at the
+ *    config, not "add one"). Both transition out the moment a
+ *    fresh ICE round gathers any `relay` candidate.
  *  - `peer-active` — ≥1 connection has completed our app-level
  *    auth handshake and is exchanging mesh traffic.
  *  - `error` — terminal startup failure; `this.error` carries the
@@ -675,7 +682,8 @@ export type MeshPhase =
   | "signaling-connecting"
   | "signaling-up"
   | "peer-discovered"
-  | "ice-failed-needs-turn"
+  | "ice-failed-no-turn"
+  | "ice-failed-turn-unreachable"
   | "peer-active"
   | "error";
 
@@ -859,7 +867,7 @@ class MeshClient {
    *  that just wants the off / starting / online / error axis,
    *  but the Status pill and any new code should read `phase`
    *  because it discriminates the user-actionable cases (e.g.
-   *  `ice-failed-needs-turn` vs the generic "online — no
+   *  `ice-failed-{no-turn,turn-unreachable}` vs the generic "online — no
    *  peers"). Updated by `updatePhase()` whenever signaling
    *  health, peer state, or WebRTC ICE state changes. */
   phase = $state<MeshPhase>("off");
@@ -2395,7 +2403,7 @@ class MeshClient {
     // (an active peer) that the whole stack is working.
     //
     // The phase machine still surfaces the underlying problem
-    // (`signaling-up` / `peer-discovered` / `ice-failed-needs-turn`)
+    // (`signaling-up` / `peer-discovered` / `ice-failed-{no-turn,turn-unreachable}`)
     // so the Status pill shows what's happening; the throttle
     // (90s, 3m, 5m, 10m) paces the actual leave/rejoin to keep
     // anti-spam happy.
@@ -3120,14 +3128,24 @@ class MeshClient {
 
     // Peer traffic visible → WebRTC negotiation should be
     // happening. Did ICE try and fail without ever gathering a
-    // relay candidate? That's the unambiguous "TURN is missing"
-    // fingerprint and it's terminal until the user adds one.
+    // relay candidate? Branch by whether the user has TURN
+    // configured at all:
+    //   - 0 TURN servers → `ice-failed-no-turn` (actionable: add one)
+    //   - ≥1 TURN configured → `ice-failed-turn-unreachable`
+    //     (actionable: check the URL / credentials / provider)
+    // Both are terminal until something changes the ICE config
+    // (user edits Settings → `reconcile()` triggers a restart
+    // with fresh ICE servers).
     const ice_failed = webrtcDiagState.iceStateChanges.some((s) =>
       s.endsWith(":failed"),
     );
     const has_relay_candidate =
       (webrtcDiagState.candidateTypes["relay"] ?? 0) > 0;
-    if (ice_failed && !has_relay_candidate) return "ice-failed-needs-turn";
+    if (ice_failed && !has_relay_candidate) {
+      return this.applied_turn.length === 0
+        ? "ice-failed-no-turn"
+        : "ice-failed-turn-unreachable";
+    }
 
     return "peer-discovered";
   }
@@ -3210,13 +3228,55 @@ class MeshClient {
     this.logDiag(
       "warn",
       `peer ${details.peerId.slice(0, 8)}… handshake failed: ${details.error}. ` +
-        `Most often: symmetric NAT (phone hotspot, CGNAT, restrictive carrier) ` +
-        `on one or both sides — STUN can't punch through and no TURN relay is ` +
-        `configured. Add a TURN server in Settings → Networks → Settings ` +
-        `(Cloudflare Calls free tier or self-hosted Coturn).`,
+        this.iceFailureGuidance(),
     );
     this.recent_ice_failure_at = Date.now();
     this.updatePhase();
+  }
+
+  /** Build the actionable guidance string we append to ICE-failed
+   *  diag log lines. Branches on whether TURN is configured because
+   *  the user's next step differs sharply:
+   *
+   *   - No TURN configured: "Add a TURN server" — the failure mode
+   *     is symmetric NAT / blocked UDP and direct WebRTC has no
+   *     remaining strategies. The user needs a relay.
+   *   - TURN configured but no `relay` candidate was ever gathered:
+   *     "Check your configured TURN — the host isn't reachable, or
+   *     the credentials are wrong." Their TURN URL string parses
+   *     but the server isn't responding. Different fix.
+   *
+   *  Single source of truth for the message — used by both
+   *  `handleJoinError` and the `watchPeerIce` failed-state branch
+   *  so the two log lines never drift apart. */
+  private iceFailureGuidance(): string {
+    if (this.applied_turn.length === 0) {
+      return (
+        `Most often: symmetric NAT (phone hotspot, CGNAT, restrictive carrier) ` +
+        `on one or both sides — STUN can't punch through and no TURN relay is ` +
+        `configured. Add a TURN server in Settings → Networks → Settings ` +
+        `(Cloudflare Calls free tier or self-hosted Coturn).`
+      );
+    }
+    const turn_hosts = Array.from(
+      new Set(
+        this.applied_turn.map((t) => {
+          // Extract the host from "turn:HOST:PORT" or "turns:HOST:PORT?..."
+          // for the user-readable hint. Best-effort string parsing; if it
+          // doesn't match expectations, fall back to the full URL.
+          const m = t.url.match(/^turns?:([^:?/]+)/);
+          return m ? m[1] : t.url;
+        }),
+      ),
+    );
+    return (
+      `TURN is configured (${turn_hosts.join(", ")}) but no relay candidate was ` +
+      `gathered — your TURN server isn't reachable. Likely causes: the host ` +
+      `doesn't resolve (DNS-level ad-blocker intercepting it, provider outage), ` +
+      `the credentials are wrong (a 401 from TURN looks the same as host unreachable ` +
+      `from ICE's perspective), or UDP is blocked end-to-end (try a TCP/TLS TURN URL ` +
+      `like 'turns:host:443?transport=tcp'). Check Settings → Networks → Settings.`
+    );
   }
 
   private watchPeerIce(peerId: string, pc: RTCPeerConnection): void {
@@ -3260,13 +3320,14 @@ class MeshClient {
         // The actionable case: ICE candidates never reached a
         // working pair. Surface as warn (always visible, even with
         // Quiet logs) and stamp `recent_ice_failure_at` so the
-        // Settings UI banner can light up.
+        // Settings UI banner can light up. `iceFailureGuidance()`
+        // branches on whether the user has TURN configured so we
+        // give different next-steps for "add TURN" vs "your TURN
+        // isn't reachable."
         this.logDiag(
           "warn",
           `ICE failed for ${peerId.slice(0, 8)}… — direct WebRTC didn't connect. ` +
-            `Most often: symmetric NAT (phone hotspot, CGNAT, restrictive carrier) on one ` +
-            `or both sides. Add a TURN server in Settings → Networks → Settings ` +
-            `(Cloudflare Calls free tier or self-hosted Coturn).`,
+            this.iceFailureGuidance(),
         );
         this.recent_ice_failure_at = Date.now();
         this.updatePhase();
