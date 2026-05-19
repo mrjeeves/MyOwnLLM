@@ -66,35 +66,51 @@ import { APP_VERSION } from "../../mesh-capabilities";
   // ---- status pill derivation -----------------------------------------
 
   /** Color + copy for the "what's the mesh doing right now" pill.
-   *  One derived value drives both so the rendered state can't
-   *  contradict itself. */
+   *  Driven by `meshClient.phase` (the canonical connection state
+   *  machine) so the rendered state can't contradict the diag
+   *  log. Each phase maps to a tone + a one-line description; if
+   *  more detail is needed the user opens Activity. */
   let statusPill = $derived.by<{
     tone: "green" | "amber" | "red" | "grey" | "blue";
     text: string;
   }>(() => {
     if (loading) return { tone: "grey", text: "Loading…" };
-    if (meshClient.status === "error") {
-      return { tone: "red", text: `Mesh error: ${meshClient.error}` };
-    }
     if (!active) {
       return { tone: "grey", text: "No active network — pick one below" };
     }
-    if (meshClient.status === "starting" || meshClient.status === "off") {
-      return { tone: "blue", text: `Joining ${active.network_id}…` };
-    }
+    const handle = active.network_id;
     const activePeers = meshClient.peers.filter(
       (p) => p.status === "active" || p.status === "shelved",
     );
-    if (activePeers.length === 0) {
-      return {
-        tone: "amber",
-        text: `Online on ${active.network_id} — waiting for peers`,
-      };
+    switch (meshClient.phase) {
+      case "off":
+      case "starting":
+        return { tone: "blue", text: `Joining ${handle}…` };
+      case "signaling-connecting":
+        return { tone: "blue", text: `Opening signaling sockets on ${handle}…` };
+      case "signaling-up":
+        return {
+          tone: "amber",
+          text: `Online on ${handle} — waiting for peer announces`,
+        };
+      case "peer-discovered":
+        return {
+          tone: "amber",
+          text: `Peer found on ${handle} — establishing WebRTC connection…`,
+        };
+      case "ice-failed-needs-turn":
+        return {
+          tone: "red",
+          text: `ICE failed on ${handle} — TURN server required (see Settings)`,
+        };
+      case "peer-active":
+        return {
+          tone: "green",
+          text: `Connected · ${handle} · ${activePeers.length} peer${activePeers.length === 1 ? "" : "s"} · auto-healing ring`,
+        };
+      case "error":
+        return { tone: "red", text: `Mesh error: ${meshClient.error}` };
     }
-    return {
-      tone: "green",
-      text: `Connected · ${active.network_id} · ${activePeers.length} peer${activePeers.length === 1 ? "" : "s"} · auto-healing ring`,
-    };
   });
 
   /** "What to do next" coachmark — anchored visually under the
@@ -110,16 +126,21 @@ import { APP_VERSION } from "../../mesh-capabilities";
    *  than a multi-step modal.  */
   let coachmark = $derived.by<string>(() => {
     if (loading) return "";
-    if (meshClient.status === "error") {
-      return "The mesh hit an error. Open the Activity tab for diagnostics, then switch networks to retry.";
-    }
     if (!active) {
       if (networks.length === 0) {
         return "Add a network below to start sharing across devices.";
       }
       return "Pick a saved network below — click Switch to join it.";
     }
-    if (meshClient.status === "starting" || meshClient.status === "off") {
+    // The phase machine drives this — each non-success phase has a
+    // single, specific next action for the user.
+    if (meshClient.phase === "error") {
+      return "The mesh hit an error. Open the Activity tab for diagnostics, then switch networks to retry.";
+    }
+    if (meshClient.phase === "ice-failed-needs-turn") {
+      return `Both ends of "${active.network_id}" need a TURN server (Settings → Networks → Settings → TURN servers). On a phone hotspot or behind CGNAT, STUN can't punch a hole — TURN relays the traffic for you. Cloudflare Calls has a free tier; Coturn self-hosts in five minutes.`;
+    }
+    if (meshClient.phase === "off" || meshClient.phase === "starting") {
       return ""; // transient
     }
     const activePeers = meshClient.peers.filter(
