@@ -71,11 +71,23 @@ and only fires when the cheaper one has been ruled out:
 | 4    | 3 re-handshakes failed OR rostered peer offline 60s+ | Trystero room rejoin            | 90s, 3m, 5m, 10m (global, throttled)  |
 | 5    | Active network changed OR transport config edited    | Stop + Start                    | Immediate                             |
 
-**Tier 4 is gated by `isSignalingHealthy()`.** If at least one relay socket
-is OPEN, a rejoin accomplishes nothing — the new connections come up with
-identical config and the only effect is a fresh round of presence-announce
-publishes that eats anti-spam budgets on rate-limited relays. The gate is
-the single most important piece of restraint in the engine.
+**Tier 4 is gated by `hasActivePeer()`.** If at least one peer is in
+`active` status, the whole stack (signaling + ICE + handshake) is
+demonstrably working — a rejoin would tear down that peer's datachannel
+for no benefit and push a fresh round of presence-announces through every
+relay, which is the failure mode that drove the original gate (flaky
+hotspot + Damus rate-limiting). When no peer is active, the throttle
+(90s/3m/5m/10m) paces actual rejoins to keep anti-spam happy.
+
+An earlier version of the gate keyed off `isSignalingHealthy()` (≥1 relay
+OPEN). That turned out to be too aggressive in the opposite direction:
+it skipped every rejoin while relays were open, even when the actionable
+case was "signaling sees the other peer's announces but our local Trystero
+peer-table is stuck on a dead `RTCPeerConnection` and won't produce a
+fresh `onPeerJoin`." The cure for that case IS a rejoin; refusing one
+stranded the mesh in `peer-discovered` with no path forward. The current
+gate fires only when we have evidence (an active peer) that the whole
+stack is working.
 
 **Tier 5's transport comparison** lives in `reconcile()`. We snapshot the
 applied signaling/STUN/TURN arrays into `applied_signaling`, `applied_stun`,
@@ -125,6 +137,7 @@ adjustment.
 | Peer powered off                                       | `onPeerLeave` from Trystero                         | Drop connection state; offline-rostered card surfaces; catalog cache preserved          | `handlePeerLeave`, `dropConnection`    |
 | Peer powered back on                                   | `onPeerJoin` for new (fresh) `peer_id`              | Capabilities cache reseeds UI immediately; fresh handshake begins                       | `handlePeerJoin`, `capabilities_cache` |
 | Asymmetric sleep (one side wakes, other has stale sub) | Rostered peer absent from connection set for 60s    | `offlineRosteredCheckTick` → `maybeForceRediscovery` (gated)                            | `offlineRosteredCheckTick`             |
+| ICE flap drops peer, Trystero peer-table stuck on dead PC | `hasActivePeer()` false + EVENTs still arriving | Gate allows rejoin (throttled); fresh announce produces new `onPeerJoin`                | `maybeForceRediscovery`, `hasActivePeer` |
 | Fresh data channel swallows first hello                | No auth_response after 5s                           | Retry at +5s, +12s, +22s (3 retries inside 30s watchdog)                                | `handlePeerJoin`                       |
 | N peers go silent together (router reboot)             | Identical backoff schedules without jitter          | ±20% jitter applied per attempt → desynced retries                                      | `jitterBackoff`, `heartbeatTickConn`   |
 | User edits STUN list                                   | `applied_stun` ≠ active network's stun_servers      | Stop + Start with new ICE config                                                        | `reconcile`, `sameStringList`          |
@@ -240,3 +253,4 @@ The Activity panel surfaces the same data the diag log holds; Quiet logs suppres
 - **`REDISCOVERY_BACKOFF_SCHEDULE_MS` first interval 60s → 90s**: gives flaky-hotspot recovery a longer window before re-publishing presence; previously 60s tripped Damus's anti-spam.
 - **Scheduler worker with `performance.now()` stamps**: replaces N main-thread setIntervals. Heavy file-encoding or SHA-256 work on the main thread no longer fakes wake-detection gaps and no longer cycles every peer through forced rediscovery.
 - **`isSignalingHealthy()` gate on auto-rediscovery**: skip the Trystero leave/rejoin churn when relays are demonstrably fine — fixes the symptom of "rostered peer offline → unnecessary rejoin → rate-limited → genuine outage."
+- **`hasActivePeer()` gate replaces `isSignalingHealthy()` gate**: the earlier signaling-only gate stranded the mesh in `peer-discovered` when ICE flapped and Trystero's local peer-table got stuck on a dead RTCPeerConnection. The new gate skips rejoin only when there's an actively-authenticated peer holding a working datachannel — which is the actual "mesh is working, don't churn it" signal. When no peer is active, the throttle alone paces rejoins.

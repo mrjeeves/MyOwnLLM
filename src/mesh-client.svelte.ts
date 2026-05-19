@@ -2036,28 +2036,37 @@ class MeshClient {
    *  REDISCOVERY_BACKOFF_SCHEDULE_MS window. Logged either
    *  way so the Activity panel shows what's been suppressed. */
   private maybeForceRediscovery(reason: string): void {
-    // Gate #1: if the signaling layer is healthy, a Trystero
-    // leave/rejoin accomplishes nothing — it just tears down 20
-    // pre-warmed RTCPeerConnections + 8 relay sockets and reopens
-    // them with identical config. Worse, the new round of
-    // presence-announce publishes pushes us deeper into the
-    // anti-spam budgets of rate-limited relays. The historical
-    // assumption "rostered peer offline → rejoin to refresh
-    // signaling" only made sense before we could observe that
-    // signaling itself is fine; now we can (`isSignalingHealthy`)
-    // and we skip.
+    // Gate #1: don't churn a working mesh. If at least one peer
+    // is currently `active`, the underlying transport (signaling +
+    // WebRTC) is working end-to-end for that peer. A leave/rejoin
+    // would tear down their datachannel for no benefit and push
+    // a fresh round of presence-announces through every relay,
+    // which is the failure mode that drove the original gate (a
+    // flaky-hotspot user kept burning Damus's anti-spam budget).
+    //
+    // The earlier gate keyed off `isSignalingHealthy()` was too
+    // aggressive in the opposite direction: it skipped EVERY
+    // rejoin while relays were OPEN, even when the actionable
+    // case was "signaling sees the other peer's announces but our
+    // local Trystero peer-table is stuck on a dead PC and won't
+    // produce a fresh onPeerJoin." The cure for that IS a rejoin;
+    // refusing one stranded the mesh in `peer-discovered` with no
+    // path forward. The new gate fires only when we have evidence
+    // (an active peer) that the whole stack is working.
     //
     // The phase machine still surfaces the underlying problem
-    // (`signaling-up` / `peer-discovered` / `ice-failed-needs-turn`),
-    // so the user knows what's actually happening even though
-    // we're not churning the room.
-    if (this.isSignalingHealthy()) {
+    // (`signaling-up` / `peer-discovered` / `ice-failed-needs-turn`)
+    // so the Status pill shows what's happening; the throttle
+    // (90s, 3m, 5m, 10m) paces the actual leave/rejoin to keep
+    // anti-spam happy.
+    if (this.hasActivePeer()) {
       this.logDiag(
         "info",
-        `rediscovery skipped (signaling healthy: ${this.last_open_relay_count} relays open, phase=${this.phase}) — ${reason}`,
+        `rediscovery skipped (peer-active connection holds, phase=${this.phase}) — ${reason}`,
       );
-      // Reset the attempt counter so a real signaling outage
-      // later gets the full fast-rejoin schedule from the top.
+      // Reset the attempt counter so a later genuine outage gets
+      // the fast first-rejoin window, not whatever stretched
+      // schedule we'd worked our way up to before recovery.
       this.consecutive_rediscovery_attempts = 0;
       return;
     }
@@ -2497,21 +2506,32 @@ class MeshClient {
   }
 
   /** True when the signaling layer can carry presence + WebRTC
-   *  signaling for us right now. Used by
-   *  `maybeForceRediscovery()` to skip a Trystero leave/rejoin
-   *  when there's nothing wrong with signaling — re-joining tears
-   *  down 20 pre-warmed peer connections + every relay socket and
-   *  re-opens them with identical config, which only adds churn
-   *  and burns through anti-spam budgets on rate-limited relays.
-   *
-   *  The bar is intentionally low (≥1 relay open). If even one
-   *  relay is delivering EVENTs, Trystero's per-relay subscribe
-   *  + announce machinery is doing its job; the failure causing
-   *  "rostered peer offline" is downstream (the other peer isn't
-   *  running, or WebRTC can't establish a candidate pair). A
-   *  rejoin fixes neither. */
+   *  signaling for us right now (≥1 relay socket OPEN). Kept as a
+   *  pure observable for diag logging and future use — the gating
+   *  decision in `maybeForceRediscovery()` now uses `hasActivePeer`
+   *  instead because "signaling healthy" alone doesn't tell us the
+   *  WebRTC half is alive (see the comment there). */
   private isSignalingHealthy(): boolean {
     return this.last_open_relay_count > 0;
+  }
+
+  /** True when at least one peer is in app-level `active` (or its
+   *  ring-shelved variant) status — i.e. fully authenticated and
+   *  exchanging mesh traffic. The "we have a working connection
+   *  somewhere" signal that the auto-rediscovery gate keys off:
+   *  if this is true, the whole stack (signaling + ICE + handshake)
+   *  is demonstrably working for that peer, so a leave/rejoin would
+   *  tear down a healthy datachannel for no benefit.
+   *
+   *  Returns false when every connection is mid-handshake, pending
+   *  approval, denied, or absent — the cases where a stuck
+   *  Trystero peer-table can actually be unblocked by a rejoin. */
+  private hasActivePeer(): boolean {
+    for (const conn of this.connections.values()) {
+      const status = this.peerStatus(conn);
+      if (status === "active" || status === "shelved") return true;
+    }
+    return false;
   }
 
   private pollIceStates(): void {
