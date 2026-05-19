@@ -376,6 +376,13 @@ const RECONNECTING_GRACE_MS = 90_000;
  *  iteration over what's typically a handful of entries; the only
  *  cost of running it more often is one extra wakeup per tick. */
 const RECONNECT_PRUNE_INTERVAL_MS = 10_000;
+/** Heartbeat cadence for the signaling-status log: if the
+ *  fingerprint (relay-open set, author count, error set, PC count
+ *  tier) hasn't changed in this long, emit one line anyway so the
+ *  console shows the engine is alive. Without this, a stable mesh
+ *  goes silent forever between events; with it, you get one line
+ *  every ~5min as proof-of-life. */
+const SIGNALING_DIAG_HEARTBEAT_MS = 5 * 60 * 1000;
 /** Backoff schedule for app-level re-handshake attempts when a
  *  peer goes silent past HEARTBEAT_TIMEOUT_MS. Each attempt
  *  re-sends `hello`; if the underlying WebRTC channel is still
@@ -884,6 +891,20 @@ class MeshClient {
   private signaling_taps = new WeakSet<WebSocket>();
   private signaling_event_counts: Record<string, number> = {};
   private signaling_event_last_log = 0;
+  /** Last fingerprint of the SHAPE of the signaling snapshot (the
+   *  parts a human cares about: relay-open set, author count,
+   *  unique candidate-errors, PC count tier). Compared in
+   *  `logSignalingDiag` so we only re-emit when something
+   *  meaningful changed — the raw event counter ticking up by 12
+   *  with everything else identical is not a meaningful change,
+   *  and it's the dominant source of console spam. Empty until
+   *  the first poll. */
+  private last_signaling_fingerprint = "";
+  /** Wall-clock ms of the last signaling log. Paired with
+   *  SIGNALING_DIAG_HEARTBEAT_MS so a steady-state mesh emits at
+   *  least one status line every few minutes — proves the engine
+   *  is alive even when nothing changed. */
+  private last_signaling_log_at = 0;
   /** Distinct Nostr event-author pubkeys we've seen inbound on any
    *  relay socket, keyed by the first 8 hex chars. Each value is a
    *  hit count. Trystero's own pubkey appears here because relays
@@ -1022,6 +1043,13 @@ class MeshClient {
    *  maybeForceRediscovery() — keeps any number of stuck peers
    *  from each triggering their own rejoin in quick succession. */
   private last_force_rediscovery_at = 0;
+  /** Wall-clock ms of the most recent "rediscovery throttled" log
+   *  emission, paired with the throttle-window snapshot below to
+   *  dedupe the throttle log within a single backoff cycle. The
+   *  user wants to know we're throttling once per cycle, not every
+   *  60s while the cycle runs out. */
+  private last_throttle_log_at = 0;
+  private last_throttle_log_window = 0;
   /** How many rediscoveries have fired since the last successful
    *  auth_response. Indexes into REDISCOVERY_BACKOFF_SCHEDULE_MS
    *  to grow the throttle window the longer we've been
@@ -1513,6 +1541,7 @@ class MeshClient {
     // rejoin a few seconds later, defeating the throttle's whole
     // purpose. The value survives across rejoin cycles by design.
     this.installLifecycleHooks();
+    this.installConsoleNoiseFilter();
     // ICE-state polling lives outside the scheduler worker because
     // it needs DOM-side access to the RTCPeerConnection objects
     // Trystero hands out — those can't ride across the worker
@@ -1613,6 +1642,7 @@ class MeshClient {
   async stop(): Promise<void> {
     this.stopping = true;
     this.uninstallLifecycleHooks();
+    this.uninstallConsoleNoiseFilter();
     this.stopIcePolling();
     this.stopSignalingDiag();
     this.stopScheduler();
@@ -2185,10 +2215,21 @@ class MeshClient {
       const wait_s = Math.ceil(
         (min_interval - (now - this.last_force_rediscovery_at)) / 1000,
       );
-      this.logDiag(
-        "info",
-        `rediscovery throttled (${reason}) — next rejoin allowed in ${wait_s}s`,
-      );
+      // Dedupe within a single throttle window — the user gets one
+      // line per cycle telling them "we're waiting Xs," not one per
+      // poll tick. We log once when the current window starts
+      // (window stamp differs from what we last logged) and stay
+      // silent the rest of the cycle. The window stamp is
+      // `last_force_rediscovery_at` so a new rediscovery firing
+      // resets the dedupe.
+      if (this.last_throttle_log_window !== this.last_force_rediscovery_at) {
+        this.logDiag(
+          "info",
+          `rediscovery throttled (${reason}) — next rejoin allowed in ${wait_s}s`,
+        );
+        this.last_throttle_log_at = now;
+        this.last_throttle_log_window = this.last_force_rediscovery_at;
+      }
       return;
     }
     this.last_force_rediscovery_at = now;
@@ -2396,6 +2437,109 @@ class MeshClient {
    *  hooks because no single event covers every platform: e.g.
    *  Tauri webview doesn't always fire `visibilitychange` on lid
    *  events, and `online` only fires on actual network toggles. */
+  /** Saved references to the original console methods so the noise
+   *  filter can be uninstalled cleanly on `stop()`. Null while
+   *  the filter isn't active — typical lifetime is "from start() to
+   *  stop()" but the references survive a network change too. */
+  private original_console_warn: typeof console.warn | null = null;
+  private original_console_error: typeof console.error | null = null;
+  /** Rolling per-pattern dedupe state: first time we see a known-
+   *  noisy upstream warning, we emit it normally with a "(further
+   *  occurrences suppressed)" trailer; subsequent hits within
+   *  CONSOLE_NOISE_SUPPRESS_MS get swallowed and counted. When the
+   *  window expires (or we hit a count milestone) we log a one-
+   *  liner summary so the user knows it kept happening. */
+  private console_noise_state = new Map<
+    string,
+    { last_emit_at: number; suppressed: number }
+  >();
+
+  /** Install a console.warn/console.error tap that dedupes the
+   *  high-frequency upstream warnings drowning out our own diag
+   *  output. Targets — by substring match, no regex perf cost —
+   *  the patterns we've actually seen flood the console:
+   *
+   *    - Trystero relay-failure / rate-limit warnings (one per
+   *      relay per second when a relay throttles us; Trystero
+   *      will reconnect on its own).
+   *    - Nostr-tools WebSocket failure logs (429 / 502 from
+   *      relays — same root cause, same recovery).
+   *
+   *  Anything that doesn't match falls through unchanged. The
+   *  filter is purely about volume control; we don't change the
+   *  semantics of upstream messages, and our own `[mesh]` logs
+   *  go through `logDiag` directly and bypass this entirely. */
+  private installConsoleNoiseFilter(): void {
+    if (typeof window === "undefined") return;
+    if (this.original_console_warn !== null) return;
+    const NOISY_PATTERNS = [
+      "Trystero: relay failure",
+      "WebSocket connection to ",
+    ];
+    const matchPattern = (args: unknown[]): string | null => {
+      // We only need to look at the FIRST arg — both Trystero and
+      // the nostr WS error path stick the full description there
+      // and use later args for objects we don't care to inspect.
+      const first = args[0];
+      if (typeof first !== "string") return null;
+      for (const p of NOISY_PATTERNS) {
+        if (first.includes(p)) return p;
+      }
+      return null;
+    };
+    const SUPPRESS_WINDOW_MS = 30_000;
+    const dedupe = (
+      orig: (...args: unknown[]) => void,
+      args: unknown[],
+    ): void => {
+      const pattern = matchPattern(args);
+      if (pattern === null) {
+        orig.apply(console, args);
+        return;
+      }
+      const state = this.console_noise_state.get(pattern);
+      const now = Date.now();
+      if (!state || now - state.last_emit_at > SUPPRESS_WINDOW_MS) {
+        // First emission in this window — let it through with a
+        // hint so the user knows we'll suppress repeats.
+        const suppressed = state?.suppressed ?? 0;
+        if (suppressed > 0) {
+          orig.call(
+            console,
+            `${args[0]} (+ ${suppressed} suppressed in the last window)`,
+            ...args.slice(1),
+          );
+        } else {
+          orig.apply(console, args);
+        }
+        this.console_noise_state.set(pattern, {
+          last_emit_at: now,
+          suppressed: 0,
+        });
+        return;
+      }
+      state.suppressed += 1;
+    };
+    this.original_console_warn = console.warn.bind(console);
+    this.original_console_error = console.error.bind(console);
+    const saved_warn = this.original_console_warn;
+    const saved_error = this.original_console_error;
+    console.warn = (...args: unknown[]) => dedupe(saved_warn, args);
+    console.error = (...args: unknown[]) => dedupe(saved_error, args);
+  }
+
+  private uninstallConsoleNoiseFilter(): void {
+    if (this.original_console_warn !== null) {
+      console.warn = this.original_console_warn;
+      this.original_console_warn = null;
+    }
+    if (this.original_console_error !== null) {
+      console.error = this.original_console_error;
+      this.original_console_error = null;
+    }
+    this.console_noise_state.clear();
+  }
+
   private installLifecycleHooks(): void {
     if (this.lifecycle_handlers !== null) return;
     if (typeof window === "undefined") return;
@@ -2507,6 +2651,8 @@ class MeshClient {
       this.signaling_diag_timer = null;
     }
     this.last_signaling_summary = "";
+    this.last_signaling_fingerprint = "";
+    this.last_signaling_log_at = 0;
     this.signaling_event_counts = {};
     this.signaling_event_pubkeys = {};
     this.signaling_event_last_log = 0;
@@ -2567,10 +2713,6 @@ class MeshClient {
       total_events += count;
       per_relay.push(`${relay}=${count}`);
     }
-    const events_changed = total_events !== this.signaling_event_last_log;
-    if (summary === this.last_signaling_summary && !events_changed) return;
-    this.last_signaling_summary = summary;
-    this.signaling_event_last_log = total_events;
 
     // Author breakdown — the most informative line. One pubkey =
     // we're alone in the room (or all events are our own echoes).
@@ -2581,6 +2723,31 @@ class MeshClient {
     const authors_str = author_entries
       .map(([k, c]) => `${k}…=${c}`)
       .join(", ");
+
+    // Build a fingerprint over the SHAPE of the signaling state —
+    // the parts a human looking at the console cares about. Skip
+    // the raw event counter: it ticks every few seconds in steady
+    // state and isn't a meaningful change. PC count is bucketed to
+    // a tier so "78 PCs → 79 PCs" doesn't trigger a re-log, but
+    // "78 PCs → 100 PCs" (a fresh round of attempts) does.
+    const cand_err_set = webrtcDiagState.candidateErrors.slice(-3).join("|");
+    const pc_tier = Math.floor(webrtcDiagState.pcCount / 20);
+    const fingerprint = [
+      summary,
+      `auth=${distinct_authors}`,
+      `pcTier=${pc_tier}`,
+      `err=${cand_err_set}`,
+    ].join("§");
+    const now = Date.now();
+    const fingerprint_changed = fingerprint !== this.last_signaling_fingerprint;
+    const heartbeat_due =
+      this.last_signaling_log_at > 0 &&
+      now - this.last_signaling_log_at >= SIGNALING_DIAG_HEARTBEAT_MS;
+    if (!fingerprint_changed && !heartbeat_due) return;
+    this.last_signaling_summary = summary;
+    this.last_signaling_fingerprint = fingerprint;
+    this.signaling_event_last_log = total_events;
+    this.last_signaling_log_at = now;
 
     const events_suffix =
       total_events > 0
