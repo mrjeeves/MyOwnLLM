@@ -41,13 +41,15 @@ The implementation lives in:
  │ Layer 2 · WebRTC + ICE                                              │
  │   STUN candidates · TURN relay candidates                           │
  │   Per-PC iceconnectionstatechange listener                          │
+ │   `disconnected` → 6s watchdog → proactive `pc.restartIce()`        │
  │   onJoinError = terminal pending-handshake failure                  │
- │   `recent_ice_failure_at` drives Settings TURN banner               │
+ │   Phase splits TURN-not-configured vs TURN-unreachable diagnoses    │
  └────────────────────────────▲────────────────────────────────────────┘
                               │
  ┌────────────────────────────┴────────────────────────────────────────┐
  │ Layer 1 · Signaling (Trystero / Nostr)                              │
- │   redundancy 8 default (or user-supplied relay list)                │
+ │   5 relays, picked from Trystero defaults with deny-filter applied  │
+ │   (damus.io / chorus.pjv.me excluded due to rate limits)            │
  │   `getRelaySockets()` polled every 10s                              │
  │   EVENT-author counting distinguishes "alone" vs "peer present"     │
  │   `isSignalingHealthy()` = ≥1 relay socket OPEN                     │
@@ -60,8 +62,9 @@ layer's state to the UI as a single enum.
 
 ## The reconnection ladder
 
-Six escalating recovery mechanisms. Each is strictly cheaper than the next
-and only fires when the cheaper one has been ruled out:
+Seven escalating recovery mechanisms (numbered with a half-tier so the
+classic naming survives). Each is strictly cheaper than the next and
+only fires when the cheaper one has been ruled out:
 
 | Tier | Trigger                                              | Action                                        | Schedule (jittered ±20%)              |
 |------|------------------------------------------------------|-----------------------------------------------|---------------------------------------|
@@ -208,7 +211,7 @@ If any of these break, it's a bug:
 3. **Transport config changes always restart.** `applied_signaling`/`applied_stun`/`applied_turn` are the trust anchor.
 4. **`recent_ice_failure_at` only changes on observed transitions.** The synchronous initial inspection in `watchPeerIce` is read-only.
 5. **`consecutive_rediscovery_attempts` resets on any successful `onPeerJoin`.** A peer turning up proves signaling + WebRTC are working.
-6. **The scheduler worker is the only authoritative wake clock.** Main-thread `Date.now()` is fine for protocol payloads but never used for wake detection.
+6. **The scheduler worker is the only authoritative wake clock.** Main-thread `Date.now()` is fine for protocol payloads but never used for wake detection. The worker-spawn-failure fallback uses `performance.now()` from a main-thread `setInterval` — less reliable for wake-gap math but the only option when `new Worker()` throws.
 7. **All backoff schedules carry jitter where multiple peers can sync.** Per-peer rehandshakes are jittered; the global rediscovery counter doesn't need it (only one fires at a time).
 8. **Hello sends are bounded.** At most 4 per peer per handshake window (initial + 3 retries). The 30s watchdog drops the peer if none reach.
 9. **`stop()` is total for live channels and timers; pubkey-keyed caches survive a same-network restart.** Every timer, every pending callback, the connections map, the room handle, and the lifecycle hooks are torn down on `stop()`. But the pubkey-keyed caches (`catalog_cache`, `capabilities_cache`, `roster_pubkeys`, `roster_labels`, `recent_disconnects`) are NOT cleared by `stop()` — they're cleared by `start()` only when the network actually changed (`network_id !== opts.networkId`). That's what makes the rediscovery stop+start cycle preserve the sidebar's cached catalogs and the "reconnecting" grace markers, instead of flashing every offline rostered peer to blank during the rejoin window. A subsequent `start()` for the SAME network resumes with those caches intact; a `start()` for a DIFFERENT network wipes them in the network-changed branch.
@@ -248,11 +251,11 @@ The non-reactive private fields fall into four groups:
 - **Identity & room handles**: `identity`, `network_id`, `network_handle`, `room`, `sendMesh`, `my_peer_id`.
 - **Applied transport snapshot**: `applied_signaling`, `applied_stun`, `applied_turn`. The single source of truth for "what does Trystero currently have baked in."
 - **Connection map**: `connections: Map<peer_id, ConnectionState>`. The hot path. One entry per live Trystero peer.
-- **Caches keyed by pubkey** (survive peer-id reissue): `roster_pubkeys`, `roster_labels`, `suffix_cache`, `catalog_cache`, `capabilities_cache`.
-- **Timers**: scheduler worker handle, ICE poll timer, signaling diag timer, lifecycle event listeners.
-- **In-flight RPC maps**: `pending_infers_{in,out}`, `pending_moves_{in,out}`, `pending_files_{in,out}`, `pending_transcribes_{in,out}`, `pending_session_{fetches,saves}`, `pending_pulls_out`, `pending_offers`. Each is cleared on `dropConnection` for the relevant peer and on `stop()` for everything.
+- **Caches keyed by pubkey** (survive peer-id reissue AND survive a same-network rediscovery): `roster_pubkeys`, `roster_labels`, `suffix_cache`, `catalog_cache`, `capabilities_cache`, `recent_disconnects`. Cleared only in the network-changed branch of `start()`.
+- **Timers**: scheduler worker handle, ICE poll timer, signaling diag timer, lifecycle event listeners, plus the fallback-path `heartbeat_timer` / `offline_check_timer` / `catalog_refresh_timer` / `reconnect_prune_timer` for worker-less environments. Per-`ConnectionState` timers (`handshake_timer`, `handshake_hello_retry_timer`, `ice_disconnected_watchdog`) are cleared in `dropConnection` and in the `stop()` teardown loop.
+- **In-flight RPC maps**: `pending_infers_{in,out}`, `pending_moves_{in,out}`, `pending_files_{in,out}`, `pending_transcribes_{in,out}`, `pending_session_{fetches,saves}`, `pending_pulls_out`, `pending_offers`, `pending_move_guids`. Each is reaped per-peer on `dropConnection` (matching by `peer_id`) and settled-with-rejection on `stop()` so all outbound callers' promises unblock with a "mesh stopped" error rather than hanging forever.
 
-The discipline rule: anything that needs to survive a peer reconnect (different peer_id, same device_pubkey) is keyed by pubkey; anything tied to the live channel is keyed by peer_id.
+The discipline rule: anything that needs to survive a peer reconnect (different peer_id, same device_pubkey) is keyed by pubkey; anything tied to the live channel is keyed by peer_id. The pubkey-keyed caches also need to survive a same-network rediscovery (`stop()` followed by `start()` for the same `network_id`) — see invariant #9 for the gate that enforces this.
 
 ## How to add a new connection feature without breaking the engine
 
@@ -260,7 +263,7 @@ A checklist for the next contributor adding, say, a new `metrics_announce` messa
 
 1. **Decide which layer it lives at.** App protocol (Layer 4) is the default. Touching Layer 3 (handshake) needs a `PROTOCOL_VERSION` bump.
 2. **If you add state to `ConnectionState`**: clear it in `dropConnection` and reset it in `createConnState`. Don't expect it to survive a peer-id reissue.
-3. **If you add a cache keyed by pubkey**: clear it in `stop()` and in the network-switch path inside `start()` (the existing `catalog_cache.clear()` / `capabilities_cache.clear()` site).
+3. **If you add a cache keyed by pubkey**: clear it ONLY in the network-changed branch of `start()` (the `network_changed === true` block where `catalog_cache.clear()` / `capabilities_cache.clear()` / `recent_disconnects.clear()` etc. live). Do NOT clear it in `stop()` — that would destroy the cache across a same-network rediscovery and break the doc's "pubkey-keyed survives peer-id reissue" invariant. The whole point of pubkey-keyed state is that the live peer-id is ephemeral; tearing it down on stop defeats that.
 4. **If you add a timer**: register it via the scheduler worker (`scheduleTick`) so it stays honest under main-thread load. If you can't (DOM access needed), make sure it's cleared in `stop()` and survives a `stop()`/`start()` cycle by being re-spawned in `start()`.
 5. **If you add an outbound action that publishes**: confirm it doesn't reset relay sockets. Anything that triggers a rejoin must go through `maybeForceRediscovery(reason)` so the gate + throttle apply.
 6. **If you read config**: read it once via `loadConfig()` at start of a turn, not mid-flight. For applying config changes, use the `reconcile()` path — extend its comparison if your config field is part of the transport snapshot.
@@ -269,8 +272,9 @@ A checklist for the next contributor adding, say, a new `metrics_announce` messa
 
 ## What's intentionally NOT in this engine
 
-- **Per-relay quality scoring.** We use redundancy 8 with Trystero's deterministic shuffle. Adding per-relay weights would mean diverging from the appId-derived ordering, which would split the mesh (a peer on the old build picks different relays than a peer on the new one).
-- **TURN health probing.** Currently passive: we learn TURN is dead by watching ICE fail. Active probing would mean periodic STUN/TURN allocations that have a real bandwidth cost, especially on metered TURN tiers (Cloudflare's 1000 GB/month is huge, but a periodic probe across N devices is still wasteful).
+- **Per-relay quality scoring.** We use redundancy 5 with Trystero's deterministic shuffle and an explicit deny-filter (`SIGNALING_RELAY_DENYLIST`) for known-noisy hosts. Adding per-relay reliability metrics would mean diverging from the appId-derived ordering further, which risks splitting the mesh if two builds compute different "best" relays from observed performance. The current deny-filter is a stable, version-controlled allowlist — easier to reason about than a live scoring loop.
+- **TURN health probing.** Currently passive: we learn TURN is dead by watching ICE fail (and now distinguish "no TURN configured" from "TURN configured but unreachable" in the phase machine — see `ice-failed-no-turn` vs `ice-failed-turn-unreachable`). Active probing would mean periodic STUN/TURN allocations that have a real bandwidth cost, especially on metered TURN tiers (Cloudflare's 1000 GB/month is huge, but a periodic probe across N devices is still wasteful). The leave-cause diag log captures `pair=relay↔srflx`-style summaries which gives us most of the same forensic value without the live cost.
+- **Per-URL TURN preference tracking.** When the user has multiple TURN URLs configured (the metered.ca config from the user's session had four — `turn:` UDP/80, `turn:` TCP/80, `turn:` UDP/443, `turns:` TCP/443), we currently pass them all to WebRTC and let ICE pick. We don't track which URL actually produced the working relay candidate, so a successful connection through one URL doesn't help future attempts skip the dead ones. The leave-cause diag now records the local/remote candidate types (`relay↔srflx`) which gives partial visibility; per-URL preference is a future addition if the audit shows real cost from the "try all" behavior.
 - **Connection multiplexing.** Each peer is one WebRTC datachannel via Trystero's typed action. Layer 4 RPC framing (id-based) does the multiplexing logically; we don't open separate channels per RPC kind.
 - **Mesh-level encryption.** ed25519 authenticates each peer; the WebRTC layer encrypts in transit; conversation payloads are passed through. Adding mesh-level E2EE would matter only if we ever introduce a relay path (a peer relaying for two others) and isn't a concern at the current direct-peer-only topology.
 
