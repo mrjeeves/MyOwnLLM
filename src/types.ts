@@ -195,9 +195,9 @@ export interface NetworkConfig {
   network_id: string;
   /** Per-network signaling / NAT settings. Each network can point
    *  at a different relay pool — home / office / public mesh all
-   *  configurable independently. Empty signaling = Trystero
-   *  defaults (public Nostr); empty stun = no NAT helpers; empty
-   *  turn = no relay fallback. */
+   *  configurable independently. Empty signaling = Trystero's
+   *  built-in Nostr default pool at redundancy 8; empty stun = no
+   *  NAT helpers; empty turn = no relay fallback. */
   signaling_servers: string[];
   stun_servers: string[];
   turn_servers: TurnServer[];

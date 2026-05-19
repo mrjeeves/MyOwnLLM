@@ -719,7 +719,7 @@ Cloud Mesh ships off by default. To turn it on, open **Settings → Networks →
 
 ### Transport: Trystero over Nostr (default)
 
-Discovery and WebRTC connection setup go through [Trystero](https://trystero.dev), which proxies signed signaling messages through decentralized infrastructure (Nostr relays by default, with BitTorrent / MQTT / IPFS available as compile-time alternatives). **MyOwnLLM operates none of these.** The default is the community-run public Nostr relay pool.
+Discovery and WebRTC connection setup go through [Trystero](https://trystero.dev), which proxies signed signaling messages through decentralized infrastructure (Nostr relays by default, with BitTorrent / MQTT / IPFS available as compile-time alternatives). **MyOwnLLM operates none of these.** The default is Trystero's built-in pool of 52 community-run public Nostr relays, deterministically shuffled by `appId` so every MyOwnLLM client lands on the same top-N relays for the same network handle — that's what makes "two devices, same Network ID" actually find each other. We bump `redundancy` to 8 (up from Trystero's default 5) so any one misbehaving relay — notably `relay.damus.io`, which sits in our top-5 and rate-limits with "you are noting too much" — only costs us 1/8 of our signaling capacity. Anyone who'd rather pin specific relays (self-hosted, private, or just to keep traffic off third-party infra) can add their own in **Settings → Networks → Settings → Signaling relays**, and those take full precedence.
 
 The relay sees only the small WebRTC offer/answer envelopes during connection setup — never the mesh's actual traffic. Once peers connect, the data channel is direct and end-to-end.
 
@@ -736,9 +736,39 @@ docker run -d -p 7777:7777 dockurr/strfry
 
 Two devices both pointed at the same private relay find each other through it without ever hitting the public Nostr network.
 
-### NAT traversal: STUN + optional TURN
+### NAT traversal: STUN + TURN
 
-WebRTC needs STUN to discover NAT mappings; the defaults are Google's public STUN pool, which works on ~95% of networks. The other 5% (symmetric NAT, both peers behind it) need a TURN relay — that's user-supplied because TURN consumes real bandwidth. Add TURN entries in **Settings → Networks → Settings → TURN servers** with their URL + credentials.
+WebRTC needs STUN to discover NAT mappings; the defaults are Google's public STUN pool, which works on ~95% of networks. The other 5% (symmetric NAT, both peers behind it) need a TURN relay because STUN-only hole-punching can't traverse a NAT that hands out a fresh outbound port for every destination.
+
+#### Phone hotspots and other symmetric-NAT cases
+
+Phone hotspots are the dominant symmetric-NAT case for laptops. Most carriers run the hotspot itself behind carrier-grade NAT (CGNAT — a second NAT layer on top of whatever the hotspot does), so STUN reports a mapping that's useless to anyone trying to reach you back. Other common cases: guest Wi-Fi on enterprise networks, some 4G/5G modems, and any network that explicitly hardens against P2P traffic.
+
+The symptom is consistent: peer connections work fine on the same LAN, and stop working the moment one device moves to the hotspot. The Activity panel surfaces this via the signaling diagnostic: `webrtc: N pc(s), candidates [host=X, srflx=Y, relay=0]` plus `ice [pc1:checking → pc1:failed]` is the unambiguous fingerprint — zero `relay` candidates gathered means no working TURN means symmetric NAT cannot establish a candidate pair.
+
+#### Why there's no built-in TURN
+
+A working TURN relay consumes real bandwidth (every byte the peers exchange flows through it), and there's no anonymous public TURN service that reliably stays up. The historical `openrelay.metered.ca` anonymous endpoint stopped allocating in 2026 (`701 TURN allocate request timed out`) — Metered now requires signup. MyOwnLLM therefore ships **no default TURN**: peers behind symmetric NAT need to point the client at a TURN server they control or have an account on. Three recommended paths, in increasing order of "you operate it yourself":
+
+#### Cloudflare Calls (free tier, account required)
+
+Cloudflare's Realtime Calls product includes a TURN service on a generous free tier (1,000 GB/month, no card on file). Create a Cloudflare account, follow the [TURN service setup](https://developers.cloudflare.com/calls/turn/), and you get a `urls`, `username`, `credential` triple to paste into **Settings → Networks → Settings → TURN servers**. Credentials rotate; the setup page documents how to refresh them.
+
+#### Open Relay Project / Metered.ca (free tier, account required)
+
+Same provider that historically ran the anonymous `openrelay.metered.ca` endpoint, now with mandatory signup. The free tier is smaller (50 GB/month) but the credentials are static once issued, so you paste them once and they keep working. [Sign up](https://www.metered.ca/tools/openrelay/) and you're given a per-account TURN URL set.
+
+#### Self-hosted Coturn (free, your own VM)
+
+```bash
+# Coturn in Docker — five minutes, free, on any small cloud VM:
+docker run -d --network=host coturn/coturn \
+  -n --lt-cred-mech \
+  --user=meshuser:meshpass \
+  --realm=mesh.example.com
+```
+
+Then add `turn:your-host:3478` with username `meshuser` / credential `meshpass` to the network's TURN list on every device that needs to connect through it (both ends — TURN works by both peers relaying through the same server, so both have to be able to authenticate to it).
 
 ### Activity log
 
@@ -746,7 +776,7 @@ Connect → handshake → approve → re-handshake → catalog announce — ever
 
 ### Resilience (post-sleep, network blips)
 
-The mesh client watches for OS sleep / network drop via four signals (`visibilitychange`, `focus`, `online`, `pageshow`) plus a heartbeat-tick clock-gap detector. On wake it pings every peer with a tight 1.5 s probe; if any peer doesn't pong it enters a backoff schedule of re-handshakes (2 s, 5 s, 10 s, 20 s, 30 s, then capped) before escalating to a forced Trystero room rejoin. Rejoins are throttled (1m → 2m → 5m → 10m → 30m) so a peer that's genuinely offline doesn't drag the rest of the mesh through a churn loop.
+The mesh client watches for OS sleep / network drop via four signals (`visibilitychange`, `focus`, `online`, `pageshow`) plus a heartbeat-tick clock-gap detector. On wake it pings every peer with a tight 1.5 s probe; if any peer doesn't pong it enters a backoff schedule of re-handshakes (2 s, 5 s, 10 s, 20 s, 30 s, then capped) before escalating to a forced Trystero room rejoin. Rejoins are throttled (1.5m → 3m → 5m → 10m, capped) so a peer that's genuinely offline doesn't drag the rest of the mesh through a churn loop and the per-rejoin presence-announce doesn't starve us out of our signaling relays' anti-spam budgets.
 
 You can force-reconnect a peer manually from its row in the Connections list.
 
@@ -1251,7 +1281,7 @@ The `manifests/` cache stores one entry per URL. When a manifest reached via an 
         "id": "net-abc123",             // stable internal id, generated on save
         "network_id": "home-mesh",      // canonical Network ID — display name + roster filename
         "locked": true,                 // true = mesh client joins when this is active
-        "signaling_servers": [],        // per-network; empty = Trystero defaults
+        "signaling_servers": [],        // per-network; empty = MyOwnLLM's curated default Nostr relay pool
         "stun_servers": [
           "stun:stun.l.google.com:19302",
           "stun:stun1.l.google.com:19302"

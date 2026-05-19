@@ -108,6 +108,118 @@ const TRYSTERO_STRATEGY: string =
  *  the dynamic import; subsequent calls reuse the resolved value. */
 let cachedJoinRoom: typeof JoinRoomType | null = null;
 
+/** Cached `getRelaySockets` reference, resolved lazily by
+ *  `loadGetRelaySockets()`. Only the Nostr strategy exports this —
+ *  the signaling-diagnostic poll no-ops on other strategies. */
+let cachedGetRelaySockets: (() => Record<string, WebSocket>) | null = null;
+
+/** Module-level WebRTC instrumentation state. The
+ *  `installRTCPeerConnectionDiag()` wrapper writes to these counters
+ *  as Trystero creates RTCPeerConnections and gathers ICE
+ *  candidates; `pollSignalingRelays()` reads them and folds the
+ *  numbers into the Activity-log summary. Module-scoped because
+ *  the wrapper itself is global (we only install it once for the
+ *  whole app), and it doesn't have easy access to the MeshClient
+ *  instance to write fields on. */
+let webrtcDiagInstalled = false;
+const webrtcDiagState = {
+  pcCount: 0,
+  candidateTypes: {} as Record<string, number>,
+  candidateErrors: [] as string[],
+  iceStateChanges: [] as string[],
+};
+
+function installRTCPeerConnectionDiag(): void {
+  if (webrtcDiagInstalled) return;
+  if (typeof window === "undefined") return;
+  const Original = window.RTCPeerConnection;
+  if (typeof Original !== "function") return;
+  webrtcDiagInstalled = true;
+
+  // Wrap, don't replace — we still need every method and property
+  // on the prototype to behave identically for Trystero. Extending
+  // the original class is the path of least surprise: instanceof
+  // checks keep working, the prototype chain is intact, and
+  // Trystero never touches our subclass directly.
+  class WrappedRTCPeerConnection extends Original {
+    constructor(...args: ConstructorParameters<typeof RTCPeerConnection>) {
+      super(...args);
+      webrtcDiagState.pcCount += 1;
+      const myIndex = webrtcDiagState.pcCount;
+      this.addEventListener("icecandidate", (ev) => {
+        const c = ev.candidate;
+        if (!c) return;
+        // `candidate.type` is the candidate kind: "host", "srflx"
+        // (server-reflexive — via STUN), "prflx" (peer-reflexive),
+        // "relay" (via TURN). The presence/absence of "relay" is
+        // the smoking gun for a busted TURN config: zero relay
+        // candidates AND symmetric NAT = guaranteed ICE failure.
+        const type = c.type ?? "unknown";
+        webrtcDiagState.candidateTypes[type] =
+          (webrtcDiagState.candidateTypes[type] ?? 0) + 1;
+      });
+      // Browsers expose `icecandidateerror` as a proper event on
+      // RTCPeerConnection; STUN/TURN allocation failures land
+      // here with a 4xx/5xx-style code from the relay's response.
+      this.addEventListener("icecandidateerror", (ev) => {
+        const e = ev as RTCPeerConnectionIceErrorEvent;
+        const url = e.url || "?";
+        const code = e.errorCode ?? 0;
+        const text = e.errorText || "";
+        const entry = `pc${myIndex}: ${url} → ${code} ${text}`;
+        // Keep the last 8 errors so the diag log doesn't grow
+        // unbounded across a long session of TURN auth failures.
+        webrtcDiagState.candidateErrors.push(entry);
+        if (webrtcDiagState.candidateErrors.length > 8) {
+          webrtcDiagState.candidateErrors.shift();
+        }
+      });
+      this.addEventListener("iceconnectionstatechange", () => {
+        const state = this.iceConnectionState;
+        const entry = `pc${myIndex}:${state}`;
+        webrtcDiagState.iceStateChanges.push(entry);
+        if (webrtcDiagState.iceStateChanges.length > 16) {
+          webrtcDiagState.iceStateChanges.shift();
+        }
+      });
+    }
+  }
+
+  (window as unknown as { RTCPeerConnection: typeof RTCPeerConnection }).RTCPeerConnection =
+    WrappedRTCPeerConnection as unknown as typeof RTCPeerConnection;
+}
+
+// Install once at module load — the wrapper is a strict superset
+// of the native RTCPeerConnection (extends it, doesn't change
+// behavior), so it's safe to run even before any mesh code
+// touches it. Doing it at module init guarantees Trystero's first
+// `new RTCPeerConnection(...)` already goes through our subclass.
+installRTCPeerConnectionDiag();
+
+/** Resolve the Nostr strategy's `getRelaySockets` so we can peek at
+ *  per-relay WebSocket readyState for diagnostics. Best-effort —
+ *  returns null when the strategy isn't Nostr or the export is
+ *  missing on this Trystero build. The poll loop checks for null
+ *  and quietly skips. */
+async function loadGetRelaySockets(): Promise<
+  (() => Record<string, WebSocket>) | null
+> {
+  if (cachedGetRelaySockets) return cachedGetRelaySockets;
+  if (TRYSTERO_STRATEGY !== "nostr") return null;
+  try {
+    const mod = (await import("trystero/nostr")) as {
+      getRelaySockets?: () => Record<string, WebSocket>;
+    };
+    if (typeof mod.getRelaySockets === "function") {
+      cachedGetRelaySockets = mod.getRelaySockets;
+      return cachedGetRelaySockets;
+    }
+  } catch {
+    // Module already loaded elsewhere or unavailable — best-effort.
+  }
+  return null;
+}
+
 /** Resolve the strategy-specific Trystero `joinRoom`. In trystero
  *  0.24+, only the Nostr submodule still ships with the main
  *  package — the other strategy entry points (`trystero/torrent`,
@@ -238,18 +350,21 @@ const REHANDSHAKE_RESCUE_ATTEMPTS = 3;
  *  peer successfully completes auth, so a peer that pops back
  *  online gets the next outage's full reactivity. */
 const REDISCOVERY_BACKOFF_SCHEDULE_MS = [
-  60_000, // 1m  — first attempt after going offline
-  120_000, // 2m
+  90_000, // 1.5m — first attempt after going offline
   180_000, // 3m
-  300_000, // 5m — final, repeated indefinitely
-  // Capped at 5m (was 30m). The previous tail made the network
-  // feel "broken forever" when a bad stretch pushed us to the
-  // back of the schedule — a peer that came back during the
-  // 30-min wait stayed invisible until the wait elapsed.
-  // 5m is a tolerable polling cadence for a peer that's
-  // genuinely off, and `consecutive_rediscovery_attempts` now
-  // resets on any onPeerJoin so the schedule unwinds the moment
-  // signaling recovers anyway.
+  300_000, // 5m
+  600_000, // 10m — final, repeated indefinitely
+  // Bumped from the prior [60s, 120s, 180s, 300s]: each forced
+  // rejoin publishes a fresh presence announce to every signaling
+  // relay, and on a flaky hotspot connection (where connections
+  // drop every couple of minutes) the old 60s first interval was
+  // tight enough that Nostr relays with anti-spam limits — Damus
+  // especially — would start rate-limiting us, which then makes
+  // the recovery worse, not better. 90s gives the channel a real
+  // window to recover on its own before we churn signaling. The
+  // 10m tail remains tolerable because
+  // `consecutive_rediscovery_attempts` resets on any onPeerJoin,
+  // so the schedule unwinds the moment a peer reappears.
 ];
 /** Cadence at which we check whether any rostered peer is offline
  *  and, if so, ask for a rediscovery. Catches the asymmetric
@@ -291,6 +406,39 @@ const CATALOG_REFRESH_INTERVAL_MS = 60_000;
  *  this window collapse into a single send so a rapid-fire rename
  *  loop doesn't spam connected peers. */
 const CATALOG_DEBOUNCE_MS = 1_500;
+/** Cadence for `pollIceStates()`. Walks Trystero's
+ *  RTCPeerConnection map to attach `iceconnectionstatechange`
+ *  listeners to newly-arrived peers. The listener fires
+ *  synchronously on transition, so the poll only races the initial
+ *  appearance — 3s is much shorter than the multi-second timers ICE
+ *  uses internally per candidate pair, so we never miss the
+ *  transition into `failed`. */
+const ICE_POLL_INTERVAL_MS = 3_000;
+/** Cadence for `pollSignalingRelays()` — the diagnostic timer that
+ *  walks every Nostr relay socket Trystero opened and reports their
+ *  readyState. Necessary because Trystero's per-relay logging is
+ *  warn-on-failure only: a relay that silently sits in CONNECTING
+ *  forever (DNS failure, deep retry backoff, or the rate-limiter
+ *  refusing the connection) leaves no trace in the console even
+ *  though it can't carry signaling traffic. 10s is slow enough not
+ *  to spam the Activity log but fast enough to surface a
+ *  signaling-channel outage before the user has spent two minutes
+ *  staring at "no peers". */
+const SIGNALING_DIAG_INTERVAL_MS = 10_000;
+/** Number of Nostr signaling relays Trystero connects to in parallel
+ *  when the user hasn't supplied their own. Trystero's built-in
+ *  default is 5; we ask for 8 to give us extra slack so that a
+ *  single misbehaving relay (notably `relay.damus.io`, which sits
+ *  in Trystero's deterministic top-5 for our app id and rate-limits
+ *  presence-announce publishes with "you are noting too much") only
+ *  costs us 1/8 of our signaling capacity instead of 1/5.
+ *
+ *  Crucially, Trystero's relay list is sliced with `redundancy` from
+ *  the SAME deterministic shuffle for every client running against
+ *  the same `appId`, so a peer on an older build that picked the
+ *  first 5 still overlaps fully with a peer on this build that
+ *  picked the first 8 — no flag-day for the mesh. */
+const DEFAULT_SIGNALING_REDUNDANCY = 8;
 /** Globally-unique app identifier passed to Trystero so MyOwnLLM
  *  peers don't accidentally match peers from unrelated apps that
  *  happen to use the same `roomId`. Bump the suffix if we ever
@@ -311,6 +459,43 @@ export interface DiagEntry {
   level: DiagLevel;
   msg: string;
 }
+
+/** Connection-layer state machine. Each value names exactly one
+ *  thing the mesh is doing right now, derived from observable
+ *  evidence rather than wall-clock timers. Transitions are logged
+ *  by `updatePhase()` whenever any underlying signal changes, so
+ *  the Activity panel shows the moment we step forward or back.
+ *
+ *  - `off` — not joined to any room (initial; after `stop()`).
+ *  - `starting` — `start()` invoked, nothing connected yet.
+ *  - `signaling-connecting` — joinRoom returned but zero relay
+ *    sockets are OPEN. Either the very first round of socket
+ *    handshakes, or an outage took every relay down at once.
+ *  - `signaling-up` — ≥1 relay socket OPEN but we've only ever
+ *    seen one EVENT-author (us) — the other peer isn't visible
+ *    on the signaling channel yet.
+ *  - `peer-discovered` — ≥2 distinct EVENT authors observed
+ *    inbound, so the other peer's presence announces are
+ *    arriving. WebRTC's offer/answer is in progress; ICE is
+ *    checking candidate pairs.
+ *  - `ice-failed-needs-turn` — ICE has reached `failed` at least
+ *    once AND zero `relay` candidates were ever gathered. The
+ *    unambiguous "TURN is missing or broken" state. Terminal
+ *    until the user adds a working TURN server (which triggers
+ *    `reconcile()` → Trystero rejoin → fresh ICE config).
+ *  - `peer-active` — ≥1 connection has completed our app-level
+ *    auth handshake and is exchanging mesh traffic.
+ *  - `error` — terminal startup failure; `this.error` carries the
+ *    detail. */
+export type MeshPhase =
+  | "off"
+  | "starting"
+  | "signaling-connecting"
+  | "signaling-up"
+  | "peer-discovered"
+  | "ice-failed-needs-turn"
+  | "peer-active"
+  | "error";
 
 export type PeerStatus =
   | "handshaking" // hello sent / received; awaiting auth_response or verifying
@@ -452,6 +637,16 @@ class MeshClient {
   // ---- reactive state ---------------------------------------------------
 
   status = $state<"off" | "starting" | "online" | "error">("off");
+  /** Fine-grained connection state machine — the canonical
+   *  "what's the mesh doing right now" surface. The legacy
+   *  `status` field stays in place for backward-compat with code
+   *  that just wants the off / starting / online / error axis,
+   *  but the Status pill and any new code should read `phase`
+   *  because it discriminates the user-actionable cases (e.g.
+   *  `ice-failed-needs-turn` vs the generic "online — no
+   *  peers"). Updated by `updatePhase()` whenever signaling
+   *  health, peer state, or WebRTC ICE state changes. */
+  phase = $state<MeshPhase>("off");
   error = $state("");
   /** Mostly informational — Trystero peer ids are short hex strings,
    *  surfaced for the Activity panel. */
@@ -496,6 +691,16 @@ class MeshClient {
    *  a spinner instead of letting the user fire a second request
    *  on top. */
   remote_infer_in_flight = $state(false);
+  /** Wall-clock ms of the most recent observed ICE failure on a
+   *  WebRTC peer connection. Driven by the per-peer
+   *  `iceconnectionstatechange` listener (`watchPeerIce`). The
+   *  Networks → Settings panel reads this to surface a banner that
+   *  points the user at the TURN section when peers are unreachable
+   *  — the typical phone-hotspot / CGNAT case where STUN can't
+   *  punch a hole. Reset to 0 when the next peer connects
+   *  successfully so the banner clears once the user has either
+   *  added a working TURN entry or moved off the symmetric NAT. */
+  recent_ice_failure_at = $state(0);
   /** Reactive snapshot of active resources for the Connections tab's
    *  "Resources in use" panel. Updated whenever a resource enters
    *  or leaves the pending maps below.
@@ -567,6 +772,46 @@ class MeshClient {
   // ---- internal --------------------------------------------------------
 
   private room: Room | null = null;
+  /** Peer ids we've already attached an `iceconnectionstatechange`
+   *  listener to. Trystero exposes the underlying RTCPeerConnection
+   *  via `room.getPeers()`, but only after signaling has produced
+   *  one — so we poll on a short interval (`ice_poll_timer`) to
+   *  pick up new entries and wire them once. Cleared on stop()
+   *  along with the polling timer. */
+  private ice_watched_peers = new Set<string>();
+  private ice_poll_timer: number | null = null;
+  /** Diagnostic timer that polls Trystero's Nostr relay sockets so
+   *  the Activity log surfaces silent failures (sockets that never
+   *  reach OPEN, or oscillate CONNECTING ↔ CLOSED under rate-limit
+   *  pressure). null when the timer isn't running. */
+  private signaling_diag_timer: number | null = null;
+  /** Last reported "{open}/{total} relays" string; we only re-log
+   *  when the snapshot changes so a steady signal doesn't pollute
+   *  the Activity panel. */
+  private last_signaling_summary = "";
+  /** Sockets we've attached an inbound-message tap to. Each tap
+   *  counts Nostr `EVENT` frames that arrive on the socket so we
+   *  can distinguish "sockets are open but no traffic is flowing"
+   *  from "sockets are open and the other peer's announces are
+   *  arriving, the failure is downstream". */
+  private signaling_taps = new WeakSet<WebSocket>();
+  private signaling_event_counts: Record<string, number> = {};
+  private signaling_event_last_log = 0;
+  /** Distinct Nostr event-author pubkeys we've seen inbound on any
+   *  relay socket, keyed by the first 8 hex chars. Each value is a
+   *  hit count. Trystero's own pubkey appears here because relays
+   *  broadcast our announces back to us as subscribers — so the
+   *  important signal is *how many distinct keys* appear. One key
+   *  means we're only seeing our own echoes; two or more means the
+   *  other peer's traffic is reaching us. */
+  private signaling_event_pubkeys: Record<string, number> = {};
+  /** Snapshot of the most recent socket-count breakdown from
+   *  `pollSignalingRelays()`. The state machine reads this to
+   *  decide whether the signaling layer is "up" (zero open
+   *  relays = signaling-connecting; any open = signaling-up or
+   *  better), and `maybeForceRediscovery()` reads it to skip
+   *  the leave/rejoin churn when relays are already healthy. */
+  private last_open_relay_count = 0;
   private sendMesh: ((data: unknown, target?: string | string[] | null) => Promise<unknown>) | null = null;
   private identity: MeshIdentity | null = null;
   private network_id = "";
@@ -946,6 +1191,8 @@ class MeshClient {
     this.identity = opts.identity;
     this.network_id = opts.networkId;
     this.connections.clear();
+    this.last_open_relay_count = 0;
+    this.updatePhase();
     // Network-scoped caches: a different active network means a
     // different roster, so the cached catalogs and capability blobs
     // from peers in the old network shouldn't leak into the sidebar
@@ -984,6 +1231,7 @@ class MeshClient {
       this.status = "error";
       this.error = `network-handle derivation: ${String(e)}`;
       this.logDiag("error", `handle derivation failed: ${String(e)}`);
+      this.updatePhase();
       return;
     }
 
@@ -1002,7 +1250,7 @@ class MeshClient {
       `joining mesh room ${room_id.slice(0, 12)}… (trystero/${TRYSTERO_STRATEGY}, app=${TRYSTERO_APP_ID}` +
         (custom_relays.length > 0
           ? `, ${custom_relays.length} custom relay${custom_relays.length === 1 ? "" : "s"})`
-          : `, default relays)`),
+          : `, trystero defaults ×${DEFAULT_SIGNALING_REDUNDANCY})`),
     );
 
     // Resolve the build-time-selected `joinRoom` once per session.
@@ -1015,6 +1263,7 @@ class MeshClient {
       this.status = "error";
       this.error = `trystero strategy load: ${String(e)}`;
       this.logDiag("error", `trystero strategy load failed: ${String(e)}`);
+      this.updatePhase();
       return;
     }
 
@@ -1023,17 +1272,46 @@ class MeshClient {
         appId: TRYSTERO_APP_ID,
         rtcConfig: { iceServers: ice_servers },
       };
+      // Plumb the signaling relay set into Trystero. Both fields go
+      // under `relayConfig` (NOT a top-level `relayUrls` — a prior
+      // typo here silently fell through to Trystero's built-in
+      // defaults, so any URLs the user added in Settings were
+      // effectively ignored). When the user has custom relays we
+      // pass them as `urls`, which replaces Trystero's defaults
+      // entirely. Otherwise we leave `urls` unset and just bump
+      // `redundancy` from Trystero's default 5 to 8, which (a)
+      // keeps every existing peer compatible because Trystero's
+      // `redundancy` slices off the front of its deterministic
+      // appId-derived shuffle (the first 5 entries are identical
+      // either way) and (b) dilutes the impact of a single
+      // misbehaving relay in that top-N — most notably
+      // `relay.damus.io`, which sits in our top-5 and rate-limits
+      // presence-announce publishes with "you are noting too much".
       if (custom_relays.length > 0) {
-        // Trystero accepts a `relayUrls` override for the current
-        // strategy. When set, only these relays are used; when not,
-        // the strategy's built-in defaults apply.
-        (room_config as Record<string, unknown>).relayUrls = custom_relays;
+        (room_config as Record<string, unknown>).relayConfig = {
+          urls: custom_relays,
+        };
+      } else {
+        (room_config as Record<string, unknown>).relayConfig = {
+          redundancy: DEFAULT_SIGNALING_REDUNDANCY,
+        };
       }
-      this.room = joinRoomFn(room_config, room_id);
+      // `onJoinError` fires when a pending peer's handshake fails or
+      // times out (10s default). It's the primary signal for the
+      // hotspot / symmetric-NAT case — Trystero hides peers from
+      // `getPeers()` while they're pending, so the only way to know
+      // ICE never completed is to listen for the timeout here. After
+      // a peer has connected at least once, the per-peer
+      // `iceconnectionstatechange` listener in `watchPeerIce` picks
+      // up subsequent failures.
+      this.room = joinRoomFn(room_config, room_id, {
+        onJoinError: (details) => this.handleJoinError(details),
+      });
     } catch (e) {
       this.status = "error";
       this.error = `trystero init: ${String(e)}`;
       this.logDiag("error", `trystero init failed: ${String(e)}`);
+      this.updatePhase();
       return;
     }
 
@@ -1068,6 +1346,12 @@ class MeshClient {
     this.status = "online";
     this.my_peer_id = `trystero/${room_id.slice(0, 8)}`;
     this.last_global_tick_at = 0;
+    // Now that the legacy status flipped to "online", let the
+    // phase machine catch up. computePhase() looks at signaling
+    // health (still zero open sockets at this exact moment, since
+    // they're opening async) and picks `signaling-connecting`
+    // until the first poll observes ≥1 OPEN.
+    this.updatePhase();
     // NB: last_force_rediscovery_at intentionally not reset here.
     // forceRediscovery() runs stop()+reconcile()+start(); reseting
     // the throttle on the post-rejoin start would let any peer
@@ -1075,6 +1359,13 @@ class MeshClient {
     // rejoin a few seconds later, defeating the throttle's whole
     // purpose. The value survives across rejoin cycles by design.
     this.installLifecycleHooks();
+    // ICE-state polling lives outside the scheduler worker because
+    // it needs DOM-side access to the RTCPeerConnection objects
+    // Trystero hands out — those can't ride across the worker
+    // postMessage boundary.
+    this.recent_ice_failure_at = 0;
+    this.startIcePolling();
+    void this.startSignalingDiag();
     // Spin up the scheduler worker. All three periodic ticks live
     // there — the worker's own event loop is what keeps them from
     // drifting under heavy main-thread load (the bug that turned
@@ -1161,6 +1452,8 @@ class MeshClient {
   async stop(): Promise<void> {
     this.stopping = true;
     this.uninstallLifecycleHooks();
+    this.stopIcePolling();
+    this.stopSignalingDiag();
     this.stopScheduler();
     if (this.rAF_handle !== null) {
       cancelAnimationFrame(this.rAF_handle);
@@ -1237,6 +1530,9 @@ class MeshClient {
     this.status = "off";
     this.error = "";
     this.last_global_tick_at = 0;
+    this.recent_ice_failure_at = 0;
+    this.last_open_relay_count = 0;
+    this.updatePhase();
     settingsAttention.set("cloud-mesh", null);
     this.logDiag("info", "stopped");
   }
@@ -1652,6 +1948,32 @@ class MeshClient {
    *  REDISCOVERY_BACKOFF_SCHEDULE_MS window. Logged either
    *  way so the Activity panel shows what's been suppressed. */
   private maybeForceRediscovery(reason: string): void {
+    // Gate #1: if the signaling layer is healthy, a Trystero
+    // leave/rejoin accomplishes nothing — it just tears down 20
+    // pre-warmed RTCPeerConnections + 8 relay sockets and reopens
+    // them with identical config. Worse, the new round of
+    // presence-announce publishes pushes us deeper into the
+    // anti-spam budgets of rate-limited relays. The historical
+    // assumption "rostered peer offline → rejoin to refresh
+    // signaling" only made sense before we could observe that
+    // signaling itself is fine; now we can (`isSignalingHealthy`)
+    // and we skip.
+    //
+    // The phase machine still surfaces the underlying problem
+    // (`signaling-up` / `peer-discovered` / `ice-failed-needs-turn`),
+    // so the user knows what's actually happening even though
+    // we're not churning the room.
+    if (this.isSignalingHealthy()) {
+      this.logDiag(
+        "info",
+        `rediscovery skipped (signaling healthy: ${this.last_open_relay_count} relays open, phase=${this.phase}) — ${reason}`,
+      );
+      // Reset the attempt counter so a real signaling outage
+      // later gets the full fast-rejoin schedule from the top.
+      this.consecutive_rediscovery_attempts = 0;
+      return;
+    }
+
     const now = Date.now();
     const idx = Math.min(
       this.consecutive_rediscovery_attempts,
@@ -1795,6 +2117,395 @@ class MeshClient {
       window.removeEventListener("pageshow", h.pageshow);
     }
     this.lifecycle_handlers = null;
+  }
+
+  /** Periodic walk of Trystero's RTCPeerConnection map. We attach
+   *  an `iceconnectionstatechange` listener exactly once per peer
+   *  so the Activity log carries an actionable message when a
+   *  peer's ICE drops AFTER having reached `connected` — e.g. the
+   *  user's hotspot reassigns the carrier-NAT mapping, or Wi-Fi
+   *  flaps and ICE doesn't recover.
+   *
+   *  Pending peers (still in handshake) are NOT in `getPeers()` —
+   *  that's the failure mode `onJoinError` covers. This poll
+   *  handles the post-connect case where a peer entry exists but
+   *  loses its ICE pair. Together they cover both classes of
+   *  hotspot/NAT pain.
+   *
+   *  Polling at 3s is plenty: ICE state changes are slow (multi-
+   *  second timers per candidate pair) and the listener itself
+   *  fires synchronously on transition, so the poll only races
+   *  the initial appearance of each peer in the map. */
+  private startIcePolling(): void {
+    if (this.ice_poll_timer !== null) return;
+    if (typeof window === "undefined") return;
+    this.ice_poll_timer = window.setInterval(() => {
+      this.pollIceStates();
+    }, ICE_POLL_INTERVAL_MS);
+  }
+
+  private stopIcePolling(): void {
+    if (this.ice_poll_timer !== null) {
+      clearInterval(this.ice_poll_timer);
+      this.ice_poll_timer = null;
+    }
+    this.ice_watched_peers.clear();
+  }
+
+  /** Start the signaling-relay socket diagnostic. Polls
+   *  `getRelaySockets()` every SIGNALING_DIAG_INTERVAL_MS and logs
+   *  any change to the "{open}/{connecting}/{closed} of {total}"
+   *  summary so the Activity panel shows whether our publishes
+   *  could plausibly have reached anywhere. */
+  private async startSignalingDiag(): Promise<void> {
+    if (this.signaling_diag_timer !== null) return;
+    if (typeof window === "undefined") return;
+    const getSockets = await loadGetRelaySockets();
+    if (!getSockets) return;
+    // Allow the first call to land immediately so the user sees a
+    // baseline reading without waiting 10s after start.
+    this.pollSignalingRelays(getSockets);
+    this.signaling_diag_timer = window.setInterval(() => {
+      this.pollSignalingRelays(getSockets);
+    }, SIGNALING_DIAG_INTERVAL_MS);
+  }
+
+  private stopSignalingDiag(): void {
+    if (this.signaling_diag_timer !== null) {
+      clearInterval(this.signaling_diag_timer);
+      this.signaling_diag_timer = null;
+    }
+    this.last_signaling_summary = "";
+    this.signaling_event_counts = {};
+    this.signaling_event_pubkeys = {};
+    this.signaling_event_last_log = 0;
+    // Note: signaling_taps is a WeakSet; the WebSocket references
+    // it holds get garbage-collected once Trystero drops them, so
+    // we don't need to clear it explicitly. The listeners attached
+    // to those sockets go with them.
+  }
+
+  private pollSignalingRelays(
+    getSockets: () => Record<string, WebSocket>,
+  ): void {
+    let sockets: Record<string, WebSocket>;
+    try {
+      sockets = getSockets();
+    } catch {
+      return;
+    }
+    const open: string[] = [];
+    const connecting: string[] = [];
+    const closing: string[] = [];
+    const closed: string[] = [];
+    for (const [, ws] of Object.entries(sockets)) {
+      const url = ws.url || "";
+      const short = url.replace(/^wss?:\/\//, "").replace(/\/$/, "");
+      if (ws.readyState === 1) open.push(short);
+      else if (ws.readyState === 0) connecting.push(short);
+      else if (ws.readyState === 2) closing.push(short);
+      else closed.push(short);
+      // Install a passive inbound-message tap once per socket so
+      // we can count Nostr EVENT frames arriving from other peers
+      // (presence announces + WebRTC offers/answers). Trystero's
+      // own `onmessage` handler is the primary listener; this is
+      // additive and never blocks delivery.
+      if (ws.readyState === 1 && !this.signaling_taps.has(ws)) {
+        this.signaling_taps.add(ws);
+        ws.addEventListener("message", (ev) => {
+          this.recordSignalingEvent(short, ev.data);
+        });
+      }
+    }
+    const total = open.length + connecting.length + closing.length + closed.length;
+    // Snapshot for the state-machine + smart-rediscovery readers.
+    // We update before the early-return so even the all-zero case
+    // (room torn down) writes the correct value.
+    this.last_open_relay_count = open.length;
+    this.updatePhase();
+    if (total === 0) return;
+    const summary = `${open.length}/${total} open, ${connecting.length} connecting, ${closing.length + closed.length} closed`;
+
+    // Snapshot the EVENT-frame counters since the last log. We re-log
+    // either when the open/closed breakdown changes OR when we've
+    // received at least one EVENT since the last poll — that's the
+    // "yes, peer traffic is flowing" signal we lacked before.
+    let total_events = 0;
+    const per_relay: string[] = [];
+    for (const [relay, count] of Object.entries(this.signaling_event_counts)) {
+      total_events += count;
+      per_relay.push(`${relay}=${count}`);
+    }
+    const events_changed = total_events !== this.signaling_event_last_log;
+    if (summary === this.last_signaling_summary && !events_changed) return;
+    this.last_signaling_summary = summary;
+    this.signaling_event_last_log = total_events;
+
+    // Author breakdown — the most informative line. One pubkey =
+    // we're alone in the room (or all events are our own echoes).
+    // Two or more pubkeys = the other peer's announces ARE
+    // arriving, so the problem is downstream of signaling.
+    const author_entries = Object.entries(this.signaling_event_pubkeys);
+    const distinct_authors = author_entries.length;
+    const authors_str = author_entries
+      .map(([k, c]) => `${k}…=${c}`)
+      .join(", ");
+
+    const events_suffix =
+      total_events > 0
+        ? `; inbound EVENTs: ${total_events} from ${distinct_authors} ` +
+          `author${distinct_authors === 1 ? "" : "s"} (${authors_str}) ` +
+          `via (${per_relay.join(", ")})`
+        : `; inbound EVENTs: 0 — no peer traffic seen yet`;
+
+    // WebRTC-level state, captured by the global RTCPeerConnection
+    // wrapper. If signaling looks healthy ("from 2 authors") but
+    // peer joined never fires, this is the next place to look:
+    // empty candidate types → ICE never gathered; "relay" missing
+    // + symmetric NAT → TURN allocation failed; ICE state stuck at
+    // "checking" or transitioning straight to "failed".
+    const cand_types = Object.entries(webrtcDiagState.candidateTypes)
+      .map(([t, n]) => `${t}=${n}`)
+      .join(", ");
+    const ice_changes = webrtcDiagState.iceStateChanges.slice(-6).join(" → ");
+    const cand_errs = webrtcDiagState.candidateErrors.slice(-3).join(" | ");
+    const webrtc_summary =
+      webrtcDiagState.pcCount === 0
+        ? "; webrtc: no peer connections created yet"
+        : `; webrtc: ${webrtcDiagState.pcCount} pc(s), candidates [${cand_types || "none"}]` +
+          (ice_changes ? `, ice [${ice_changes}]` : "") +
+          (cand_errs ? `, errors [${cand_errs}]` : "");
+
+    if (open.length === 0) {
+      const dead = [...connecting, ...closing, ...closed].join(", ");
+      this.logDiag(
+        "warn",
+        `signaling: ${summary}. Zero open relays — presence publishes are being dropped. Dead/pending: ${dead}${events_suffix}${webrtc_summary}`,
+      );
+    } else {
+      const openList = open.join(", ");
+      const deadList =
+        connecting.length + closing.length + closed.length > 0
+          ? ` (down: ${[...connecting, ...closing, ...closed].join(", ")})`
+          : "";
+      this.logDiag(
+        "info",
+        `signaling: ${summary}. Open: ${openList}${deadList}${events_suffix}${webrtc_summary}`,
+      );
+    }
+  }
+
+  /** Inbound Nostr message tap. Counts only `EVENT` frames — the
+   *  ones carrying actual peer traffic (announces, WebRTC offers,
+   *  answers). NOTICE/EOSE/OK frames are protocol bookkeeping
+   *  that Trystero handles internally and don't tell us whether
+   *  peers are reaching us. Also extracts the event-author
+   *  `pubkey` and bumps a per-pubkey counter; this lets us tell
+   *  a "lots of events but all our own echoes" sea of presence
+   *  noise apart from "events from another peer are actually
+   *  arriving" (≥2 distinct pubkeys observed). */
+  private recordSignalingEvent(relay: string, raw: unknown): void {
+    if (typeof raw !== "string") return;
+    if (!raw.startsWith('["EVENT"')) return;
+    this.signaling_event_counts[relay] =
+      (this.signaling_event_counts[relay] ?? 0) + 1;
+    // Parse the frame to extract the author pubkey. JSON parse on
+    // every inbound event is cheap (frames are small) and only
+    // runs on EVENT frames because of the prefix gate above.
+    let pubkey = "";
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed) && parsed.length >= 3) {
+        const payload = parsed[2] as { pubkey?: unknown } | undefined;
+        if (payload && typeof payload.pubkey === "string") {
+          pubkey = payload.pubkey.slice(0, 8);
+        }
+      }
+    } catch {
+      // Malformed frame — Trystero will ignore it; we skip
+      // counting an author.
+    }
+    if (pubkey !== "") {
+      this.signaling_event_pubkeys[pubkey] =
+        (this.signaling_event_pubkeys[pubkey] ?? 0) + 1;
+    }
+    // Inbound peer traffic is one of the inputs the state
+    // machine watches — a new author appearing flips the phase
+    // from `signaling-up` to `peer-discovered`. Update on every
+    // EVENT (cheap; the function early-exits if nothing changed).
+    this.updatePhase();
+  }
+
+  /** Compute the canonical connection phase from the observable
+   *  evidence: legacy `status`, the live peer-connection map, the
+   *  signaling-diagnostic snapshot, and the global WebRTC
+   *  instrumentation. Pure function of state — no side effects —
+   *  so the caller decides when to invoke it (via `updatePhase()`
+   *  which compares + assigns + logs the transition). */
+  private computePhase(): MeshPhase {
+    if (this.status === "off") return "off";
+    if (this.status === "error") return "error";
+
+    // Any peer past our app-level handshake wins — that's the
+    // success state, regardless of what ICE is doing on other
+    // pre-warmed connections. `peerStatus()` returns "active"
+    // when both sides have approved and exchanged the approve
+    // message; "shelved" is the ring-parked variant of the same
+    // thing (the channel is still open for heartbeat).
+    for (const conn of this.connections.values()) {
+      const ps = this.peerStatus(conn);
+      if (ps === "active" || ps === "shelved") return "peer-active";
+    }
+
+    // No relay sockets open = nothing's reaching anyone.
+    // Distinguish first-time setup ("starting") from a steady
+    // outage ("signaling-connecting") via the legacy status.
+    if (this.last_open_relay_count === 0) {
+      return this.status === "starting" ? "starting" : "signaling-connecting";
+    }
+
+    // ≥2 distinct EVENT authors = the other peer's announces are
+    // arriving. (One author = our own publishes echoed back. The
+    // 2-author threshold is correct for any number of peers
+    // because seeing N≥2 means at least one is not us.)
+    const distinct_authors = Object.keys(this.signaling_event_pubkeys).length;
+    if (distinct_authors < 2) return "signaling-up";
+
+    // Peer traffic visible → WebRTC negotiation should be
+    // happening. Did ICE try and fail without ever gathering a
+    // relay candidate? That's the unambiguous "TURN is missing"
+    // fingerprint and it's terminal until the user adds one.
+    const ice_failed = webrtcDiagState.iceStateChanges.some((s) =>
+      s.endsWith(":failed"),
+    );
+    const has_relay_candidate =
+      (webrtcDiagState.candidateTypes["relay"] ?? 0) > 0;
+    if (ice_failed && !has_relay_candidate) return "ice-failed-needs-turn";
+
+    return "peer-discovered";
+  }
+
+  /** Re-evaluate the phase against current state and log any
+   *  transition. Cheap to call from every state-changing code
+   *  path; the early-exit on `next === this.phase` keeps the
+   *  Activity log clean. */
+  private updatePhase(): void {
+    const next = this.computePhase();
+    if (next === this.phase) return;
+    const prev = this.phase;
+    this.phase = next;
+    this.logDiag("info", `phase: ${prev} → ${next}`);
+  }
+
+  /** True when the signaling layer can carry presence + WebRTC
+   *  signaling for us right now. Used by
+   *  `maybeForceRediscovery()` to skip a Trystero leave/rejoin
+   *  when there's nothing wrong with signaling — re-joining tears
+   *  down 20 pre-warmed peer connections + every relay socket and
+   *  re-opens them with identical config, which only adds churn
+   *  and burns through anti-spam budgets on rate-limited relays.
+   *
+   *  The bar is intentionally low (≥1 relay open). If even one
+   *  relay is delivering EVENTs, Trystero's per-relay subscribe
+   *  + announce machinery is doing its job; the failure causing
+   *  "rostered peer offline" is downstream (the other peer isn't
+   *  running, or WebRTC can't establish a candidate pair). A
+   *  rejoin fixes neither. */
+  private isSignalingHealthy(): boolean {
+    return this.last_open_relay_count > 0;
+  }
+
+  private pollIceStates(): void {
+    const room = this.room;
+    if (!room) return;
+    let peers: Record<string, RTCPeerConnection>;
+    try {
+      peers = room.getPeers() as Record<string, RTCPeerConnection>;
+    } catch {
+      // Older Trystero builds or a torn-down room — nothing to do.
+      return;
+    }
+    for (const [peerId, pc] of Object.entries(peers)) {
+      if (this.ice_watched_peers.has(peerId)) continue;
+      this.ice_watched_peers.add(peerId);
+      this.watchPeerIce(peerId, pc);
+    }
+    // Garbage-collect entries for peers Trystero has dropped so a
+    // peer that rejoins the room later gets a fresh listener.
+    for (const peerId of [...this.ice_watched_peers]) {
+      if (!(peerId in peers)) {
+        this.ice_watched_peers.delete(peerId);
+      }
+    }
+  }
+
+  /** Trystero's `onJoinError` handler — fires when a pending peer's
+   *  handshake fails or times out. The most common cause when peers
+   *  are present in the room but never become active is ICE never
+   *  reaching a working candidate pair (symmetric NAT / CGNAT /
+   *  blocked UDP). Surface this as a warn diag + flip the banner
+   *  flag so the Settings UI lights up.
+   *
+   *  The `details.error` string is informational only; we don't
+   *  parse it because Trystero may change the exact wording. */
+  private handleJoinError(details: { error: string; peerId: string }): void {
+    this.logDiag(
+      "warn",
+      `peer ${details.peerId.slice(0, 8)}… handshake failed: ${details.error}. ` +
+        `Most often: symmetric NAT (phone hotspot, CGNAT, restrictive carrier) ` +
+        `on one or both sides — STUN can't punch through and no TURN relay is ` +
+        `configured. Add a TURN server in Settings → Networks → Settings ` +
+        `(Cloudflare Calls free tier or self-hosted Coturn).`,
+    );
+    this.recent_ice_failure_at = Date.now();
+    this.updatePhase();
+  }
+
+  private watchPeerIce(peerId: string, pc: RTCPeerConnection): void {
+    const onChange = () => {
+      const state = pc.iceConnectionState;
+      if (state === "failed") {
+        // The actionable case: ICE candidates never reached a
+        // working pair. Surface as warn (always visible, even with
+        // Quiet logs) and stamp `recent_ice_failure_at` so the
+        // Settings UI banner can light up.
+        this.logDiag(
+          "warn",
+          `ICE failed for ${peerId.slice(0, 8)}… — direct WebRTC didn't connect. ` +
+            `Most often: symmetric NAT (phone hotspot, CGNAT, restrictive carrier) on one ` +
+            `or both sides. Add a TURN server in Settings → Networks → Settings ` +
+            `(Cloudflare Calls free tier or self-hosted Coturn).`,
+        );
+        this.recent_ice_failure_at = Date.now();
+        this.updatePhase();
+      } else if (state === "connected" || state === "completed") {
+        // A successful candidate pair clears the banner — either the
+        // user has fixed their TURN config or the offending peer is
+        // no longer the active one.
+        this.updatePhase();
+        if (this.recent_ice_failure_at !== 0) {
+          this.logDiag(
+            "info",
+            `ICE connected for ${peerId.slice(0, 8)}… — clearing failure banner`,
+          );
+        }
+        this.recent_ice_failure_at = 0;
+      }
+      // `disconnected` is transient (ICE consult-and-retry) — no
+      // log. If it ages into `failed`, the next event lands above.
+    };
+    try {
+      pc.addEventListener("iceconnectionstatechange", onChange);
+    } catch {
+      // Some test doubles for RTCPeerConnection don't expose
+      // addEventListener; ignore so the watcher doesn't crash the
+      // poll loop.
+    }
+    // If the peer was already past the transition by the time we
+    // attached (likely — `getPeers()` only surfaces connected
+    // peers in steady state), run the handler once synchronously
+    // so a freshly-connected peer still clears any prior banner.
+    onChange();
   }
 
   private handlePeerLeave(peer_id: string): void {
@@ -2767,6 +3478,11 @@ class MeshClient {
 
   private republishPeers(): void {
     this.peers = this.computePeers();
+    // Peer state is one of the inputs the phase machine watches —
+    // `republishPeers()` is called from every peer-state-changing
+    // path (join, leave, drop, approve, shelve, rehandshake), so
+    // hooking the phase update here covers them all in one place.
+    this.updatePhase();
   }
 
   /** rAF-batched variant of `refreshFileResources`. The file-receive

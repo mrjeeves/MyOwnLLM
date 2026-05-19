@@ -47,12 +47,14 @@ const DEFAULT_REMOTE_UI: RemoteUiConfig = {
 };
 
 // Signaling is handled by Trystero over Nostr relays. The default
-// `signaling_servers` list is empty so Trystero falls back to its
-// built-in public-relay pool — anyone who wants to point at a
+// per-network `signaling_servers` list is empty so the mesh client
+// uses Trystero's built-in 52-relay public pool, bumped to
+// redundancy 8 at connect time (see `DEFAULT_SIGNALING_REDUNDANCY`
+// in mesh-client.svelte.ts). Anyone who wants to point at a
 // self-hosted Nostr relay (or a private one for office/LAN use)
-// adds entries here from the Cloud Mesh → Addresses tab. STUN
-// servers default to Google's public pool, which is the de-facto
-// baseline.
+// adds entries from the Cloud Mesh → Addresses tab and those
+// replace the default pool entirely. STUN servers default to
+// Google's public pool, which is the de-facto baseline.
 //
 // Legacy entries from earlier PeerJS-based commits get stripped
 // on load so testers don't end up pointing Trystero at a
@@ -65,10 +67,9 @@ const LEGACY_PEERJS_SIGNALING_URLS = [
 
 /** Defaults for newly-added networks. Empty signaling = Trystero's
  *  public Nostr relays; Google's STUN pool for NAT helpers; empty
- *  TURN by default (user supplies their own credentials if they
- *  need one). Applied by `createNetwork` and by the legacy-config
- *  migration so a pre-multi-network install lands with sane
- *  per-network defaults. */
+ *  per-network TURN by default. Applied by `createNetwork` and by
+ *  the legacy-config migration so a pre-multi-network install
+ *  lands with sane per-network defaults. */
 export const DEFAULT_NETWORK_SIGNALING: string[] = [];
 export const DEFAULT_NETWORK_STUN: string[] = [
   "stun:stun.l.google.com:19302",
@@ -246,7 +247,18 @@ function cleanSignaling(raw: string[] | undefined): string[] {
  *  pre-Phase-3 schema, where locking gated mesh start) are
  *  silently dropped — saving is now the commit gesture and the
  *  delete-network modal carries the confirmation guard. */
-function mergeNetwork(raw: Partial<NetworkConfig> & { locked?: boolean }): NetworkConfig {
+function mergeNetwork(
+  raw: Partial<NetworkConfig> & { locked?: boolean; use_public_turn_fallback?: boolean },
+): NetworkConfig {
+  // `use_public_turn_fallback` was a brief experiment that shipped a
+  // hard-coded Open Relay TURN URL pair as a fallback. Open Relay's
+  // free service no longer allocates ("701 TURN allocate request
+  // timed out"), so the fallback added latency and noisy errors
+  // without ever connecting a peer. The field is silently dropped
+  // on load — any existing config retains its `turn_servers` list
+  // as-is, and users who need TURN now point at a working server
+  // (Cloudflare Calls, self-hosted Coturn) via the UI.
+  void raw.use_public_turn_fallback;
   return {
     id: raw.id || newNetworkInternalId(),
     network_id: raw.network_id || "",

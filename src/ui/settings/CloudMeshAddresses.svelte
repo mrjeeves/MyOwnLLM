@@ -10,6 +10,7 @@
    *  to edit any saved network's transport config without
    *  affecting which network is live. */
   let networks = $state<NetworkConfig[]>([]);
+  let activeNetworkId = $state<string | null>(null);
   let editingId = $state<string | null>(null);
   let editing = $derived(networks.find((n) => n.id === editingId) ?? null);
 
@@ -35,6 +36,7 @@
     try {
       const cfg = await loadConfig();
       networks = cfg.cloud_mesh.networks;
+      activeNetworkId = cfg.cloud_mesh.active_network_id;
       const active = activeNetwork(cfg);
       // Pick the edit target: preserve the user's current choice
       // when possible; fall back to active; fall back to first
@@ -139,6 +141,20 @@
     turnServers = turnServers.filter((_, idx) => idx !== i);
     void persist();
   }
+
+  /** True when the mesh client has logged a recent ICE failure and
+   *  the user is currently editing the active network. Drives the
+   *  inline NAT banner in the TURN section — symmetric NAT (phone
+   *  hotspot, CGNAT) is the dominant cause and the banner points
+   *  the user at the two practical fixes: enable the public
+   *  fallback or add their own TURN entry. Scoped to the active
+   *  network because failures on the live mesh aren't attributable
+   *  to a different saved network's config. */
+  let showIceBanner = $derived(
+    meshClient.recent_ice_failure_at > 0 &&
+      editingId !== null &&
+      editingId === activeNetworkId,
+  );
 </script>
 
 <div class="root">
@@ -295,10 +311,43 @@
       <h3>TURN servers</h3>
       <div class="block-hint">
         Relay servers used when direct peer connections can't be
-        established. Optional — most home networks don't need one.
-        TURN typically requires credentials and consumes bandwidth, so
-        plan accordingly.
+        established. Required for peers behind symmetric NAT (phone
+        hotspots, carrier-grade NAT, restrictive corporate or guest
+        Wi-Fi) because STUN-only hole-punching can't traverse those.
+        TURN consumes real bandwidth, so there's no free
+        no-signup public service that reliably stays up. Use one of:
       </div>
+      <ul class="turn-options">
+        <li>
+          <strong>Cloudflare Calls</strong> — free tier with 1,000
+          GB/month, requires a Cloudflare account.
+          <a href="https://developers.cloudflare.com/calls/turn/" target="_blank" rel="noopener">Setup guide →</a>
+        </li>
+        <li>
+          <strong>Open Relay Project (Metered.ca)</strong> — 50 GB/month
+          free, requires signup; rotating credentials are scoped to
+          your account.
+          <a href="https://www.metered.ca/tools/openrelay/" target="_blank" rel="noopener">Sign up →</a>
+        </li>
+        <li>
+          <strong>Self-hosted Coturn</strong> — five-minute Docker
+          deploy on any VM you control. See the
+          <code>NAT traversal</code> section of DOCS.md for the
+          recipe.
+        </li>
+      </ul>
+
+      {#if showIceBanner}
+        <div class="ice-banner" role="alert">
+          <strong>Peers couldn't connect directly.</strong>
+          The last connection attempt's WebRTC ICE check failed.
+          Both sides need at least one TURN server they can reach;
+          a phone hotspot or CGNAT on either end makes a TURN
+          relay mandatory. Add one above, on both devices, then
+          retry.
+        </div>
+      {/if}
+
       <div class="list">
         {#each turnServers as t, i (i)}
           <div class="turn-row">
@@ -403,6 +452,37 @@
     color: #666;
     line-height: 1.5;
     max-width: 36rem;
+  }
+
+  .ice-banner {
+    padding: 0.6rem 0.8rem;
+    border-radius: 6px;
+    background: #2a1f10;
+    border: 1px solid #5a3f1a;
+    color: #e0bb78;
+    font-size: 0.74rem;
+    line-height: 1.5;
+    max-width: 36rem;
+  }
+  .ice-banner strong { color: #f0d28b; display: block; margin-bottom: 0.15rem; }
+
+  .turn-options {
+    margin: 0;
+    padding-left: 1.1rem;
+    max-width: 36rem;
+    font-size: 0.74rem;
+    color: #888;
+    line-height: 1.6;
+  }
+  .turn-options strong { color: #ccc; font-weight: 500; }
+  .turn-options a { color: #6f9aff; text-decoration: none; }
+  .turn-options a:hover { text-decoration: underline; }
+  .turn-options code {
+    font-size: 0.72rem;
+    background: #1a1a20;
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+    color: #c0c0c0;
   }
 
   .list { display: flex; flex-direction: column; gap: 0.3rem; }
