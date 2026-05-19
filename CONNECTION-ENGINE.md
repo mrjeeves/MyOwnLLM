@@ -67,10 +67,27 @@ and only fires when the cheaper one has been ruled out:
 |------|------------------------------------------------------|-----------------------------------------------|---------------------------------------|
 | 1    | App-level message arrives                            | Reset `last_recv_at`                          | Continuous                            |
 | 2    | Wake event (lifecycle OR tick gap)                   | Ping all + 1.5s probe                         | Coalesced to 2s window                |
+| 2.5  | Per-peer ICE = `disconnected`                        | `pc.restartIce()` after 6s if still disconnected | Per-peer setTimeout, cleared on recover/fail/drop |
 | 3    | Wake probe: ALL peers silent                         | `pc.restartIce()` per PC + 4s recovery window | Once per wake (auto-falls to Tier 4)  |
 | 4    | Silence > 75s OR wake probe + ICE restart failed     | Per-peer re-handshake (hello)                 | 2s, 5s, 10s, 20s, 30s (per peer)      |
 | 5    | 3 re-handshakes failed OR rostered peer offline 60s+ | Trystero room rejoin                          | 90s, 3m, 5m, 10m (global, throttled)  |
 | 6    | Active network changed OR transport config edited    | Stop + Start                                  | Immediate                             |
+
+**Tier 2.5 is the per-peer ICE-disconnected layer.** WebRTC's ICE state
+machine transitions to `disconnected` when at least one connectivity check
+starts failing — it'll try to self-recover for ~5-15s before escalating to
+`failed`. On a fast LAN flap that's fine; the path heals on its own. On a
+TURN-via-TCP connection where a NAT pinhole closes, ICE never makes it back
+to `connected` and the SCTP datachannel times out long before ICE
+escalates, dropping us into the room-rejoin sledgehammer with all auth
+state lost. Tier 2.5 schedules a `setTimeout` per peer when ICE enters
+`disconnected`; if the peer is still disconnected after
+`ICE_DISCONNECTED_RESTART_MS` (6s), `proactiveIceRestart()` fires
+`pc.restartIce()` to kick a fresh candidate exchange. Often that picks up
+a different working path (alternate TURN URL, fresh srflx mapping) and the
+datachannel resumes without the peer ever dropping. Tier 2.5's watchdog is
+cleared the moment ICE transitions to `connected`/`completed`/`failed` or
+the connection is dropped, so a normal recovery short-circuits the kick.
 
 **Tier 3 is the network-swap layer.** When the OS jumps interfaces (phone
 hotspot↔home Wi-Fi, ethernet plugged/unplugged), the local IPs that ICE
@@ -139,6 +156,7 @@ the declaration captures the rationale.
 | `REDISCOVERY_REJOIN_GAP_MS`            | 1.5s                 | Leave-to-join gap to let transport tear down                  |
 | `OFFLINE_ROSTERED_CHECK_INTERVAL_MS`   | 60s                  | Asymmetric-sleep safety net                                   |
 | `ICE_POLL_INTERVAL_MS`                 | 3s                   | Pick up new `RTCPeerConnection` objects from Trystero         |
+| `ICE_DISCONNECTED_RESTART_MS`          | 6s                   | Per-peer watchdog before proactive `restartIce()` (Tier 2.5)  |
 | `SIGNALING_DIAG_INTERVAL_MS`           | 10s                  | Refresh signaling-relay health snapshot                       |
 | `DEFAULT_SIGNALING_REDUNDANCY`         | 5                    | Built-in Nostr relay count, after we filter `SIGNALING_RELAY_DENYLIST` out of Trystero's shuffle. Was 8 (to dilute Damus); the deny-filter is the targeted fix and dilution was no longer needed |
 | `SIGNALING_RELAY_DENYLIST`             | damus.io, chorus.pjv.me | Hosts always skipped in the deterministic-shuffle slice; both rate-limit the announce loop                       |
@@ -162,6 +180,7 @@ adjustment.
 | Asymmetric sleep (one side wakes, other has stale sub) | Rostered peer absent from connection set for 60s    | `offlineRosteredCheckTick` → `maybeForceRediscovery` (gated)                            | `offlineRosteredCheckTick`             |
 | ICE flap drops peer, Trystero peer-table stuck on dead PC | `hasActivePeer()` false + EVENTs still arriving | Gate allows rejoin (throttled); fresh announce produces new `onPeerJoin`                | `maybeForceRediscovery`, `hasActivePeer` |
 | Network swap (hotspot↔LAN, ethernet plugged/unplugged) | All peers silent in wake probe                     | Tier 3: `pc.restartIce()` per PC, Trystero ferries the renegotiation; falls to Tier 5 in 4s if no recovery | `handleWake`, `restartIceForUnresponsivePeers` |
+| TURN-via-TCP NAT pinhole closes mid-conversation       | Per-peer ICE state = `disconnected`                 | Tier 2.5: 6s watchdog → proactive `pc.restartIce()` on that one peer; recovers without dropping handshake | `watchPeerIce`, `proactiveIceRestart`  |
 | Fresh data channel swallows first hello                | No auth_response after 5s                           | Retry at +5s, +12s, +22s (3 retries inside 30s watchdog)                                | `handlePeerJoin`                       |
 | N peers go silent together (router reboot)             | Identical backoff schedules without jitter          | ±20% jitter applied per attempt → desynced retries                                      | `jitterBackoff`, `heartbeatTickConn`   |
 | User edits STUN list                                   | `applied_stun` ≠ active network's stun_servers      | Stop + Start with new ICE config                                                        | `reconcile`, `sameStringList`          |
@@ -284,3 +303,4 @@ The Activity panel surfaces the same data the diag log holds; Quiet logs suppres
 - **ICE-restart layer (Tier 3) ahead of room rejoin**: a network swap (phone hotspot↔LAN, ethernet plugged/unplugged) used to take the room-rejoin sledgehammer — 8 relay sockets torn down, ~20 PCs discarded, every authenticated peer demoted to handshaking. The relay sockets were going to reconnect on their own anyway, and the only thing actually broken were the ICE candidate pairs. Now when the wake probe finds all peers silent, we call `pc.restartIce()` per PC; Trystero's `onnegotiationneeded` ferries the renegotiation through the still-up signaling, new candidates form on whatever interface is now reachable, and the datachannel resumes with all app state preserved. Room rejoin still fires if the restart doesn't recover within 4s, so the worst case is unchanged.
 - **Stable peer identity (`recent_disconnects` + `reconnecting` status)**: ephemeral Trystero `peer_id` made every brief drop look like a fresh peer arrival — the UI churned through `active → offline → handshaking → active` for what was really one device with the same `device_pubkey` doing a network blip. Now when an authenticated peer drops, the pubkey enters `recent_disconnects` with a 90s grace window and the UI renders them as `reconnecting…` (amber pulsing dot, cached catalog stays visible). If a new connection lands inside the window with the same pubkey, the marker clears and the card flips straight back to `active`. After grace expires the janitor sweeps the entry and the card transitions cleanly to `offline`. No protocol change — pure UI/state-layer stabilization keyed off the durable identity we already had.
 - **Leave-cause diagnostics (`last_ice_state`, `selected_candidate_summary`, `first_active_at`)**: `peer left` log lines now print "ICE=failed (8s ago), pair=srflx↔relay, lived=4m" so the difference between "network/TURN broke" and "datachannel died on its own" is observable in the diag panel. Observability only; informs the design of future fixes.
+- **Per-peer ICE-disconnected watchdog (Tier 2.5)**: previously `disconnected` was treated as transient with no action; the engine relied on WebRTC's natural consult-and-retry to restore the path. That worked for LAN flaps but lost the TURN-via-TCP case — a NAT pinhole on the relay closes, ICE goes `disconnected` permanently, the SCTP datachannel times out, Trystero fires `onPeerLeave` with all auth state lost. The user observed this directly: 36s connection lifetime with `ICE=disconnected (5s ago), pair=relay↔srflx, lived=36s` in the leave log. The fix is a per-peer setTimeout scheduled in `watchPeerIce` whenever ICE enters `disconnected`: after `ICE_DISCONNECTED_RESTART_MS` (6s), `proactiveIceRestart()` calls `pc.restartIce()` to kick a fresh candidate exchange. The watchdog is cleared on any transition out of `disconnected` (recovered or escalated to `failed`) and on drop, so a normal recovery short-circuits the kick. Sibling of the Tier 3 wake-probe ICE-restart but scoped to one peer and triggered by observed state rather than wake.

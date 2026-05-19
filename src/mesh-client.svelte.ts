@@ -420,6 +420,27 @@ const WAKE_PROBE_DELAY_MS = 1_500;
  *  WAKE_PROBE_DELAY_MS + ICE_RESTART_RECOVERY_MS ≈ 5.5s — that a user
  *  who really needs a full rebuild isn't left staring at a frozen UI. */
 const ICE_RESTART_RECOVERY_MS = 4_000;
+/** Per-peer watchdog: when ICE transitions to `disconnected` and
+ *  doesn't recover on its own within this window, fire a proactive
+ *  `pc.restartIce()` so a fresh candidate exchange has a chance to
+ *  pick up whatever path is currently live.
+ *
+ *  Sized to give WebRTC's natural consult-and-retry a fair shot
+ *  (5-15s before it gives up and goes to `failed`) without waiting
+ *  so long that the SCTP datachannel times out and Trystero fires
+ *  `onPeerLeave` underneath us. The original engine treated
+ *  `disconnected` as transient and did nothing — that was fine for
+ *  fast LAN flaps but lost the TURN-via-TCP case where a NAT
+ *  pinhole closes and the path is permanently dead. A 6s watchdog
+ *  recovers those cases without restarting handshake.
+ *
+ *  This is independent of the wake-probe ICE-restart path (Tier 3
+ *  in the ladder). Tier 3 fires when ALL peers are silent after a
+ *  wake event; this watchdog fires per-peer on observed ICE state.
+ *  Both call into Trystero's `negotiationneeded` path; either is
+ *  safe to fire on the same PC because Trystero's perfect-
+ *  negotiation handler dedupes back-to-back offers. */
+const ICE_DISCONNECTED_RESTART_MS = 6_000;
 /** How long an authenticated peer that just dropped stays in the
  *  "reconnecting" UI bucket before it falls through to plain
  *  "offline." The user-visible difference is small but important:
@@ -817,6 +838,15 @@ interface ConnectionState {
    *  to `connected`/`completed`. Empty while we've never had a
    *  working pair, or if `getStats()` failed. */
   selected_candidate_summary: string;
+  /** setTimeout handle for the per-peer ICE-disconnected watchdog.
+   *  Set when this peer's ICE state transitions to `disconnected`;
+   *  cleared on `connected`/`completed`/`failed` or on drop. When
+   *  it fires, `proactiveIceRestart()` calls `pc.restartIce()` so a
+   *  fresh candidate exchange can pick up whatever path is still
+   *  reachable — recovers the TURN-via-TCP-pinhole-expiry case
+   *  before Trystero gives up on the datachannel. Null when no
+   *  watchdog is pending. See `ICE_DISCONNECTED_RESTART_MS`. */
+  ice_disconnected_watchdog: number | null;
 }
 
 class MeshClient {
@@ -1866,6 +1896,7 @@ class MeshClient {
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
       if (c.handshake_hello_retry_timer !== null) clearTimeout(c.handshake_hello_retry_timer);
+      if (c.ice_disconnected_watchdog !== null) clearTimeout(c.ice_disconnected_watchdog);
     }
     this.connections.clear();
     if (this.room) {
@@ -2579,6 +2610,49 @@ class MeshClient {
     return kicked;
   }
 
+  /** Per-peer ICE-disconnected watchdog action: fired by the
+   *  setTimeout scheduled in `watchPeerIce` when a peer's ICE state
+   *  stayed at `disconnected` past ICE_DISCONNECTED_RESTART_MS.
+   *  Kicks `pc.restartIce()` so a fresh candidate exchange picks up
+   *  the live path before the datachannel dies underneath us.
+   *
+   *  Sibling of `restartIceForUnresponsivePeers` (the wake-probe
+   *  Tier-3 path) but scoped to one peer and triggered by observed
+   *  ICE state rather than wake. Both paths can safely fire on the
+   *  same PC because Trystero's perfect-negotiation handler dedupes
+   *  back-to-back offers. */
+  private proactiveIceRestart(peer_id: string): void {
+    const conn = this.connections.get(peer_id);
+    if (!conn) return;
+    conn.ice_disconnected_watchdog = null;
+    // Re-check ICE state. The watchdog races with normal ICE
+    // recovery — if the path healed in the last ~6s the state is
+    // back to `connected`, and there's nothing to restart.
+    const room = this.room;
+    if (!room) return;
+    let pc: RTCPeerConnection | undefined;
+    try {
+      pc = (room.getPeers() as Record<string, RTCPeerConnection>)[peer_id];
+    } catch {
+      return;
+    }
+    if (!pc) return;
+    if (pc.connectionState === "closed") return;
+    if (pc.iceConnectionState !== "disconnected") return;
+    if (typeof pc.restartIce !== "function") return;
+    try {
+      pc.restartIce();
+      this.logDiag(
+        "info",
+        `ICE disconnected >${Math.round(ICE_DISCONNECTED_RESTART_MS / 1000)}s for ${peer_id.slice(0, 8)}… — kicking restartIce() to try a fresh candidate pair`,
+      );
+    } catch {
+      // Best-effort. A throw here is unusual (restartIce is sync
+      // and rarely fails) and there's nothing actionable beyond
+      // letting the natural ICE timeout escalate to `failed`.
+    }
+  }
+
   /** Bind OS lifecycle observables that signal the JS runtime may
    *  have just resumed from a paused state — laptop opened,
    *  network came back, tab refocused. Each one funnels into
@@ -3145,6 +3219,18 @@ class MeshClient {
         conn.last_ice_state = state;
         conn.last_ice_state_at = Date.now();
       }
+      // Any transition out of `disconnected` (recovered to connected,
+      // or progressed to failed) cancels the proactive-restart
+      // watchdog. We clear on `failed` too because at that point
+      // restartIce won't help — the candidate pool already exhausted.
+      if (
+        conn &&
+        conn.ice_disconnected_watchdog !== null &&
+        state !== "disconnected"
+      ) {
+        clearTimeout(conn.ice_disconnected_watchdog);
+        conn.ice_disconnected_watchdog = null;
+      }
       if (state === "failed") {
         // The actionable case: ICE candidates never reached a
         // working pair. Surface as warn (always visible, even with
@@ -3181,8 +3267,27 @@ class MeshClient {
         }
         this.recent_ice_failure_at = 0;
       }
-      // `disconnected` is transient (ICE consult-and-retry) — no
-      // log. If it ages into `failed`, the next event lands above.
+      // `disconnected` is the ICE state machine's "lost a check;
+      // trying to recover" — sometimes self-heals back to
+      // `connected`, sometimes ages into `failed` after a longer
+      // timeout (~30s default in Chromium). Historically we did
+      // nothing on this transition, which was fine for fast LAN
+      // flaps but cost us the TURN-via-TCP case: a NAT pinhole on
+      // the relay path closes, ICE state goes disconnected, the
+      // SCTP datachannel times out long before ICE escalates to
+      // `failed`, and Trystero fires `onPeerLeave` with all auth
+      // state lost. The watchdog kicks `pc.restartIce()` after
+      // ICE_DISCONNECTED_RESTART_MS so a fresh candidate exchange
+      // gets a shot at finding a live path before the datachannel
+      // dies underneath us.
+      else if (state === "disconnected" && conn && !is_initial) {
+        if (conn.ice_disconnected_watchdog !== null) {
+          clearTimeout(conn.ice_disconnected_watchdog);
+        }
+        conn.ice_disconnected_watchdog = window.setTimeout(() => {
+          this.proactiveIceRestart(peerId);
+        }, ICE_DISCONNECTED_RESTART_MS);
+      }
     };
     try {
       pc.addEventListener("iceconnectionstatechange", () => onChange(false));
@@ -3349,6 +3454,7 @@ class MeshClient {
       last_ice_state_at: 0,
       first_active_at: 0,
       selected_candidate_summary: "",
+      ice_disconnected_watchdog: null,
     };
   }
 
@@ -4083,6 +4189,7 @@ class MeshClient {
     if (!c) return;
     if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
     if (c.handshake_hello_retry_timer !== null) clearTimeout(c.handshake_hello_retry_timer);
+    if (c.ice_disconnected_watchdog !== null) clearTimeout(c.ice_disconnected_watchdog);
     // Preserve the catalog from this connection so the offline
     // sidebar render still shows the peer's conversations dimmed
     // instead of going blank. Only worth caching for peers we'd
