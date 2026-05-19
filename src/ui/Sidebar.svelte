@@ -50,7 +50,8 @@
       .filter(
         (p) =>
           ((p.status === "active" || p.status === "shelved") ||
-            (p.status === "offline" && p.catalog.length > 0)) &&
+            ((p.status === "offline" || p.status === "reconnecting") &&
+              p.catalog.length > 0)) &&
           p.authorized &&
           p.device_pubkey,
       )
@@ -455,7 +456,7 @@
         peer_id: string;
         peer_label: string;
         device_pubkey: string;
-        status: "active" | "shelved" | "offline";
+        status: "active" | "shelved" | "offline" | "reconnecting";
       }
     /** A saved-network row in the sidebar's Network section. Menu
      *  exposes switch / forget / settings. */
@@ -527,7 +528,7 @@
     peer_id: string,
     peer_label: string,
     device_pubkey: string,
-    status: "active" | "shelved" | "offline",
+    status: "active" | "shelved" | "offline" | "reconnecting",
   ) {
     e.preventDefault();
     e.stopPropagation();
@@ -1211,6 +1212,7 @@
               class="peer-group"
               class:standby={peer.status === "shelved"}
               class:offline={peer.status === "offline"}
+              class:reconnecting={peer.status === "reconnecting"}
               role="button"
               tabindex="0"
               oncontextmenu={(e) =>
@@ -1219,7 +1221,7 @@
                   peer.peer_id,
                   peer.label || peer.device_pubkey.slice(0, 8),
                   peer.device_pubkey,
-                  peer.status as "active" | "shelved" | "offline",
+                  peer.status as "active" | "shelved" | "offline" | "reconnecting",
                 )}
               onclick={(e) => {
                 e.stopPropagation();
@@ -1235,11 +1237,11 @@
                     peer.peer_id,
                     peer.label || peer.device_pubkey.slice(0, 8),
                     peer.device_pubkey,
-                    peer.status as "active" | "shelved" | "offline",
+                    peer.status as "active" | "shelved" | "offline" | "reconnecting",
                   );
                 }
               }}
-              title={`${peer.label || "Unnamed device"}${peer.device_suffix ? ` -${peer.device_suffix}` : ""}${peer.status === "offline" ? " (offline — cached view)" : ""}`}
+              title={`${peer.label || "Unnamed device"}${peer.device_suffix ? ` -${peer.device_suffix}` : ""}${peer.status === "offline" ? " (offline — cached view)" : peer.status === "reconnecting" ? " (reconnecting — cached view)" : ""}`}
             >
               <span class="folder-caret" aria-hidden="true">{isPeerCollapsed ? "▸" : "▾"}</span>
               <span class="peer-dot" data-status={peer.status} aria-hidden="true"></span>
@@ -1252,6 +1254,9 @@
               {/if}
               {#if peer.status === "offline"}
                 <span class="peer-offline-pill">offline</span>
+              {/if}
+              {#if peer.status === "reconnecting"}
+                <span class="peer-reconnecting-pill">reconnecting…</span>
               {/if}
               {#if peer.capabilities.app_version && peer.capabilities.app_version !== APP_VERSION}
                 <!-- Version mismatch surfaced inline so the user
@@ -1380,7 +1385,9 @@
       ? `${entry.title} — click to open, right-click to pull onto this device`
       : peer.status === "offline"
         ? `${entry.title} (hosted on ${peer.label || "this peer"}; host offline — right-click to pull when they're back)`
-        : `${entry.title} (hosted on ${peer.label || "this peer"}; right-click to pull)`}
+        : peer.status === "reconnecting"
+          ? `${entry.title} (hosted on ${peer.label || "this peer"}; reconnecting — right-click to pull once the link's back)`
+          : `${entry.title} (hosted on ${peer.label || "this peer"}; right-click to pull)`}
   >
     {#if entry.mode === "transcribe" || entry.mode === "diarize"}
       <svg
@@ -1599,22 +1606,24 @@
       </button>
     {:else if menu.target.kind === "peer"}
       {@const target = menu.target}
+      {@const disconnected = target.status === "offline" || target.status === "reconnecting"}
       <div class="menu-section-label">
         {target.peer_label}
         {#if target.status === "offline"}<span class="menu-section-tag">offline</span>{/if}
+        {#if target.status === "reconnecting"}<span class="menu-section-tag">reconnecting</span>{/if}
       </div>
       <button
         onclick={() => {
           closeMenu();
           void meshClient.reconnectPeer(target.peer_id);
         }}
-        title={target.status === "offline"
+        title={disconnected
           ? "Attempt to restore the connection by rejoining the mesh room"
           : "Re-send hello to this peer right now (bypasses the re-handshake backoff)"}
       >
         Refresh
       </button>
-      {#if target.status !== "offline"}
+      {#if !disconnected}
         <button
           onclick={() => startFileSend(target.peer_id, target.peer_label)}
           title="Pick a file from your computer to ship to this peer over the mesh"
@@ -1626,7 +1635,7 @@
       <button onclick={openMeshConnectionsSettings} title="Open Networks → Connections">
         Settings
       </button>
-      {#if target.status === "offline"}
+      {#if disconnected}
         <div class="menu-divider"></div>
         <button
           class="danger"
@@ -2138,6 +2147,12 @@
      glance without needing to look at the dot color. */
   .peer-group.offline { opacity: .5; }
   .peer-group.offline:hover { opacity: .7; }
+  /* Reconnecting peers stay nearly fully opaque — the soft framing
+     vs offline is "system is working on it, don't act yet." A
+     subtle dim distinguishes from active without going as far as
+     the offline gray. */
+  .peer-group.reconnecting { opacity: .75; }
+  .peer-group.reconnecting:hover { opacity: .9; }
   .peer-dot {
     width: 8px;
     height: 8px;
@@ -2149,6 +2164,15 @@
   .peer-dot[data-status="shelved"] {
     background: #b9c9ee;
     box-shadow: 0 0 5px rgba(185, 201, 238, 0.5);
+  }
+  .peer-dot[data-status="reconnecting"] {
+    background: #e9b860;
+    box-shadow: 0 0 5px rgba(233, 184, 96, 0.6);
+    animation: peer-dot-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes peer-dot-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: .35; }
   }
   .peer-dot[data-status="offline"] {
     background: #555;
@@ -2185,6 +2209,16 @@
     letter-spacing: .06em;
     background: #1e1e1e;
     color: #888;
+    border-radius: 3px;
+    padding: .05rem .3rem;
+    flex-shrink: 0;
+  }
+  .peer-reconnecting-pill {
+    font-size: .55rem;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    background: #2a2418;
+    color: #e9b860;
     border-radius: 3px;
     padding: .05rem .3rem;
     flex-shrink: 0;

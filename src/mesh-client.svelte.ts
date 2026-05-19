@@ -353,6 +353,29 @@ const WAKE_PROBE_DELAY_MS = 1_500;
  *  WAKE_PROBE_DELAY_MS + ICE_RESTART_RECOVERY_MS ≈ 5.5s — that a user
  *  who really needs a full rebuild isn't left staring at a frozen UI. */
 const ICE_RESTART_RECOVERY_MS = 4_000;
+/** How long an authenticated peer that just dropped stays in the
+ *  "reconnecting" UI bucket before it falls through to plain
+ *  "offline." The user-visible difference is small but important:
+ *  "reconnecting…" communicates "the system is actively working on
+ *  this — don't go fiddle with anything," "offline" communicates
+ *  "this peer isn't coming back without intervention."
+ *
+ *  Sized to overlap the first auto-rediscovery window
+ *  (`REDISCOVERY_BACKOFF_SCHEDULE_MS[0]` = 90s) so the UI doesn't
+ *  flip to "offline" right as the engine is finally about to try
+ *  the heavy rejoin. If a peer hasn't come back by then, two things
+ *  are likely: (a) they're genuinely off, or (b) their network
+ *  doesn't allow any candidate pair we can form — both warrant
+ *  the harsher "offline" framing.
+ *
+ *  Stable-identity matching means a peer who returns DURING this
+ *  window with the same `device_pubkey` reuses the existing card —
+ *  no `offline → handshaking → active` UI churn for a quick blip. */
+const RECONNECTING_GRACE_MS = 90_000;
+/** Cadence for pruning expired `recent_disconnects` entries. Cheap
+ *  iteration over what's typically a handful of entries; the only
+ *  cost of running it more often is one extra wakeup per tick. */
+const RECONNECT_PRUNE_INTERVAL_MS = 10_000;
 /** Backoff schedule for app-level re-handshake attempts when a
  *  peer goes silent past HEARTBEAT_TIMEOUT_MS. Each attempt
  *  re-sends `hello`; if the underlying WebRTC channel is still
@@ -482,6 +505,7 @@ const TRYSTERO_APP_ID = "myownllm-cloud-mesh-v1";
 const SCHED_HEARTBEAT = "heartbeat";
 const SCHED_OFFLINE_CHECK = "offline-check";
 const SCHED_CATALOG_REFRESH = "catalog-refresh";
+const SCHED_RECONNECT_PRUNE = "reconnect-prune";
 
 export type DiagLevel = "info" | "warn" | "error";
 export interface DiagEntry {
@@ -533,6 +557,7 @@ export type PeerStatus =
   | "pending_remote" // we've acted, OR we're waiting for the host's first move
   | "active" // both sides have approved and exchanged approve messages
   | "shelved" // ring topology has parked this peer; channel open for heartbeat only
+  | "reconnecting" // active peer dropped within the last RECONNECTING_GRACE_MS — same identity, link healing
   | "offline" // rostered peer not currently present in the Trystero room
   | "denied" // user denied; close imminent
   | "failed"; // protocol error; close imminent
@@ -954,6 +979,28 @@ class MeshClient {
    *  or pick a different host. Lives in memory; relaunch reseeds
    *  on next hello. */
   private capabilities_cache = new Map<string, Capabilities>();
+  /** Rostered peers whose authenticated connection dropped within
+   *  the last RECONNECTING_GRACE_MS, keyed by device_pubkey. Drives
+   *  the "reconnecting…" UI state: a peer that flaps off-then-on
+   *  inside the grace window stays on the same card with the same
+   *  label/catalog/capabilities, no `offline → handshaking → active`
+   *  churn. Entries are added by `dropConnection` for peers that
+   *  ever reached `active`, removed when a fresh active connection
+   *  to the same pubkey lands, and pruned by the janitor tick once
+   *  they expire.
+   *
+   *  We don't stash capabilities/catalog here — those already live
+   *  in `capabilities_cache`/`catalog_cache` so they survive the
+   *  drop independently. This map just tracks the WHEN, so the UI
+   *  knows which of those "offline" entries to render with the
+   *  softer "reconnecting" framing. */
+  private recent_disconnects = new Map<
+    string,
+    { since: number; expires_at: number }
+  >();
+  /** setInterval handle for `pruneRecentDisconnects`. Cleared in
+   *  stop(). */
+  private reconnect_prune_timer: number | null = null;
   /** Queued requestAnimationFrame handle for batched file-resource
    *  UI refreshes. A multi-MB file transfer calls
    *  `scheduleRefreshFileResources` on every chunk; rAF coalesces
@@ -1502,6 +1549,9 @@ class MeshClient {
       this.catalog_refresh_timer = window.setInterval(() => {
         void this.refreshLocalCatalog();
       }, CATALOG_REFRESH_INTERVAL_MS);
+      this.reconnect_prune_timer = window.setInterval(() => {
+        this.pruneRecentDisconnects();
+      }, RECONNECT_PRUNE_INTERVAL_MS);
       return;
     }
     worker.onmessage = (e: MessageEvent<{ type: "tick"; id: string; t: number }>) => {
@@ -1517,6 +1567,9 @@ class MeshClient {
         case SCHED_CATALOG_REFRESH:
           void this.refreshLocalCatalog();
           break;
+        case SCHED_RECONNECT_PRUNE:
+          this.pruneRecentDisconnects();
+          break;
       }
     };
     worker.onerror = (e: ErrorEvent) => {
@@ -1526,6 +1579,7 @@ class MeshClient {
     this.scheduleTick(SCHED_HEARTBEAT, HEARTBEAT_INTERVAL_MS);
     this.scheduleTick(SCHED_OFFLINE_CHECK, OFFLINE_ROSTERED_CHECK_INTERVAL_MS);
     this.scheduleTick(SCHED_CATALOG_REFRESH, CATALOG_REFRESH_INTERVAL_MS);
+    this.scheduleTick(SCHED_RECONNECT_PRUNE, RECONNECT_PRUNE_INTERVAL_MS);
   }
 
   private scheduleTick(id: string, interval_ms: number): void {
@@ -1572,6 +1626,15 @@ class MeshClient {
       clearInterval(this.catalog_refresh_timer);
       this.catalog_refresh_timer = null;
     }
+    if (this.reconnect_prune_timer !== null) {
+      clearInterval(this.reconnect_prune_timer);
+      this.reconnect_prune_timer = null;
+    }
+    // Clear the reconnecting-bucket: stop() means the user is
+    // shutting the mesh down or switching networks. Any pending
+    // "give them a sec to come back" timers are irrelevant — the
+    // mesh-level identity is going away.
+    this.recent_disconnects.clear();
     // Resolve every in-flight remote inference as failed so callers
     // unblock cleanly instead of hanging on a promise that will
     // never resolve.
@@ -3659,6 +3722,18 @@ class MeshClient {
       if (conn.first_active_at === 0) {
         conn.first_active_at = Date.now();
       }
+      // Stable-identity rejoin: this peer is back. If they were in
+      // the reconnecting bucket (i.e. they were `active` very recently
+      // and dropped within RECONNECTING_GRACE_MS), drop the marker so
+      // computePeers stops rendering the "reconnecting" framing. The
+      // UI sees a single state transition (reconnecting → active),
+      // not the offline→handshaking→active churn.
+      if (this.recent_disconnects.delete(conn.device_pubkey)) {
+        this.logDiag(
+          "info",
+          `peer ${conn.device_pubkey.slice(0, 8)}… reconnected within grace window — same identity, link healed`,
+        );
+      }
       this.logDiag("info", `peer active: ${conn.device_pubkey.slice(0, 8)}…`);
       // Phase 2: send our current catalog so the peer can render it
       // in the Network view without waiting for a mutation, and
@@ -3690,6 +3765,29 @@ class MeshClient {
     // strangers shouldn't leak into the sidebar.
     if (c.device_pubkey && c.catalog.length > 0 && this.roster_pubkeys.has(c.device_pubkey)) {
       this.catalog_cache.set(c.device_pubkey, c.catalog);
+    }
+    // Stable-identity bookkeeping: if this peer was actively working
+    // (reached `peer-active` at some point in its lifetime) and is
+    // rostered, mark it as "reconnecting" rather than letting it
+    // fall straight to "offline." computePeers picks this up and
+    // renders the gentler framing; a fresh active connection to the
+    // same device_pubkey within RECONNECTING_GRACE_MS clears the
+    // marker via maybePromoteToActive, and the janitor sweeps stale
+    // entries. We gate on `first_active_at` rather than
+    // `peer_authenticated` so a peer that failed mid-handshake
+    // doesn't get the soft framing — those failures are user-
+    // actionable (denied, malformed hello, etc.) and shouldn't
+    // pretend recovery is just around the corner.
+    if (
+      c.device_pubkey &&
+      c.first_active_at > 0 &&
+      this.roster_pubkeys.has(c.device_pubkey)
+    ) {
+      const now = Date.now();
+      this.recent_disconnects.set(c.device_pubkey, {
+        since: now,
+        expires_at: now + RECONNECTING_GRACE_MS,
+      });
     }
     this.connections.delete(peer_id);
     for (const [guid, pending] of this.pending_moves_out) {
@@ -3853,6 +3951,7 @@ class MeshClient {
     const active_pubkeys = new Set(
       active.filter((p) => p.device_pubkey !== "").map((p) => p.device_pubkey),
     );
+    const now = Date.now();
     const offline: PeerEntry[] = [];
     for (const pubkey of this.roster_pubkeys) {
       if (active_pubkeys.has(pubkey)) continue;
@@ -3863,13 +3962,24 @@ class MeshClient {
       // is currently away. EMPTY_CAPABILITIES otherwise — a peer
       // we've never connected to (roster entry only) reads blank.
       const cachedCap = this.capabilities_cache.get(pubkey);
+      // Stable-identity: was this peer just here? If a previously
+      // active connection to this pubkey dropped within
+      // RECONNECTING_GRACE_MS, render the soft "reconnecting"
+      // framing instead of "offline." When the peer comes back
+      // their new connection lands in `active` and replaces this
+      // synthesized entry — the UI sees `reconnecting → active`
+      // without a visit to `offline → handshaking`. The "since"
+      // stamp powers a countdown if any UI surfaces it; the actual
+      // expiry check is `now > expires_at`.
+      const disconnect = this.recent_disconnects.get(pubkey);
+      const reconnecting = disconnect !== undefined && now <= disconnect.expires_at;
       offline.push({
         peer_id: `offline:${pubkey}`,
         device_pubkey: pubkey,
         device_suffix: suffix,
         device_id_display: suffix ? `${pubkey}-${suffix}` : pubkey,
         label: this.roster_labels.get(pubkey) ?? "",
-        status: "offline",
+        status: reconnecting ? "reconnecting" : "offline",
         authorized: true,
         approver_role: false,
         local_approved: false,
@@ -3890,6 +4000,36 @@ class MeshClient {
       });
     }
     return [...active, ...offline];
+  }
+
+  /** Periodic janitor: prune `recent_disconnects` entries that have
+   *  aged past their grace window. Mostly a memory-hygiene measure
+   *  — the map is bounded by roster size so it can't grow without
+   *  bound — but also triggers a peers republish whenever an entry
+   *  actually expired, so the UI flips from "reconnecting" to
+   *  "offline" without waiting for the next unrelated event to
+   *  rebuild the list. */
+  private pruneRecentDisconnects(): void {
+    if (this.recent_disconnects.size === 0) return;
+    const now = Date.now();
+    let expired = 0;
+    for (const [pubkey, entry] of this.recent_disconnects) {
+      if (now > entry.expires_at) {
+        this.recent_disconnects.delete(pubkey);
+        expired++;
+      }
+    }
+    if (expired > 0) {
+      // One log line per sweep so the activity panel records the
+      // transition. Cheaper than per-pubkey logging and the user
+      // doesn't need to know WHICH pubkey timed out — the peer card
+      // flipping from reconnecting to offline conveys that.
+      this.logDiag(
+        "info",
+        `${expired} peer(s) aged out of reconnecting grace — now offline`,
+      );
+      this.republishPeers();
+    }
   }
 
   /** Drop a peer's cached catalog. Wired to the sidebar's right-
