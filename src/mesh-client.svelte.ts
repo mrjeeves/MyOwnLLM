@@ -757,6 +757,14 @@ class MeshClient {
    *  the Network sub-tab so it has something to render even when
    *  no peers are connected yet. */
   my_catalog = $state<CatalogEntry[]>([]);
+  /** Stable string fingerprint of `my_catalog`. Recomputed on every
+   *  successful refresh; `refreshLocalCatalog` short-circuits the
+   *  broadcast when the fingerprint matches the previous run. Cuts
+   *  the 60s safety-net tick from "blast a full snapshot at every
+   *  active peer regardless" down to "send only when something
+   *  actually changed externally" — typical steady-state is zero
+   *  outbound catalog bytes between user edits. */
+  private my_catalog_fingerprint = "";
   /** True when ring shelving / unshelving is mid-evaluation. Used
    *  by the Connections card to gate the "standby" badge from
    *  flickering on/off during a transient rebalance. */
@@ -4273,13 +4281,17 @@ class MeshClient {
   // ---- catalog gossip --------------------------------------------------
 
   /** Walk the local conversation tree and update `my_catalog`. Sends
-   *  a fresh `catalog_announce` to every active peer afterwards.
-   *  Safe to call frequently — internally debounced so a rapid
-   *  series of mutations collapses to one announce. */
+   *  a fresh `catalog_announce` to every active peer afterwards
+   *  ONLY when the catalog actually changed since the last refresh —
+   *  the fingerprint compare keeps the 60s safety-net tick silent
+   *  in steady state. Safe to call frequently — the broadcast itself
+   *  is debounced and the no-change short-circuit makes worst case
+   *  cheap. */
   async refreshLocalCatalog(): Promise<void> {
+    let next: CatalogEntry[];
     try {
       const { conversations } = await listConversations();
-      this.my_catalog = conversations.map((c) => ({
+      next = conversations.map((c) => ({
         guid: c.id,
         title: c.title,
         mode: c.mode,
@@ -4298,7 +4310,44 @@ class MeshClient {
       this.logDiag("warn", `catalog refresh failed: ${String(e)}`);
       return;
     }
+    // Stable string form keyed by guid order, so two refreshes with
+    // identical underlying data produce the same fingerprint
+    // regardless of `listConversations` ordering. Cheap — bounded
+    // by roster size and conversation count, runs at most every 60s
+    // on the safety-net path (per-mutation pushes don't go through
+    // this short-circuit; they already know something changed).
+    const fingerprint = this.computeCatalogFingerprint(next);
+    if (fingerprint === this.my_catalog_fingerprint && this.my_catalog.length === next.length) {
+      // No change since the last walk — and we already broadcast the
+      // current fingerprint to whoever was active at the time. Skip
+      // the wire activity. New peers that come online get the
+      // current snapshot via `maybePromoteToActive`, so this skip
+      // doesn't leave joiners stale.
+      return;
+    }
+    this.my_catalog = next;
+    this.my_catalog_fingerprint = fingerprint;
     this.broadcastCatalogDebounced();
+  }
+
+  /** Build the stable fingerprint for a catalog snapshot. The format
+   *  is intentionally simple — we just need to detect change with
+   *  high probability, not protect against adversaries. Sort by guid
+   *  so two snapshots with identical content always produce the
+   *  same string. Include every wire-relevant field so a title edit
+   *  or path move triggers a re-broadcast even when the guid set is
+   *  unchanged. */
+  private computeCatalogFingerprint(catalog: CatalogEntry[]): string {
+    if (catalog.length === 0) return "0";
+    const sorted = [...catalog].sort((a, b) => (a.guid < b.guid ? -1 : 1));
+    // Tab-separated tuples + newline-separated rows. Cheap to build,
+    // cheap to compare, identical bytes for identical inputs.
+    return sorted
+      .map(
+        (c) =>
+          `${c.guid}\t${c.updated_at}\t${c.mode}\t${c.title}\t${c.path ?? ""}\t${c.pending_move ? "1" : "0"}`,
+      )
+      .join("\n");
   }
 
   /** Public notify hook for code paths that just mutated the
