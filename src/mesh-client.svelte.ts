@@ -114,6 +114,35 @@ const TRYSTERO_STRATEGY: string =
  *  the dynamic import; subsequent calls reuse the resolved value. */
 let cachedJoinRoom: typeof JoinRoomType | null = null;
 
+/** Cached `getRelaySockets` reference, resolved lazily by
+ *  `loadGetRelaySockets()`. Only the Nostr strategy exports this —
+ *  the signaling-diagnostic poll no-ops on other strategies. */
+let cachedGetRelaySockets: (() => Record<string, WebSocket>) | null = null;
+
+/** Resolve the Nostr strategy's `getRelaySockets` so we can peek at
+ *  per-relay WebSocket readyState for diagnostics. Best-effort —
+ *  returns null when the strategy isn't Nostr or the export is
+ *  missing on this Trystero build. The poll loop checks for null
+ *  and quietly skips. */
+async function loadGetRelaySockets(): Promise<
+  (() => Record<string, WebSocket>) | null
+> {
+  if (cachedGetRelaySockets) return cachedGetRelaySockets;
+  if (TRYSTERO_STRATEGY !== "nostr") return null;
+  try {
+    const mod = (await import("trystero/nostr")) as {
+      getRelaySockets?: () => Record<string, WebSocket>;
+    };
+    if (typeof mod.getRelaySockets === "function") {
+      cachedGetRelaySockets = mod.getRelaySockets;
+      return cachedGetRelaySockets;
+    }
+  } catch {
+    // Module already loaded elsewhere or unavailable — best-effort.
+  }
+  return null;
+}
+
 /** Resolve the strategy-specific Trystero `joinRoom`. In trystero
  *  0.24+, only the Nostr submodule still ships with the main
  *  package — the other strategy entry points (`trystero/torrent`,
@@ -308,6 +337,17 @@ const CATALOG_DEBOUNCE_MS = 1_500;
  *  uses internally per candidate pair, so we never miss the
  *  transition into `failed`. */
 const ICE_POLL_INTERVAL_MS = 3_000;
+/** Cadence for `pollSignalingRelays()` — the diagnostic timer that
+ *  walks every Nostr relay socket Trystero opened and reports their
+ *  readyState. Necessary because Trystero's per-relay logging is
+ *  warn-on-failure only: a relay that silently sits in CONNECTING
+ *  forever (DNS failure, deep retry backoff, or the rate-limiter
+ *  refusing the connection) leaves no trace in the console even
+ *  though it can't carry signaling traffic. 10s is slow enough not
+ *  to spam the Activity log but fast enough to surface a
+ *  signaling-channel outage before the user has spent two minutes
+ *  staring at "no peers". */
+const SIGNALING_DIAG_INTERVAL_MS = 10_000;
 /** Number of Nostr signaling relays Trystero connects to in parallel
  *  when the user hasn't supplied their own. Trystero's built-in
  *  default is 5; we ask for 8 to give us extra slack so that a
@@ -616,6 +656,15 @@ class MeshClient {
    *  along with the polling timer. */
   private ice_watched_peers = new Set<string>();
   private ice_poll_timer: number | null = null;
+  /** Diagnostic timer that polls Trystero's Nostr relay sockets so
+   *  the Activity log surfaces silent failures (sockets that never
+   *  reach OPEN, or oscillate CONNECTING ↔ CLOSED under rate-limit
+   *  pressure). null when the timer isn't running. */
+  private signaling_diag_timer: number | null = null;
+  /** Last reported "{open}/{total} relays" string; we only re-log
+   *  when the snapshot changes so a steady signal doesn't pollute
+   *  the Activity panel. */
+  private last_signaling_summary = "";
   private sendMesh: ((data: unknown, target?: string | string[] | null) => Promise<unknown>) | null = null;
   private identity: MeshIdentity | null = null;
   private network_id = "";
@@ -1164,6 +1213,7 @@ class MeshClient {
     // postMessage boundary.
     this.recent_ice_failure_at = 0;
     this.startIcePolling();
+    void this.startSignalingDiag();
     // Spin up the scheduler worker. All three periodic ticks live
     // there — the worker's own event loop is what keeps them from
     // drifting under heavy main-thread load (the bug that turned
@@ -1251,6 +1301,7 @@ class MeshClient {
     this.stopping = true;
     this.uninstallLifecycleHooks();
     this.stopIcePolling();
+    this.stopSignalingDiag();
     this.stopScheduler();
     if (this.rAF_handle !== null) {
       cancelAnimationFrame(this.rAF_handle);
@@ -1919,6 +1970,81 @@ class MeshClient {
       this.ice_poll_timer = null;
     }
     this.ice_watched_peers.clear();
+  }
+
+  /** Start the signaling-relay socket diagnostic. Polls
+   *  `getRelaySockets()` every SIGNALING_DIAG_INTERVAL_MS and logs
+   *  any change to the "{open}/{connecting}/{closed} of {total}"
+   *  summary so the Activity panel shows whether our publishes
+   *  could plausibly have reached anywhere. */
+  private async startSignalingDiag(): Promise<void> {
+    if (this.signaling_diag_timer !== null) return;
+    if (typeof window === "undefined") return;
+    const getSockets = await loadGetRelaySockets();
+    if (!getSockets) return;
+    // Allow the first call to land immediately so the user sees a
+    // baseline reading without waiting 10s after start.
+    this.pollSignalingRelays(getSockets);
+    this.signaling_diag_timer = window.setInterval(() => {
+      this.pollSignalingRelays(getSockets);
+    }, SIGNALING_DIAG_INTERVAL_MS);
+  }
+
+  private stopSignalingDiag(): void {
+    if (this.signaling_diag_timer !== null) {
+      clearInterval(this.signaling_diag_timer);
+      this.signaling_diag_timer = null;
+    }
+    this.last_signaling_summary = "";
+  }
+
+  private pollSignalingRelays(
+    getSockets: () => Record<string, WebSocket>,
+  ): void {
+    let sockets: Record<string, WebSocket>;
+    try {
+      sockets = getSockets();
+    } catch {
+      return;
+    }
+    const open: string[] = [];
+    const connecting: string[] = [];
+    const closing: string[] = [];
+    const closed: string[] = [];
+    for (const [, ws] of Object.entries(sockets)) {
+      const url = ws.url || "";
+      const short = url.replace(/^wss?:\/\//, "").replace(/\/$/, "");
+      if (ws.readyState === 1) open.push(short);
+      else if (ws.readyState === 0) connecting.push(short);
+      else if (ws.readyState === 2) closing.push(short);
+      else closed.push(short);
+    }
+    const total = open.length + connecting.length + closing.length + closed.length;
+    if (total === 0) return;
+    const summary = `${open.length}/${total} open, ${connecting.length} connecting, ${closing.length + closed.length} closed`;
+    if (summary === this.last_signaling_summary) return;
+    this.last_signaling_summary = summary;
+    if (open.length === 0) {
+      // No working signaling channel — publishes can't land
+      // anywhere, peers can't see us, neither can we see them.
+      const dead = [...connecting, ...closing, ...closed].join(", ");
+      this.logDiag(
+        "warn",
+        `signaling: ${summary}. Zero open relays — presence publishes are being dropped. Dead/pending: ${dead}`,
+      );
+    } else {
+      // Working but worth showing the breakdown so the user knows
+      // how much redundancy they actually have right now.
+      const openList = open.join(", ");
+      const deadList =
+        connecting.length + closing.length + closed.length > 0
+          ? ` (down: ${[...connecting, ...closing, ...closed].join(", ")})`
+          : "";
+      this.logDiag(
+        "info",
+        `signaling: ${summary}. Open: ${openList}${deadList}`,
+      );
+    }
   }
 
   private pollIceStates(): void {
