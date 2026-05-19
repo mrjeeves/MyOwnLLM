@@ -673,6 +673,14 @@ class MeshClient {
   private signaling_taps = new WeakSet<WebSocket>();
   private signaling_event_counts: Record<string, number> = {};
   private signaling_event_last_log = 0;
+  /** Distinct Nostr event-author pubkeys we've seen inbound on any
+   *  relay socket, keyed by the first 8 hex chars. Each value is a
+   *  hit count. Trystero's own pubkey appears here because relays
+   *  broadcast our announces back to us as subscribers — so the
+   *  important signal is *how many distinct keys* appear. One key
+   *  means we're only seeing our own echoes; two or more means the
+   *  other peer's traffic is reaching us. */
+  private signaling_event_pubkeys: Record<string, number> = {};
   private sendMesh: ((data: unknown, target?: string | string[] | null) => Promise<unknown>) | null = null;
   private identity: MeshIdentity | null = null;
   private network_id = "";
@@ -2005,6 +2013,7 @@ class MeshClient {
     }
     this.last_signaling_summary = "";
     this.signaling_event_counts = {};
+    this.signaling_event_pubkeys = {};
     this.signaling_event_last_log = 0;
     // Note: signaling_taps is a WeakSet; the WebSocket references
     // it holds get garbage-collected once Trystero drops them, so
@@ -2063,9 +2072,21 @@ class MeshClient {
     this.last_signaling_summary = summary;
     this.signaling_event_last_log = total_events;
 
+    // Author breakdown — the most informative line. One pubkey =
+    // we're alone in the room (or all events are our own echoes).
+    // Two or more pubkeys = the other peer's announces ARE
+    // arriving, so the problem is downstream of signaling.
+    const author_entries = Object.entries(this.signaling_event_pubkeys);
+    const distinct_authors = author_entries.length;
+    const authors_str = author_entries
+      .map(([k, c]) => `${k}…=${c}`)
+      .join(", ");
+
     const events_suffix =
       total_events > 0
-        ? `; inbound EVENTs: ${total_events} (${per_relay.join(", ")})`
+        ? `; inbound EVENTs: ${total_events} from ${distinct_authors} ` +
+          `author${distinct_authors === 1 ? "" : "s"} (${authors_str}) ` +
+          `via (${per_relay.join(", ")})`
         : `; inbound EVENTs: 0 — no peer traffic seen yet`;
 
     if (open.length === 0) {
@@ -2091,15 +2112,36 @@ class MeshClient {
    *  ones carrying actual peer traffic (announces, WebRTC offers,
    *  answers). NOTICE/EOSE/OK frames are protocol bookkeeping
    *  that Trystero handles internally and don't tell us whether
-   *  peers are reaching us. */
+   *  peers are reaching us. Also extracts the event-author
+   *  `pubkey` and bumps a per-pubkey counter; this lets us tell
+   *  a "lots of events but all our own echoes" sea of presence
+   *  noise apart from "events from another peer are actually
+   *  arriving" (≥2 distinct pubkeys observed). */
   private recordSignalingEvent(relay: string, raw: unknown): void {
     if (typeof raw !== "string") return;
-    // Cheap prefix check before parsing — every Trystero relay
-    // message is a JSON array. EVENT is the only frame we care
-    // about; bail early on anything else.
     if (!raw.startsWith('["EVENT"')) return;
     this.signaling_event_counts[relay] =
       (this.signaling_event_counts[relay] ?? 0) + 1;
+    // Parse the frame to extract the author pubkey. JSON parse on
+    // every inbound event is cheap (frames are small) and only
+    // runs on EVENT frames because of the prefix gate above.
+    let pubkey = "";
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed) && parsed.length >= 3) {
+        const payload = parsed[2] as { pubkey?: unknown } | undefined;
+        if (payload && typeof payload.pubkey === "string") {
+          pubkey = payload.pubkey.slice(0, 8);
+        }
+      }
+    } catch {
+      // Malformed frame — Trystero will ignore it; we skip
+      // counting an author.
+    }
+    if (pubkey !== "") {
+      this.signaling_event_pubkeys[pubkey] =
+        (this.signaling_event_pubkeys[pubkey] ?? 0) + 1;
+    }
   }
 
   private pollIceStates(): void {
