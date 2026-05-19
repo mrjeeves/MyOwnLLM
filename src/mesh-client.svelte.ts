@@ -665,6 +665,14 @@ class MeshClient {
    *  when the snapshot changes so a steady signal doesn't pollute
    *  the Activity panel. */
   private last_signaling_summary = "";
+  /** Sockets we've attached an inbound-message tap to. Each tap
+   *  counts Nostr `EVENT` frames that arrive on the socket so we
+   *  can distinguish "sockets are open but no traffic is flowing"
+   *  from "sockets are open and the other peer's announces are
+   *  arriving, the failure is downstream". */
+  private signaling_taps = new WeakSet<WebSocket>();
+  private signaling_event_counts: Record<string, number> = {};
+  private signaling_event_last_log = 0;
   private sendMesh: ((data: unknown, target?: string | string[] | null) => Promise<unknown>) | null = null;
   private identity: MeshIdentity | null = null;
   private network_id = "";
@@ -1996,6 +2004,12 @@ class MeshClient {
       this.signaling_diag_timer = null;
     }
     this.last_signaling_summary = "";
+    this.signaling_event_counts = {};
+    this.signaling_event_last_log = 0;
+    // Note: signaling_taps is a WeakSet; the WebSocket references
+    // it holds get garbage-collected once Trystero drops them, so
+    // we don't need to clear it explicitly. The listeners attached
+    // to those sockets go with them.
   }
 
   private pollSignalingRelays(
@@ -2018,23 +2032,49 @@ class MeshClient {
       else if (ws.readyState === 0) connecting.push(short);
       else if (ws.readyState === 2) closing.push(short);
       else closed.push(short);
+      // Install a passive inbound-message tap once per socket so
+      // we can count Nostr EVENT frames arriving from other peers
+      // (presence announces + WebRTC offers/answers). Trystero's
+      // own `onmessage` handler is the primary listener; this is
+      // additive and never blocks delivery.
+      if (ws.readyState === 1 && !this.signaling_taps.has(ws)) {
+        this.signaling_taps.add(ws);
+        ws.addEventListener("message", (ev) => {
+          this.recordSignalingEvent(short, ev.data);
+        });
+      }
     }
     const total = open.length + connecting.length + closing.length + closed.length;
     if (total === 0) return;
     const summary = `${open.length}/${total} open, ${connecting.length} connecting, ${closing.length + closed.length} closed`;
-    if (summary === this.last_signaling_summary) return;
+
+    // Snapshot the EVENT-frame counters since the last log. We re-log
+    // either when the open/closed breakdown changes OR when we've
+    // received at least one EVENT since the last poll — that's the
+    // "yes, peer traffic is flowing" signal we lacked before.
+    let total_events = 0;
+    const per_relay: string[] = [];
+    for (const [relay, count] of Object.entries(this.signaling_event_counts)) {
+      total_events += count;
+      per_relay.push(`${relay}=${count}`);
+    }
+    const events_changed = total_events !== this.signaling_event_last_log;
+    if (summary === this.last_signaling_summary && !events_changed) return;
     this.last_signaling_summary = summary;
+    this.signaling_event_last_log = total_events;
+
+    const events_suffix =
+      total_events > 0
+        ? `; inbound EVENTs: ${total_events} (${per_relay.join(", ")})`
+        : `; inbound EVENTs: 0 — no peer traffic seen yet`;
+
     if (open.length === 0) {
-      // No working signaling channel — publishes can't land
-      // anywhere, peers can't see us, neither can we see them.
       const dead = [...connecting, ...closing, ...closed].join(", ");
       this.logDiag(
         "warn",
-        `signaling: ${summary}. Zero open relays — presence publishes are being dropped. Dead/pending: ${dead}`,
+        `signaling: ${summary}. Zero open relays — presence publishes are being dropped. Dead/pending: ${dead}${events_suffix}`,
       );
     } else {
-      // Working but worth showing the breakdown so the user knows
-      // how much redundancy they actually have right now.
       const openList = open.join(", ");
       const deadList =
         connecting.length + closing.length + closed.length > 0
@@ -2042,9 +2082,24 @@ class MeshClient {
           : "";
       this.logDiag(
         "info",
-        `signaling: ${summary}. Open: ${openList}${deadList}`,
+        `signaling: ${summary}. Open: ${openList}${deadList}${events_suffix}`,
       );
     }
+  }
+
+  /** Inbound Nostr message tap. Counts only `EVENT` frames — the
+   *  ones carrying actual peer traffic (announces, WebRTC offers,
+   *  answers). NOTICE/EOSE/OK frames are protocol bookkeeping
+   *  that Trystero handles internally and don't tell us whether
+   *  peers are reaching us. */
+  private recordSignalingEvent(relay: string, raw: unknown): void {
+    if (typeof raw !== "string") return;
+    // Cheap prefix check before parsing — every Trystero relay
+    // message is a JSON array. EVENT is the only frame we care
+    // about; bail early on anything else.
+    if (!raw.startsWith('["EVENT"')) return;
+    this.signaling_event_counts[relay] =
+      (this.signaling_event_counts[relay] ?? 0) + 1;
   }
 
   private pollIceStates(): void {
