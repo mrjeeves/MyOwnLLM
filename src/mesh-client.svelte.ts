@@ -1925,6 +1925,16 @@ class MeshClient {
     }
     this.pending_transcribes_out.clear();
     this.pending_transcribes_in.clear();
+    // Outbound moves: settle the on_complete callback so the
+    // initiating UI unblocks instead of waiting on a promise that'll
+    // never resolve. (`dropConnection` already does the per-peer
+    // case; `stop()` is the no-peer-left fallback that covers the
+    // mesh-wide teardown — without this `pending_moves_out` was the
+    // one map silently leaking across stop cycles.)
+    for (const [, pending] of this.pending_moves_out) {
+      pending.on_complete?.(false, "mesh stopped");
+    }
+    this.pending_moves_out.clear();
     this.pending_moves_in.clear();
     this.pending_move_guids.clear();
     for (const [, pending] of this.pending_pulls_out) {
@@ -1973,6 +1983,14 @@ class MeshClient {
     this.recent_ice_failure_at = 0;
     this.last_open_relay_count = 0;
     this.last_lifecycle_wake_at = 0;
+    // Normalize the rediscovery transient flag. `forceRediscovery`
+    // sets it in a try/finally that always resets it, so the common
+    // case doesn't need this reset — but anything that calls stop()
+    // from OUTSIDE that try block (a direct user-initiated stop,
+    // an error path in reconcile) would otherwise leave the flag
+    // stuck true, which the UI reads to render "rediscovering…"
+    // forever.
+    this.is_rediscovering = false;
     // Clear the applied-transport snapshot so the next start() with
     // any config is treated as a fresh apply, not a "no change since
     // last time" no-op.
