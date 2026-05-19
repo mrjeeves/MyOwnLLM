@@ -60,18 +60,40 @@ layer's state to the UI as a single enum.
 
 ## The reconnection ladder
 
-Five escalating recovery mechanisms. Each is strictly cheaper than the next
+Six escalating recovery mechanisms. Each is strictly cheaper than the next
 and only fires when the cheaper one has been ruled out:
 
-| Tier | Trigger                                              | Action                          | Schedule (jittered ±20%)              |
-|------|------------------------------------------------------|---------------------------------|---------------------------------------|
-| 1    | App-level message arrives                            | Reset `last_recv_at`            | Continuous                            |
-| 2    | Wake event (lifecycle OR tick gap)                   | Ping all + 1.5s probe           | Coalesced to 2s window                |
-| 3    | Silence > 75s OR wake probe failed                   | Per-peer re-handshake (hello)   | 2s, 5s, 10s, 20s, 30s (per peer)      |
-| 4    | 3 re-handshakes failed OR rostered peer offline 60s+ | Trystero room rejoin            | 90s, 3m, 5m, 10m (global, throttled)  |
-| 5    | Active network changed OR transport config edited    | Stop + Start                    | Immediate                             |
+| Tier | Trigger                                              | Action                                        | Schedule (jittered ±20%)              |
+|------|------------------------------------------------------|-----------------------------------------------|---------------------------------------|
+| 1    | App-level message arrives                            | Reset `last_recv_at`                          | Continuous                            |
+| 2    | Wake event (lifecycle OR tick gap)                   | Ping all + 1.5s probe                         | Coalesced to 2s window                |
+| 3    | Wake probe: ALL peers silent                         | `pc.restartIce()` per PC + 4s recovery window | Once per wake (auto-falls to Tier 4)  |
+| 4    | Silence > 75s OR wake probe + ICE restart failed     | Per-peer re-handshake (hello)                 | 2s, 5s, 10s, 20s, 30s (per peer)      |
+| 5    | 3 re-handshakes failed OR rostered peer offline 60s+ | Trystero room rejoin                          | 90s, 3m, 5m, 10m (global, throttled)  |
+| 6    | Active network changed OR transport config edited    | Stop + Start                                  | Immediate                             |
 
-**Tier 4 is gated by `hasActivePeer()`.** If at least one peer is in
+**Tier 3 is the network-swap layer.** When the OS jumps interfaces (phone
+hotspot↔home Wi-Fi, ethernet plugged/unplugged), the local IPs that ICE
+candidate pairs were anchored to vanish and every PC goes silent. The
+naive recovery — tear down the room and rebuild — is wildly disproportionate:
+the relay sockets reconnect on their own through the new interface, both
+sides' auth state is intact, and the only thing actually broken is the
+candidate pairs. So Tier 3 calls `pc.restartIce()` on each silent peer's
+RTCPeerConnection; Trystero's own `onnegotiationneeded` handler ferries
+the fresh offer/answer through the still-up signaling, new candidates form
+on whatever interface is now reachable, and the datachannel resumes with
+all app state preserved. The other side doesn't fire `peer-leave` and
+doesn't reset auth — it just sees a brief ICE flap. With three devices,
+the device that swapped networks restarts ICE on its two PCs while the
+other two devices' connection to each other never blinks.
+
+The Tier 3 → Tier 5 fallback is automatic: if no peer pongs within
+`ICE_RESTART_RECOVERY_MS` after the restart kick, the wake-probe path
+escalates to `maybeForceRediscovery`. Total wake-to-rejoin latency stays
+short (~5.5s) so a user who really does need a full rebuild isn't left
+staring at a frozen UI.
+
+**Tier 5 is gated by `hasActivePeer()`.** If at least one peer is in
 `active` status, the whole stack (signaling + ICE + handshake) is
 demonstrably working — a rejoin would tear down that peer's datachannel
 for no benefit and push a fresh round of presence-announces through every
@@ -89,7 +111,7 @@ stranded the mesh in `peer-discovered` with no path forward. The current
 gate fires only when we have evidence (an active peer) that the whole
 stack is working.
 
-**Tier 5's transport comparison** lives in `reconcile()`. We snapshot the
+**Tier 6's transport comparison** lives in `reconcile()`. We snapshot the
 applied signaling/STUN/TURN arrays into `applied_signaling`, `applied_stun`,
 `applied_turn` at `start()`. On the next `reconcile()` call we compare,
 and if any of those changed, we restart. **This is what makes STUN/TURN
@@ -138,6 +160,7 @@ adjustment.
 | Peer powered back on                                   | `onPeerJoin` for new (fresh) `peer_id`              | Capabilities cache reseeds UI immediately; fresh handshake begins                       | `handlePeerJoin`, `capabilities_cache` |
 | Asymmetric sleep (one side wakes, other has stale sub) | Rostered peer absent from connection set for 60s    | `offlineRosteredCheckTick` → `maybeForceRediscovery` (gated)                            | `offlineRosteredCheckTick`             |
 | ICE flap drops peer, Trystero peer-table stuck on dead PC | `hasActivePeer()` false + EVENTs still arriving | Gate allows rejoin (throttled); fresh announce produces new `onPeerJoin`                | `maybeForceRediscovery`, `hasActivePeer` |
+| Network swap (hotspot↔LAN, ethernet plugged/unplugged) | All peers silent in wake probe                     | Tier 3: `pc.restartIce()` per PC, Trystero ferries the renegotiation; falls to Tier 5 in 4s if no recovery | `handleWake`, `restartIceForUnresponsivePeers` |
 | Fresh data channel swallows first hello                | No auth_response after 5s                           | Retry at +5s, +12s, +22s (3 retries inside 30s watchdog)                                | `handlePeerJoin`                       |
 | N peers go silent together (router reboot)             | Identical backoff schedules without jitter          | ±20% jitter applied per attempt → desynced retries                                      | `jitterBackoff`, `heartbeatTickConn`   |
 | User edits STUN list                                   | `applied_stun` ≠ active network's stun_servers      | Stop + Start with new ICE config                                                        | `reconcile`, `sameStringList`          |
@@ -254,3 +277,4 @@ The Activity panel surfaces the same data the diag log holds; Quiet logs suppres
 - **Scheduler worker with `performance.now()` stamps**: replaces N main-thread setIntervals. Heavy file-encoding or SHA-256 work on the main thread no longer fakes wake-detection gaps and no longer cycles every peer through forced rediscovery.
 - **`isSignalingHealthy()` gate on auto-rediscovery**: skip the Trystero leave/rejoin churn when relays are demonstrably fine — fixes the symptom of "rostered peer offline → unnecessary rejoin → rate-limited → genuine outage."
 - **`hasActivePeer()` gate replaces `isSignalingHealthy()` gate**: the earlier signaling-only gate stranded the mesh in `peer-discovered` when ICE flapped and Trystero's local peer-table got stuck on a dead RTCPeerConnection. The new gate skips rejoin only when there's an actively-authenticated peer holding a working datachannel — which is the actual "mesh is working, don't churn it" signal. When no peer is active, the throttle alone paces rejoins.
+- **ICE-restart layer (Tier 3) ahead of room rejoin**: a network swap (phone hotspot↔LAN, ethernet plugged/unplugged) used to take the room-rejoin sledgehammer — 8 relay sockets torn down, ~20 PCs discarded, every authenticated peer demoted to handshaking. The relay sockets were going to reconnect on their own anyway, and the only thing actually broken were the ICE candidate pairs. Now when the wake probe finds all peers silent, we call `pc.restartIce()` per PC; Trystero's `onnegotiationneeded` ferries the renegotiation through the still-up signaling, new candidates form on whatever interface is now reachable, and the datachannel resumes with all app state preserved. Room rejoin still fires if the restart doesn't recover within 4s, so the worst case is unchanged.

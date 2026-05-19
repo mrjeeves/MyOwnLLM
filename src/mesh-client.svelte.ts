@@ -342,6 +342,17 @@ const WAKE_DETECTION_THRESHOLD_MS = HEARTBEAT_INTERVAL_MS * 2;
  *  post-wake stall. Sized so a healthy peer's pong (sub-second
  *  RTT typical) lands comfortably inside the window. */
 const WAKE_PROBE_DELAY_MS = 1_500;
+/** After the wake probe reports all peers silent, give an ICE restart
+ *  this long to land a fresh candidate pair before falling back to a
+ *  Trystero room rejoin. Sized for: (a) Chrome's typical candidate-
+ *  gathering window on a freshly-up interface (~0.5–2s); (b) one
+ *  signal/answer roundtrip through the slowest healthy relay (~0.5–1s);
+ *  (c) one ping/pong over the freshly-rebuilt datachannel (sub-second).
+ *  4s comfortably covers a network swap (hotspot↔LAN), and the rejoin
+ *  fallback still fires fast enough — total wake-to-rejoin latency is
+ *  WAKE_PROBE_DELAY_MS + ICE_RESTART_RECOVERY_MS ≈ 5.5s — that a user
+ *  who really needs a full rebuild isn't left staring at a frozen UI. */
+const ICE_RESTART_RECOVERY_MS = 4_000;
 /** Backoff schedule for app-level re-handshake attempts when a
  *  peer goes silent past HEARTBEAT_TIMEOUT_MS. Each attempt
  *  re-sends `hello`; if the underlying WebRTC channel is still
@@ -2141,12 +2152,32 @@ class MeshClient {
     window.setTimeout(() => {
       // Count peers that didn't reply to the wake ping. If none
       // responded the WebRTC channels are almost certainly dead
-      // (the laptop-slept-while-home-office-stayed-on case) and
-      // we need a fresh discovery pass — Trystero keeps the
-      // peer ids in its room state until it notices the
-      // half-closed datachannels itself, which can take minutes.
-      // Short-circuiting to a rejoin here gets us reconnected
-      // in seconds instead.
+      // (the laptop-slept-while-home-office-stayed-on case, OR
+      // a network swap that killed the candidate pairs out from
+      // under us — hotspot↔LAN is the canonical case).
+      //
+      // The room-rejoin nuke used to be the only recovery here.
+      // That's the heaviest hammer in the engine: 8 relay sockets
+      // torn down + ~20 RTCPeerConnections discarded + every
+      // authenticated peer demoted to handshaking. Most network
+      // swaps don't need any of that — the relay sockets reconnect
+      // on their own through the new interface, the auth state on
+      // both ends is fine, and the only thing actually broken is
+      // the ICE candidate pairs (the local IPs they were anchored
+      // to no longer exist). For that, an ICE restart is the right
+      // tool: pc.restartIce() re-gathers candidates on the new
+      // interface, Trystero's `onnegotiationneeded` hook ferries
+      // the renegotiation through the still-up signaling, and the
+      // datachannel resumes on the new transport with app state
+      // preserved.
+      //
+      // So: try ICE restart first. If everyone's STILL silent after
+      // ICE_RESTART_RECOVERY_MS, fall back to the room rejoin.
+      // Three-device case the user worried about: device B's
+      // network swap fires ICE restart on its two PCs; A and C
+      // each see a renegotiation arrive (no peer-leave, no auth
+      // reset), keep their state, and recover their channel to B
+      // alone. A↔C never blinks.
       let unresponsive = 0;
       let total = 0;
       for (const conn of this.connections.values()) {
@@ -2154,6 +2185,43 @@ class MeshClient {
         if (conn.wake_probe_pending) unresponsive++;
       }
       if (total > 0 && unresponsive === total) {
+        const ice_restarted = this.restartIceForUnresponsivePeers();
+        if (ice_restarted > 0) {
+          // Re-ping the same peers — if any pong inside the
+          // recovery window we know ICE restart did its job and
+          // we can skip the room rejoin entirely.
+          const reping_t = Date.now();
+          for (const conn of this.connections.values()) {
+            if (!conn.wake_probe_pending) continue;
+            this.send(conn, { kind: "ping", t: reping_t });
+          }
+          window.setTimeout(() => {
+            let still_silent = 0;
+            let still_total = 0;
+            for (const conn of this.connections.values()) {
+              still_total++;
+              if (conn.wake_probe_pending) still_silent++;
+            }
+            if (still_total > 0 && still_silent === still_total) {
+              this.maybeForceRediscovery(
+                `wake + ICE restart: ${still_total} peer(s) still silent`,
+              );
+              return;
+            }
+            const recovered = still_total - still_silent;
+            this.logDiag(
+              "info",
+              `ICE restart recovered ${recovered}/${still_total} peer(s) — no room rejoin needed`,
+            );
+            for (const conn of this.connections.values()) {
+              this.heartbeatTickConn(conn);
+            }
+          }, ICE_RESTART_RECOVERY_MS);
+          return;
+        }
+        // No restart kicked off (room torn down, no PCs accessible,
+        // or every restartIce() call threw). Fall through to the
+        // original rejoin path.
         this.maybeForceRediscovery(
           `wake probe: all ${total} peer(s) unresponsive`,
         );
@@ -2163,6 +2231,68 @@ class MeshClient {
         this.heartbeatTickConn(conn);
       }
     }, WAKE_PROBE_DELAY_MS);
+  }
+
+  /** Trigger an ICE restart on every still-silent peer's
+   *  RTCPeerConnection. Returns the count of peers we actually
+   *  kicked, so the caller can tell "we did something, give it a
+   *  moment" from "nothing to do, fall back."
+   *
+   *  Trystero exposes the live PC map via room.getPeers(); calling
+   *  pc.restartIce() sets the restart-hint on the next offer and
+   *  fires `negotiationneeded`. Trystero's own handler picks up
+   *  the event, sends the offer through the room signal protocol
+   *  (which has perfect-negotiation glare handling), the remote
+   *  side answers, and new candidate pairs form on whatever
+   *  interface is now reachable. The datachannel and all app-level
+   *  state survive — that's the whole point of using ICE restart
+   *  instead of the room-rejoin sledgehammer. */
+  private restartIceForUnresponsivePeers(): number {
+    const room = this.room;
+    if (!room) return 0;
+    let peers: Record<string, RTCPeerConnection>;
+    try {
+      peers = room.getPeers() as Record<string, RTCPeerConnection>;
+    } catch {
+      // Older Trystero builds or a torn-down room — nothing to do.
+      return 0;
+    }
+    let kicked = 0;
+    let no_pc = 0;
+    let closed = 0;
+    let unsupported = 0;
+    let threw = 0;
+    for (const conn of this.connections.values()) {
+      if (!conn.wake_probe_pending) continue;
+      const pc = peers[conn.peer_id];
+      if (!pc) { no_pc++; continue; }
+      if (pc.connectionState === "closed") { closed++; continue; }
+      if (typeof pc.restartIce !== "function") { unsupported++; continue; }
+      try {
+        pc.restartIce();
+        kicked++;
+      } catch {
+        threw++;
+      }
+    }
+    if (kicked > 0) {
+      // One line, terse — the wake-probe log just above already
+      // explained the trigger. Diag readers can correlate by the
+      // adjacent timestamps.
+      const skipped_parts: string[] = [];
+      if (no_pc) skipped_parts.push(`${no_pc} no-pc`);
+      if (closed) skipped_parts.push(`${closed} closed`);
+      if (unsupported) skipped_parts.push(`${unsupported} unsupported`);
+      if (threw) skipped_parts.push(`${threw} threw`);
+      const skipped = skipped_parts.length
+        ? ` (skipped: ${skipped_parts.join(", ")})`
+        : "";
+      this.logDiag(
+        "info",
+        `ICE restart triggered on ${kicked} peer connection(s) — waiting ${Math.round(ICE_RESTART_RECOVERY_MS / 1000)}s for new candidates${skipped}`,
+      );
+    }
+    return kicked;
   }
 
   /** Bind OS lifecycle observables that signal the JS runtime may
