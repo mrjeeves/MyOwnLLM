@@ -32,6 +32,7 @@
   import { stickToBottom } from "./stick-to-bottom";
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
   import { loadConfig } from "../config";
+  import { pinDownloadedModel } from "../model-lifecycle";
   import {
     loadConversation,
     saveConversation,
@@ -673,6 +674,10 @@
     asrPullStatus = `Downloading ${runtime} model '${model}'…`;
     try {
       await invoke("asr_model_pull", { name: model });
+      // User pressed Record / Upload — that's an explicit "I want
+      // this model on this device" action, so pin to survive future
+      // provider-manifest changes and cleanup passes.
+      try { await pinDownloadedModel(model); } catch {}
       asrPullStatus = "";
       return true;
     } catch (e) {
@@ -695,6 +700,10 @@
       if (present) return true;
       diarizePullStatus = "Downloading speaker models…";
       await invoke("diarize_model_pull", { name: defaultDiarizeModel });
+      // User toggled "Identify speakers" and started a session — pin
+      // both diarize components (the helper splits the composite) so
+      // the next manifest update can't quietly evict them.
+      try { await pinDownloadedModel(defaultDiarizeModel); } catch {}
       diarizePullStatus = "";
       return true;
     } catch (e) {

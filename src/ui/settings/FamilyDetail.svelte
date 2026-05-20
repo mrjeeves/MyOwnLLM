@@ -11,6 +11,7 @@
     tierRuntime,
   } from "../../manifest";
   import { loadConfig, saveConfig, invalidateConfigCache } from "../../config";
+  import { pinDownloadedModel } from "../../model-lifecycle";
   import { scrollAffordance } from "../scroll-affordance";
   import type {
     HardwareProfile,
@@ -547,6 +548,13 @@
       clearDownload(model);
       if (wasCancelled && options.switchInitiated && options.familyName && options.mode) {
         await writeFamilyOverride(options.familyName, options.mode, null);
+      }
+      // Pin manually-downloaded tiers so a later provider manifest
+      // shuffle (or auto-cleanup pass) doesn't drop the model the
+      // user just chose to install. Cancelled pulls don't get pinned
+      // — there's nothing complete on disk to keep.
+      if (!wasCancelled) {
+        try { await pinDownloadedModel(model); } catch {}
       }
       await load();
     } catch (e) {

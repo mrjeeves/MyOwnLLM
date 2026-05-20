@@ -74,7 +74,7 @@
   }
 
   function openSettings() {
-    onOpenSettings(updateUi.available ? "updates" : "providers");
+    onOpenSettings(updateUi.available ? "updates" : "families");
   }
 </script>
 

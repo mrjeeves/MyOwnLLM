@@ -18,6 +18,36 @@
     formatPeerCompat,
   } from "../mesh-capabilities";
 
+  /** Persisted collapse state for local + remote folder trees. Folders
+   *  default to expanded; this Set holds the paths the user has
+   *  explicitly closed. Stale entries (folder renamed, deleted, peer
+   *  pubkey changed) just don't match anything in the live tree, which
+   *  is harmless. */
+  const COLLAPSED_FOLDERS_KEY = "myownllm.sidebarCollapsedFolders";
+  const COLLAPSED_REMOTE_FOLDERS_KEY = "myownllm.sidebarCollapsedRemoteFolders";
+
+  function readStringSet(key: string): Set<string> {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) return new Set();
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return new Set(parsed.filter((v) => typeof v === "string"));
+    } catch {
+      // localStorage may be unavailable in some embedded webviews, or
+      // the stored JSON may be corrupted. Either way fall back to a
+      // fresh (all-expanded) set.
+    }
+    return new Set();
+  }
+
+  function writeStringSet(key: string, value: Set<string>): void {
+    try {
+      localStorage.setItem(key, JSON.stringify([...value]));
+    } catch {
+      // Best-effort: in-memory state still works without persistence.
+    }
+  }
+
   /** Peers eligible as Move targets — active and authorized. The
    *  context-menu uses this directly; if the list is empty the
    *  "Move to device…" submenu just shows a hint. */
@@ -228,14 +258,17 @@
 
   /** Collapse state for remote folders. Keyed by
    *  `${peer_pubkey}:${folder_path}` so a folder on peer-A doesn't
-   *  collapse the same-named folder on peer-B. Default expanded. */
-  let remoteFolderCollapsed = $state<Set<string>>(new Set());
+   *  collapse the same-named folder on peer-B. Default expanded.
+   *  Persisted — pubkeys are stable across reconnects so the saved
+   *  keys remain meaningful. */
+  let remoteFolderCollapsed = $state<Set<string>>(readStringSet(COLLAPSED_REMOTE_FOLDERS_KEY));
 
   function toggleRemoteFolderCollapsed(key: string) {
     remoteFolderCollapsed.has(key)
       ? remoteFolderCollapsed.delete(key)
       : remoteFolderCollapsed.add(key);
     remoteFolderCollapsed = new Set(remoteFolderCollapsed);
+    writeStringSet(COLLAPSED_REMOTE_FOLDERS_KEY, remoteFolderCollapsed);
   }
 
   /** Tracks an in-flight outgoing Move so the context menu can show
@@ -477,8 +510,10 @@
     node.select();
   }
 
-  /** Folder paths the user has collapsed. Folders default to expanded. */
-  let collapsed = $state<Set<string>>(new Set());
+  /** Folder paths the user has collapsed. Folders default to expanded.
+   *  Persisted (see helpers at top of file) so the open/close state
+   *  survives reloads. */
+  let collapsed = $state<Set<string>>(readStringSet(COLLAPSED_FOLDERS_KEY));
 
   /** Non-native delete-confirmation modal. `window.confirm()` used to
    *  drive the delete flows, but Tauri's `dialog:default` capability
@@ -670,6 +705,7 @@
       const next = new Set(collapsed);
       next.delete(parent);
       collapsed = next;
+      writeStringSet(COLLAPSED_FOLDERS_KEY, collapsed);
     }
     newFolderName = "";
     creatingFolderParent = parent;
@@ -979,6 +1015,7 @@
           const next = new Set(collapsed);
           next.delete(path);
           collapsed = next;
+          writeStringSet(COLLAPSED_FOLDERS_KEY, collapsed);
         }
         hoverExpandTimer = null;
       }, HOVER_EXPAND_MS);
@@ -1029,6 +1066,7 @@
     if (next.has(path)) next.delete(path);
     else next.add(path);
     collapsed = next;
+    writeStringSet(COLLAPSED_FOLDERS_KEY, collapsed);
   }
 
   function handleRowClick(id: string) {

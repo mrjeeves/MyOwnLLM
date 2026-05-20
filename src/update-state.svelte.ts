@@ -7,7 +7,6 @@
  */
 
 export type SettingsTab =
-  | "providers"
   | "families"
   | "models"
   | "storage"
@@ -15,7 +14,12 @@ export type SettingsTab =
   | "cloud-mesh"
   | "permissions"
   | "transcription"
-  | "updates";
+  | "updates"
+  // Legacy deep-link target. The Providers tab was retired and now
+  // lives as a sub-page inside Updates; `SettingsPanel` maps this to
+  // `"updates"` with the providers sub-page pre-opened so older
+  // callsites still land on the right surface.
+  | "providers";
 
 class UpdateUiState {
   /** Set when startup detects a release we can apply (already staged or just

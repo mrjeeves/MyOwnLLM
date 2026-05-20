@@ -3,6 +3,7 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { open as openExternal } from "@tauri-apps/plugin-shell";
   import { onDestroy } from "svelte";
+  import { pinDownloadedModel } from "../model-lifecycle";
   import type { HardwareProfile } from "../types";
 
   let {
@@ -218,8 +219,16 @@
             await runDiarize(followUpDiarize);
             if (cancelRequested) { phase = "cancelled"; return; }
           }
+          // Pin both diarize components — the user just paid for them,
+          // their existence on disk should outlive a provider manifest
+          // change. The helper splits the composite for us.
+          try { await pinDownloadedModel(followUpDiarize); } catch {}
         }
       }
+      // Pin the main model the user just downloaded. Done after the
+      // diarize follow-up so a successful ASR pull stays pinned even
+      // if the diarize step trips up.
+      try { await pinDownloadedModel(modelName); } catch {}
       phase = "done";
       if (waitingTimer) {
         clearInterval(waitingTimer);

@@ -5,7 +5,14 @@
   import type { Provider } from "../../types";
   import { scrollAffordance } from "../scroll-affordance";
 
-  let { onChanged } = $props<{ onChanged: () => void }>();
+  let { onChanged, showBack = false, onBack } = $props<{
+    onChanged: () => void;
+    /** Render a "← Updates" back button in the head. Set by the
+     *  Updates tab when it embeds this section as a sub-page, so the
+     *  user can walk back to the updates view. */
+    showBack?: boolean;
+    onBack?: () => void;
+  }>();
 
   let providers = $state<Provider[]>([]);
   let activeProvider = $state("");
@@ -55,6 +62,11 @@
 
 <div class="section">
   <div class="head">
+    {#if showBack}
+      <button class="back" onclick={() => onBack?.()} aria-label="Back to updates">
+        ← Updates
+      </button>
+    {/if}
     <p class="lede">
       A <strong>provider</strong> publishes a manifest of model families. Pick one as
       active — all family/model recommendations come from it.
@@ -98,6 +110,13 @@
 <style>
   .section { display: flex; flex-direction: column; height: 100%; min-height: 0; }
   .head { padding: .75rem 1rem; border-bottom: 1px solid #1e1e1e; flex-shrink: 0; }
+  .back {
+    background: none; border: none;
+    color: #6e6ef7; font-size: .78rem;
+    padding: 0 0 .4rem 0;
+    cursor: pointer;
+  }
+  .back:hover { color: #8a8af7; }
   .lede { font-size: .78rem; color: #888; line-height: 1.5; }
   .lede strong { color: #ccc; font-weight: 600; }
   .list { flex: 1; overflow-y: auto; padding: .5rem; display: flex; flex-direction: column; gap: .25rem; min-height: 0; --scroll-fade-bg: #111; }

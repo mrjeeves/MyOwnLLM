@@ -5,7 +5,6 @@
     getModelStatusWithMeta,
     keepModel,
     unkeepModel,
-    setModeOverride,
     recomputeRecommendedSet,
     lookupModelUsage,
     type ModelUsage,
@@ -49,10 +48,6 @@
    *  than the old "in N providers" which lost the family signal entirely. */
   let tagFamilies = $state<Record<string, Array<{ provider: string; familyName: string; familyLabel: string }>>>({});
 
-  /** Per-row override popover. Anchored to the model row, lets the user
-   *  pin this exact tag as the override for any mode, or revert all modes
-   *  it currently overrides. */
-  let rowOverridePicker = $state<{ tag: string; runtime: string } | null>(null);
   let deleteTarget = $state<{
     name: string;
     size: number;
@@ -88,6 +83,18 @@
     loading = false;
   }
 
+  /** Diarize tiers ship composite tags joined with `+`
+   *  (e.g. `pyannote-seg-3.0+wespeaker-r34`) — segmenter + embedder.
+   *  On disk those land as two separate ONNX files registered under
+   *  the component names. Anywhere we walk manifest tags to build a
+   *  set keyed by on-disk model name, we need each component, not
+   *  the joined string nobody has on disk. Non-composite tags pass
+   *  through as a single element. */
+  function expandComposite(tag: string | null | undefined): string[] {
+    if (!tag) return [];
+    return tag.includes("+") ? tag.split("+").filter(Boolean) : [tag];
+  }
+
   /** Walk every saved provider's manifest and bucket every tag into:
    *  (a) the active-family lock set, and
    *  (b) the per-tag family map for row badges. One pass over O(providers
@@ -119,12 +126,22 @@
             for (const tier of modeSpec.tiers) {
               for (const tag of [tier.model, tier.fallback]) {
                 if (!tag) continue;
-                if (isActiveFam) lockSet.add(tag);
-                const list = map[tag] ?? [];
-                if (!list.find((e) => e.provider === provider.name && e.familyName === familyName)) {
-                  list.push({ provider: provider.name, familyName, familyLabel: family.label });
+                // Diarize tiers use composite tags joined with `+`
+                // (e.g. `pyannote-seg-3.0+wespeaker-r34`). Each
+                // component pulls down as its own ONNX file under
+                // `~/.myownllm/models/diarize/` and shows up as a
+                // separate row in the Models list. Register every
+                // component — not just the composite — so the
+                // individual rows pick up the family-membership badge
+                // instead of reading as unrecommended.
+                for (const part of expandComposite(tag)) {
+                  if (isActiveFam) lockSet.add(part);
+                  const list = map[part] ?? [];
+                  if (!list.find((e) => e.provider === provider.name && e.familyName === familyName)) {
+                    list.push({ provider: provider.name, familyName, familyLabel: family.label });
+                  }
+                  map[part] = list;
                 }
-                map[tag] = list;
               }
             }
           }
@@ -157,7 +174,12 @@
                 config.active_family,
                 config.family_overrides,
               );
-              if (tag) lockSet.add(tag);
+              // Diarize resolves to a composite ("seg+embedder") —
+              // expand so each on-disk component is locked, not just
+              // the joined string nobody else has on disk.
+              for (const part of expandComposite(tag)) {
+                lockSet.add(part);
+              }
             } catch {}
           }
         }
@@ -275,43 +297,6 @@
     );
   }
 
-  /** Per-row override action. If `mode` is null, revert every mode that
-   *  currently overrides to this tag (the Revert path). Otherwise pin
-   *  this tag as the override for the picked mode (the Override path).
-   *  Whisper tags can only ever override transcribe — the picker hides
-   *  the other rows for those rows so the user can't pin a whisper tag
-   *  as the text/code/vision override and break the runtime resolver. */
-  async function applyRowOverride(tag: string, mode: Mode | null) {
-    if (mode === null) {
-      const cfg = await loadConfig();
-      for (const m of modes) {
-        if (cfg.mode_overrides[m] === tag) {
-          await setModeOverride(m, null);
-        }
-      }
-    } else {
-      await setModeOverride(mode, tag);
-    }
-    rowOverridePicker = null;
-    await reload();
-    onChanged?.();
-  }
-
-  /** Modes legal as override targets for `runtime`. Local-runtime ASR
-   *  tags (moonshine / parakeet) are only valid for transcribe; the
-   *  diarize runtime is only valid for diarize; ollama tags for
-   *  everything else. The picker uses this to hide invalid choices
-   *  instead of silently misrouting. */
-  function eligibleModes(runtime: string): Mode[] {
-    if (runtime === "asr" || runtime === "moonshine" || runtime === "parakeet") {
-      return ["transcribe"];
-    }
-    if (runtime === "diarize" || runtime === "pyannote-diarize") {
-      return ["diarize"];
-    }
-    return ["text", "vision", "code"];
-  }
-
   function ageLabel(isoDate: string): string {
     const ms = Date.now() - new Date(isoDate).getTime();
     const hours = Math.floor(ms / 3_600_000);
@@ -323,8 +308,6 @@
   function sizeLabel(bytes: number): string {
     return (bytes / 1024 / 1024 / 1024).toFixed(1) + " GB";
   }
-
-  const modes: Mode[] = ["text", "vision", "code", "transcribe"];
 </script>
 
 <div class="section">
@@ -345,7 +328,6 @@
           {@const inActive = activeFamilyTags.has(m.name)}
           {@const fams = tagFamilies[m.name] ?? []}
           {@const otherFams = fams.filter((f) => !(inActive && f.familyLabel === activeFamilyLabel))}
-          {@const isOverridden = m.override_for.length > 0}
           <div class="model-row" class:unrecommended={!inActive && fams.length === 0}>
             <div class="model-info">
               <div class="name-row">
@@ -373,9 +355,6 @@
                   also in {otherFams.length === 1 ? `${otherFams[0].familyLabel} family` : `${otherFams.length} other families`}
                 </span>
               {/if}
-              {#if m.override_for.length > 0}
-                <span class="override-badge">override: {m.override_for.join(", ")}</span>
-              {/if}
             </div>
             <button
               class="pin-btn"
@@ -384,29 +363,6 @@
               title={m.kept ? "Unpin" : "Pin (never clean up)"}
             >
               {m.kept ? "📌" : "📍"}
-            </button>
-            <button
-              class="override-btn"
-              class:active={isOverridden}
-              onclick={() => (rowOverridePicker = { tag: m.name, runtime: m.runtime })}
-              title={isOverridden
-                ? `Revert (currently overrides: ${m.override_for.join(", ")})`
-                : "Override"}
-              aria-label={isOverridden ? "Revert override" : "Set as override"}
-            >
-              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
-                {#if isOverridden}
-                  <path
-                    fill="currentColor"
-                    d="M12 5V2L7 7l5 5V8c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 14c0-4.42-3.58-8-8-8z"
-                  />
-                {:else}
-                  <path
-                    fill="currentColor"
-                    d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"
-                  />
-                {/if}
-              </svg>
             </button>
             {#if inActive}
               <span
@@ -449,40 +405,6 @@
     {:else}
       <div class="loading">Loading…</div>
     {/if}
-  {/if}
-
-  {#if rowOverridePicker}
-    {@const target = rowOverridePicker}
-    {@const targetMeta = models.find((m) => m.name === target.tag)}
-    {@const overriddenModes = targetMeta?.override_for ?? []}
-    <div class="picker-overlay" onclick={() => (rowOverridePicker = null)} role="presentation"></div>
-    <div class="picker row-picker" role="dialog" aria-label="Override modes for {target.tag}">
-      <div class="picker-header">
-        <span>Use <strong>{target.tag}</strong> for…</span>
-        <button class="close" onclick={() => (rowOverridePicker = null)}>✕</button>
-      </div>
-      <div class="row-picker-body">
-        {#each eligibleModes(target.runtime) as mode}
-          {@const isOn = overriddenModes.includes(mode)}
-          <button
-            class="mode-toggle"
-            class:on={isOn}
-            onclick={() => applyRowOverride(target.tag, isOn ? null : mode)}
-            title={isOn
-              ? `Currently overrides ${mode} — click to revert`
-              : `Pin as ${mode} override`}
-          >
-            <span class="mode-name">{mode}</span>
-            <span class="mode-state">{isOn ? "✓ override" : "set"}</span>
-          </button>
-        {/each}
-        {#if overriddenModes.length > 0}
-          <button class="revert-all" onclick={() => applyRowOverride(target.tag, null)}>
-            Revert all overrides for this model
-          </button>
-        {/if}
-      </div>
-    </div>
   {/if}
 
   {#if deleteTarget}
@@ -595,67 +517,10 @@
   .rec-badge.soft { color: #777; }
   .rec-meta { font-size: .68rem; color: #555; font-style: italic; }
   .unrec-badge { font-size: .7rem; color: #777; }
-  .override-badge { font-size: .68rem; color: #9a7; }
   .pin-btn { background: none; border: none; cursor: pointer; font-size: .9rem; opacity: .5; }
   .pin-btn:hover, .pin-btn.pinned { opacity: 1; }
   .trash-btn { background: none; border: none; cursor: pointer; font-size: .9rem; opacity: .5; }
   .trash-btn:hover { opacity: 1; color: #f66; }
-  .override-btn {
-    background: none; border: none; cursor: pointer;
-    color: #777; opacity: .55;
-    display: inline-flex; align-items: center; justify-content: center;
-    padding: .15rem .25rem; border-radius: 5px;
-    transition: opacity .12s, color .12s, background .12s;
-  }
-  .override-btn:hover { opacity: 1; background: #1a1a2a; color: #b3b3ff; }
-  .override-btn.active {
-    color: #ffd166; opacity: 1; background: #2a2210;
-  }
-  .override-btn.active:hover { color: #ffe39a; background: #3a3014; }
-  .picker-overlay {
-    position: fixed; inset: 0; z-index: 20;
-  }
-  .picker {
-    position: fixed; bottom: 0; right: 0; width: 360px;
-    background: #161616; border: 1px solid #2a2a2a; border-radius: 10px 10px 0 0;
-    z-index: 21; max-height: 50vh; display: flex; flex-direction: column;
-  }
-  .picker-header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: .75rem 1rem; border-bottom: 1px solid #222; font-size: .85rem; color: #ccc;
-  }
-  .close { background: none; border: none; color: #666; font-size: 1rem; cursor: pointer; }
-  .close:hover { color: #ccc; }
-  .row-picker { width: 320px; max-height: 60vh; }
-  .row-picker-body {
-    padding: .5rem;
-    display: flex; flex-direction: column; gap: .3rem;
-    overflow-y: auto;
-  }
-  .mode-toggle {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: .5rem .65rem;
-    background: #131318; border: 1px solid #1f1f24;
-    color: #ccc; border-radius: 6px; cursor: pointer;
-    font-size: .82rem;
-  }
-  .mode-toggle:hover { border-color: #3a3a55; background: #1a1a26; }
-  .mode-toggle.on {
-    background: #2a2210; border-color: #4a3a18; color: #ffd166;
-  }
-  .mode-toggle.on:hover { background: #3a3014; border-color: #6a4a20; }
-  .mode-name { text-transform: capitalize; font-weight: 500; }
-  .mode-state {
-    font-size: .7rem; color: inherit; opacity: .7;
-    font-family: monospace;
-  }
-  .revert-all {
-    margin-top: .25rem;
-    padding: .4rem .65rem; background: none; border: 1px dashed #4a3a18;
-    color: #ffd166; border-radius: 6px; cursor: pointer;
-    font-size: .76rem;
-  }
-  .revert-all:hover { background: #2a2210; }
   .confirm-overlay {
     position: fixed; inset: 0; background: rgba(0, 0, 0, .65); z-index: 30;
   }
