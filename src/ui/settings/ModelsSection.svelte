@@ -88,6 +88,18 @@
     loading = false;
   }
 
+  /** Diarize tiers ship composite tags joined with `+`
+   *  (e.g. `pyannote-seg-3.0+wespeaker-r34`) — segmenter + embedder.
+   *  On disk those land as two separate ONNX files registered under
+   *  the component names. Anywhere we walk manifest tags to build a
+   *  set keyed by on-disk model name, we need each component, not
+   *  the joined string nobody has on disk. Non-composite tags pass
+   *  through as a single element. */
+  function expandComposite(tag: string | null | undefined): string[] {
+    if (!tag) return [];
+    return tag.includes("+") ? tag.split("+").filter(Boolean) : [tag];
+  }
+
   /** Walk every saved provider's manifest and bucket every tag into:
    *  (a) the active-family lock set, and
    *  (b) the per-tag family map for row badges. One pass over O(providers
@@ -119,12 +131,22 @@
             for (const tier of modeSpec.tiers) {
               for (const tag of [tier.model, tier.fallback]) {
                 if (!tag) continue;
-                if (isActiveFam) lockSet.add(tag);
-                const list = map[tag] ?? [];
-                if (!list.find((e) => e.provider === provider.name && e.familyName === familyName)) {
-                  list.push({ provider: provider.name, familyName, familyLabel: family.label });
+                // Diarize tiers use composite tags joined with `+`
+                // (e.g. `pyannote-seg-3.0+wespeaker-r34`). Each
+                // component pulls down as its own ONNX file under
+                // `~/.myownllm/models/diarize/` and shows up as a
+                // separate row in the Models list. Register every
+                // component — not just the composite — so the
+                // individual rows pick up the family-membership badge
+                // instead of reading as unrecommended.
+                for (const part of expandComposite(tag)) {
+                  if (isActiveFam) lockSet.add(part);
+                  const list = map[part] ?? [];
+                  if (!list.find((e) => e.provider === provider.name && e.familyName === familyName)) {
+                    list.push({ provider: provider.name, familyName, familyLabel: family.label });
+                  }
+                  map[part] = list;
                 }
-                map[tag] = list;
               }
             }
           }
@@ -157,7 +179,12 @@
                 config.active_family,
                 config.family_overrides,
               );
-              if (tag) lockSet.add(tag);
+              // Diarize resolves to a composite ("seg+embedder") —
+              // expand so each on-disk component is locked, not just
+              // the joined string nobody else has on disk.
+              for (const part of expandComposite(tag)) {
+                lockSet.add(part);
+              }
             } catch {}
           }
         }
