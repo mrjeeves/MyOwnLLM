@@ -425,14 +425,17 @@ const ICE_RESTART_RECOVERY_MS = 4_000;
  *  `pc.restartIce()` so a fresh candidate exchange has a chance to
  *  pick up whatever path is currently live.
  *
- *  Sized to give WebRTC's natural consult-and-retry a fair shot
- *  (5-15s before it gives up and goes to `failed`) without waiting
- *  so long that the SCTP datachannel times out and Trystero fires
- *  `onPeerLeave` underneath us. The original engine treated
- *  `disconnected` as transient and did nothing — that was fine for
- *  fast LAN flaps but lost the TURN-via-TCP case where a NAT
- *  pinhole closes and the path is permanently dead. A 6s watchdog
- *  recovers those cases without restarting handshake.
+ *  Sized aggressively to fire BEFORE Trystero's underlying
+ *  datachannel-close timeout kills the PC. Observed in the wild:
+ *  Trystero fires `onPeerLeave` ~5s after ICE goes `disconnected`
+ *  (likely SCTP / negotiation-needed timeout interaction). If the
+ *  watchdog waits longer than that, the PC is destroyed before the
+ *  watchdog has a chance to fire, and we never even attempt
+ *  restartIce on the network-swap path that motivated the
+ *  watchdog. 3s gives WebRTC's natural consult-and-retry just
+ *  enough time to heal a true LAN flap (those recover in well
+ *  under 1s) while leaving a ~2s window before Trystero's
+ *  give-up boundary for the restart negotiation to start.
  *
  *  This is independent of the wake-probe ICE-restart path (Tier 3
  *  in the ladder). Tier 3 fires when ALL peers are silent after a
@@ -440,7 +443,7 @@ const ICE_RESTART_RECOVERY_MS = 4_000;
  *  Both call into Trystero's `negotiationneeded` path; either is
  *  safe to fire on the same PC because Trystero's perfect-
  *  negotiation handler dedupes back-to-back offers. */
-const ICE_DISCONNECTED_RESTART_MS = 6_000;
+const ICE_DISCONNECTED_RESTART_MS = 3_000;
 /** How long an authenticated peer that just dropped stays in the
  *  "reconnecting" UI bucket before it falls through to plain
  *  "offline." The user-visible difference is small but important:
@@ -2514,9 +2517,24 @@ class MeshClient {
     for (const conn of this.connections.values()) {
       if (conn.device_pubkey) active_pubkeys.add(conn.device_pubkey);
     }
+    const now = Date.now();
     let offline = 0;
     for (const pk of this.roster_pubkeys) {
-      if (!active_pubkeys.has(pk)) offline += 1;
+      if (active_pubkeys.has(pk)) continue;
+      // Skip peers currently in the reconnecting-grace window.
+      // Trystero's natural discovery (presence-announce every
+      // 5.333s) has RECONNECTING_GRACE_MS = 90s to find them
+      // again, and during that window the UI is already showing
+      // "reconnecting…" continuously. Firing a heavy rediscovery
+      // mid-grace tears down our own room and rebuilds it — the
+      // exact tear-down/rebuild churn the user feels as
+      // "fragile." If grace expires without recovery, the
+      // janitor in `pruneRecentDisconnects` kicks rediscovery
+      // immediately as a backstop, so we don't lose recovery
+      // latency by waiting for the next tick.
+      const dc = this.recent_disconnects.get(pk);
+      if (dc && now <= dc.expires_at) continue;
+      offline += 1;
     }
     if (offline === 0) return;
     this.maybeForceRediscovery(
@@ -4587,9 +4605,11 @@ class MeshClient {
     if (this.recent_disconnects.size === 0) return;
     const now = Date.now();
     let expired = 0;
+    const expired_pubkeys: string[] = [];
     for (const [pubkey, entry] of this.recent_disconnects) {
       if (now > entry.expires_at) {
         this.recent_disconnects.delete(pubkey);
+        expired_pubkeys.push(pubkey);
         expired++;
       }
     }
@@ -4603,6 +4623,30 @@ class MeshClient {
         `${expired} peer(s) aged out of reconnecting grace — now offline`,
       );
       this.republishPeers();
+      // Backstop: if any of the expired peers are STILL rostered and
+      // STILL not active, kick a rediscovery NOW. Without this, the
+      // user waits up to OFFLINE_ROSTERED_CHECK_INTERVAL_MS (60s)
+      // for the next periodic tick to notice and trigger
+      // `maybeForceRediscovery` itself — meaning the worst-case
+      // recovery latency adds the offline-check cadence on top of
+      // the grace window. The whole point of suppressing
+      // mid-grace rediscovery was to let natural Trystero
+      // discovery work without interference; that's the same
+      // reason firing it the moment grace ends is correct (natural
+      // discovery had its 90s shot and didn't recover, so the
+      // heavier hammer is now appropriate).
+      const active_pubkeys = new Set<string>();
+      for (const conn of this.connections.values()) {
+        if (conn.device_pubkey) active_pubkeys.add(conn.device_pubkey);
+      }
+      const still_offline = expired_pubkeys.filter(
+        (pk) => this.roster_pubkeys.has(pk) && !active_pubkeys.has(pk),
+      );
+      if (still_offline.length > 0) {
+        this.maybeForceRediscovery(
+          `${still_offline.length} peer(s) aged out of grace and still offline — kicking rediscovery`,
+        );
+      }
     }
   }
 

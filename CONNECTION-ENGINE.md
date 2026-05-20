@@ -80,17 +80,22 @@ only fires when the cheaper one has been ruled out:
 machine transitions to `disconnected` when at least one connectivity check
 starts failing — it'll try to self-recover for ~5-15s before escalating to
 `failed`. On a fast LAN flap that's fine; the path heals on its own. On a
-TURN-via-TCP connection where a NAT pinhole closes, ICE never makes it back
-to `connected` and the SCTP datachannel times out long before ICE
-escalates, dropping us into the room-rejoin sledgehammer with all auth
-state lost. Tier 2.5 schedules a `setTimeout` per peer when ICE enters
-`disconnected`; if the peer is still disconnected after
-`ICE_DISCONNECTED_RESTART_MS` (6s), `proactiveIceRestart()` fires
-`pc.restartIce()` to kick a fresh candidate exchange. Often that picks up
-a different working path (alternate TURN URL, fresh srflx mapping) and the
-datachannel resumes without the peer ever dropping. Tier 2.5's watchdog is
-cleared the moment ICE transitions to `connected`/`completed`/`failed` or
-the connection is dropped, so a normal recovery short-circuits the kick.
+TURN-via-TCP connection where a NAT pinhole closes, or a LAN↔WAN swap that
+invalidates the local host candidate, ICE never makes it back to
+`connected` and the SCTP datachannel / Trystero peer-state times out
+~5s after the disconnect — dropping us into the room-rejoin sledgehammer
+with all auth state lost. Tier 2.5 schedules a `setTimeout` per peer when
+ICE enters `disconnected`; if the peer is still disconnected after
+`ICE_DISCONNECTED_RESTART_MS` (3s), `proactiveIceRestart()` fires
+`pc.restartIce()` to kick a fresh candidate exchange. The 3s window is
+specifically sized to fire BEFORE Trystero's ~5s give-up boundary — at 6s
+the watchdog was consistently outrun by Trystero's teardown and never even
+got a chance to attempt restartIce on the network-swap path. Often the
+restart picks up a different working path (alternate TURN URL, fresh srflx
+mapping, new host candidate on the post-swap interface) and the datachannel
+resumes without the peer ever dropping. Tier 2.5's watchdog is cleared the
+moment ICE transitions to `connected`/`completed`/`failed` or the
+connection is dropped, so a normal recovery short-circuits the kick.
 
 **Tier 3 is the network-swap layer.** When the OS jumps interfaces (phone
 hotspot↔home Wi-Fi, ethernet plugged/unplugged), the local IPs that ICE
@@ -159,7 +164,7 @@ the declaration captures the rationale.
 | `REDISCOVERY_REJOIN_GAP_MS`            | 1.5s                 | Leave-to-join gap to let transport tear down                  |
 | `OFFLINE_ROSTERED_CHECK_INTERVAL_MS`   | 60s                  | Asymmetric-sleep safety net                                   |
 | `ICE_POLL_INTERVAL_MS`                 | 3s                   | Pick up new `RTCPeerConnection` objects from Trystero         |
-| `ICE_DISCONNECTED_RESTART_MS`          | 6s                   | Per-peer watchdog before proactive `restartIce()` (Tier 2.5)  |
+| `ICE_DISCONNECTED_RESTART_MS`          | 3s                   | Per-peer watchdog before proactive `restartIce()` (Tier 2.5). Sized to fire before Trystero's ~5s give-up on the datachannel — at 6s the watchdog was consistently outrun by Trystero's teardown |
 | `SIGNALING_DIAG_INTERVAL_MS`           | 10s                  | Refresh signaling-relay health snapshot                       |
 | `DEFAULT_SIGNALING_REDUNDANCY`         | 5                    | Built-in Nostr relay count, after we filter `SIGNALING_RELAY_DENYLIST` out of Trystero's shuffle. Was 8 (to dilute Damus); the deny-filter is the targeted fix and dilution was no longer needed |
 | `SIGNALING_RELAY_DENYLIST`             | damus.io, chorus.pjv.me | Hosts always skipped in the deterministic-shuffle slice; both rate-limit the announce loop                       |
@@ -201,6 +206,7 @@ adjustment.
 | Protocol mismatch (old peer talks to new build)        | `hello.protocol` ≠ PROTOCOL_VERSION                 | Send `deny`, drop connection                                                            | `handleHello`                          |
 | Identity-key rotation (user blew away `~/.myownllm/.secrets`) | `device_id` change at next reconcile         | Old roster entries become unmatched; new device must be re-approved by peers            | `reconcile`                            |
 | Authenticated peer dropped within last 90s             | `dropConnection` on `first_active_at > 0` rostered peer | Status → `reconnecting`; if same `device_pubkey` returns inside the window, UI flips back to `active` without intermediate `offline`/`handshaking` | `dropConnection`, `recent_disconnects`, `computePeers`, `pruneRecentDisconnects` |
+| Network swap (LAN→WAN or vice versa) drops a previously-active peer | Peer in `recent_disconnects` AND `offlineRosteredCheckTick` would otherwise force-rediscover | Skip the heavy room-rebuild during the grace window — natural Trystero discovery (5.333s presence-announce cadence) has 90s to find the peer on the new network. UI stays on "reconnecting…" continuously rather than churning through a stop+start cycle. If grace expires without recovery, `pruneRecentDisconnects` triggers `maybeForceRediscovery` immediately as a backstop | `offlineRosteredCheckTick`, `pruneRecentDisconnects` |
 
 ## Invariants the engine maintains
 
@@ -314,3 +320,8 @@ The Activity panel surfaces the same data the diag log holds; Quiet logs suppres
 - **Phase machine: `ice-failed-needs-turn` split into `ice-failed-no-turn` + `ice-failed-turn-unreachable`**: the old single phase advised "Add a TURN server" regardless of whether the user already had one configured. When the user had TURN configured but it was unreachable (DNS blocked by an ad-blocker intercepting trafficmanager.net, wrong credentials, all-UDP path blocked), they were told to "add a TURN server" they already had — confusing and wrong. The fix branches `computePhase` on `applied_turn.length`: zero TURN configured → `ice-failed-no-turn` (provider-suggestion banner); ≥1 configured → `ice-failed-turn-unreachable` (causes-and-checks banner enumerating DNS / credentials / UDP-blocked). A shared `iceFailureGuidance()` helper builds the diag log warning so the `handleJoinError` and `watchPeerIce` failed-state paths emit the same message and can't drift apart. Settings status panel reads both phases for its action hint text.
 - **Worker-fallback heartbeat + post-stop guards on wake callbacks**: an audit caught that `startScheduler`'s worker-spawn-failure branch set up offline-check / catalog-refresh / reconnect-prune timers but forgot the heartbeat — silently disabling wake detection, the rehandshake loop, and every per-peer liveness path in worker-less environments. The fix adds a `heartbeat_timer` field with matching teardown in `stop()`; the fallback now fires `runHeartbeatTick(performance.now())` on the same `HEARTBEAT_INTERVAL_MS` cadence the worker would. Worker-less environments are rare (the diag log already prints a warn when the worker spawn throws) but the failure-mode silence was a real reliability hole. Same commit added `if (this.status === "off" || !this.room) return` guards to both setTimeouts inside `handleWake`, which previously ran their full bodies post-stop — at best a no-op on a cleared connections map, at worst calling `maybeForceRediscovery` against a torn-down room. Belt-and-suspenders with `stopping`.
 - **`pending_moves_out` rejection in `stop()` + `is_rediscovering` reset**: every other pending RPC map was settled (with a "mesh stopped" error) and cleared in `stop()` — `pending_moves_out` was the one silent omission, so outbound move callers held onto promises that would never resolve across a stop cycle. Now mirrored with the rest of the maps. Also added an `is_rediscovering = false` reset to the same site: the `forceRediscovery` try/finally was the only normalizer, and any code path that calls `stop()` directly (user-initiated stop, error path in reconcile, etc.) would otherwise leave the UI's "rediscovering…" indicator stuck on. Pure correctness — no behavior change in the common case.
+- **LAN↔WAN swap UX: ICE watchdog 6s → 3s, suppress rediscovery during grace, kick on grace expiry**: the previous round of fixes added Tier 2.5 and the `reconnecting` grace state, but the user still observed slow + fragile recovery on LAN↔WAN swaps with visible "tearing down and building up over and over." The leave-cause logs revealed three compounding issues:
+   1. The 6s ICE-disconnected watchdog never fired — Trystero killed the datachannel ~5s after ICE goes `disconnected` (`ICE=disconnected (5s ago)` in every leave log), beating our watchdog by 1s. The watchdog wasn't even attempting restartIce. Lowered to 3s so the watchdog fires before Trystero's give-up boundary, leaving a ~2s window for the restart negotiation to begin.
+   2. `offlineRosteredCheckTick` was firing `maybeForceRediscovery` mid-grace-window (the 60s tick during the 90s grace). That triggered the heavy stop+start, tearing down our room while natural Trystero discovery was still trying to find the peer on their new network. The fix: skip peers currently in `recent_disconnects` during the tick. Lets natural discovery (presence-announce every 5.333s) have its 90s shot without interference.
+   3. With the mid-grace rediscovery suppressed, a peer that DIDN'T recover via natural discovery would have waited up to OFFLINE_ROSTERED_CHECK_INTERVAL_MS (60s) after grace expired for the next tick to fire rediscovery. That added 0-60s of "offline" UI on top of the 90s grace. Fixed by extending `pruneRecentDisconnects`: when an expiry sweep finds rostered-and-still-offline peers, `maybeForceRediscovery` fires immediately as a backstop. Worst-case recovery latency now equals one grace window (90s) instead of "grace + next-tick (up to 150s)."
+   Net UX: visible churn during recovery drops from "tearing down and building up over and over" to "reconnecting…" displayed continuously for up to 90s, with the heavy hammer firing only as a real fallback when natural discovery genuinely fails.
