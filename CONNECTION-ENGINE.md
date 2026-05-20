@@ -160,11 +160,11 @@ the declaration captures the rationale.
 | `REHANDSHAKE_BACKOFF_MS_SCHEDULE`      | [2,5,10,20,30] s     | Per-peer hello-retry cadence (jittered ±20%)                  |
 | `REHANDSHAKE_JITTER_FRACTION`          | 0.20                 | Desync N-peer simultaneous reconnects                         |
 | `REHANDSHAKE_RESCUE_ATTEMPTS`          | 3                    | Failures before escalating to room rejoin                     |
-| `REDISCOVERY_BACKOFF_SCHEDULE_MS`      | [90s, 3m, 5m, 10m]   | Global throttle on Trystero rejoins                           |
+| `REDISCOVERY_BACKOFF_SCHEDULE_MS`      | [30s, 90s, 3m, 5m]   | Global throttle on Trystero rejoins                           |
 | `REDISCOVERY_REJOIN_GAP_MS`            | 1.5s                 | Leave-to-join gap to let transport tear down                  |
 | `OFFLINE_ROSTERED_CHECK_INTERVAL_MS`   | 60s                  | Asymmetric-sleep safety net                                   |
 | `ICE_POLL_INTERVAL_MS`                 | 3s                   | Pick up new `RTCPeerConnection` objects from Trystero         |
-| `ICE_DISCONNECTED_RESTART_MS`          | 3s                   | Per-peer watchdog before proactive `restartIce()` (Tier 2.5). Sized to fire before Trystero's ~5s give-up on the datachannel — at 6s the watchdog was consistently outrun by Trystero's teardown |
+| `ICE_DISCONNECTED_RESTART_MS`          | 1s                   | Per-peer watchdog before proactive `restartIce()` (Tier 2.5). Fires within Trystero's ~5s give-up window, leaving ~4s for the restart renegotiation to complete |
 | `SIGNALING_DIAG_INTERVAL_MS`           | 10s                  | Refresh signaling-relay health snapshot                       |
 | `DEFAULT_SIGNALING_REDUNDANCY`         | 5                    | Built-in Nostr relay count, after we filter `SIGNALING_RELAY_DENYLIST` out of Trystero's shuffle. Was 8 (to dilute Damus); the deny-filter is the targeted fix and dilution was no longer needed |
 | `SIGNALING_RELAY_DENYLIST`             | damus.io, chorus.pjv.me | Hosts always skipped in the deterministic-shuffle slice; both rate-limit the announce loop                       |
@@ -276,6 +276,48 @@ A checklist for the next contributor adding, say, a new `metrics_announce` messa
 7. **Log via `logDiag`**, not `console.log`. Honor the Quiet-mode flag (`info` is suppressible, `warn`/`error` always land).
 8. **Test the four-peer mass-wake case.** Open four laptops on the same mesh, sleep them all, wake them at once. If your change holds up — backoff jitter desyncs them, signaling stays healthy, rejoin throttle holds — you're good. If you see a relay rate-limit warning in the diag log, you've added load somewhere.
 
+## Known upstream limitations
+
+The engine has to work around a couple of Trystero v0.24.0 internal-state
+bugs that we can't fix from outside the library. They're documented here
+so future contributors don't waste time trying to "fix" them at our layer.
+
+**Trystero `offerAnswered` state-stickiness.** In
+`@trystero-p2p/core/dist/signal-handler.mjs`, every connected peer
+gets `peerStates[peerId].offerAnswered = true` set when we answer
+their offer (line 302). That flag would normally be reset by either
+the offer-expiry timer (after `offerPostAnswerTtlMs = 23.3s`) firing
+on a not-yet-connected peer, OR by `resetOfferState` being called
+from `onOfferPeerClosedOrError`. But once the connection is live for
+the full 23s, the expiry timer's callback short-circuits via
+`current.connectedPeer` being truthy and never reschedules. From that
+point on, `offerAnswered` is permanently `true` for the lifetime of
+the room — `clearConnectedPeer` (which fires when the PC dies)
+clears `connectedPeer` and `connectedPeerUnhealthySinceMs` but does
+NOT touch `offerAnswered`.
+
+The downstream effect: when the peer's PC dies and they announce
+again over Nostr, the signal-handler at line 352 checks
+`announcePeerState.answeringPeer || announcePeerState.connectedPeer || announcePeerState.offerAnswered`
+and returns early. Natural re-handshake never starts. The only way
+to clear `offerAnswered` is a full room rejoin (which creates a
+fresh `ctx.peerStates` map).
+
+That's why the engine still does heavy `stop()` + `start()`
+rediscovery whenever an authenticated peer drops and grace expires
+without natural recovery — the rejoin is the only mechanism that
+clears Trystero's stuck state. The user's LAN↔WAN swap sessions
+made this observable: `pcCount` never increased between the drop
+and the rejoin, because Trystero was receiving the peer's announces
+and ignoring them due to `offerAnswered: true`. `ctx.peerStates` is
+closure-scoped in the strategy factory and not exposed via the room
+object, so we can't reach in and reset just the stuck flag — full
+rejoin remains the only option until this is fixed upstream.
+
+Engine-side mitigation: short grace window (30s) + immediate
+rediscovery on grace expiry + 30s first-throttle interval so the
+unavoidable rejoin happens fast.
+
 ## What's intentionally NOT in this engine
 
 - **Per-relay quality scoring.** We use redundancy 5 with Trystero's deterministic shuffle and an explicit deny-filter (`SIGNALING_RELAY_DENYLIST`) for known-noisy hosts. Adding per-relay reliability metrics would mean diverging from the appId-derived ordering further, which risks splitting the mesh if two builds compute different "best" relays from observed performance. The current deny-filter is a stable, version-controlled allowlist — easier to reason about than a live scoring loop.
@@ -320,6 +362,7 @@ The Activity panel surfaces the same data the diag log holds; Quiet logs suppres
 - **Phase machine: `ice-failed-needs-turn` split into `ice-failed-no-turn` + `ice-failed-turn-unreachable`**: the old single phase advised "Add a TURN server" regardless of whether the user already had one configured. When the user had TURN configured but it was unreachable (DNS blocked by an ad-blocker intercepting trafficmanager.net, wrong credentials, all-UDP path blocked), they were told to "add a TURN server" they already had — confusing and wrong. The fix branches `computePhase` on `applied_turn.length`: zero TURN configured → `ice-failed-no-turn` (provider-suggestion banner); ≥1 configured → `ice-failed-turn-unreachable` (causes-and-checks banner enumerating DNS / credentials / UDP-blocked). A shared `iceFailureGuidance()` helper builds the diag log warning so the `handleJoinError` and `watchPeerIce` failed-state paths emit the same message and can't drift apart. Settings status panel reads both phases for its action hint text.
 - **Worker-fallback heartbeat + post-stop guards on wake callbacks**: an audit caught that `startScheduler`'s worker-spawn-failure branch set up offline-check / catalog-refresh / reconnect-prune timers but forgot the heartbeat — silently disabling wake detection, the rehandshake loop, and every per-peer liveness path in worker-less environments. The fix adds a `heartbeat_timer` field with matching teardown in `stop()`; the fallback now fires `runHeartbeatTick(performance.now())` on the same `HEARTBEAT_INTERVAL_MS` cadence the worker would. Worker-less environments are rare (the diag log already prints a warn when the worker spawn throws) but the failure-mode silence was a real reliability hole. Same commit added `if (this.status === "off" || !this.room) return` guards to both setTimeouts inside `handleWake`, which previously ran their full bodies post-stop — at best a no-op on a cleared connections map, at worst calling `maybeForceRediscovery` against a torn-down room. Belt-and-suspenders with `stopping`.
 - **`pending_moves_out` rejection in `stop()` + `is_rediscovering` reset**: every other pending RPC map was settled (with a "mesh stopped" error) and cleared in `stop()` — `pending_moves_out` was the one silent omission, so outbound move callers held onto promises that would never resolve across a stop cycle. Now mirrored with the rest of the maps. Also added an `is_rediscovering = false` reset to the same site: the `forceRediscovery` try/finally was the only normalizer, and any code path that calls `stop()` directly (user-initiated stop, error path in reconcile, etc.) would otherwise leave the UI's "rediscovering…" indicator stuck on. Pure correctness — no behavior change in the common case.
+- **Trystero `offerAnswered` state-stickiness root cause + shorter grace/throttle to mask it**: prior attempts to make network-swap recovery feel less fragile (Tier 2.5 watchdog, 90s grace, mid-grace rediscovery suppression) all assumed that natural Trystero discovery would eventually re-handshake a dropped peer if we just waited long enough. The user's logs proved this assumption wrong: `pcCount` never increased during grace, meaning Trystero was receiving the peer's announce events and silently ignoring them. Root cause located in `@trystero-p2p/core/dist/signal-handler.mjs`: when we answer a peer's offer, `peerStates[peerId].offerAnswered` is set to `true` (line 302) and an offer-expiry timer is scheduled at `offerPostAnswerTtlMs = 23.3s`. If the connection lives past 23s, that timer's callback short-circuits (`current.connectedPeer` is truthy) and never reschedules. From that point on, `offerAnswered` is permanently `true` for the lifetime of the room — `clearConnectedPeer` (which fires when the PC dies) clears `connectedPeer` but does NOT touch `offerAnswered`. Subsequent announces hit the early-return at line 352 (`offerAnswered: true`) and never trigger a fresh handshake. The only mechanism that clears this state is a full room rejoin (new `ctx.peerStates` map). `ctx.peerStates` is closure-scoped in the strategy factory and not exposed via the room object, so we can't reach in to surgically reset just the stuck flag. Documented as a known upstream limitation; engine response is to shorten grace and throttle so the unavoidable rejoin happens fast: `RECONNECTING_GRACE_MS` 90s → 30s, `REDISCOVERY_BACKOFF_SCHEDULE_MS` first interval 90s → 30s, `ICE_DISCONNECTED_RESTART_MS` 3s → 1s. Net effect: worst-case reconnect drops from ~120s (90s grace + 30s rebuild) to ~60s (30s grace + 30s rebuild) for the LAN↔WAN swap case the user repeatedly hit.
 - **LAN↔WAN swap UX: ICE watchdog 6s → 3s, suppress rediscovery during grace, kick on grace expiry**: the previous round of fixes added Tier 2.5 and the `reconnecting` grace state, but the user still observed slow + fragile recovery on LAN↔WAN swaps with visible "tearing down and building up over and over." The leave-cause logs revealed three compounding issues:
    1. The 6s ICE-disconnected watchdog never fired — Trystero killed the datachannel ~5s after ICE goes `disconnected` (`ICE=disconnected (5s ago)` in every leave log), beating our watchdog by 1s. The watchdog wasn't even attempting restartIce. Lowered to 3s so the watchdog fires before Trystero's give-up boundary, leaving a ~2s window for the restart negotiation to begin.
    2. `offlineRosteredCheckTick` was firing `maybeForceRediscovery` mid-grace-window (the 60s tick during the 90s grace). That triggered the heavy stop+start, tearing down our room while natural Trystero discovery was still trying to find the peer on their new network. The fix: skip peers currently in `recent_disconnects` during the tick. Lets natural discovery (presence-announce every 5.333s) have its 90s shot without interference.

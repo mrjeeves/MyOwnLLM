@@ -425,17 +425,31 @@ const ICE_RESTART_RECOVERY_MS = 4_000;
  *  `pc.restartIce()` so a fresh candidate exchange has a chance to
  *  pick up whatever path is currently live.
  *
- *  Sized aggressively to fire BEFORE Trystero's underlying
- *  datachannel-close timeout kills the PC. Observed in the wild:
- *  Trystero fires `onPeerLeave` ~5s after ICE goes `disconnected`
- *  (likely SCTP / negotiation-needed timeout interaction). If the
- *  watchdog waits longer than that, the PC is destroyed before the
- *  watchdog has a chance to fire, and we never even attempt
- *  restartIce on the network-swap path that motivated the
- *  watchdog. 3s gives WebRTC's natural consult-and-retry just
- *  enough time to heal a true LAN flap (those recover in well
- *  under 1s) while leaving a ~2s window before Trystero's
- *  give-up boundary for the restart negotiation to start.
+ *  Sized aggressively to fire as early as possible BEFORE
+ *  Trystero's underlying datachannel-close timeout kills the PC.
+ *  Observed in the wild: Trystero fires `onPeerLeave` ~5s after
+ *  ICE goes `disconnected` (likely SCTP / negotiation-needed
+ *  timeout interaction). The Nostr-signaling renegotiation
+ *  required by `pc.restartIce()` (offer → answer → ICE re-gather)
+ *  takes 2-4s end-to-end across the public relay path, so the
+ *  watchdog needs to fire within the first second to have any
+ *  chance of completing before Trystero gives up. Empirically
+ *  at 3s and 6s we logged the watchdog firing but the connection
+ *  still dropped at 5s — every time. 1s gives WebRTC's natural
+ *  consult-and-retry only a brief look (most LAN flaps heal in
+ *  well under 500ms) and leaves ~4s for the restart renegotiation
+ *  to actually complete.
+ *
+ *  Note that even with the maximum window, `restartIce` does not
+ *  always save the connection — Trystero v0.24.0 has a separate
+ *  state-stickiness issue (the `offerAnswered` flag in
+ *  `signal-handler.mjs` never gets reset after a connection
+ *  death, blocking subsequent natural re-handshakes) that means
+ *  some connection drops genuinely require a full room rejoin
+ *  to recover. The watchdog covers the cases where restart CAN
+ *  win the race; the rejoin path covers the rest. See the
+ *  Trystero-state-stickiness note in CONNECTION-ENGINE.md for
+ *  the full rationale.
  *
  *  This is independent of the wake-probe ICE-restart path (Tier 3
  *  in the ladder). Tier 3 fires when ALL peers are silent after a
@@ -443,7 +457,7 @@ const ICE_RESTART_RECOVERY_MS = 4_000;
  *  Both call into Trystero's `negotiationneeded` path; either is
  *  safe to fire on the same PC because Trystero's perfect-
  *  negotiation handler dedupes back-to-back offers. */
-const ICE_DISCONNECTED_RESTART_MS = 3_000;
+const ICE_DISCONNECTED_RESTART_MS = 1_000;
 /** How long an authenticated peer that just dropped stays in the
  *  "reconnecting" UI bucket before it falls through to plain
  *  "offline." The user-visible difference is small but important:
@@ -451,18 +465,25 @@ const ICE_DISCONNECTED_RESTART_MS = 3_000;
  *  this — don't go fiddle with anything," "offline" communicates
  *  "this peer isn't coming back without intervention."
  *
- *  Sized to overlap the first auto-rediscovery window
- *  (`REDISCOVERY_BACKOFF_SCHEDULE_MS[0]` = 90s) so the UI doesn't
- *  flip to "offline" right as the engine is finally about to try
- *  the heavy rejoin. If a peer hasn't come back by then, two things
- *  are likely: (a) they're genuinely off, or (b) their network
- *  doesn't allow any candidate pair we can form — both warrant
- *  the harsher "offline" framing.
+ *  Originally sized at 90s to overlap the first auto-rediscovery
+ *  window so natural Trystero discovery had a long runway to
+ *  reconnect the peer without our heavy rejoin firing. That
+ *  rationale broke once we realized Trystero v0.24.0 has a
+ *  state-stickiness bug (the `offerAnswered` flag in
+ *  `@trystero-p2p/core/dist/signal-handler.mjs` never clears
+ *  after a connection death once the post-answer expiry timer
+ *  has fired on a live connection): natural re-handshake is
+ *  blocked and a room rejoin is the only path back. Waiting 90s
+ *  is therefore 60s of dead time before the rejoin we always
+ *  end up needing. 30s keeps "reconnecting…" UI for a brief
+ *  flap-recovery window but kicks the rejoin sooner when it's
+ *  going to be needed.
  *
  *  Stable-identity matching means a peer who returns DURING this
- *  window with the same `device_pubkey` reuses the existing card —
- *  no `offline → handshaking → active` UI churn for a quick blip. */
-const RECONNECTING_GRACE_MS = 90_000;
+ *  window (via fresh peer_id from a Trystero rejoin on their
+ *  side) with the same `device_pubkey` reuses the existing
+ *  card — no `offline → handshaking → active` UI churn. */
+const RECONNECTING_GRACE_MS = 30_000;
 /** Cadence for pruning expired `recent_disconnects` entries. Cheap
  *  iteration over what's typically a handful of entries; the only
  *  cost of running it more often is one extra wakeup per tick. */
@@ -501,21 +522,33 @@ const REHANDSHAKE_RESCUE_ATTEMPTS = 3;
  *  peer successfully completes auth, so a peer that pops back
  *  online gets the next outage's full reactivity. */
 const REDISCOVERY_BACKOFF_SCHEDULE_MS = [
-  90_000, // 1.5m — first attempt after going offline
+  30_000, // 30s — first attempt: must fire immediately when
+          // grace expires, since (a) we've now demonstrated
+          // natural Trystero discovery can't recover from the
+          // state-stickiness bug without our help, and (b) the
+          // `SIGNALING_RELAY_DENYLIST` already removed the
+          // rate-limiting relays (Damus, chorus.pjv.me), so
+          // 30s no longer trips Nostr anti-spam.
+  90_000, // 1.5m — second attempt
   180_000, // 3m
-  300_000, // 5m
-  600_000, // 10m — final, repeated indefinitely
-  // Bumped from the prior [60s, 120s, 180s, 300s]: each forced
-  // rejoin publishes a fresh presence announce to every signaling
-  // relay, and on a flaky hotspot connection (where connections
-  // drop every couple of minutes) the old 60s first interval was
-  // tight enough that Nostr relays with anti-spam limits — Damus
-  // especially — would start rate-limiting us, which then makes
-  // the recovery worse, not better. 90s gives the channel a real
-  // window to recover on its own before we churn signaling. The
-  // 10m tail remains tolerable because
-  // `consecutive_rediscovery_attempts` resets on any onPeerJoin,
-  // so the schedule unwinds the moment a peer reappears.
+  300_000, // 5m — final, repeated indefinitely
+  // Schedule history: originally [60s, 120s, 180s, 300s], then
+  // bumped to [90s, 3m, 5m, 10m] when Damus rate-limiting was
+  // chronically blowing us up on flaky networks. The deny-filter
+  // commit removed Damus from the relay set entirely, which
+  // freed us to bring the first interval back down — and we want
+  // it as short as we can manage because of the Trystero
+  // state-stickiness bug: every drop of an authenticated peer
+  // is effectively guaranteed to require a rejoin to recover
+  // (natural Trystero re-handshake is blocked by the stuck
+  // `offerAnswered` flag in core/signal-handler.mjs), so the
+  // throttle is no longer protecting an actual recovery path,
+  // it's just gating how long the user stares at "reconnecting…"
+  // before we do the only thing that works. The 5m tail stays
+  // long enough that a genuinely-offline peer doesn't pull the
+  // mesh through an endless rejoin loop. `consecutive_rediscovery_attempts`
+  // resets on any onPeerJoin so the schedule unwinds the moment
+  // a peer reappears.
 ];
 /** Cadence at which we check whether any rostered peer is offline
  *  and, if so, ask for a rediscovery. Catches the asymmetric
