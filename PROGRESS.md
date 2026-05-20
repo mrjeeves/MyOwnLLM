@@ -1,366 +1,260 @@
-# Mesh re-handshake after LAN↔WAN swap — open handoff
+# Mesh re-handshake after network swap — root cause found, patch shipped
 
-You are continuing work on a real bug. **Read this whole file before writing
-any code.** Multiple hypotheses have already been tried and disproven, and
-the most recent fix did fire in the wild but still didn't solve the user's
-problem. Be precise about which question you're answering before you
-propose a change.
+**Status:** Root cause located and patched in commit `<TBD>` on this branch
+(PR #186). Awaiting in-the-wild verification by the user on the next
+network swap. If the patch works as expected, recovery time should drop
+from ~95s to under 15s and we can close this out.
 
-## What's broken (user-visible)
+If it doesn't work, this doc still serves the next agent — see "If the
+patch doesn't help" at the bottom.
 
-Two devices, MyOwnLLM running on each (Tauri desktop). They join the same
-mesh ("cpjeeves-home") via Trystero's Nostr strategy. They connect, talk
-for ~30 seconds, then the user switches the **desktop's** network (Wi-Fi
-↔ Ethernet, different SSID). The desktop side detects the drop fast
-(`peer left ICE=disconnected (5s ago)`) — that part works.
+## The bug, in one paragraph
 
-What **doesn't** work: the natural re-handshake. For 90 seconds after the
-peer-left, no new offer/answer pair completes. Eventually the
-`RECONNECTING_GRACE_MS = 90_000` timer expires and our own
-`forceRediscovery()` fires a heavy `room.leave() + joinRoom()` rebuild,
-which **always** reconnects within ~5 seconds. So the user lives with
-~95s of "offline" UX every time they switch networks — feels broken.
+Nostr relays drop subscription state when the underlying WebSocket
+closes — that's per-spec (NIP-01 subscriptions are per-connection).
+Trystero v0.24.0's `@trystero-p2p/core` reconnects the WebSocket
+transparently inside `makeSocket` (`utils.mjs:70-96`) but its
+`strategy.mjs` calls the strategy's `subscribe()` callback exactly
+once at room init (line 222) and never re-runs it. So after any
+event that closes the socket (network swap is the visible case;
+relay churn / mobile-screen-off / Wi-Fi blip would all hit the
+same path), the new socket reopens but the relay has no record of
+our REQs and forwards nothing. The connection looks perfectly fine
+from `getRelaySockets()` — `readyState === 1`, our presence publishes
+go out — but **zero inbound EVENTs arrive**, so natural re-handshake
+silently stalls. Eventually `forceRediscovery`'s heavy room rebuild
+fires a fresh `joinRoom()` (which calls `subscribe()` from scratch)
+and everything works in ~1s because that's what fresh subscriptions
+do.
 
-The goal is to make the natural re-handshake work so we don't need to
-fall back to the rebuild backstop.
+This explains every observation the prior hypotheses couldn't:
 
-## Branch / PR / repo
+- **Why the gap is silent on both sides.** The swap-side is a
+  publish-only zombie (no inbound). The non-swap side's sockets
+  are healthy and it does send `{peerId: selfId}` follower
+  acknowledgements to our announces, but they're tossed by the
+  relay because we're not subscribed.
+- **Why the signaling diag goes quiet for the whole 90s.** The
+  fingerprint (open count, distinct authors seen, PC tier) doesn't
+  change — sockets are open, author counts are cumulative-since-start
+  so they don't decrement, no new candidate errors fire. Change-gated
+  log → nothing to log.
+- **Why post-rebuild is instant.** `joinRoom` calls the strategy's
+  `subscribe()` afresh on the new sockets. Relay starts forwarding.
+  Within one announce interval (5.333s) the offer-answer round-trip
+  completes.
+- **Why prior pool-flush / `offerAnswered` hypotheses didn't help.**
+  Both addressed Trystero-internal state that wasn't the bottleneck.
+  The bottleneck is upstream of all peer-state machinery: we never
+  see the announces because our subscription is dead at the relay.
 
-- Repo: `mrjeeves/MyOwnLLM`
-- Branch: `claude/fix-ice-restart-timeout-XIDXj`
-- PR: **#186** — open
-- Latest commit at handoff time: `ad8a1b9` (see "Iterations" below for
-  what each commit does)
+## The patch
+
+`patches/@trystero-p2p__core@0.24.0.patch` adds a hunk on
+`dist/utils.mjs::makeSocket`:
+
+1. **Track outgoing subscriptions.** `client.send` intercepts strings
+   that parse as `["REQ", subId, …]` (added to `activeSubscriptions
+   Map<subId, reqMsg>`) and `["CLOSE", subId]` (removed). Non-JSON /
+   non-array payloads (EVENT publishes, MQTT binary frames, etc.)
+   fall through untouched via the JSON.parse-error no-op path.
+
+2. **Replay on every subsequent `onopen`.** A `hasOpenedOnce` flag
+   gates the replay so the first open behaves exactly like upstream
+   (strategy will send its own REQ via `subscribe()` callback). Every
+   reopen after that calls `scheduleReplay()`.
+
+3. **Anti-flood backoff.** `scheduleReplay` shares per-socket state
+   (`resubscribeAttempt`, `lastResubscribeAt`, `pendingResubscribeTimer`)
+   that enforces a schedule of **5s / 10s / 15s / 30s / 60s, sticking
+   at 60s**. Reset to attempt 0 after `60s` of quiet so a long-stable
+   socket that finally blips doesn't sit at the cap. If a reconnect
+   lands while a replay is already scheduled, the scheduler is a
+   no-op (one in-flight replay per URL).
+
+4. **Observable.** One log line per replay event:
+   `[trystero-patch] <host> replayed N subscription(s) on reconnect
+   (attempt=M, next-eligible-in=Ks)`. Not per-message — state-transition
+   only, in line with the existing patch's log discipline.
+
+The other hunks on this patch (the `getConnectedPeerHealth =
+transient on disconnected` fix in `shared-peer.mjs`, the
+`flushStaleOfferPool` on `onPeerLeave` in `strategy.mjs`, the
+defensive `offerAnswered` clears in `signal-handler.mjs`, and all
+the `_mom*` instrumentation) all stay — they're correct fixes for
+adjacent problems and the instrumentation is what made this
+diagnosis possible.
+
+## What to verify in the wild
+
+Get one network-swap reproduction with the patched build on at
+least the swap-side (ideally both, since the same code runs on
+both). With DevTools open and console filtered for `[trystero-patch]`:
+
+1. **Module-load markers fire.** `[trystero-patch] signal-handler.mjs
+   loaded` and `[trystero-patch] strategy.mjs loaded` print once per
+   page load. If they don't, the patched bundle isn't running — see
+   "Don't trust pnpm 'Already up to date'" in the old notes.
+
+2. **`replayed N subscription(s)` fires on the swap.** Within a few
+   seconds of the WebSocket onclose burst (the 5 `WebSocket connection
+   to 'wss://…' failed: The network connection was lost.` lines), you
+   should see one `[trystero-patch] <relay> replayed 2 subscription(s)
+   on reconnect (attempt=1, next-eligible-in=10s)` line per relay
+   that reopens. N=2 because Trystero subscribes to root + self topics.
+
+3. **Natural re-handshake completes inside the grace window.** Look
+   for `received offer` (if we're the answering side) or `sending
+   offer` (if we're the leader) within 15-30s of the peer-left, not
+   the 90+s it was previously taking. The `_mom*` state machine
+   should transition `connected → offering → connected` or
+   `connected → ??? → connected` (the latter for the answering
+   side, which doesn't have a clean intermediate state — that's a
+   gap in the patch's state machine, noted below).
+
+4. **No `auto rediscovery #1 — N peer(s) aged out of grace`.** That
+   message firing means the patch didn't help in time and the heavy
+   rebuild still had to backstop. If you see it, capture the trace
+   — we want to know whether the replays fired but didn't restore
+   message flow (relay-side problem? subscription rejected?) or
+   whether the replays didn't fire (`hasOpenedOnce` not flipping?
+   wrong code path?).
+
+5. **No reply storms.** With 5 relays and the laptop's network
+   flapping, the worst case is 5 × (one replay per backoff slot).
+   If you swap repeatedly with the laptop, the second swap's
+   replays should be 10s apart (per the backoff), the third 15s,
+   etc. — visible in the `next-eligible-in` log values.
 
 ## Setup, both ends
 
-The two ends in the user's environment:
-- A Windows desktop (the side that swaps networks)
-- An Apple Silicon "Neo" laptop (the other end — confusingly called "Pi"
-  in older messages; it is **not** a Raspberry Pi)
+- **Windows desktop** — the OTHER end this run. Doesn't swap. Static
+  LAN.
+- **Apple Silicon laptop** ("Neo") — the swap-side this run.
+  Switching between LAN Wi-Fi and phone hotspot. **Note**: prior
+  versions of this doc said the desktop was swapping. The user
+  is now testing with the laptop swapping. Both sides need the
+  patched build; the logic on the swap-side is where the fix
+  primarily acts but the non-swap side benefits from the same
+  patch on its own future swaps.
 
-Both run `just dev` (which calls `pnpm install --frozen-lockfile` then
-`pnpm tauri dev`). Both need the patched build deployed before testing.
-The user already has both ends on this branch; **don't** assume their
-machines are stale, but if a trace looks wrong ask them to confirm
-`git log -1` matches.
+Both run `just dev` (which calls `pnpm install --frozen-lockfile`
+then `pnpm tauri dev`). pnpm re-applies the patch on every install
+via `patchedDependencies` in `package.json`. Vite's dep pre-bundle
+is disabled for trystero packages (`vite.config.ts`
+`optimizeDeps.exclude`) and `package.json`'s `postinstall` wipes
+`node_modules/.vite` so patch changes always reach the dev bundle
+on the next `just dev` — verify these stay in place.
 
-A real reproduction is one network swap with both ends running this
-branch and DevTools open on the swap-side. Filter the console for
-`[trystero-patch]`.
+## How to read the swap-side trace now
 
-## What the patch currently does
+State-transition logs from the existing instrumentation:
+- `<peerid>… first seen (announce)`
+- `<peerid>… received offer <ofId> (we are answering)`
+- `<peerid>… sending offer <ofId>`
+- `<peerid>… replacing offer <old> (after Ns, no answer) with <new>`
+- `<peerid>… STILL no answer for offer <ofId> after Ns`
+- `<peerid>… received answer for <ofId> after Ns`
+- `<peerid>… fresh → connected` / `… → connected`
+- `<peerid>… connected → disconnected` (NB: this only fires via
+  `clearConnectedPeer` in signal-handler.mjs; the strategy.mjs
+  `onPeerLeave` path doesn't route through it, so leaves seen
+  through `room.onPeerLeave` log via `[mesh] peer left` instead.
+  Not a bug, just a quirk of the state-machine coverage.)
+- `<peerid>… ICE health=transient — entered 7.5s grace`
 
-The patched files live in `node_modules/.pnpm/@trystero-p2p+core@0.24.0_patch_hash=*/node_modules/@trystero-p2p/core/dist/`
-and the patch file is `patches/@trystero-p2p__core@0.24.0.patch`. pnpm
-re-applies it on every install via the `patchedDependencies` field in
-`package.json`. Vite's dep pre-bundle is disabled for trystero packages
-(`vite.config.ts` `optimizeDeps.exclude`) and `package.json`'s
-`postinstall` script wipes `node_modules/.vite` so patch changes always
-reach the dev bundle on the next `just dev` — verify these stay in place.
+New from this round:
+- `<relay-host> replayed N subscription(s) on reconnect (attempt=M,
+  next-eligible-in=Ks)` — fires per relay each time we successfully
+  resubscribe after a reopen. The `next-eligible-in` value confirms
+  the backoff schedule is moving as designed.
 
-Three functional changes to the upstream library are live:
-
-1. **`shared-peer.mjs::getConnectedPeerHealth`** now returns `"transient"`
-   (not `"live"`) when `connection.connectionState === "disconnected"`,
-   even if `channel.readyState` is still `"open"`. This was a real bug:
-   the data channel can linger at `"open"` for 15-30s after ICE has
-   gone disconnected, and the upstream short-circuit prevented the
-   existing 7.5s `disconnectedPeerGraceMs` window in
-   `createSignalHandler` from ever engaging. The fix is correct and
-   helps on the non-swap side.
-2. **`signal-handler.mjs::clearConnectedPeer`** defensively clears
-   `state.offerAnswered = false` (alongside the existing `connectedPeer
-   = null`). Tracing shows `offerAnswered` is usually already false at
-   this point because `attachSharedPeerToRoom` calls `resetOfferState`
-   at connect time — but the defensive clear is free.
-3. **`strategy.mjs::flushStaleOfferPool`** (this is the one the user is
-   currently testing): the `room`'s `onPeerLeave` callback destroys
-   every pre-cached peer in `pool.pool`, throttled to once per 10s.
-   The hypothesis was that `OfferPool.warmup()` pre-allocates 20
-   offer-peers whose `getOffer()` SDP bakes in our pre-swap ICE
-   candidates, so post-swap checkouts hand out unanswerable offers
-   for the first ~57s until `offerTtl` fires the `restartIce` branch.
-   `OfferPool.checkout` handles an empty pool by allocating fresh
-   peers on demand.
-
-Instrumentation is state-transition based (see `_mom*` helpers in
-`signal-handler.mjs` plus a couple of hooks in `strategy.mjs`). Logs
-fire on lifecycle transitions and on stuck thresholds (15s/30s/60s/120s
-since an unanswered offer). **Do not regress this to a per-event
-firehose** — the user explicitly called that out as making things
-worse. If you need more visibility, add a tracked event with a clear
-single-line log, not a `console.warn` in a hot path.
-
-Module-load markers (`[trystero-patch] signal-handler.mjs loaded` and
-`[trystero-patch] strategy.mjs loaded`) fire once per page load and let
-the user confirm at-a-glance that the patched build is running. Don't
-remove them.
-
-## Latest trace (commit `ad8a1b9` in the wild)
-
-The user reproduced one swap and shared the full DevTools console. Key
-lines, in order:
-
-```
-[trystero-patch] signal-handler.mjs loaded
-[trystero-patch] strategy.mjs loaded
-[trystero-patch] MmInySIg… first seen (announce)
-[trystero-patch] MmInySIg… received offer 63ilGb5x (we are answering)
-[trystero-patch] MmInySIg… fresh → connected (held 0s)
-[mesh] peer joined: MmInySIg…
-[mesh] auth ok with fustnkbg… (approver=false)
-[mesh] peer active: fustnkbg…
-... (34s of healthy connection) ...
-[mesh] ICE disconnected >1s for MmInySIg… — kicking restartIce()
-[trystero-patch] MmInySIg… ICE health=transient — entered 7.5s grace
-[mesh] peer left: MmInySIg… — ICE=disconnected (5s ago), pair=host↔host, lived=34s
-[trystero-patch] offer-pool flushed 20 stale entries (reason=peer-left:MmInySIg)
-... (90 seconds of silence from trystero-patch — only [mesh] signaling diag firing) ...
-[mesh] 1 peer(s) aged out of reconnecting grace — now offline
-[mesh] auto rediscovery #1 — kicking rediscovery
-[mesh] rediscovery — leaving and rejoining mesh room
-... (mesh restarts) ...
-[trystero-patch] MmInySIg… received offer mpu6F7H2 (we are answering)
-[mesh] peer joined: MmInySIg…  ← post-rebuild reconnect
-```
-
-This trace is decisive on three things:
-
-1. **The flush fires** (`offer-pool flushed 20 stale entries`) at the
-   right moment. Good. But it doesn't help in this scenario, because:
-2. **We are the answering side in both attempts** (`received offer
-   63ilGb5x` initially, `received offer mpu6F7H2` post-rebuild). The
-   pool flush only matters for the side that **sends** offers. The
-   other end (Apple Silicon laptop) is the leader. Our pool is
-   irrelevant here.
-3. **The leader (MmInySIg) doesn't send a fresh offer for 90s**. We
-   keep sending it `{peerId: selfId}` announce-back-ids (the
-   non-leading-side response to incoming announcements — silently, no
-   log), and it never responds with a new offer. Then our local
-   `forceRediscovery` rebuilds the room, and *immediately* after our
-   rejoin presence event lands, MmInySIg sends offer `mpu6F7H2` and
-   we're reconnected within seconds.
-
-That last point is the open question.
-
-## The open question
-
-**Why does the leader (MmInySIg) only send us a fresh offer after our
-local rebuild, and not in response to the 90 seconds of regular
-presence announces we send beforehand?**
-
-From our pre-rebuild perspective, we send the leader the same kind of
-Nostr presence events we always send. From the leader's
-`createSignalHandler` perspective, those events arrive as
-announcements. With both ends on this branch, the leader's state for
-us should be:
-
-- `state.connectedPeer = null` (cleared by their own
-  `strategy.onPeerLeave` when their underlying connection to us died)
-- `state.offerAnswered = false` (cleared by `attachSharedPeerToRoom`'s
-  `resetOfferState` at connect time, and again defensively by our
-  patched `clearConnectedPeer`)
-- `state.answeringPeer = null`
-- `state.offerPeer = null`
-- `state.offerRelays = []`
-
-If all that holds, their `handleAnnouncement` should reach
-`ensureOffer → signalPeer(offer)` and send us a new offer. It
-doesn't, for 90s. **Something on the leader's side is preventing the
-new offer.**
-
-Possibilities the next agent should chase, in rough order of likelihood:
-
-### Hypothesis A: the leader's connection state hasn't actually been cleared
-
-`strategy.onPeerLeave` only fires when `room.mjs`'s `exitPeer` runs,
-which only runs when `binding.handlers.close` fires, which only runs
-when `SharedPeerManager.clear` runs, which only runs when the raw
-peer's underlying close event fires. On the **non-swap** side, that
-close event might not fire until WebRTC's full ICE consent freshness
-timeout (15-30s). During that window, the leader's `state.connectedPeer`
-is still set; our patched `getConnectedPeerHealth` returns
-`"transient"`; `createSignalHandler` would clear via the 7.5s grace —
-**but only when it receives a message from us with the peer attached**.
-
-The leader receives Nostr presence events from us (just `{peerId:
-selfId}`). The signal-handler code path for an announcement with
-`state.connectedPeer` set is:
-
-```js
-if (connectedPeer && state) {
-    const health = getConnectedPeerHealth(connectedPeer);
-    if (health === "live") return;
-    // ... transient grace handling ...
-}
-```
-
-If the leader's local PC state is `"disconnected"`, `health =
-"transient"`, the grace window engages, and after 7.5s of incoming
-announces from us their `state.connectedPeer` is cleared. Then the
-next announce should trigger `handleAnnouncement` → fresh offer.
-
-If the leader's local PC state stays `"connected"` (their channel
-appears healthy from their side even though the link is dead), then
-`health = "live"` and they early-return on every announce forever.
-
-**Action for next agent:** get a trace from the leader's side during
-a swap. The user has tested both sides on this branch. Ask them to
-open DevTools on the **non-swap** end and reproduce. Look for what
-`getConnectedPeerHealth` returns when our messages arrive after our
-network change. If it stays `"live"`, the patch needs to also consider
-`iceConnectionState === "disconnected"` and possibly RTT-based
-liveness signals.
-
-### Hypothesis B: the leader's offer pool is also stale somehow
-
-Less likely — the leader's IP didn't change. But their pool peers
-might have been created during a period where their network was
-flapping. Their `peer.created` timestamps and `offerTtl` interaction
-might be relevant. Check: when the leader does eventually send a
-post-rebuild offer, is it from a fresh pool peer or a long-cached one?
-
-### Hypothesis C: the answer is being sent but lost in transit
-
-We're confident the leader doesn't send a fresh offer because our
-`handleOffer:received offer` log doesn't fire. But there could be a
-Nostr relay routing issue where messages from the leader to us during
-the 90s window go via a different path than messages after our
-rebuild. The user's mesh routes via 5 Nostr relays. Check whether
-the `signaling: 5/5 open` lines during the wait window show inbound
-EVENTs from the leader's pubkey (the trace shows two authors
-`cfe5d8aa…` and `11b21a59…` — figure out which is the leader).
-
-### Hypothesis D: there's a third state field I haven't identified
-
-`signal-handler.mjs` has a few more state fields I haven't fully
-chased: `offerInitPromise`, `offerExpiryTimer`, `offerSignalRelays`,
-`offerSignalBacklog`, `offerRelayTimers`, `pendingCandidates`. One
-of these might be stuck on the leader's side after disconnect.
-`pendingCandidates` is the one I'd suspect most — if it accumulated
-stale ICE candidates during the dying connection, the leader might
-be trying to apply them to the new answer-peer and failing silently.
-
-### Hypothesis E: it's not the leader, it's that *our* peer state is
-gone on their side
-
-When OUR side fires `room.leave()` during the rebuild, the leader
-should see our connection vanish (Nostr stops publishing our
-presence to them briefly, then a fresh-room presence event arrives).
-Maybe what unsticks them isn't our re-presence but the *gap* — they
-might have something gated on "we haven't seen this peer for X seconds,
-treat them as new". If so, an equivalent on the swap side would be a
-mechanism to explicitly tell the leader "discard your state for me".
-This is hard to do without their cooperation, but Trystero's
-`{peerId: selfId, hasOutgoingOffer: ...}` payload has a
-`hasOutgoingOfferHint` field we could repurpose — or we could add a
-new payload flag in the patch.
+`[mesh] peer left` includes `pair=<localCandidateType>↔<remoteCandidateType>`
+and `lived=Ns`. `[mesh] signaling: …` is change-gated (5-min
+heartbeat), so silence during a stable gap is expected.
 
 ## Iterations that have already been tried
 
-In commit order on this branch, what we tried and what we learned:
+In commit order on this branch:
 
 | Commit | What it did | What we learned |
 |---|---|---|
-| `8c01989` | Patched `state.offerAnswered = false` in `clearConnectedPeer` and `strategy.onPeerLeave` because we thought `offerAnswered` was sticky | **Wrong hypothesis.** `attachSharedPeerToRoom`'s `resetOfferState` already clears `offerAnswered` at connect time, so it's `false` by the time these callbacks fire. The patch was a no-op. Kept the clears defensively. |
-| `0f2e015` | Per-event diagnostic firehose | **Too noisy** — drowned the console. User explicitly called this out. Replaced with state-transition logging in `ad8a1b9`. |
-| `039de8d` | `vite.config.ts` `optimizeDeps.exclude` for trystero packages + module-load markers in the patch | **Real reliability fix.** pnpm-patch changes were getting lost in vite's dep pre-bundle cache. Module-load markers let us verify the patched bundle is what's running. Keep these. |
-| `3581327` | `package.json` postinstall script that nukes `node_modules/.vite` | **Real reliability fix.** Same problem, belt-and-suspenders on top of `optimizeDeps.exclude`. Keep this. |
-| `9c7f688` | `shared-peer.mjs::getConnectedPeerHealth` returns `"transient"` for `connectionState === "disconnected"` | **Correct fix.** This is the right behavior — the upstream `"live"` short-circuit was too forgiving. Helps on the non-swap side specifically. Keep this. |
-| `ad8a1b9` (current) | `flushStaleOfferPool` in `strategy.mjs::onPeerLeave` + state-transition instrumentation | **Functional but insufficient.** The flush fires correctly (verified in trace), but it only helps the side that sends offers, and the user's test scenario has them as the *answering* side. Need to investigate the leader's behavior. |
+| `8c01989` | Patched `state.offerAnswered = false` in `clearConnectedPeer` and `strategy.onPeerLeave` because we thought `offerAnswered` was sticky | **Wrong hypothesis.** `attachSharedPeerToRoom`'s `resetOfferState` already clears `offerAnswered` at connect time, so it's `false` by the time these callbacks fire. Kept the clears defensively. |
+| `0f2e015` | Per-event diagnostic firehose | **Too noisy** — drowned the console. Replaced with state-transition logging in `ad8a1b9`. |
+| `039de8d` | `vite.config.ts` `optimizeDeps.exclude` for trystero packages + module-load markers in the patch | **Real reliability fix.** Keep these. |
+| `3581327` | `package.json` postinstall script that nukes `node_modules/.vite` | **Real reliability fix.** Belt-and-suspenders. Keep. |
+| `9c7f688` | `shared-peer.mjs::getConnectedPeerHealth` returns `"transient"` for `connectionState === "disconnected"` | **Correct fix.** Right behavior; the upstream `"live"` short-circuit was too forgiving. Keep. |
+| `ad8a1b9` | `flushStaleOfferPool` in `strategy.mjs::onPeerLeave` + state-transition instrumentation | **Correct fix for the offer-side stale-candidate problem, but not the bottleneck.** The 90s window persisted because we couldn't even RECEIVE announces — see this commit. |
+| `<this>` | `utils.mjs::makeSocket` replays Nostr `REQ` subscriptions on every WebSocket reopen with 5/10/15/30/60s backoff | **Root-cause fix (pending in-the-wild verification).** The 90s gap was the relay forwarding zero events to a reconnected-but-resubscribed socket. |
 
-## Files to know
+## Why earlier hypotheses missed this
 
-- `patches/@trystero-p2p__core@0.24.0.patch` — the patch file. Do not
-  edit this directly; use `pnpm patch @trystero-p2p/core@0.24.0` to
-  open an editable copy, then `pnpm patch-commit <dir>` to regenerate
-  the patch. The editable copy lives at
-  `node_modules/.pnpm_patches/@trystero-p2p/core@0.24.0`.
+The prior round was looking at `peerStates[peerId]` and offer-pool
+contents to explain why `handleAnnouncement` wouldn't send a fresh
+offer. That assumed `handleAnnouncement` was being CALLED in the
+first place — i.e. that announces were arriving. They weren't,
+because subscriptions were dead at the relay. The state-transition
+instrumentation logged nothing during the gap not because
+`handleAnnouncement` early-returned, but because no message ever
+made it to `createSignalHandler`.
+
+The clue that broke this open: the signaling diag is **change-gated**
+(`fingerprint_changed && heartbeat_due`), so total silence during
+the 90s gap means "state is stable" — not "relays are down." Sockets
+were sitting at `readyState === 1`, looking perfectly healthy, but
+silently subscribe-less. The user's comment "starting a connection
+is so fast, but reconnecting is impossibly slow" pointed straight
+at this: cold start runs `subscribe()`; reconnect doesn't.
+
+## If the patch doesn't help
+
+If a verified swap on this build still shows 90s of dead air, here
+are the most likely next places to look, in order:
+
+1. **The patch isn't running.** Module-load markers are the
+   sanity check. Also `grep -c "replayed.*subscription"
+   dist/assets/nostr-*.js` should return ≥1 in the built bundle.
+2. **The replays fire but the relay rejects them.** Some Nostr
+   relays may close the connection on a duplicate-subId REQ
+   instead of just refreshing the subscription. If you see
+   `[trystero-patch] <host> replayed …` followed by another
+   `WebSocket connection to 'wss://…' failed`, the replay
+   triggered the rejection. Workaround: regen `subId` per
+   reconnect (would require also updating Trystero's `msgHandlers`
+   map to remap the new subId to the same handler — a deeper
+   patch).
+3. **The other side has a different bug.** Capture the non-swap
+   side's trace (the desktop) during the same swap. Look for
+   whether the desktop sees our resubscribe-triggered events
+   in inbound EVENT counters. If the desktop's relays are
+   forwarding our announces but the offer/answer still isn't
+   completing, the issue moved into the WebRTC layer.
+4. **The backoff is too long for the failure mode.** If
+   reconnects come in bursts faster than 5s, the first replay
+   fires but subsequent replays are deferred. Could shorten the
+   first-slot to ~2s if that's what the trace shows.
+
+## Files to know (unchanged from the prior handoff)
+
+- `patches/@trystero-p2p__core@0.24.0.patch` — the patch file. Use
+  `pnpm patch @trystero-p2p/core@0.24.0` to open an editable copy at
+  `node_modules/.pnpm_patches/@trystero-p2p/core@0.24.0`, then
+  `pnpm patch-commit <path>` to regenerate.
 - `src/mesh-client.svelte.ts` — the application's mesh client.
-  Constants worth knowing: `RECONNECTING_GRACE_MS = 90_000`,
-  `ICE_DISCONNECTED_RESTART_MS = 1_000`. The `forceRediscovery` path
-  (the heavy rebuild backstop) is at `forceRediscovery` / `reconcile`.
-- `CONNECTION-ENGINE.md` — the architecture / journal doc. Section
-  "Known upstream limitations (and how we patch them)" is the current
-  state-of-knowledge; the journal at the bottom is the chronological
-  history. **Update both** when you ship a real fix.
-- `vite.config.ts` — `optimizeDeps.exclude` keeps trystero out of the
-  pre-bundle cache.
+  Constants: `RECONNECTING_GRACE_MS = 90_000`,
+  `ICE_DISCONNECTED_RESTART_MS = 1_000`.
+- `CONNECTION-ENGINE.md` — the architecture / journal doc.
+  "Known upstream limitations" updated for this round.
+- `vite.config.ts` — `optimizeDeps.exclude` keeps trystero out
+  of the pre-bundle cache.
 - `package.json` — `postinstall` nukes `.vite`; `patchedDependencies`
   applies the patch.
 
-## What NOT to do
+## What NOT to do (still applies)
 
-- **Don't revert grace timing back to 30s.** The user has called out
-  that giving up by making the rebuild fire fast is not the answer.
-  90s of grace gives the natural re-handshake room to engage. Find
-  the bug.
-- **Don't add log-spam per-event.** State transitions only. If you
-  need volume during a specific debugging session, gate it behind a
-  `localStorage.trysteroPatchVerbose` flag so it's off by default.
-- **Don't speculate without evidence.** Every hypothesis above came
-  from a clear signal in a trace. Get a trace before changing code.
-- **Don't trust pnpm "Already up to date".** On Windows in
-  particular, pnpm's patch-application check is unreliable. The
-  module-load marker is the only way to be sure the patched bundle
-  is running. If the marker isn't in the console, something is
-  wrong — typical fix is `Remove-Item -Recurse -Force node_modules
-  && just dev`. The postinstall + `optimizeDeps.exclude` should
-  prevent this but don't always.
-
-## Reading the diag logs
-
-State-transition logs:
-- `<peerid>… first seen (announce)` — first announcement from this peer
-- `<peerid>… received offer <ofId> (we are answering)` — they led
-- `<peerid>… sending offer <ofId>` — we led, first send for this offer
-- `<peerid>… replacing offer <old> (after Ns, no answer) with <new>` — we generated a new offer
-- `<peerid>… STILL no answer for offer <ofId> after Ns` — stuck (15s/30s/60s/120s thresholds)
-- `<peerid>… received answer for <ofId> after Ns`
-- `<peerid>… fresh → connected (held 0s)` — handshake completed
-- `<peerid>… connected → disconnected (held Ns) lived=Ns reason=...`
-- `<peerid>… ICE health=transient — entered 7.5s grace` — connection unhealthy
-- `offer-pool flushed N stale entries (reason=...)` — our pool flush fired
-
-Application-level mesh logs are tagged `[mesh]` and come from
-`mesh-client.svelte.ts`. The `peer left` line includes
-`pair=<localCandidateType>↔<remoteCandidateType>` and `lived=Ns`
-which are useful.
-
-## Suggested first 30 minutes
-
-1. Read this file. Read `CONNECTION-ENGINE.md`'s "Known upstream
-   limitations" section.
-2. Skim the latest trace excerpt above. Identify the 90-second silent
-   window.
-3. Pull the branch and run a no-swap sanity check (`git pull && just
-   dev` on either machine, watch for the two module-load markers).
-4. **Before writing any patch code**, ask the user to capture a
-   trace from the *other* end (non-swap side) during a swap.
-   Specifically, you want to see what their `getConnectedPeerHealth`
-   returns when our presence announce arrives after our network
-   change. That trace will tell you whether Hypothesis A or some
-   other one is right.
-
-## Caveats / gotchas
-
-- The user has two devices: **Windows desktop** (the swap-side) and
-  **Apple Silicon laptop** (the other end). Older messages call the
-  laptop "Pi" — this is incorrect, it's a Mac.
-- Trystero's `selfId` is generated once per `import` of the library.
-  In one trace we saw the laptop's `selfId` change between cycles
-  (`mKkDmcjz` → `wdMvW9K2`) — that means their app/process restarted
-  between cycles. Don't assume the same selfId across reproductions.
-- The user is sometimes Windows PowerShell. Common gotcha:
-  execution policy. They have it set to `RemoteSigned -Scope
-  CurrentUser` now. If a fresh test machine has issues, that's
-  probably the cause.
-- `just dev` runs `pnpm install --frozen-lockfile` then `pnpm tauri
-  dev`. The frozen-lockfile flag means pnpm won't update the
-  lockfile even if the patch changes — but it does still re-apply
-  patches whose hash matches the lockfile entry, so this is fine in
-  the common case.
-
-Good luck. The user has been patient through five iterations. Be
-honest about what you find.
+- **Don't revert grace timing.** 90s remains a fine backstop for
+  the rebuild path. We just shouldn't need it to fire.
+- **Don't add log-spam per-event.** State transitions only.
+- **Don't speculate without evidence.** Get a trace.
+- **Don't trust pnpm "Already up to date".** Module-load marker is
+  the only way to be sure the patched bundle is running.

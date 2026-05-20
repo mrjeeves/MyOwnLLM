@@ -309,3 +309,110 @@ index 97d76310a7c0af76d63f5fa135ede35fa73d164a..b7c102c5e19716141ea47cbb42e987f6
  		}, () => {
  			didLeaveRoom = true;
  			onPeerConnect = noOp;
+diff --git a/dist/utils.mjs b/dist/utils.mjs
+index 25fabfb27d599eb00791f8770b37930245e214a9..9d5025421710997a0b79ec16885ae238d98b2101 100644
+--- a/dist/utils.mjs
++++ b/dist/utils.mjs
+@@ -69,6 +69,73 @@ const resumeRelayReconnection = () => {
+ };
+ const makeSocket = (url, onMessage) => {
+ 	const client = {};
++	// MyOwnLLM patch (CONNECTION-ENGINE.md → Known upstream limitations):
++	// Nostr relays drop subscription state when their underlying
++	// WebSocket closes — that's per-spec. Trystero's strategy.mjs
++	// calls the strategy's `subscribe()` exactly once at room init
++	// (line 222 of strategy.mjs), so after a network swap (e.g.
++	// laptop wifi → phone hotspot) the new sockets reopen but the
++	// relay has no record of our REQs and forwards nothing. The
++	// connection looks fine from `getRelaySockets()` (`readyState
++	// === 1`), our presence publishes go out, but no inbound
++	// EVENTs ever arrive — natural re-handshake silently stalls
++	// for the full 90s grace window until `forceRediscovery`'s
++	// heavy room rebuild fires a fresh `joinRoom()` (which calls
++	// `subscribe()` again from scratch). Symptom in the trace:
++	// 90s of dead air, then post-rebuild reconnect in ~1s.
++	//
++	// The fix:
++	//   1. Intercept outgoing `["REQ", subId, …]` / `["CLOSE", subId]`
++	//      in `client.send` and track the active subscription set
++	//      per WebSocket URL.
++	//   2. On every `onopen` AFTER the first, replay the active REQ
++	//      messages so the relay re-establishes its forward path.
++	//
++	// Anti-flood: resubscribe attempts share a per-socket backoff
++	// schedule (5s / 10s / 15s / 30s / 60s, sticking at 60s). The
++	// backoff index resets after BACKOFF_RESET_AFTER_MS of quiet
++	// so a long-stable connection that finally blips doesn't pay
++	// the cap. If a reconnect lands while a replay is already
++	// scheduled, the schedule call is a no-op — one in-flight
++	// replay per URL at a time. Non-JSON / non-REQ-CLOSE sends
++	// (e.g. EVENT publishes) pass through untouched.
++	const activeSubscriptions = new Map();
++	const resubscribeBackoffMs = [5e3, 10e3, 15e3, 30e3, 60e3];
++	const backoffResetAfterMs = 60e3;
++	let resubscribeAttempt = 0;
++	let lastResubscribeAt = 0;
++	let pendingResubscribeTimer = null;
++	let hasOpenedOnce = false;
++	const shortUrl = url.replace(/^wss?:\/\//, "").replace(/\/$/, "");
++	const patchLog = (msg) => {
++		if (typeof console !== "undefined" && console.warn) console.warn("[trystero-patch] " + msg);
++	};
++	const executeReplay = () => {
++		const socket = client.socket;
++		if (!socket || socket.readyState !== 1) return;
++		if (activeSubscriptions.size === 0) return;
++		for (const reqMsg of activeSubscriptions.values()) socket.send(reqMsg);
++		lastResubscribeAt = Date.now();
++		resubscribeAttempt += 1;
++		const idx = Math.min(resubscribeAttempt, resubscribeBackoffMs.length - 1);
++		patchLog(shortUrl + " replayed " + activeSubscriptions.size + " subscription(s) on reconnect (attempt=" + resubscribeAttempt + ", next-eligible-in=" + Math.round(resubscribeBackoffMs[idx] / 1e3) + "s)");
++	};
++	const scheduleReplay = () => {
++		if (pendingResubscribeTimer !== null) return;
++		const now = Date.now();
++		if (lastResubscribeAt > 0 && now - lastResubscribeAt > backoffResetAfterMs) resubscribeAttempt = 0;
++		const idx = Math.min(resubscribeAttempt, resubscribeBackoffMs.length - 1);
++		const desired = resubscribeBackoffMs[idx];
++		const sinceLast = now - lastResubscribeAt;
++		if (lastResubscribeAt === 0 || sinceLast >= desired) {
++			executeReplay();
++			return;
++		}
++		pendingResubscribeTimer = setTimeout(() => {
++			pendingResubscribeTimer = null;
++			executeReplay();
++		}, desired - sinceLast);
++	};
+ 	const init = () => {
+ 		const socket = new WebSocket(url);
+ 		socket.onclose = () => {
+@@ -86,8 +153,28 @@ const makeSocket = (url, onMessage) => {
+ 		client.ready = new Promise((res) => socket.onopen = () => {
+ 			res(client);
+ 			socketRetryPeriods[url] = defaultRetryMs;
++			// MyOwnLLM patch: replay subscriptions on every reopen
++			// AFTER the first. The strategy's subscribe() callback
++			// fires on the first open and seeds activeSubscriptions
++			// itself via the client.send interception below.
++			if (hasOpenedOnce) scheduleReplay();
++			hasOpenedOnce = true;
+ 		});
+ 		client.send = (data) => {
++			// MyOwnLLM patch: capture Nostr REQ/CLOSE on the wire so
++			// we can replay active subscriptions across reconnects.
++			// Non-JSON data and other strategies (e.g. MQTT binary)
++			// fall through silently — the JSON.parse failure path
++			// is the no-op.
++			if (typeof data === "string" && data.charCodeAt(0) === 91 /* '[' */) {
++				try {
++					const parsed = JSON.parse(data);
++					if (Array.isArray(parsed) && typeof parsed[1] === "string") {
++						if (parsed[0] === "REQ") activeSubscriptions.set(parsed[1], data);
++						else if (parsed[0] === "CLOSE") activeSubscriptions.delete(parsed[1]);
++					}
++				} catch (_) { /* not JSON, ignore */ }
++			}
+ 			if (socket.readyState === 1) socket.send(data);
+ 		};
+ 	};
