@@ -49,6 +49,18 @@ export default defineConfig({
     strictPort: true,
     watch: { ignored: ["**/src-tauri/**"] },
   },
+  // Skip vite's dep pre-bundling for trystero / @trystero-p2p packages.
+  // We apply a pnpm patch to @trystero-p2p/core (see patches/) and the
+  // pre-bundle cache in node_modules/.vite/deps/ does not reliably
+  // invalidate when the patch changes — especially across OSes (Windows
+  // dev sessions kept serving the unpatched bundle until a manual cache
+  // wipe). Excluding them makes vite serve the patched .mjs files
+  // directly from node_modules on every page load, so any patch change
+  // takes effect on the next reload with no manual intervention. The
+  // production build path (rollup, not optimizeDeps) is unaffected.
+  optimizeDeps: {
+    exclude: ["trystero", "@trystero-p2p/core", "@trystero-p2p/nostr"],
+  },
   envPrefix: ["VITE_", "TAURI_ENV_*"],
   define: {
     __APP_VERSION__: JSON.stringify(APP_VERSION),

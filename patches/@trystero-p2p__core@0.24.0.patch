@@ -1,8 +1,25 @@
 diff --git a/dist/signal-handler.mjs b/dist/signal-handler.mjs
-index d8841faba4ec9daf93b020967f13db5609148928..7d7c18c3127ee0d89629522993a3c953f428c429 100644
+index d8841faba4ec9daf93b020967f13db5609148928..b3d0365ef235386989378f5c72d45dd0ccdb561e 100644
 --- a/dist/signal-handler.mjs
 +++ b/dist/signal-handler.mjs
-@@ -9,6 +9,20 @@ const disconnectedPeerGraceMs = 7533;
+@@ -2,6 +2,16 @@ import { all, candidateType, fromJson, genId, mkErr, resetTimer, selfId, toJson,
+ import { sha1 } from "./crypto.mjs";
+ import { offerTtl } from "./offer-pool.mjs";
+ import { getConnectedPeerHealth } from "./shared-peer.mjs";
++// MyOwnLLM patch — module-load marker (see CONNECTION-ENGINE.md
++// "Known upstream limitations"). Fires exactly once when this file
++// is first imported. Lets us verify at a glance that the patched
++// signal-handler.mjs is the one bundled into the running app; if
++// you don't see "[trystero-patch] signal-handler.mjs loaded" in
++// devtools shortly after the app starts, something is wrong with
++// the install or the bundler is serving an unpatched copy.
++if (typeof console !== "undefined" && console.warn) {
++	console.warn("[trystero-patch] signal-handler.mjs loaded (diag overlay v2)");
++}
+ //#region src/signal-handler.ts
+ const offerPostAnswerTtlMs = 23333;
+ const offerIdSize = 12;
+@@ -9,6 +19,20 @@ const disconnectedPeerGraceMs = 7533;
  const answeringTtlMs = 23333;
  const legacyCandidateKey = "__legacy__";
  const offerRelayPlaceholder = "offer-placeholder";
@@ -23,7 +40,7 @@ index d8841faba4ec9daf93b020967f13db5609148928..7d7c18c3127ee0d89629522993a3c953
  const publishCipheredSignalingMessage = (ctx, signal, peerTopic, signalPeer, buildPayload, stillValid) => {
  	ctx.toCipher(signal).then((encryptedSignal) => {
  		if (ctx.isLeaving() || !stillValid()) return;
-@@ -48,10 +62,23 @@ const clearAnswering = (state, peer) => {
+@@ -48,10 +72,23 @@ const clearAnswering = (state, peer) => {
  	}
  };
  const clearConnectedPeer = (state, peerId, _reason) => {
@@ -48,7 +65,7 @@ index d8841faba4ec9daf93b020967f13db5609148928..7d7c18c3127ee0d89629522993a3c953
  	updateStatus(state);
  };
  const clearOfferRelay = (state, relayId) => {
-@@ -158,19 +185,26 @@ const ensureOffer = (ctx, state, peerId, relayId) => {
+@@ -158,19 +195,26 @@ const ensureOffer = (ctx, state, peerId, relayId) => {
  	return state.offerInitPromise;
  };
  const handleAnnouncement = async (ctx, relayId, peerId, shared, signalPeer) => {
@@ -76,7 +93,7 @@ index d8841faba4ec9daf93b020967f13db5609148928..7d7c18c3127ee0d89629522993a3c953
  		clearOfferRelayIfPlaceholder(state, relayId);
  		return;
  	}
-@@ -188,6 +222,7 @@ const handleAnnouncement = async (ctx, relayId, peerId, shared, signalPeer) => {
+@@ -188,6 +232,7 @@ const handleAnnouncement = async (ctx, relayId, peerId, shared, signalPeer) => {
  			candidate: sdp
  		}), () => !state.connectedPeer && state.offerPeer === offerInfo.peer && state.offerId === offerInfo.offerId);
  	};
@@ -84,7 +101,7 @@ index d8841faba4ec9daf93b020967f13db5609148928..7d7c18c3127ee0d89629522993a3c953
  	signalPeer(peerTopic, toJson({
  		peerId: selfId,
  		offerId: offerInfo.offerId,
-@@ -198,7 +233,11 @@ const handleAnnouncement = async (ctx, relayId, peerId, shared, signalPeer) => {
+@@ -198,7 +243,11 @@ const handleAnnouncement = async (ctx, relayId, peerId, shared, signalPeer) => {
  };
  const handleOffer = async (ctx, relayId, peerId, offer, offerId, hasOutgoingOfferHint, signalPeer) => {
  	const state = getState(ctx.peerStates, peerId);
@@ -97,7 +114,7 @@ index d8841faba4ec9daf93b020967f13db5609148928..7d7c18c3127ee0d89629522993a3c953
  	const hasTrackedOutgoingOffer = Boolean(state.offerPeer || state.offerRelays.some(Boolean));
  	if ((hasTrackedOutgoingOffer || hasOutgoingOfferHint) && selfId < peerId) return;
  	if (hasTrackedOutgoingOffer) resetOfferState(state, ctx.offerPool);
-@@ -290,6 +329,7 @@ const handleAnswer = async (ctx, relayId, peerId, answer, offerId, peer) => {
+@@ -290,6 +339,7 @@ const handleAnswer = async (ctx, relayId, peerId, answer, offerId, peer) => {
  		return;
  	}
  	if (peer) {
@@ -105,7 +122,7 @@ index d8841faba4ec9daf93b020967f13db5609148928..7d7c18c3127ee0d89629522993a3c953
  		ctx.offerPool.claimLeased(peer);
  		peer.setHandlers({
  			connect: () => ctx.connectPeer(peer, peerId, relayId),
-@@ -298,7 +338,11 @@ const handleAnswer = async (ctx, relayId, peerId, answer, offerId, peer) => {
+@@ -298,7 +348,11 @@ const handleAnswer = async (ctx, relayId, peerId, answer, offerId, peer) => {
  		peer.signal(plainAnswer);
  	} else {
  		const state = ctx.peerStates[peerId];
@@ -118,7 +135,7 @@ index d8841faba4ec9daf93b020967f13db5609148928..7d7c18c3127ee0d89629522993a3c953
  		state.offerAnswered = true;
  		scheduleOfferExpiry(ctx, state, peerId, offerPostAnswerTtlMs);
  		state.offerPeer.signal(plainAnswer);
-@@ -320,6 +364,7 @@ const createSignalHandler = (ctx) => (relayId) => async (topic, msg, signalPeer)
+@@ -320,6 +374,7 @@ const createSignalHandler = (ctx) => (relayId) => async (topic, msg, signalPeer)
  	const peer = payload["peer"];
  	const hasOutgoingOfferHint = payload["hasOutgoingOffer"] === true;
  	if (peerId === selfId) return;
@@ -126,7 +143,7 @@ index d8841faba4ec9daf93b020967f13db5609148928..7d7c18c3127ee0d89629522993a3c953
  	const state = ctx.peerStates[peerId];
  	const connectedPeer = state?.connectedPeer;
  	if (connectedPeer && state) {
-@@ -328,17 +373,23 @@ const createSignalHandler = (ctx) => (relayId) => async (topic, msg, signalPeer)
+@@ -328,17 +383,23 @@ const createSignalHandler = (ctx) => (relayId) => async (topic, msg, signalPeer)
  			state.connectedPeerUnhealthySinceMs = null;
  			return;
  		}
@@ -151,7 +168,7 @@ index d8841faba4ec9daf93b020967f13db5609148928..7d7c18c3127ee0d89629522993a3c953
  		ctx.sharedPeers.clear(ctx.appId, peerId, { destroyPeer: true });
  		shared = void 0;
  	}
-@@ -349,13 +400,22 @@ const createSignalHandler = (ctx) => (relayId) => async (topic, msg, signalPeer)
+@@ -349,13 +410,22 @@ const createSignalHandler = (ctx) => (relayId) => async (topic, msg, signalPeer)
  	if (isAnnouncement && !shared) {
  		const announcePeerState = getState(ctx.peerStates, peerId);
  		const shouldLeadOffer = selfId < peerId;
@@ -177,10 +194,22 @@ index d8841faba4ec9daf93b020967f13db5609148928..7d7c18c3127ee0d89629522993a3c953
  		updateStatus(announcePeerState);
  	}
 diff --git a/dist/strategy.mjs b/dist/strategy.mjs
-index 97d76310a7c0af76d63f5fa135ede35fa73d164a..3535adbf17f0d228f3e791573f9f4fe306b8567c 100644
+index 97d76310a7c0af76d63f5fa135ede35fa73d164a..ce268f032110b5d78e6d2ba7521892c4406e2e9b 100644
 --- a/dist/strategy.mjs
 +++ b/dist/strategy.mjs
-@@ -99,6 +99,14 @@ var strategy_default = ({ init, subscribe, announce }) => {
+@@ -6,6 +6,11 @@ import peer_default from "./peer.mjs";
+ import room_default from "./room.mjs";
+ import { SharedPeerManager } from "./shared-peer.mjs";
+ import { clearConnectedPeer, createSignalHandler, getState, resetOfferState, updateStatus } from "./signal-handler.mjs";
++// MyOwnLLM patch — module-load marker for strategy.mjs. See
++// CONNECTION-ENGINE.md "Known upstream limitations".
++if (typeof console !== "undefined" && console.warn) {
++	console.warn("[trystero-patch] strategy.mjs loaded (diag overlay v2)");
++}
+ //#region src/strategy.ts
+ const announceIntervalMs = 5333;
+ const announceWarmupIntervalsMs = [
+@@ -99,6 +104,14 @@ var strategy_default = ({ init, subscribe, announce }) => {
  		};
  		const attachSharedPeerToRoom = (peerId, shared) => {
  			const state = getState(ctx.peerStates, peerId);
@@ -195,7 +224,7 @@ index 97d76310a7c0af76d63f5fa135ede35fa73d164a..3535adbf17f0d228f3e791573f9f4fe3
  			state.answeringExpiryTimer = resetTimer(state.answeringExpiryTimer);
  			state.answeringPeer = null;
  			const { proxy, isNew } = sharedPeers.bind(roomId, roomNamespacePromise, shared, { onDetach: () => {
-@@ -116,6 +124,15 @@ var strategy_default = ({ init, subscribe, announce }) => {
+@@ -116,6 +129,15 @@ var strategy_default = ({ init, subscribe, announce }) => {
  			resetOfferState(state, pool);
  		};
  		const connectPeer = (peer, peerId, _relayId) => {
@@ -211,7 +240,7 @@ index 97d76310a7c0af76d63f5fa135ede35fa73d164a..3535adbf17f0d228f3e791573f9f4fe3
  			if (didLeaveRoom) {
  				peer.destroy();
  				return;
-@@ -221,8 +238,31 @@ var strategy_default = ({ init, subscribe, announce }) => {
+@@ -221,8 +243,31 @@ var strategy_default = ({ init, subscribe, announce }) => {
  		const joinedRoom = room_default((f) => onPeerConnect = f, (id) => {
  			if (didLeaveRoom) return;
  			const state = ctx.peerStates[id];
