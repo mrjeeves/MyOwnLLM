@@ -129,17 +129,6 @@
     <ProvidersSection {onChanged} showBack onBack={() => (showProviders = false)} />
   {:else}
     <div class="content">
-      <button class="providers-card" onclick={() => (showProviders = true)}>
-        <div class="providers-card-main">
-          <span class="providers-card-title">Providers</span>
-          <span class="providers-card-desc">
-            Manage manifest sources — add, switch, or remove the providers
-            that publish model families.
-          </span>
-        </div>
-        <span class="providers-card-chevron" aria-hidden="true">›</span>
-      </button>
-
       {#if loading}
         <div class="loading">Loading…</div>
       {:else if error && !status}
@@ -256,6 +245,17 @@
         <div class="error">{error}</div>
       {/if}
       {/if}
+
+      <button class="providers-card" onclick={() => (showProviders = true)}>
+        <div class="providers-card-main">
+          <span class="providers-card-title">Providers</span>
+          <span class="providers-card-desc">
+            Manage manifest sources — add, switch, or remove the providers
+            that publish model families.
+          </span>
+        </div>
+        <span class="providers-card-chevron" aria-hidden="true">›</span>
+      </button>
     </div>
   {/if}
 </div>
