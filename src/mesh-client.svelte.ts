@@ -387,13 +387,22 @@ const WAKE_COALESCE_MS = 2_000;
  *  the budget has to absorb a real model-load pause. */
 const HEARTBEAT_INTERVAL_MS = 30_000;
 /** Consider the channel stale (start re-handshaking) if no message
- *  has arrived in this window. ~2.5 missed pings of grace before
- *  we enter the reconnect loop; chosen to be tolerant of a brief
- *  network jitter and the longest main-thread stalls we see in
- *  practice (model load) without burying real stalls. Post-wake
- *  detection is much faster via WAKE_PROBE_DELAY_MS — this window
- *  only governs steady-state stalls. */
-const HEARTBEAT_TIMEOUT_MS = 75_000;
+ *  has arrived in this window. Sized to match the ping cadence
+ *  exactly: a healthy connection sees at least one message per
+ *  interval (the pong we ourselves elicit, plus any organic
+ *  protocol traffic). One full interval of silence is already
+ *  abnormal — by the time the second interval would fire we
+ *  should already be re-handshaking, not still waiting. The old
+ *  75s value was nominally "2.5 missed pings of grace" but in
+ *  practice it just blanketed real network-swap zombies for a
+ *  full minute past when they were detectable. Combined with the
+ *  Trystero-patch hunks (subscription replay, transient-on-
+ *  disconnected, inbound-silence zombie clear), 30s timeout
+ *  gives the swap-side a hard deadline to notice its own
+ *  one-sided-connected state instead of riding WebRTC's consent
+ *  freshness lag. Post-wake detection still runs faster via
+ *  WAKE_PROBE_DELAY_MS. */
+const HEARTBEAT_TIMEOUT_MS = 30_000;
 /** When the gap between two heartbeat ticks is larger than this,
  *  assume the device just woke from sleep / suspend. setInterval
  *  pauses while the JS engine is frozen, so a gap much greater
@@ -3273,20 +3282,42 @@ class MeshClient {
   }
 
   /** True when at least one peer is in app-level `active` (or its
-   *  ring-shelved variant) status — i.e. fully authenticated and
-   *  exchanging mesh traffic. The "we have a working connection
-   *  somewhere" signal that the auto-rediscovery gate keys off:
-   *  if this is true, the whole stack (signaling + ICE + handshake)
-   *  is demonstrably working for that peer, so a leave/rejoin would
-   *  tear down a healthy datachannel for no benefit.
+   *  ring-shelved variant) status AND its data channel is
+   *  demonstrably alive right now — i.e. fully authenticated AND
+   *  hasn't burned through the per-peer rescue loop. The "we have
+   *  a working connection somewhere" signal that the
+   *  auto-rediscovery gate keys off.
+   *
+   *  Note: `peerStatus === "active"` alone is not enough. The status
+   *  reflects the last successful handshake; it stays "active" even
+   *  after the data channel goes silent because we don't clear
+   *  `state.connectedPeer` or the auth flag on each missed pong.
+   *  A peer that has hit `REHANDSHAKE_RESCUE_ATTEMPTS` of failed
+   *  hello-retries has proven the underlying channel is dead — we
+   *  shouldn't let its stale "active" status block the
+   *  forceRediscovery backstop, which is the only mechanism that
+   *  can actually unstick the situation. Without this carve-out,
+   *  the rescue-loop escalation at the end of
+   *  `runPerPeerRehandshake` calls `maybeForceRediscovery` only to
+   *  have it immediately skipped because the same peer it's trying
+   *  to rescue is the one gating it. Field-observed: laptop swap
+   *  to hotspot kills TURN reachability, host-only candidates fail
+   *  for symmetric NAT, re-handshake hellos go into the void, and
+   *  we sit in attempt 4 / 5 / 6 / … forever instead of rejoining.
    *
    *  Returns false when every connection is mid-handshake, pending
-   *  approval, denied, or absent — the cases where a stuck
-   *  Trystero peer-table can actually be unblocked by a rejoin. */
+   *  approval, denied, absent, or in a failed rescue loop — the
+   *  cases where a stuck Trystero peer-table CAN be unblocked by
+   *  a rejoin. */
   private hasActivePeer(): boolean {
     for (const conn of this.connections.values()) {
       const status = this.peerStatus(conn);
-      if (status === "active" || status === "shelved") return true;
+      if (status !== "active" && status !== "shelved") continue;
+      // Carve-out: a peer mid-rescue with all attempts exhausted
+      // isn't really "active" — the data channel has had 3+
+      // chances to prove itself and didn't.
+      if (conn.rehandshake_attempts >= REHANDSHAKE_RESCUE_ATTEMPTS) continue;
+      return true;
     }
     return false;
   }
