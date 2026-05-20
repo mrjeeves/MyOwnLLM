@@ -282,46 +282,68 @@ Trystero v0.24.0 has internal-state behaviors that block natural
 recovery from network swaps. The relevant ones are documented here
 along with how we work around them.
 
-**Trystero `offerAnswered` state-stickiness — patched locally.** In
-`@trystero-p2p/core/dist/signal-handler.mjs`, every connected peer
-gets `peerStates[peerId].offerAnswered = true` set when we answer
-their offer (line 302). That flag would normally be reset by either
-the offer-expiry timer (after `offerPostAnswerTtlMs = 23.3s`) firing
-on a not-yet-connected peer, OR by `resetOfferState` being called
-from `onOfferPeerClosedOrError`. But once the connection is live for
-the full 23s, the expiry timer's callback short-circuits via
-`current.connectedPeer` being truthy and never reschedules. From
-that point on, `offerAnswered` stays `true` until something tears
-the room down — and neither `clearConnectedPeer` (called via
-`message-from-stale-peer` / `message-from-prolonged-disconnect`)
-nor `strategy.mjs`'s `onPeerLeave` callback (called from
-`room.mjs`'s `exitPeer` when the PC closes) touches it.
+**Trystero natural re-handshake doesn't engage after a peer drops — under investigation.** The original hypothesis was that `peerStates[peerId].offerAnswered` was sticky after first connection and blocked subsequent announce processing. Field testing disproved that: the `[trystero-patch]` warning we wired up to log when the patch's `state.offerAnswered = false` actually clears something **never fires in the wild**. Re-reading the code path confirms why: `strategy.mjs`'s `attachSharedPeerToRoom` calls `resetOfferState(state, pool)` at connection time, which sets `state.offerAnswered = false`. By the time the peer drops and `clearConnectedPeer` or `strategy.onPeerLeave` runs, `offerAnswered` is already false — the guarded `if (state.offerAnswered)` is always false, the patch is a no-op.
 
-The downstream effect: when the peer's PC dies and they announce
-again over Nostr, the signal-handler at line 352 checks
-`answeringPeer || connectedPeer || offerAnswered` and returns
-early. Natural re-handshake never starts.
+The real bug is somewhere else. The mesh-side instrumentation
+(`peer … reconnected within grace (Ns) — natural Trystero
+re-handshake (no rebuild)` vs `post-rebuild`) tells the truth in
+the user's logs: every reconnect after a swap is `post-rebuild`,
+meaning the heavy `stop()` + `start()` rejoin is what saves us.
+Natural re-handshake never engages. Yet our trace shows:
+- `strategy.onPeerLeave` does fire (mesh-side `peer left` log
+  comes from the same `exitPeer` call).
+- After it, `state.connectedPeer = null`, `state.offerAnswered`
+  already false, `state.offerPeer` already null (from
+  `resetOfferState` at connect time), `state.answeringPeer` null,
+  `state.offerRelays = []`.
+- So `handleAnnouncement` on the next presence announce **should**
+  pass all the early-return checks and start a fresh offer.
+- But it doesn't.
 
-We patch this from the outside via pnpm-patches —
-`patches/@trystero-p2p__core@0.24.0.patch` adds `state.offerAnswered = false`
-to both paths that clear `connectedPeer` (the `clearConnectedPeer`
-helper and the strategy's `onPeerLeave` room callback). The patch
-is referenced from `package.json` under `pnpm.patchedDependencies`,
-which means `pnpm install` re-applies it automatically. Each
-clear logs a `[trystero-patch]` warning to the console so we can
-verify in the wild that the patch is actually engaging — and the
-mesh-side `peer … reconnected within grace (Ns) — natural Trystero
-re-handshake (no rebuild)` log distinguishes patch-driven recovery
-from rebuild-driven recovery.
+To find what's actually blocking it,
+`patches/@trystero-p2p__core@0.24.0.patch` carries a **diagnostic
+overlay** alongside the (now defensive) `offerAnswered = false`
+clears. Every interesting choke point logs a one-line
+`[trystero-patch:diag] <where> peer=<id>… cp=<0|1> oa=<0|1>
+op=<0|1> ap=<0|1> or=<n> orp=<n> …` record with the relevant
+state flags (cp=connectedPeer, oa=offerAnswered, op=offerPeer,
+ap=answeringPeer, or=offerRelays truthy count, orp=placeholder
+count). Instrumented sites:
 
-With the patch in place, natural Trystero discovery (presence
-announces every 5.333s) re-handshakes a dropped peer in seconds
-across a network swap, and our heavy `stop()` + `start()` rejoin
-returns to being a true backstop for genuinely-stuck cases (peer
-shut down for the night, etc.) instead of the primary recovery
-path. The grace and throttle windows are sized for that backstop
-role: 90s grace overlaps the first auto-rediscovery window,
-giving natural recovery a long runway.
+- `clearConnectedPeer` entry, no-op path, and offerAnswered-clear
+  path (signal-handler.mjs)
+- `handleAnnouncement` entry, every early-return reason
+  (skip-state, skip-no-placeholder, skip-post-ensureOffer), and
+  the sending-offer success path
+- `handleOffer` entry and the skip-busy path
+- `handleAnswer` entry (leased-peer vs state-peer branches) and
+  the skip path with the specific reason
+- `createSignalHandler` unhealthy-peer branches and the
+  announce-block decision tree (skip-busy, send-back-id,
+  skip-existing-relay, set-placeholder)
+- `strategy.onPeerLeave` (the room-level callback) — unconditional
+  entry log so we see whether it fires at all
+- `strategy.connectPeer` entry — confirms whether new
+  handshake attempts are even reaching this point
+- `strategy.attachSharedPeerToRoom` entry — confirms the
+  state-reset moment on (re)connect
+
+Workflow: ship this patch, reproduce a LAN↔WAN swap in the wild
+with the dev tools open, filter the console for
+`[trystero-patch:diag]`, and look for what `handleAnnouncement`
+does (or fails to do) for the dropped peer's `peer_id` between
+the `strategy.onPeerLeave` event and the eventual `post-rebuild`
+reconnect. The trace should make the structural blocker visible.
+
+While we hunt the real bug, grace stays at the
+backstop-sized 90s and the rediscovery schedule stays
+`[90s, 3m, 5m, 10m]`. `ICE_DISCONNECTED_RESTART_MS` stays at
+1s — that's about beating Trystero's 5s data-channel close
+timer for restartIce, independent of whatever is blocking
+natural recovery. UX cost: a network swap that should
+recover in seconds via natural re-handshake currently waits
+~90s for the rebuild backstop. Acceptable while we
+instrument; not acceptable as a steady state.
 
 **Upstream PR.** A one-line equivalent of this patch belongs
 upstream in `dmotz/trystero` so every Trystero user benefits and
@@ -379,3 +401,4 @@ The Activity panel surfaces the same data the diag log holds; Quiet logs suppres
    3. With the mid-grace rediscovery suppressed, a peer that DIDN'T recover via natural discovery would have waited up to OFFLINE_ROSTERED_CHECK_INTERVAL_MS (60s) after grace expired for the next tick to fire rediscovery. That added 0-60s of "offline" UI on top of the 90s grace. Fixed by extending `pruneRecentDisconnects`: when an expiry sweep finds rostered-and-still-offline peers, `maybeForceRediscovery` fires immediately as a backstop. Worst-case recovery latency now equals one grace window (90s) instead of "grace + next-tick (up to 150s)."
    Net UX: visible churn during recovery drops from "tearing down and building up over and over" to "reconnecting…" displayed continuously for up to 90s, with the heavy hammer firing only as a real fallback when natural discovery genuinely fails.
 - **`pnpm patch` for Trystero `offerAnswered` + revert grace/throttle to backstop sizing**: the previous round documented the upstream `offerAnswered` stickiness as unfixable from outside the library and shortened `RECONNECTING_GRACE_MS` (90s → 30s) and the first `REDISCOVERY_BACKOFF_SCHEDULE_MS` interval (90s → 30s) so the unavoidable rebuild fired fast. Reassessment: the patch IS reachable from outside via pnpm-patches. `patches/@trystero-p2p__core@0.24.0.patch` adds `state.offerAnswered = false` to both paths that clear `state.connectedPeer` — the `clearConnectedPeer` helper in `signal-handler.mjs` AND the strategy's `onPeerLeave` room callback in `strategy.mjs`. `package.json`'s `pnpm.patchedDependencies` field re-applies it on every install. Each path emits a `[trystero-patch]` console.warn so we can verify in the wild that the patch is engaging; the mesh-side `peer … reconnected within grace (Ns) — natural Trystero re-handshake (no rebuild)` log distinguishes patch-driven recovery from rebuild-driven recovery (compares `last_force_rediscovery_at` against the original disconnect timestamp). With the patch in place, natural Trystero discovery (presence announces every 5.333s) re-handshakes a dropped peer in seconds rather than being structurally blocked, so the heavy rebuild returns to backstop duty. Grace reverted to 90s, throttle first interval reverted to 90s, schedule extended to `[90s, 3m, 5m, 10m]`. `ICE_DISCONNECTED_RESTART_MS` stays at 1s — that's about beating Trystero's 5s data-channel close timer for restartIce renegotiation, independent of the `offerAnswered` bug. Companion upstream PR for `dmotz/trystero` so every Trystero user benefits and we can drop the patch on the next release.
+- **`offerAnswered` hypothesis disproved + diagnostic patch overlay for the real bug**: live testing of the prior patched build with `[trystero-patch]` instrumentation showed `[trystero-patch]` never fires in the wild AND natural re-handshake still doesn't work — every reconnect after a swap is `post-rebuild`, never natural. Re-reading the code: `attachSharedPeerToRoom` calls `resetOfferState(state, pool)` at connection time (strategy.mjs line 116), which sets `state.offerAnswered = false`. So by the time `clearConnectedPeer` or the strategy's `onPeerLeave` runs on disconnect, `offerAnswered` is already false. The guarded `if (state.offerAnswered)` in both patch sites is always false; the patch is structurally a no-op. The `offerAnswered`-stickiness theory was wrong, but the symptom (natural re-handshake refusing to engage after a peer drop) is still real and reproducible. Trace says state IS clean post-drop: `state.connectedPeer = null` (cleared by strategy.onPeerLeave), `state.offerAnswered = false`, `state.offerPeer = null`, `state.answeringPeer = null`, `state.offerRelays = []`. `handleAnnouncement` on the next presence event SHOULD start a fresh offer and doesn't. Patch reframed as a **diagnostic overlay**: keep the defensive `state.offerAnswered = false` clears, but make every interesting choke point emit a one-line `[trystero-patch:diag]` log with the current state flags (`cp`, `oa`, `op`, `ap`, `or`, `orp`). Instrumented sites: `clearConnectedPeer` (entry / no-op / cleared-offerAnswered), `handleAnnouncement` (entry, all early-return reasons, sending-offer), `handleOffer` (entry, skip-busy), `handleAnswer` (entry, skip with specific reason), `createSignalHandler` (unhealthy branches, announce-block decision tree), `strategy.onPeerLeave` (unconditional entry), `strategy.connectPeer` (entry), `strategy.attachSharedPeerToRoom` (entry). Volume is bounded — the per-message early-return on `health === "live"` is skipped silently so steady-state traffic stays quiet. Grace stays at backstop-sized 90s while we capture the trace; cost is ~90s of "broken-feeling" UX per swap until we find the real blocker. Next step: reproduce LAN↔WAN swap with dev tools open, filter `[trystero-patch:diag]`, look at what `handleAnnouncement` does (or fails to do) for the dropped peer's `peer_id` between `strategy.onPeerLeave` and the eventual `post-rebuild` reconnect.
