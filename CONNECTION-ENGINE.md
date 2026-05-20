@@ -160,7 +160,7 @@ the declaration captures the rationale.
 | `REHANDSHAKE_BACKOFF_MS_SCHEDULE`      | [2,5,10,20,30] s     | Per-peer hello-retry cadence (jittered ±20%)                  |
 | `REHANDSHAKE_JITTER_FRACTION`          | 0.20                 | Desync N-peer simultaneous reconnects                         |
 | `REHANDSHAKE_RESCUE_ATTEMPTS`          | 3                    | Failures before escalating to room rejoin                     |
-| `REDISCOVERY_BACKOFF_SCHEDULE_MS`      | [30s, 90s, 3m, 5m]   | Global throttle on Trystero rejoins                           |
+| `REDISCOVERY_BACKOFF_SCHEDULE_MS`      | [90s, 3m, 5m, 10m]   | Global throttle on Trystero rejoins                           |
 | `REDISCOVERY_REJOIN_GAP_MS`            | 1.5s                 | Leave-to-join gap to let transport tear down                  |
 | `OFFLINE_ROSTERED_CHECK_INTERVAL_MS`   | 60s                  | Asymmetric-sleep safety net                                   |
 | `ICE_POLL_INTERVAL_MS`                 | 3s                   | Pick up new `RTCPeerConnection` objects from Trystero         |
@@ -276,13 +276,13 @@ A checklist for the next contributor adding, say, a new `metrics_announce` messa
 7. **Log via `logDiag`**, not `console.log`. Honor the Quiet-mode flag (`info` is suppressible, `warn`/`error` always land).
 8. **Test the four-peer mass-wake case.** Open four laptops on the same mesh, sleep them all, wake them at once. If your change holds up — backoff jitter desyncs them, signaling stays healthy, rejoin throttle holds — you're good. If you see a relay rate-limit warning in the diag log, you've added load somewhere.
 
-## Known upstream limitations
+## Known upstream limitations (and how we patch them)
 
-The engine has to work around a couple of Trystero v0.24.0 internal-state
-bugs that we can't fix from outside the library. They're documented here
-so future contributors don't waste time trying to "fix" them at our layer.
+Trystero v0.24.0 has internal-state behaviors that block natural
+recovery from network swaps. The relevant ones are documented here
+along with how we work around them.
 
-**Trystero `offerAnswered` state-stickiness.** In
+**Trystero `offerAnswered` state-stickiness — patched locally.** In
 `@trystero-p2p/core/dist/signal-handler.mjs`, every connected peer
 gets `peerStates[peerId].offerAnswered = true` set when we answer
 their offer (line 302). That flag would normally be reset by either
@@ -290,33 +290,43 @@ the offer-expiry timer (after `offerPostAnswerTtlMs = 23.3s`) firing
 on a not-yet-connected peer, OR by `resetOfferState` being called
 from `onOfferPeerClosedOrError`. But once the connection is live for
 the full 23s, the expiry timer's callback short-circuits via
-`current.connectedPeer` being truthy and never reschedules. From that
-point on, `offerAnswered` is permanently `true` for the lifetime of
-the room — `clearConnectedPeer` (which fires when the PC dies)
-clears `connectedPeer` and `connectedPeerUnhealthySinceMs` but does
-NOT touch `offerAnswered`.
+`current.connectedPeer` being truthy and never reschedules. From
+that point on, `offerAnswered` stays `true` until something tears
+the room down — and neither `clearConnectedPeer` (called via
+`message-from-stale-peer` / `message-from-prolonged-disconnect`)
+nor `strategy.mjs`'s `onPeerLeave` callback (called from
+`room.mjs`'s `exitPeer` when the PC closes) touches it.
 
 The downstream effect: when the peer's PC dies and they announce
 again over Nostr, the signal-handler at line 352 checks
-`announcePeerState.answeringPeer || announcePeerState.connectedPeer || announcePeerState.offerAnswered`
-and returns early. Natural re-handshake never starts. The only way
-to clear `offerAnswered` is a full room rejoin (which creates a
-fresh `ctx.peerStates` map).
+`answeringPeer || connectedPeer || offerAnswered` and returns
+early. Natural re-handshake never starts.
 
-That's why the engine still does heavy `stop()` + `start()`
-rediscovery whenever an authenticated peer drops and grace expires
-without natural recovery — the rejoin is the only mechanism that
-clears Trystero's stuck state. The user's LAN↔WAN swap sessions
-made this observable: `pcCount` never increased between the drop
-and the rejoin, because Trystero was receiving the peer's announces
-and ignoring them due to `offerAnswered: true`. `ctx.peerStates` is
-closure-scoped in the strategy factory and not exposed via the room
-object, so we can't reach in and reset just the stuck flag — full
-rejoin remains the only option until this is fixed upstream.
+We patch this from the outside via pnpm-patches —
+`patches/@trystero-p2p__core@0.24.0.patch` adds `state.offerAnswered = false`
+to both paths that clear `connectedPeer` (the `clearConnectedPeer`
+helper and the strategy's `onPeerLeave` room callback). The patch
+is referenced from `package.json` under `pnpm.patchedDependencies`,
+which means `pnpm install` re-applies it automatically. Each
+clear logs a `[trystero-patch]` warning to the console so we can
+verify in the wild that the patch is actually engaging — and the
+mesh-side `peer … reconnected within grace (Ns) — natural Trystero
+re-handshake (no rebuild)` log distinguishes patch-driven recovery
+from rebuild-driven recovery.
 
-Engine-side mitigation: short grace window (30s) + immediate
-rediscovery on grace expiry + 30s first-throttle interval so the
-unavoidable rejoin happens fast.
+With the patch in place, natural Trystero discovery (presence
+announces every 5.333s) re-handshakes a dropped peer in seconds
+across a network swap, and our heavy `stop()` + `start()` rejoin
+returns to being a true backstop for genuinely-stuck cases (peer
+shut down for the night, etc.) instead of the primary recovery
+path. The grace and throttle windows are sized for that backstop
+role: 90s grace overlaps the first auto-rediscovery window,
+giving natural recovery a long runway.
+
+**Upstream PR.** A one-line equivalent of this patch belongs
+upstream in `dmotz/trystero` so every Trystero user benefits and
+we can drop the patch on the next release. When that lands, remove
+the `pnpm.patchedDependencies` entry and the `patches/` file.
 
 ## What's intentionally NOT in this engine
 
@@ -368,3 +378,4 @@ The Activity panel surfaces the same data the diag log holds; Quiet logs suppres
    2. `offlineRosteredCheckTick` was firing `maybeForceRediscovery` mid-grace-window (the 60s tick during the 90s grace). That triggered the heavy stop+start, tearing down our room while natural Trystero discovery was still trying to find the peer on their new network. The fix: skip peers currently in `recent_disconnects` during the tick. Lets natural discovery (presence-announce every 5.333s) have its 90s shot without interference.
    3. With the mid-grace rediscovery suppressed, a peer that DIDN'T recover via natural discovery would have waited up to OFFLINE_ROSTERED_CHECK_INTERVAL_MS (60s) after grace expired for the next tick to fire rediscovery. That added 0-60s of "offline" UI on top of the 90s grace. Fixed by extending `pruneRecentDisconnects`: when an expiry sweep finds rostered-and-still-offline peers, `maybeForceRediscovery` fires immediately as a backstop. Worst-case recovery latency now equals one grace window (90s) instead of "grace + next-tick (up to 150s)."
    Net UX: visible churn during recovery drops from "tearing down and building up over and over" to "reconnecting…" displayed continuously for up to 90s, with the heavy hammer firing only as a real fallback when natural discovery genuinely fails.
+- **`pnpm patch` for Trystero `offerAnswered` + revert grace/throttle to backstop sizing**: the previous round documented the upstream `offerAnswered` stickiness as unfixable from outside the library and shortened `RECONNECTING_GRACE_MS` (90s → 30s) and the first `REDISCOVERY_BACKOFF_SCHEDULE_MS` interval (90s → 30s) so the unavoidable rebuild fired fast. Reassessment: the patch IS reachable from outside via pnpm-patches. `patches/@trystero-p2p__core@0.24.0.patch` adds `state.offerAnswered = false` to both paths that clear `state.connectedPeer` — the `clearConnectedPeer` helper in `signal-handler.mjs` AND the strategy's `onPeerLeave` room callback in `strategy.mjs`. `package.json`'s `pnpm.patchedDependencies` field re-applies it on every install. Each path emits a `[trystero-patch]` console.warn so we can verify in the wild that the patch is engaging; the mesh-side `peer … reconnected within grace (Ns) — natural Trystero re-handshake (no rebuild)` log distinguishes patch-driven recovery from rebuild-driven recovery (compares `last_force_rediscovery_at` against the original disconnect timestamp). With the patch in place, natural Trystero discovery (presence announces every 5.333s) re-handshakes a dropped peer in seconds rather than being structurally blocked, so the heavy rebuild returns to backstop duty. Grace reverted to 90s, throttle first interval reverted to 90s, schedule extended to `[90s, 3m, 5m, 10m]`. `ICE_DISCONNECTED_RESTART_MS` stays at 1s — that's about beating Trystero's 5s data-channel close timer for restartIce renegotiation, independent of the `offerAnswered` bug. Companion upstream PR for `dmotz/trystero` so every Trystero user benefits and we can drop the patch on the next release.

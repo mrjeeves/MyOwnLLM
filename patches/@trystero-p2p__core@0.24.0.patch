@@ -1,0 +1,44 @@
+diff --git a/dist/signal-handler.mjs b/dist/signal-handler.mjs
+index d8841faba4ec9daf93b020967f13db5609148928..0833a9849fadbb84874e0deae8d397ad12cdcd8c 100644
+--- a/dist/signal-handler.mjs
++++ b/dist/signal-handler.mjs
+@@ -52,6 +52,17 @@ const clearConnectedPeer = (state, peerId, _reason) => {
+ 	if (!state.connectedPeer.isDead) state.connectedPeer.destroy();
+ 	state.connectedPeer = null;
+ 	state.connectedPeerUnhealthySinceMs = null;
++	// MyOwnLLM patch (CONNECTION-ENGINE.md → Known upstream limitations):
++	// also clear `offerAnswered` so the next presence-announce from this
++	// peer can trigger a fresh handshake. Without this, the early-return
++	// in createSignalHandler (state.offerAnswered branch) blocks natural
++	// recovery and the only way back is a full room rejoin.
++	if (state.offerAnswered) {
++		state.offerAnswered = false;
++		if (typeof console !== "undefined" && console.warn) {
++			console.warn("[trystero-patch] clearConnectedPeer cleared sticky offerAnswered for peer " + peerId + " (reason: " + _reason + ")");
++		}
++	}
+ 	updateStatus(state);
+ };
+ const clearOfferRelay = (state, relayId) => {
+diff --git a/dist/strategy.mjs b/dist/strategy.mjs
+index 97d76310a7c0af76d63f5fa135ede35fa73d164a..4658ff85b1e50e2db6818eb1c93ed5c948290100 100644
+--- a/dist/strategy.mjs
++++ b/dist/strategy.mjs
+@@ -223,6 +223,17 @@ var strategy_default = ({ init, subscribe, announce }) => {
+ 			const state = ctx.peerStates[id];
+ 			if (state?.connectedPeer) {
+ 				state.connectedPeer = null;
++				// MyOwnLLM patch (CONNECTION-ENGINE.md → Known upstream limitations):
++				// the room's onPeerLeave path clears connectedPeer directly without
++				// going through clearConnectedPeer, so the same offerAnswered-stuck
++				// problem applies here. Clear it so the next announce from this peer
++				// can re-handshake naturally.
++				if (state.offerAnswered) {
++					state.offerAnswered = false;
++					if (typeof console !== "undefined" && console.warn) {
++						console.warn("[trystero-patch] onPeerLeave cleared sticky offerAnswered for peer " + id);
++					}
++				}
+ 				updateStatus(state);
+ 			}
+ 		}, () => {
