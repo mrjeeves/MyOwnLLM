@@ -1,0 +1,418 @@
+diff --git a/dist/shared-peer.mjs b/dist/shared-peer.mjs
+index 4fef72061c27829de77abd00fe0317393d12af2c..9ff6bb8a2f224ef5521dc0a35754179f52c12d28 100644
+--- a/dist/shared-peer.mjs
++++ b/dist/shared-peer.mjs
+@@ -51,8 +51,26 @@ const isPeerUnderlyingStale = (peer) => {
+ };
+ const getConnectedPeerHealth = (peer) => {
+ 	if (isPeerUnderlyingStale(peer)) return "stale";
+-	const { channel } = peer;
++	const { connection, channel } = peer;
+ 	if (!channel || channel.readyState !== "open") return "transient";
++	// MyOwnLLM patch (CONNECTION-ENGINE.md → Known upstream limitations):
++	// also treat `connectionState === "disconnected"` as transient. The
++	// data channel readyState can linger at "open" for 15-30s after a
++	// peer's network actually vanishes (e.g. when their device swaps
++	// Wi-Fi → ethernet, the local connection enters "disconnected"
++	// but does not transition to "failed" until ICE consent freshness
++	// finally times out). During that window `getConnectedPeerHealth`
++	// returns "live", which makes createSignalHandler early-return on
++	// every presence-announce from the dropped peer and blocks the
++	// natural re-handshake on the side that hasn't itself swapped
++	// networks. Returning "transient" instead lets the existing 7.5s
++	// `disconnectedPeerGraceMs` window in createSignalHandler clear
++	// the stuck state automatically, so the next announce after the
++	// grace expires triggers a fresh handshake. If the connection
++	// recovers within the grace (a real network blip), the next
++	// message sees `live` again and `connectedPeerUnhealthySinceMs`
++	// resets — no premature teardown.
++	if (connection.connectionState === "disconnected") return "transient";
+ 	return "live";
+ };
+ var SharedPeerManager = class {
+diff --git a/dist/signal-handler.mjs b/dist/signal-handler.mjs
+index d8841faba4ec9daf93b020967f13db5609148928..072b03e3d84c3900d754f6c671522adf2489f2d5 100644
+--- a/dist/signal-handler.mjs
++++ b/dist/signal-handler.mjs
+@@ -2,6 +2,115 @@ import { all, candidateType, fromJson, genId, mkErr, resetTimer, selfId, toJson,
+ import { sha1 } from "./crypto.mjs";
+ import { offerTtl } from "./offer-pool.mjs";
+ import { getConnectedPeerHealth } from "./shared-peer.mjs";
++// MyOwnLLM patch (CONNECTION-ENGINE.md → Known upstream limitations).
++// Module-load marker — confirms the patched signal-handler is the
++// one bundled in the running app.
++if (typeof console !== "undefined" && console.warn) {
++	console.warn("[trystero-patch] signal-handler.mjs loaded");
++}
++// MyOwnLLM patch: targeted, state-transition instrumentation. Each
++// peer has a tracker that records the high-level lifecycle of our
++// interaction with them — fresh → offering → connected → disconnected
++// → recovering → connected. We log on transitions and on periodic
++// "stuck" thresholds (15s / 30s / 60s of waiting for an answer or for
++// a re-handshake). Raw per-event logs (every announce, every
++// sending-offer iteration to N relays) are deliberately suppressed —
++// they were swamping the console and hiding the actual signal.
++const _momSessions = new Map();
++const _momKey = (peerId) => (peerId || "?").slice(0, 8) + "…";
++const _momLog = (msg) => {
++	if (typeof console !== "undefined" && console.warn) console.warn("[trystero-patch] " + msg);
++};
++const _momGetSession = (peerId) => {
++	let s = _momSessions.get(peerId);
++	if (!s) {
++		s = {
++			peerId,
++			firstSeenAt: Date.now(),
++			state: "fresh",
++			stateSince: Date.now(),
++			currentOfferId: null,
++			currentOfferSentAt: null,
++			currentOfferLogThresholds: [],
++			connectCount: 0,
++			disconnectCount: 0,
++			lastConnectedAt: null,
++			lastDisconnectedAt: null
++		};
++		_momSessions.set(peerId, s);
++		_momLog(_momKey(peerId) + " first seen (announce)");
++	}
++	return s;
++};
++const _momTransition = (peerId, newState, extra) => {
++	const s = _momGetSession(peerId);
++	if (s.state === newState) return;
++	const prev = s.state;
++	const heldFor = Math.round((Date.now() - s.stateSince) / 1000);
++	s.state = newState;
++	s.stateSince = Date.now();
++	_momLog(_momKey(peerId) + " " + prev + " → " + newState + " (held " + heldFor + "s)" + (extra ? " " + extra : ""));
++};
++const _momOfferStarted = (peerId, offerId) => {
++	const s = _momGetSession(peerId);
++	if (s.currentOfferId === offerId) return;
++	const prevOfferAgeS = s.currentOfferSentAt ? Math.round((Date.now() - s.currentOfferSentAt) / 1000) : null;
++	if (s.currentOfferId && prevOfferAgeS !== null) {
++		_momLog(_momKey(peerId) + " replacing offer " + (s.currentOfferId || "?").slice(0, 8) + " (after " + prevOfferAgeS + "s, no answer) with " + offerId.slice(0, 8));
++	} else {
++		_momLog(_momKey(peerId) + " sending offer " + offerId.slice(0, 8));
++	}
++	s.currentOfferId = offerId;
++	s.currentOfferSentAt = Date.now();
++	s.currentOfferLogThresholds = [15000, 30000, 60000, 120000];
++	_momTransition(peerId, "offering");
++};
++const _momOfferRetryCheck = (peerId) => {
++	const s = _momSessions.get(peerId);
++	if (!s || !s.currentOfferId || !s.currentOfferSentAt) return;
++	const waited = Date.now() - s.currentOfferSentAt;
++	while (s.currentOfferLogThresholds.length && waited >= s.currentOfferLogThresholds[0]) {
++		const t = s.currentOfferLogThresholds.shift();
++		_momLog(_momKey(peerId) + " STILL no answer for offer " + s.currentOfferId.slice(0, 8) + " after " + Math.round(t / 1000) + "s");
++	}
++};
++const _momAnswerReceived = (peerId, offerId) => {
++	const s = _momGetSession(peerId);
++	if (s.currentOfferId !== offerId) {
++		_momLog(_momKey(peerId) + " received answer for old offer " + (offerId || "?").slice(0, 8) + " (current: " + (s.currentOfferId || "none").slice(0, 8) + ")");
++	}
++	const waited = s.currentOfferSentAt ? Math.round((Date.now() - s.currentOfferSentAt) / 1000) : -1;
++	_momLog(_momKey(peerId) + " received answer for " + offerId.slice(0, 8) + " after " + waited + "s");
++};
++const _momOfferReceived = (peerId, offerId) => {
++	const s = _momGetSession(peerId);
++	if (s.lastIncomingOfferId === offerId) return;
++	s.lastIncomingOfferId = offerId;
++	_momLog(_momKey(peerId) + " received offer " + (offerId || "?").slice(0, 8) + " (we are answering)");
++};
++const _momConnected = (peerId) => {
++	const s = _momGetSession(peerId);
++	s.connectCount += 1;
++	s.lastConnectedAt = Date.now();
++	const recoveryS = s.lastDisconnectedAt ? Math.round((Date.now() - s.lastDisconnectedAt) / 1000) : null;
++	_momTransition(peerId, "connected", recoveryS !== null ? "(reconnect " + recoveryS + "s after last leave)" : null);
++	s.currentOfferId = null;
++	s.currentOfferSentAt = null;
++	s.currentOfferLogThresholds = [];
++};
++const _momDisconnected = (peerId, reason) => {
++	const s = _momGetSession(peerId);
++	s.disconnectCount += 1;
++	s.lastDisconnectedAt = Date.now();
++	const livedS = s.lastConnectedAt ? Math.round((Date.now() - s.lastConnectedAt) / 1000) : -1;
++	_momTransition(peerId, "disconnected", "lived=" + livedS + "s reason=" + reason);
++};
++const _momGraceStarted = (peerId) => {
++	const s = _momGetSession(peerId);
++	if (s.graceLoggedAt && Date.now() - s.graceLoggedAt < 15000) return;
++	s.graceLoggedAt = Date.now();
++	_momLog(_momKey(peerId) + " ICE health=transient — entered 7.5s grace");
++};
+ //#region src/signal-handler.ts
+ const offerPostAnswerTtlMs = 23333;
+ const offerIdSize = 12;
+@@ -52,6 +161,12 @@ const clearConnectedPeer = (state, peerId, _reason) => {
+ 	if (!state.connectedPeer.isDead) state.connectedPeer.destroy();
+ 	state.connectedPeer = null;
+ 	state.connectedPeerUnhealthySinceMs = null;
++	// MyOwnLLM patch: defensive clear of `offerAnswered`. Tracing shows
++	// this is usually already false (resetOfferState in
++	// attachSharedPeerToRoom clears it at connect time), but keeping
++	// the clear costs nothing and protects against any edge case.
++	state.offerAnswered = false;
++	_momDisconnected(peerId, _reason);
+ 	updateStatus(state);
+ };
+ const clearOfferRelay = (state, relayId) => {
+@@ -188,6 +303,11 @@ const handleAnnouncement = async (ctx, relayId, peerId, shared, signalPeer) => {
+ 			candidate: sdp
+ 		}), () => !state.connectedPeer && state.offerPeer === offerInfo.peer && state.offerId === offerInfo.offerId);
+ 	};
++	// MyOwnLLM patch: log first offer of a given offerId; subsequent
++	// sends to other relays are not noise — they're part of the same
++	// attempt.
++	_momOfferStarted(peerId, offerInfo.offerId);
++	_momOfferRetryCheck(peerId);
+ 	signalPeer(peerTopic, toJson({
+ 		peerId: selfId,
+ 		offerId: offerInfo.offerId,
+@@ -202,6 +322,7 @@ const handleOffer = async (ctx, relayId, peerId, offer, offerId, hasOutgoingOffe
+ 	const hasTrackedOutgoingOffer = Boolean(state.offerPeer || state.offerRelays.some(Boolean));
+ 	if ((hasTrackedOutgoingOffer || hasOutgoingOfferHint) && selfId < peerId) return;
+ 	if (hasTrackedOutgoingOffer) resetOfferState(state, ctx.offerPool);
++	_momOfferReceived(peerId, offerId);
+ 	const answerPeer = ctx.initPeer(false, ctx.config);
+ 	state.answeringPeer = answerPeer;
+ 	scheduleAnsweringExpiry(ctx, state, peerId, answerPeer);
+@@ -290,6 +411,7 @@ const handleAnswer = async (ctx, relayId, peerId, answer, offerId, peer) => {
+ 		return;
+ 	}
+ 	if (peer) {
++		_momAnswerReceived(peerId, offerId);
+ 		ctx.offerPool.claimLeased(peer);
+ 		peer.setHandlers({
+ 			connect: () => ctx.connectPeer(peer, peerId, relayId),
+@@ -299,6 +421,7 @@ const handleAnswer = async (ctx, relayId, peerId, answer, offerId, peer) => {
+ 	} else {
+ 		const state = ctx.peerStates[peerId];
+ 		if (!state || !state.offerPeer || state.offerAnswered || offerId && state.offerId && offerId !== state.offerId || state.offerPeer.isDead) return;
++		_momAnswerReceived(peerId, offerId);
+ 		state.offerAnswered = true;
+ 		scheduleOfferExpiry(ctx, state, peerId, offerPostAnswerTtlMs);
+ 		state.offerPeer.signal(plainAnswer);
+@@ -332,6 +455,9 @@ const createSignalHandler = (ctx) => (relayId) => async (topic, msg, signalPeer)
+ 		else {
+ 			const nowMs = Date.now();
+ 			const unhealthySinceMs = state.connectedPeerUnhealthySinceMs ?? nowMs;
++			if (state.connectedPeerUnhealthySinceMs === null || state.connectedPeerUnhealthySinceMs === undefined) {
++				_momGraceStarted(peerId);
++			}
+ 			state.connectedPeerUnhealthySinceMs = unhealthySinceMs;
+ 			if (nowMs - unhealthySinceMs < disconnectedPeerGraceMs) return;
+ 			clearConnectedPeer(state, peerId, "message-from-prolonged-disconnect");
+@@ -370,6 +496,8 @@ const createSignalHandler = (ctx) => (relayId) => async (topic, msg, signalPeer)
+ 	if (answer) return handleAnswer(ctx, relayId, peerId, answer, offerId, peer);
+ };
+ //#endregion
+-export { clearConnectedPeer, createSignalHandler, getState, resetOfferState, updateStatus };
++// MyOwnLLM patch: also export the _mom* hooks so strategy.mjs can fire
++// "connected" / "pool-invalidated" transitions from there.
++export { _momConnected, clearConnectedPeer, createSignalHandler, getState, resetOfferState, updateStatus };
+ 
+ //# sourceMappingURL=signal-handler.mjs.map
+\ No newline at end of file
+diff --git a/dist/strategy.mjs b/dist/strategy.mjs
+index 97d76310a7c0af76d63f5fa135ede35fa73d164a..b7c102c5e19716141ea47cbb42e987f6fa578857 100644
+--- a/dist/strategy.mjs
++++ b/dist/strategy.mjs
+@@ -5,7 +5,15 @@ import { createPasswordHandshake } from "./handshake.mjs";
+ import peer_default from "./peer.mjs";
+ import room_default from "./room.mjs";
+ import { SharedPeerManager } from "./shared-peer.mjs";
+-import { clearConnectedPeer, createSignalHandler, getState, resetOfferState, updateStatus } from "./signal-handler.mjs";
++import { _momConnected, clearConnectedPeer, createSignalHandler, getState, resetOfferState, updateStatus } from "./signal-handler.mjs";
++// MyOwnLLM patch — module-load marker for strategy.mjs. See
++// CONNECTION-ENGINE.md "Known upstream limitations".
++if (typeof console !== "undefined" && console.warn) {
++	console.warn("[trystero-patch] strategy.mjs loaded");
++}
++const _momLog = (msg) => {
++	if (typeof console !== "undefined" && console.warn) console.warn("[trystero-patch] " + msg);
++};
+ //#region src/strategy.ts
+ const announceIntervalMs = 5333;
+ const announceWarmupIntervalsMs = [
+@@ -97,6 +105,32 @@ var strategy_default = ({ init, subscribe, announce }) => {
+ 			if (!plainOffer || plainOffer.type !== "offer") throw mkErr("failed to get offer for peer");
+ 			return (await toCipher(plainOffer)).sdp;
+ 		};
++		// MyOwnLLM patch (CONNECTION-ENGINE.md → Known upstream limitations):
++		// Drop the entire pre-warmed offer pool. Used when we detect that
++		// our local network has changed (a peer dropped, ICE went stale),
++		// because every pre-cached offer in the pool was generated with
++		// our previous IP candidates and an offer with stale candidates
++		// is unanswerable — the remote side will ICE-check our old IP,
++		// fail, and never respond. After dumping the pool, the next
++		// offerPool.checkout() falls through to its `if (missing > 0)
++		// peers.push(...alloc(missing, this.makeOffer))` branch and
++		// allocates a fresh peer whose getOffer() reflects our current
++		// candidates. Throttled to once per 10s to avoid hammering when
++		// many peers drop simultaneously.
++		let lastPoolFlushAt = 0;
++		const flushStaleOfferPool = (reason) => {
++			const now = Date.now();
++			if (now - lastPoolFlushAt < 10000) return;
++			lastPoolFlushAt = now;
++			const drained = pool.pool ? pool.pool.length : 0;
++			if (drained === 0) return;
++			pool.pool.forEach((peer) => {
++				if (peer && !peer.isDead) peer.destroy();
++				if (pool.pooled) pool.pooled.delete(peer);
++			});
++			pool.pool = [];
++			_momLog("offer-pool flushed " + drained + " stale entries (reason=" + reason + ")");
++		};
+ 		const attachSharedPeerToRoom = (peerId, shared) => {
+ 			const state = getState(ctx.peerStates, peerId);
+ 			state.answeringExpiryTimer = resetTimer(state.answeringExpiryTimer);
+@@ -114,6 +148,11 @@ var strategy_default = ({ init, subscribe, announce }) => {
+ 			updateStatus(state);
+ 			if (isNew) onPeerConnect(proxy, peerId);
+ 			resetOfferState(state, pool);
++			// MyOwnLLM patch: log connection lifecycle via the per-peer
++			// session tracker in signal-handler.mjs. Fires only on the
++			// transition into "connected" — does not spam on each
++			// attachSharedPeerToRoom call.
++			_momConnected(peerId);
+ 		};
+ 		const connectPeer = (peer, peerId, _relayId) => {
+ 			if (didLeaveRoom) {
+@@ -223,8 +262,22 @@ var strategy_default = ({ init, subscribe, announce }) => {
+ 			const state = ctx.peerStates[id];
+ 			if (state?.connectedPeer) {
+ 				state.connectedPeer = null;
++				// MyOwnLLM patch: defensive clear of `offerAnswered`. Tracing
++				// shows this is usually already false at this point, but the
++				// clear costs nothing.
++				state.offerAnswered = false;
+ 				updateStatus(state);
+ 			}
++			// MyOwnLLM patch (the actual fix): a peer dropped means the
++			// connection died. If this happened because OUR local network
++			// changed (the LAN↔WAN swap case), every pre-warmed offer in
++			// the offer pool now has stale ICE candidates from our old
++			// network, and the next handshake attempt will fail silently
++			// because the remote can't reach our old IP. Dump the pool so
++			// the next checkout allocates a fresh peer with current
++			// candidates. Throttled inside flushStaleOfferPool to once per
++			// 10s.
++			flushStaleOfferPool("peer-left:" + id.slice(0, 8));
+ 		}, () => {
+ 			didLeaveRoom = true;
+ 			onPeerConnect = noOp;
+diff --git a/dist/utils.mjs b/dist/utils.mjs
+index 25fabfb27d599eb00791f8770b37930245e214a9..9d5025421710997a0b79ec16885ae238d98b2101 100644
+--- a/dist/utils.mjs
++++ b/dist/utils.mjs
+@@ -69,6 +69,73 @@ const resumeRelayReconnection = () => {
+ };
+ const makeSocket = (url, onMessage) => {
+ 	const client = {};
++	// MyOwnLLM patch (CONNECTION-ENGINE.md → Known upstream limitations):
++	// Nostr relays drop subscription state when their underlying
++	// WebSocket closes — that's per-spec. Trystero's strategy.mjs
++	// calls the strategy's `subscribe()` exactly once at room init
++	// (line 222 of strategy.mjs), so after a network swap (e.g.
++	// laptop wifi → phone hotspot) the new sockets reopen but the
++	// relay has no record of our REQs and forwards nothing. The
++	// connection looks fine from `getRelaySockets()` (`readyState
++	// === 1`), our presence publishes go out, but no inbound
++	// EVENTs ever arrive — natural re-handshake silently stalls
++	// for the full 90s grace window until `forceRediscovery`'s
++	// heavy room rebuild fires a fresh `joinRoom()` (which calls
++	// `subscribe()` again from scratch). Symptom in the trace:
++	// 90s of dead air, then post-rebuild reconnect in ~1s.
++	//
++	// The fix:
++	//   1. Intercept outgoing `["REQ", subId, …]` / `["CLOSE", subId]`
++	//      in `client.send` and track the active subscription set
++	//      per WebSocket URL.
++	//   2. On every `onopen` AFTER the first, replay the active REQ
++	//      messages so the relay re-establishes its forward path.
++	//
++	// Anti-flood: resubscribe attempts share a per-socket backoff
++	// schedule (5s / 10s / 15s / 30s / 60s, sticking at 60s). The
++	// backoff index resets after BACKOFF_RESET_AFTER_MS of quiet
++	// so a long-stable connection that finally blips doesn't pay
++	// the cap. If a reconnect lands while a replay is already
++	// scheduled, the schedule call is a no-op — one in-flight
++	// replay per URL at a time. Non-JSON / non-REQ-CLOSE sends
++	// (e.g. EVENT publishes) pass through untouched.
++	const activeSubscriptions = new Map();
++	const resubscribeBackoffMs = [5e3, 10e3, 15e3, 30e3, 60e3];
++	const backoffResetAfterMs = 60e3;
++	let resubscribeAttempt = 0;
++	let lastResubscribeAt = 0;
++	let pendingResubscribeTimer = null;
++	let hasOpenedOnce = false;
++	const shortUrl = url.replace(/^wss?:\/\//, "").replace(/\/$/, "");
++	const patchLog = (msg) => {
++		if (typeof console !== "undefined" && console.warn) console.warn("[trystero-patch] " + msg);
++	};
++	const executeReplay = () => {
++		const socket = client.socket;
++		if (!socket || socket.readyState !== 1) return;
++		if (activeSubscriptions.size === 0) return;
++		for (const reqMsg of activeSubscriptions.values()) socket.send(reqMsg);
++		lastResubscribeAt = Date.now();
++		resubscribeAttempt += 1;
++		const idx = Math.min(resubscribeAttempt, resubscribeBackoffMs.length - 1);
++		patchLog(shortUrl + " replayed " + activeSubscriptions.size + " subscription(s) on reconnect (attempt=" + resubscribeAttempt + ", next-eligible-in=" + Math.round(resubscribeBackoffMs[idx] / 1e3) + "s)");
++	};
++	const scheduleReplay = () => {
++		if (pendingResubscribeTimer !== null) return;
++		const now = Date.now();
++		if (lastResubscribeAt > 0 && now - lastResubscribeAt > backoffResetAfterMs) resubscribeAttempt = 0;
++		const idx = Math.min(resubscribeAttempt, resubscribeBackoffMs.length - 1);
++		const desired = resubscribeBackoffMs[idx];
++		const sinceLast = now - lastResubscribeAt;
++		if (lastResubscribeAt === 0 || sinceLast >= desired) {
++			executeReplay();
++			return;
++		}
++		pendingResubscribeTimer = setTimeout(() => {
++			pendingResubscribeTimer = null;
++			executeReplay();
++		}, desired - sinceLast);
++	};
+ 	const init = () => {
+ 		const socket = new WebSocket(url);
+ 		socket.onclose = () => {
+@@ -86,8 +153,28 @@ const makeSocket = (url, onMessage) => {
+ 		client.ready = new Promise((res) => socket.onopen = () => {
+ 			res(client);
+ 			socketRetryPeriods[url] = defaultRetryMs;
++			// MyOwnLLM patch: replay subscriptions on every reopen
++			// AFTER the first. The strategy's subscribe() callback
++			// fires on the first open and seeds activeSubscriptions
++			// itself via the client.send interception below.
++			if (hasOpenedOnce) scheduleReplay();
++			hasOpenedOnce = true;
+ 		});
+ 		client.send = (data) => {
++			// MyOwnLLM patch: capture Nostr REQ/CLOSE on the wire so
++			// we can replay active subscriptions across reconnects.
++			// Non-JSON data and other strategies (e.g. MQTT binary)
++			// fall through silently — the JSON.parse failure path
++			// is the no-op.
++			if (typeof data === "string" && data.charCodeAt(0) === 91 /* '[' */) {
++				try {
++					const parsed = JSON.parse(data);
++					if (Array.isArray(parsed) && typeof parsed[1] === "string") {
++						if (parsed[0] === "REQ") activeSubscriptions.set(parsed[1], data);
++						else if (parsed[0] === "CLOSE") activeSubscriptions.delete(parsed[1]);
++					}
++				} catch (_) { /* not JSON, ignore */ }
++			}
+ 			if (socket.readyState === 1) socket.send(data);
+ 		};
+ 	};

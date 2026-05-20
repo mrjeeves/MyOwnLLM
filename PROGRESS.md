@@ -1,138 +1,260 @@
-# Diarization + ASR-swap progress
+# Mesh re-handshake after network swap — root cause found, patch shipped
 
-Working notes started on `claude/implement-diarization-5TGwZ` (merged
-as #101) and continued on `claude/wire-ort-inference` (the
-follow-up). The original plan lives at
-`/root/.claude/plans/because-we-need-this-lexical-hinton.md` and the
-PR descriptions on GitHub.
+**Status:** Root cause located and patched in commit `<TBD>` on this branch
+(PR #186). Awaiting in-the-wild verification by the user on the next
+network swap. If the patch works as expected, recovery time should drop
+from ~95s to under 15s and we can close this out.
 
-## Status
+If it doesn't work, this doc still serves the next agent — see "If the
+patch doesn't help" at the bottom.
 
-| Area | State |
-|---|---|
-| Manifest schema v13 (per-tier `runtime`) | ✅ landed (#101) |
-| Default manifest (transcribe + diarize tier ladders) | ✅ landed (#101) |
-| `models.rs` central downloader | ✅ landed (#101) |
-| `asr/` module: trait, Moonshine + Parakeet | ✅ **ONNX forward wired** |
-| `diarize/` module: pyannote-diarize backend, segmenter, embedder, online clusterer | ✅ **ONNX forward wired** |
-| `transcribe.rs` rewrite (AsrBackend, segment frames, backpressure, diarize join) | ✅ landed (#101) |
-| Tauri commands (`asr_*`, `diarize_*`) | ✅ landed (#101) |
-| `preload.rs` (per-tier runtime aware) | ✅ landed (#101) |
-| Frontend (TranscribeView segment rendering, diarize toggle, etc.) | ✅ landed (#101) |
-| `Conversation.transcript: TranscriptSegment[]` migration | ✅ landed (#101) |
-| NOTICE.md + DOCS.md + README.md + ARCHITECTURE.md refresh | ✅ landed (#101) |
-| **`FrameSink` trait abstraction over `WebviewWindow`** | ✅ **new** |
-| **`CaptureSink` for headless transcribe tests** | ✅ **new** |
-| **`join_segments` unit tests (5)** | ✅ **new** |
-| Golden-audio integration test (full pipeline on real audio) | ⏳ deferred — needs ONNX models in CI |
-| Cached-path Moonshine decoder (past-KV, faster) | ⏳ follow-up optimisation |
-| Real-hardware verification (Pi 5 + Apple Silicon + x86) | ⏳ next |
+## The bug, in one paragraph
 
-## What landed in the ort wire-up PR (`claude/wire-ort-inference`)
+Nostr relays drop subscription state when the underlying WebSocket
+closes — that's per-spec (NIP-01 subscriptions are per-connection).
+Trystero v0.24.0's `@trystero-p2p/core` reconnects the WebSocket
+transparently inside `makeSocket` (`utils.mjs:70-96`) but its
+`strategy.mjs` calls the strategy's `subscribe()` callback exactly
+once at room init (line 222) and never re-runs it. So after any
+event that closes the socket (network swap is the visible case;
+relay churn / mobile-screen-off / Wi-Fi blip would all hit the
+same path), the new socket reopens but the relay has no record of
+our REQs and forwards nothing. The connection looks perfectly fine
+from `getRelaySockets()` — `readyState === 1`, our presence publishes
+go out — but **zero inbound EVENTs arrive**, so natural re-handshake
+silently stalls. Eventually `forceRediscovery`'s heavy room rebuild
+fires a fresh `joinRoom()` (which calls `subscribe()` from scratch)
+and everything works in ~1s because that's what fresh subscriptions
+do.
 
-### Four ONNX forward passes wired against `ort 2.0.0-rc.12`
+This explains every observation the prior hypotheses couldn't:
 
-| File | What's now live |
-|---|---|
-| `src-tauri/src/asr/moonshine.rs` | Encoder `[1, N]` PCM → `[1, T, D]` hidden; autoregressive **no-cache** greedy decoder loop with `use_cache_branch=false` and zero-shape past-KV dummy tensors; tokenizer.decode at the end. O(n²) per chunk but `n ≤ ~30` so a 1 s chunk completes in tens of ms even on Pi-class hardware. The cached past-KV path is a follow-up optimisation when there's a measured latency win to chase. |
-| `src-tauri/src/asr/parakeet.rs` | Single-pass forward `[1, N]` PCM (+ optional `[1]` lengths i64) → token IDs (i64 or i32 → widen to i64) + optional per-token frame indices → existing `decode_to_segments`. |
-| `src-tauri/src/diarize/segmenter.rs` | Forward `[1, N]` PCM → `[1, T, 7]` powerset logits → per-frame argmax → existing `rle_to_slices`. |
-| `src-tauri/src/diarize/embedder.rs` | Forward `[1, N]` PCM → `[1, D]` (or `[1, 1, D]`) → L2-normalize → cache `dim`. |
+- **Why the gap is silent on both sides.** The swap-side is a
+  publish-only zombie (no inbound). The non-swap side's sockets
+  are healthy and it does send `{peerId: selfId}` follower
+  acknowledgements to our announces, but they're tossed by the
+  relay because we're not subscribed.
+- **Why the signaling diag goes quiet for the whole 90s.** The
+  fingerprint (open count, distinct authors seen, PC tier) doesn't
+  change — sockets are open, author counts are cumulative-since-start
+  so they don't decrement, no new candidate errors fire. Change-gated
+  log → nothing to log.
+- **Why post-rebuild is instant.** `joinRoom` calls the strategy's
+  `subscribe()` afresh on the new sockets. Relay starts forwarding.
+  Within one announce interval (5.333s) the offer-answer round-trip
+  completes.
+- **Why prior pool-flush / `offerAnswered` hypotheses didn't help.**
+  Both addressed Trystero-internal state that wasn't the bottleneck.
+  The bottleneck is upstream of all peer-state machinery: we never
+  see the announces because our subscription is dead at the relay.
 
-All four backends sniff input / output tensor names by suffix-match at
-warm-up, so the canonical names (`audio_signal`, `tokens`, `logits`,
-`embedding`, `past_key_values.N.*`, `use_cache_branch`) can be
-renamed by a future ONNX re-export without breaking the wire-up.
+## The patch
 
-### `FrameSink` testability seam
+`patches/@trystero-p2p__core@0.24.0.patch` adds a hunk on
+`dist/utils.mjs::makeSocket`:
 
-`src-tauri/src/frame_sink.rs` (new):
+1. **Track outgoing subscriptions.** `client.send` intercepts strings
+   that parse as `["REQ", subId, …]` (added to `activeSubscriptions
+   Map<subId, reqMsg>`) and `["CLOSE", subId]` (removed). Non-JSON /
+   non-array payloads (EVENT publishes, MQTT binary frames, etc.)
+   fall through untouched via the JSON.parse-error no-op path.
 
-- `pub trait FrameSink: Send + Sync { fn emit_frame(&self, event: &str, frame: TranscribeFrame); }`
-- `impl FrameSink for tauri::WebviewWindow` (delegates to `tauri::Emitter::emit`).
-- `pub struct CaptureSink` (test-only) that records `(event, frame)` pairs in a `Mutex<Vec>`.
+2. **Replay on every subsequent `onopen`.** A `hasOpenedOnce` flag
+   gates the replay so the first open behaves exactly like upstream
+   (strategy will send its own REQ via `subscribe()` callback). Every
+   reopen after that calls `scheduleReplay()`.
 
-`transcribe.rs` now takes `&Arc<dyn FrameSink>` instead of
-`&WebviewWindow`. Public Tauri commands still receive `WebviewWindow`
-and wrap it in `Arc::new(window)` before calling the internals. The
-ingest thread `Arc::clone`s the sink across worker boundaries.
+3. **Anti-flood backoff.** `scheduleReplay` shares per-socket state
+   (`resubscribeAttempt`, `lastResubscribeAt`, `pendingResubscribeTimer`)
+   that enforces a schedule of **5s / 10s / 15s / 30s / 60s, sticking
+   at 60s**. Reset to attempt 0 after `60s` of quiet so a long-stable
+   socket that finally blips doesn't sit at the cap. If a reconnect
+   lands while a replay is already scheduled, the scheduler is a
+   no-op (one in-flight replay per URL).
 
-### Important Cargo.toml change
+4. **Observable.** One log line per replay event:
+   `[trystero-patch] <host> replayed N subscription(s) on reconnect
+   (attempt=M, next-eligible-in=Ks)`. Not per-message — state-transition
+   only, in line with the existing patch's log discipline.
 
-`ndarray` pinned to `0.17` to match what `ort 2.0.0-rc.12`
-internally depends on. Mixing `0.16` and `0.17` compiles them as
-distinct types, so `Tensor::from_array` doesn't accept an array from
-the wrong version — symptomatic failure is a confusing "trait not
-satisfied" error pointing at the same-looking type.
+The other hunks on this patch (the `getConnectedPeerHealth =
+transient on disconnected` fix in `shared-peer.mjs`, the
+`flushStaleOfferPool` on `onPeerLeave` in `strategy.mjs`, the
+defensive `offerAnswered` clears in `signal-handler.mjs`, and all
+the `_mom*` instrumentation) all stay — they're correct fixes for
+adjacent problems and the instrumentation is what made this
+diagnosis possible.
 
-## ort 2.0.0-rc.12 API notes (in case the next ort version churns)
+## What to verify in the wild
 
-- `session.inputs()` is a method (not a field). `Outlet::name()` →
-  `&str`.
-- Owned tensor: `Tensor::from_array(arr)` consumes the
-  `ndarray::Array`. Borrowed: `TensorRef::from_array_view(&arr)`
-  works but the generics inference is fragile — turbofish it if you
-  hit the "trait not satisfied" wall.
-- Run with `session.run(ort::inputs![ name => tensor, ... ])` or a
-  built-up `Vec<(Cow<'static, str>, SessionInputValue)>` for cases
-  with a dynamic input set (Moonshine's past-KV).
-- `ort::Error` is **not** `Send + Sync`, so `?` against an
-  `anyhow::Result` won't work. Use `.map_err(|e| anyhow!("ort: {e}"))`.
-- `outputs.get(name)` returns `Option<&DynValue>`. Extract with
-  `value.try_extract_array::<f32>()` → `ArrayViewD<'_, f32>` (borrowed
-  view). Call `.to_owned()` for an `ArrayD` that survives past the
-  next `.run`.
-- Build with `default-features = false, features = ["std", "load-dynamic", "ndarray", "api-22"]`.
-  Skipping `api-22` gives "unknown field
-  `SessionOptionsAppendExecutionProvider_VitisAI`" — `vitis.rs`
-  references it unconditionally despite being feature-gated on the
-  bindings side.
+Get one network-swap reproduction with the patched build on at
+least the swap-side (ideally both, since the same code runs on
+both). With DevTools open and console filtered for `[trystero-patch]`:
 
-## Real-hardware verification — the load-bearing next step
+1. **Module-load markers fire.** `[trystero-patch] signal-handler.mjs
+   loaded` and `[trystero-patch] strategy.mjs loaded` print once per
+   page load. If they don't, the patched bundle isn't running — see
+   "Don't trust pnpm 'Already up to date'" in the old notes.
 
-Everything compiles and `cargo test` is green (98 tests, including
-new ones for `join_segments`, `CaptureSink`, and `l2_normalize`),
-**but none of the four ONNX forward passes have run against a real
-model file**. The shapes and tensor names are inferred from the
-upstream model cards + sherpa-onnx / istupakov community exports.
-The next session should:
+2. **`replayed N subscription(s)` fires on the swap.** Within a few
+   seconds of the WebSocket onclose burst (the 5 `WebSocket connection
+   to 'wss://…' failed: The network connection was lost.` lines), you
+   should see one `[trystero-patch] <relay> replayed 2 subscription(s)
+   on reconnect (attempt=1, next-eligible-in=10s)` line per relay
+   that reopens. N=2 because Trystero subscribes to root + self topics.
 
-1. On a Pi 5: pull the Moonshine Small composite via the GUI's "first
-   run" flow or `myownllm preload transcribe`. Open the transcribe
-   pane, record 30 seconds of speech, verify segments arrive and the
-   transcript is sensible.
-2. On Apple Silicon / x86 with ≥ 16 GB unified RAM: same but for
-   Parakeet TDT.
-3. Toggle "Identify speakers" on either platform. Verify the
-   diarize models pull, the segmenter + embedder forward without
-   shape errors, and speaker pills render correctly.
-4. If any forward errors with a shape mismatch, the most likely
-   cause is a renamed I/O tensor on a fresh upstream export — the
-   suffix-match should handle most cases, but rare ones may need an
-   added pattern in the `warm_up` sniffer.
+3. **Natural re-handshake completes inside the grace window.** Look
+   for `received offer` (if we're the answering side) or `sending
+   offer` (if we're the leader) within 15-30s of the peer-left, not
+   the 90+s it was previously taking. The `_mom*` state machine
+   should transition `connected → offering → connected` or
+   `connected → ??? → connected` (the latter for the answering
+   side, which doesn't have a clean intermediate state — that's a
+   gap in the patch's state machine, noted below).
 
-## Deferred items (still useful, no longer load-bearing)
+4. **No `auto rediscovery #1 — N peer(s) aged out of grace`.** That
+   message firing means the patch didn't help in time and the heavy
+   rebuild still had to backstop. If you see it, capture the trace
+   — we want to know whether the replays fired but didn't restore
+   message flow (relay-side problem? subscription rejected?) or
+   whether the replays didn't fire (`hasOpenedOnce` not flipping?
+   wrong code path?).
 
-- **Cached Moonshine decoder**. The no-cache loop is O(n²); the
-  cached path is O(n). For 1 s chunks (`n ≤ 30`) the absolute cost
-  is small but a longer chunk size or a wider model would benefit.
-- **Golden-audio integration test**. Now genuinely tractable since
-  `CaptureSink` exists. Blocker is shipping ~150 MB of ONNX models
-  to CI (Moonshine alone) plus a small fixture WAV. Options:
-  download-on-demand in the test (slow CI), gate on a
-  `MYOWNLLM_TEST_ASSETS_DIR` env var (skip when unset), or store
-  fixtures via Git LFS. Worth deciding once one platform has been
-  manually verified.
-- **`diarize_model_remove` Tauri command + Settings UI hook**. Lets
-  users free disk by removing pyannote / wespeaker / CAM++ without
-  touching the filesystem. Low priority — `models::remove` is
-  already there; just needs the command + UI wiring.
+5. **No reply storms.** With 5 relays and the laptop's network
+   flapping, the worst case is 5 × (one replay per backoff slot).
+   If you swap repeatedly with the laptop, the second swap's
+   replays should be 10s apart (per the backoff), the third 15s,
+   etc. — visible in the `next-eligible-in` log values.
 
-## CI gates (all green locally on this branch)
+## Setup, both ends
 
-```
-cd src-tauri && cargo fmt --check    # OK
-cd src-tauri && cargo clippy --all-targets   # 1 pre-existing warning (remote_ui)
-cd src-tauri && cargo test --no-fail-fast    # 98 passing
-pnpm install && pnpm check                   # 0 errors
-```
+- **Windows desktop** — the OTHER end this run. Doesn't swap. Static
+  LAN.
+- **Apple Silicon laptop** ("Neo") — the swap-side this run.
+  Switching between LAN Wi-Fi and phone hotspot. **Note**: prior
+  versions of this doc said the desktop was swapping. The user
+  is now testing with the laptop swapping. Both sides need the
+  patched build; the logic on the swap-side is where the fix
+  primarily acts but the non-swap side benefits from the same
+  patch on its own future swaps.
+
+Both run `just dev` (which calls `pnpm install --frozen-lockfile`
+then `pnpm tauri dev`). pnpm re-applies the patch on every install
+via `patchedDependencies` in `package.json`. Vite's dep pre-bundle
+is disabled for trystero packages (`vite.config.ts`
+`optimizeDeps.exclude`) and `package.json`'s `postinstall` wipes
+`node_modules/.vite` so patch changes always reach the dev bundle
+on the next `just dev` — verify these stay in place.
+
+## How to read the swap-side trace now
+
+State-transition logs from the existing instrumentation:
+- `<peerid>… first seen (announce)`
+- `<peerid>… received offer <ofId> (we are answering)`
+- `<peerid>… sending offer <ofId>`
+- `<peerid>… replacing offer <old> (after Ns, no answer) with <new>`
+- `<peerid>… STILL no answer for offer <ofId> after Ns`
+- `<peerid>… received answer for <ofId> after Ns`
+- `<peerid>… fresh → connected` / `… → connected`
+- `<peerid>… connected → disconnected` (NB: this only fires via
+  `clearConnectedPeer` in signal-handler.mjs; the strategy.mjs
+  `onPeerLeave` path doesn't route through it, so leaves seen
+  through `room.onPeerLeave` log via `[mesh] peer left` instead.
+  Not a bug, just a quirk of the state-machine coverage.)
+- `<peerid>… ICE health=transient — entered 7.5s grace`
+
+New from this round:
+- `<relay-host> replayed N subscription(s) on reconnect (attempt=M,
+  next-eligible-in=Ks)` — fires per relay each time we successfully
+  resubscribe after a reopen. The `next-eligible-in` value confirms
+  the backoff schedule is moving as designed.
+
+`[mesh] peer left` includes `pair=<localCandidateType>↔<remoteCandidateType>`
+and `lived=Ns`. `[mesh] signaling: …` is change-gated (5-min
+heartbeat), so silence during a stable gap is expected.
+
+## Iterations that have already been tried
+
+In commit order on this branch:
+
+| Commit | What it did | What we learned |
+|---|---|---|
+| `8c01989` | Patched `state.offerAnswered = false` in `clearConnectedPeer` and `strategy.onPeerLeave` because we thought `offerAnswered` was sticky | **Wrong hypothesis.** `attachSharedPeerToRoom`'s `resetOfferState` already clears `offerAnswered` at connect time, so it's `false` by the time these callbacks fire. Kept the clears defensively. |
+| `0f2e015` | Per-event diagnostic firehose | **Too noisy** — drowned the console. Replaced with state-transition logging in `ad8a1b9`. |
+| `039de8d` | `vite.config.ts` `optimizeDeps.exclude` for trystero packages + module-load markers in the patch | **Real reliability fix.** Keep these. |
+| `3581327` | `package.json` postinstall script that nukes `node_modules/.vite` | **Real reliability fix.** Belt-and-suspenders. Keep. |
+| `9c7f688` | `shared-peer.mjs::getConnectedPeerHealth` returns `"transient"` for `connectionState === "disconnected"` | **Correct fix.** Right behavior; the upstream `"live"` short-circuit was too forgiving. Keep. |
+| `ad8a1b9` | `flushStaleOfferPool` in `strategy.mjs::onPeerLeave` + state-transition instrumentation | **Correct fix for the offer-side stale-candidate problem, but not the bottleneck.** The 90s window persisted because we couldn't even RECEIVE announces — see this commit. |
+| `<this>` | `utils.mjs::makeSocket` replays Nostr `REQ` subscriptions on every WebSocket reopen with 5/10/15/30/60s backoff | **Root-cause fix (pending in-the-wild verification).** The 90s gap was the relay forwarding zero events to a reconnected-but-resubscribed socket. |
+
+## Why earlier hypotheses missed this
+
+The prior round was looking at `peerStates[peerId]` and offer-pool
+contents to explain why `handleAnnouncement` wouldn't send a fresh
+offer. That assumed `handleAnnouncement` was being CALLED in the
+first place — i.e. that announces were arriving. They weren't,
+because subscriptions were dead at the relay. The state-transition
+instrumentation logged nothing during the gap not because
+`handleAnnouncement` early-returned, but because no message ever
+made it to `createSignalHandler`.
+
+The clue that broke this open: the signaling diag is **change-gated**
+(`fingerprint_changed && heartbeat_due`), so total silence during
+the 90s gap means "state is stable" — not "relays are down." Sockets
+were sitting at `readyState === 1`, looking perfectly healthy, but
+silently subscribe-less. The user's comment "starting a connection
+is so fast, but reconnecting is impossibly slow" pointed straight
+at this: cold start runs `subscribe()`; reconnect doesn't.
+
+## If the patch doesn't help
+
+If a verified swap on this build still shows 90s of dead air, here
+are the most likely next places to look, in order:
+
+1. **The patch isn't running.** Module-load markers are the
+   sanity check. Also `grep -c "replayed.*subscription"
+   dist/assets/nostr-*.js` should return ≥1 in the built bundle.
+2. **The replays fire but the relay rejects them.** Some Nostr
+   relays may close the connection on a duplicate-subId REQ
+   instead of just refreshing the subscription. If you see
+   `[trystero-patch] <host> replayed …` followed by another
+   `WebSocket connection to 'wss://…' failed`, the replay
+   triggered the rejection. Workaround: regen `subId` per
+   reconnect (would require also updating Trystero's `msgHandlers`
+   map to remap the new subId to the same handler — a deeper
+   patch).
+3. **The other side has a different bug.** Capture the non-swap
+   side's trace (the desktop) during the same swap. Look for
+   whether the desktop sees our resubscribe-triggered events
+   in inbound EVENT counters. If the desktop's relays are
+   forwarding our announces but the offer/answer still isn't
+   completing, the issue moved into the WebRTC layer.
+4. **The backoff is too long for the failure mode.** If
+   reconnects come in bursts faster than 5s, the first replay
+   fires but subsequent replays are deferred. Could shorten the
+   first-slot to ~2s if that's what the trace shows.
+
+## Files to know (unchanged from the prior handoff)
+
+- `patches/@trystero-p2p__core@0.24.0.patch` — the patch file. Use
+  `pnpm patch @trystero-p2p/core@0.24.0` to open an editable copy at
+  `node_modules/.pnpm_patches/@trystero-p2p/core@0.24.0`, then
+  `pnpm patch-commit <path>` to regenerate.
+- `src/mesh-client.svelte.ts` — the application's mesh client.
+  Constants: `RECONNECTING_GRACE_MS = 90_000`,
+  `ICE_DISCONNECTED_RESTART_MS = 1_000`.
+- `CONNECTION-ENGINE.md` — the architecture / journal doc.
+  "Known upstream limitations" updated for this round.
+- `vite.config.ts` — `optimizeDeps.exclude` keeps trystero out
+  of the pre-bundle cache.
+- `package.json` — `postinstall` nukes `.vite`; `patchedDependencies`
+  applies the patch.
+
+## What NOT to do (still applies)
+
+- **Don't revert grace timing.** 90s remains a fine backstop for
+  the rebuild path. We just shouldn't need it to fire.
+- **Don't add log-spam per-event.** State transitions only.
+- **Don't speculate without evidence.** Get a trace.
+- **Don't trust pnpm "Already up to date".** Module-load marker is
+  the only way to be sure the patched bundle is running.

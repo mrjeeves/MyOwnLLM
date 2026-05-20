@@ -465,25 +465,24 @@ const ICE_DISCONNECTED_RESTART_MS = 1_000;
  *  this — don't go fiddle with anything," "offline" communicates
  *  "this peer isn't coming back without intervention."
  *
- *  Originally sized at 90s to overlap the first auto-rediscovery
- *  window so natural Trystero discovery had a long runway to
- *  reconnect the peer without our heavy rejoin firing. That
- *  rationale broke once we realized Trystero v0.24.0 has a
- *  state-stickiness bug (the `offerAnswered` flag in
- *  `@trystero-p2p/core/dist/signal-handler.mjs` never clears
- *  after a connection death once the post-answer expiry timer
- *  has fired on a live connection): natural re-handshake is
- *  blocked and a room rejoin is the only path back. Waiting 90s
- *  is therefore 60s of dead time before the rejoin we always
- *  end up needing. 30s keeps "reconnecting…" UI for a brief
- *  flap-recovery window but kicks the rejoin sooner when it's
- *  going to be needed.
+ *  Sized at 90s to overlap the first auto-rediscovery window so
+ *  natural Trystero discovery has a long runway to reconnect the
+ *  peer without our heavy rejoin firing. The Trystero
+ *  state-stickiness bug (`offerAnswered` not cleared in
+ *  `clearConnectedPeer`) used to break natural recovery and force
+ *  a rebuild on every drop — that's why this constant briefly went
+ *  to 30s — but we now ship a local patch
+ *  (`patches/@trystero-p2p__core@0.24.0.patch`) that clears
+ *  `offerAnswered` on disconnect, so natural re-handshake works
+ *  again and the long grace window is back to being useful: most
+ *  LAN↔WAN swaps recover inside 10s via Trystero's 5.333s
+ *  presence-announce cadence + ICE restart, well inside 90s.
  *
  *  Stable-identity matching means a peer who returns DURING this
  *  window (via fresh peer_id from a Trystero rejoin on their
  *  side) with the same `device_pubkey` reuses the existing
  *  card — no `offline → handshaking → active` UI churn. */
-const RECONNECTING_GRACE_MS = 30_000;
+const RECONNECTING_GRACE_MS = 90_000;
 /** Cadence for pruning expired `recent_disconnects` entries. Cheap
  *  iteration over what's typically a handful of entries; the only
  *  cost of running it more often is one extra wakeup per tick. */
@@ -522,33 +521,27 @@ const REHANDSHAKE_RESCUE_ATTEMPTS = 3;
  *  peer successfully completes auth, so a peer that pops back
  *  online gets the next outage's full reactivity. */
 const REDISCOVERY_BACKOFF_SCHEDULE_MS = [
-  30_000, // 30s — first attempt: must fire immediately when
-          // grace expires, since (a) we've now demonstrated
-          // natural Trystero discovery can't recover from the
-          // state-stickiness bug without our help, and (b) the
-          // `SIGNALING_RELAY_DENYLIST` already removed the
-          // rate-limiting relays (Damus, chorus.pjv.me), so
-          // 30s no longer trips Nostr anti-spam.
-  90_000, // 1.5m — second attempt
-  180_000, // 3m
-  300_000, // 5m — final, repeated indefinitely
-  // Schedule history: originally [60s, 120s, 180s, 300s], then
-  // bumped to [90s, 3m, 5m, 10m] when Damus rate-limiting was
-  // chronically blowing us up on flaky networks. The deny-filter
-  // commit removed Damus from the relay set entirely, which
-  // freed us to bring the first interval back down — and we want
-  // it as short as we can manage because of the Trystero
-  // state-stickiness bug: every drop of an authenticated peer
-  // is effectively guaranteed to require a rejoin to recover
-  // (natural Trystero re-handshake is blocked by the stuck
-  // `offerAnswered` flag in core/signal-handler.mjs), so the
-  // throttle is no longer protecting an actual recovery path,
-  // it's just gating how long the user stares at "reconnecting…"
-  // before we do the only thing that works. The 5m tail stays
-  // long enough that a genuinely-offline peer doesn't pull the
-  // mesh through an endless rejoin loop. `consecutive_rediscovery_attempts`
-  // resets on any onPeerJoin so the schedule unwinds the moment
-  // a peer reappears.
+  90_000, // 1.5m — first attempt: lets natural Trystero discovery
+          // (presence announces every 5.333s) and the per-peer ICE
+          // restart watchdog do their work without a heavy rebuild
+          // racing them. With the upstream `offerAnswered` patch in
+          // place, natural re-handshake actually works after a peer
+          // drop, so the room rejoin returns to being a true backstop
+          // for the genuinely-stuck case rather than the primary
+          // recovery path. A peer that's coming back via natural
+          // discovery typically returns inside ~10s of the drop, well
+          // under this window.
+  180_000, // 3m — second attempt
+  300_000, // 5m
+  600_000, // 10m — final, repeated indefinitely
+  // Schedule history: [60s, 120s, 180s, 300s] → [90s, 3m, 5m, 10m]
+  // (Damus anti-spam protection) → briefly [30s, 90s, 3m, 5m] while
+  // we believed natural recovery was impossible due to the Trystero
+  // `offerAnswered` stickiness → back to [90s, 3m, 5m, 10m] now that
+  // the patch (`patches/@trystero-p2p__core@0.24.0.patch`) clears
+  // the stuck flag and natural discovery genuinely recovers most
+  // drops. `consecutive_rediscovery_attempts` resets on any
+  // onPeerJoin so the schedule unwinds the moment a peer reappears.
 ];
 /** Cadence at which we check whether any rostered peer is offline
  *  and, if so, ask for a rediscovery. Catches the asymmetric
@@ -4352,10 +4345,24 @@ class MeshClient {
       // computePeers stops rendering the "reconnecting" framing. The
       // UI sees a single state transition (reconnecting → active),
       // not the offline→handshaking→active churn.
+      const disconnect_entry = this.recent_disconnects.get(conn.device_pubkey);
       if (this.recent_disconnects.delete(conn.device_pubkey)) {
+        // Distinguish natural Trystero re-handshake (the upstream
+        // `offerAnswered` patch path — Trystero discovered the peer
+        // again on its own, no rebuild needed) from a rebuild-driven
+        // recovery (we tore down the room and rejoined). If the last
+        // forced rediscovery is OLDER than the original disconnect,
+        // we never rebuilt — natural recovery worked. This is the
+        // signal that confirms `patches/@trystero-p2p__core@0.24.0.patch`
+        // is engaging: pre-patch, this branch should never fire after
+        // a network swap because natural recovery was structurally
+        // blocked by the stuck `offerAnswered` flag.
+        const since = disconnect_entry?.since ?? 0;
+        const recovery_age_s = Math.max(0, Math.round((Date.now() - since) / 1000));
+        const natural = since > 0 && this.last_force_rediscovery_at < since;
         this.logDiag(
           "info",
-          `peer ${conn.device_pubkey.slice(0, 8)}… reconnected within grace window — same identity, link healed`,
+          `peer ${conn.device_pubkey.slice(0, 8)}… reconnected within grace (${recovery_age_s}s) — ${natural ? "natural Trystero re-handshake (no rebuild)" : "post-rebuild"}`,
         );
       }
       this.logDiag("info", `peer active: ${conn.device_pubkey.slice(0, 8)}…`);

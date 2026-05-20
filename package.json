@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "lint:rs": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -W warnings",
-    "fmt:rs": "cargo fmt --manifest-path src-tauri/Cargo.toml"
+    "fmt:rs": "cargo fmt --manifest-path src-tauri/Cargo.toml",
+    "postinstall": "node -e \"try { require('fs').rmSync('node_modules/.vite', { recursive: true, force: true }) } catch (_) {}\""
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -31,6 +32,9 @@
   "pnpm": {
     "onlyBuiltDependencies": [
       "esbuild"
-    ]
+    ],
+    "patchedDependencies": {
+      "@trystero-p2p/core@0.24.0": "patches/@trystero-p2p__core@0.24.0.patch"
+    }
   }
 }
