@@ -1,5 +1,4 @@
 <script lang="ts">
-  import ProvidersSection from "./settings/ProvidersSection.svelte";
   import FamiliesSection from "./settings/FamiliesSection.svelte";
   import ModelsSection from "./settings/ModelsSection.svelte";
   import StorageSection from "./settings/StorageSection.svelte";
@@ -13,18 +12,21 @@
   import type { CloudMeshSubTab } from "./settings-route.svelte";
 
   type Tab =
-    | "providers"
     | "families"
     | "models"
-    | "storage"
+    | "permissions"
     | "hardware"
+    | "storage"
     | "usage"
     | "cloud-mesh"
-    | "permissions"
     | "updates"
     // Legacy values that still appear in old `initialTab` deep-links
     // from earlier code paths. We map them to current ids on entry so a
-    // stale callsite doesn't render an empty tab.
+    // stale callsite doesn't render an empty tab. "providers" is
+    // mapped to "updates" with `showProviders` set — the providers
+    // screen now lives as a sub-page of Updates rather than its own
+    // top-level tab.
+    | "providers"
     | "transcription"
     | "remote";
 
@@ -55,18 +57,25 @@
       ? "models"
       : initialTab === "remote"
         ? "cloud-mesh"
-        : initialTab,
+        : initialTab === "providers"
+          ? "updates"
+          : initialTab,
   );
 
-  const tabs: Array<{ id: Exclude<Tab, "transcription" | "remote">; label: string }> = [
+  /** Drives the embedded providers sub-page inside Updates. Seeded
+   *  true when the deep-link target was "providers" so the legacy
+   *  callsite lands directly on the providers screen. */
+  // svelte-ignore state_referenced_locally
+  let initialShowProviders = $state<boolean>(initialTab === "providers");
+
+  const tabs: Array<{ id: Exclude<Tab, "providers" | "transcription" | "remote">; label: string }> = [
     { id: "families", label: "Family" },
-    { id: "providers", label: "Providers" },
     { id: "models", label: "Models" },
-    { id: "storage", label: "Storage" },
+    { id: "permissions", label: "Permissions" },
     { id: "hardware", label: "Hardware" },
+    { id: "storage", label: "Storage" },
     { id: "usage", label: "Usage" },
     { id: "cloud-mesh", label: "Networks" },
-    { id: "permissions", label: "Permissions" },
     { id: "updates", label: "Updates" },
   ];
 
@@ -118,8 +127,6 @@
     <div class="content">
       {#if active === "families"}
         <FamiliesSection {onChanged} {onClose} {initialDetailFamily} />
-      {:else if active === "providers"}
-        <ProvidersSection {onChanged} />
       {:else if active === "models"}
         <ModelsSection {onChanged} {onClose} />
       {:else if active === "storage"}
@@ -133,7 +140,7 @@
       {:else if active === "permissions"}
         <PermissionsSection />
       {:else if active === "updates"}
-        <UpdatesSection />
+        <UpdatesSection {onChanged} {initialShowProviders} />
       {/if}
     </div>
   </div>

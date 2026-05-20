@@ -63,7 +63,7 @@
    *  `myownllm purge {models,conversations,data}` subcommands. */
   type DangerKey = "models" | "conversations" | "data";
 
-  type Tab = "providers" | "families" | "models" | "storage" | "updates";
+  type Tab = "families" | "models" | "storage" | "updates";
 
   let { setActive } = $props<{ setActive: (tab: Tab) => void }>();
 

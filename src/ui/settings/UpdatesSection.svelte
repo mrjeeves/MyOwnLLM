@@ -1,6 +1,19 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import ProvidersSection from "./ProvidersSection.svelte";
+
+  let { onChanged, initialShowProviders = false } = $props<{
+    onChanged: () => void;
+    /** Open straight into the embedded Providers screen on mount.
+     *  Set when a deep-link target asks for the providers panel —
+     *  the providers tab itself was retired, the screen now lives
+     *  as a sub-page inside Updates. */
+    initialShowProviders?: boolean;
+  }>();
+
+  // svelte-ignore state_referenced_locally
+  let showProviders = $state<boolean>(initialShowProviders);
 
   interface PendingUpdate {
     version: string;
@@ -112,12 +125,26 @@
 </script>
 
 <div class="section">
-  {#if loading}
-    <div class="loading">Loading…</div>
-  {:else if error && !status}
-    <div class="error">{error}</div>
-  {:else if status}
+  {#if showProviders}
+    <ProvidersSection {onChanged} showBack onBack={() => (showProviders = false)} />
+  {:else}
     <div class="content">
+      <button class="providers-card" onclick={() => (showProviders = true)}>
+        <div class="providers-card-main">
+          <span class="providers-card-title">Providers</span>
+          <span class="providers-card-desc">
+            Manage manifest sources — add, switch, or remove the providers
+            that publish model families.
+          </span>
+        </div>
+        <span class="providers-card-chevron" aria-hidden="true">›</span>
+      </button>
+
+      {#if loading}
+        <div class="loading">Loading…</div>
+      {:else if error && !status}
+        <div class="error">{error}</div>
+      {:else if status}
       <div class="header-row">
         <div>
           <div class="version">myownllm {status.current_version}</div>
@@ -228,6 +255,7 @@
       {#if error}
         <div class="error">{error}</div>
       {/if}
+      {/if}
     </div>
   {/if}
 </div>
@@ -240,6 +268,24 @@
     padding: 1rem 1.1rem;
     overflow-y: auto;
     display: flex; flex-direction: column; gap: 1rem;
+  }
+  .providers-card {
+    width: 100%;
+    text-align: left;
+    background: #131318;
+    border: 1px solid #1e1e1e;
+    border-radius: 8px;
+    padding: .75rem .9rem;
+    color: #ccc;
+    cursor: pointer;
+    display: flex; align-items: center; gap: .75rem;
+  }
+  .providers-card:hover { background: #181820; border-color: #2a2a2a; }
+  .providers-card-main { flex: 1; display: flex; flex-direction: column; gap: .2rem; min-width: 0; }
+  .providers-card-title { font-size: .92rem; font-weight: 600; color: #e8e8e8; }
+  .providers-card-desc { font-size: .76rem; color: #888; line-height: 1.45; }
+  .providers-card-chevron {
+    color: #555; font-size: 1.2rem; line-height: 1; flex-shrink: 0;
   }
   .header-row {
     display: flex; align-items: center; justify-content: space-between; gap: 1rem;

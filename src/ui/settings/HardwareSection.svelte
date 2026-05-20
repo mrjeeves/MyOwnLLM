@@ -7,7 +7,7 @@
   import { scrollAffordance } from "../scroll-affordance";
   import type { HardwareProfile, GpuType, MicConfig } from "../../types";
 
-  type Tab = "providers" | "families" | "models" | "storage" | "updates" | "hardware";
+  type Tab = "families" | "models" | "storage" | "updates" | "hardware";
 
   let { setActive } = $props<{ setActive: (tab: Tab) => void }>();
 
