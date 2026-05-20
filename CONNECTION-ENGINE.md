@@ -279,10 +279,11 @@ A checklist for the next contributor adding, say, a new `metrics_announce` messa
 ## Known upstream limitations (and how we patch them)
 
 Trystero v0.24.0 has internal-state behaviors that block natural
-recovery from network swaps. Two are documented here along with
-how we work around them. Both fixes live in
-`patches/@trystero-p2p__core@0.24.0.patch` (a single patch file
-with multiple hunks) and ship via pnpm's `patchedDependencies`.
+recovery from network swaps and from one-sided-zombie situations.
+Three are documented here along with how we work around them.
+All fixes live in `patches/@trystero-p2p__core@0.24.0.patch` (a
+single patch file with multiple hunks) and ship via pnpm's
+`patchedDependencies`.
 
 ### 1. Subscription state lost on WebSocket reconnect (the load-bearing fix)
 
@@ -359,6 +360,54 @@ but was unreachable. A real network blip that recovers inside the
 7.5s grace doesn't trigger a teardown — the next message sees
 `connectionState` back to `"connected"` and
 `connectedPeerUnhealthySinceMs` resets to null.
+
+### 3. Inbound silence makes one side a zombie while it still believes it's connected
+
+Issue 2 above only fires once `connection.connectionState ===
+"disconnected"` is true — but WebRTC's ICE consent freshness can
+take 15-30s to flip the state to `"disconnected"` after the peer
+has actually gone away. During that lag,
+`getConnectedPeerHealth` returns `"live"` because
+`connection.connectionState === "connected"` and
+`channel.readyState === "open"` both still look fine.
+`createSignalHandler` then short-circuits on every inbound
+presence-announce from the peer (who, after recovery, IS sending
+fresh announces), refusing to answer their reconnection request.
+The connection appears healthy on one side and is dead on the
+other, and the side that thinks it's still connected won't
+engage a re-handshake until consent freshness finally tips state
+to `disconnected` — at which point Issue 2's 7.5s grace adds
+more on top of that. Total stuck-time can hit 20-40s in adverse
+environments.
+
+**Fix.** Track the timestamp of the last inbound signaling
+message per peer in a module-level `_lastInboundAt: Map<peerId,
+ts>` inside `signal-handler.mjs`. In `createSignalHandler`, read
+the prior timestamp BEFORE updating, then compute
+`isInboundStale = now - prevInbound > _STALE_INBOUND_MS` (25s,
+~5× Trystero's 5.333s announce cadence — well above any
+single-relay blip the subscription-replay patch can't catch). If
+true, override `getConnectedPeerHealth` to `"stale"` instead of
+calling it; the existing `health === "stale"` branch then calls
+`clearConnectedPeer` immediately. The message itself then
+proceeds through `handleAnnouncement` / `handleOffer` /
+`handleAnswer` naturally — no Trystero-level grace window
+needed, because mesh-level identity validation (the
+`auth_response` signature in `mesh-protocol.ts`) re-establishes
+trust on the new handshake. `_lastInboundAt.delete(peerId)` is
+called from `clearConnectedPeer` so a future reconnect starts
+the staleness clock fresh.
+
+Why no Trystero-level grace before clearing: the message
+arriving NOW from this peer is positive proof the peer is alive
+*and* the prior silence proves the old connection was dead.
+There's no scenario where we want to keep waiting — the peer is
+asking to reconnect, our job at this layer is to let them. The
+mesh layer above will re-auth them anyway.
+
+State-transition log: `[trystero-patch] <peerid> inbound silent
+<N>s — clearing zombie connectedPeer (identity will re-validate)`.
+Fires per stale-clear event.
 
 ### Other hunks in the patch
 
@@ -463,3 +512,5 @@ The Activity panel surfaces the same data the diag log holds; Quiet logs suppres
 - **Asymmetric WebRTC failure detection + `getConnectedPeerHealth` patch + Windows pnpm-patch reliability work**: the diag trace from a real LAN↔WAN swap exposed the real blocker. After the desktop swapped networks, our side (the swap-side) hit `strategy.onPeerLeave` within ~5s — OS network-change events plus ICE consent freshness pushed the local `RTCPeerConnection` to `failed` fast. Our state went clean (`cp=0 oa=0 op=0 ap=0 or=0`), and our `createSignalHandler` correctly responded to the dropped peer's presence announces with `announce-send-back-id` — once per relay every ~5s, for 90 straight seconds — without ever seeing a `handleOffer:entry` come back. The leading peer (the Pi at the other end, the side that didn't swap) was supposed to reply with a fresh offer once it saw our send-back-id, but didn't. Root cause traced to `shared-peer.mjs::getConnectedPeerHealth`: when the local `RTCPeerConnection` enters `connectionState === "disconnected"` but `channel.readyState` is still `"open"` (the typical state for the side whose remote peer vanished), the upstream function short-circuits to `"live"`. The slow side's `createSignalHandler` early-returns on every incoming announce from us — never reaching the announce-block / `handleAnnouncement` / `ensureOffer` path — for the full 15-30s it takes Chrome/WebView to escalate the connection from `disconnected` to `failed`. By the time the slow side finally declares the channel stale, our rebuild backstop has already taken over. Patch: return `"transient"` when `connectionState === "disconnected"` even if the channel is still open. The existing 7.5s `disconnectedPeerGraceMs` window in `createSignalHandler` then engages — it has been there all along but was unreachable because the channel-readyState gate was too forgiving — and the slow side clears its `state.connectedPeer` ~7.5s after our announce-back-ids start arriving. The next announce after that triggers a real `handleAnnouncement` → `ensureOffer` → offer-send, and natural re-handshake completes inside ~10s instead of waiting 90s for the rebuild. Real network blips that recover within the 7.5s window don't trigger a teardown — next message sees `connectionState` back to `connected`, health goes back to `"live"`, `connectedPeerUnhealthySinceMs` resets to null. Sibling reliability work in the same iteration: `vite.config.ts` `optimizeDeps.exclude` for `trystero`, `@trystero-p2p/core`, `@trystero-p2p/nostr` so pnpm-patch changes always reach the dev bundle without manual cache wipes; `package.json` `postinstall` script that nukes `node_modules/.vite` after every `pnpm install` for the same reason on machines whose vite cache invalidation is flaky (Windows in particular); module-load `[trystero-patch] signal-handler.mjs loaded (diag overlay v2)` markers in both patched files so the patch's presence in the running bundle can be confirmed at a glance instead of requiring a swap to verify.
 - **Stale offer pool after network swap + state-transition instrumentation**: with both ends patched and the previous round's `getConnectedPeerHealth` fix in place, field testing still showed the natural re-handshake refusing to engage on the second swap of a session. The diag trace exposed the precise pattern: peer drops, we send offer `6F0TWy18i4Ih` to all 5 relays repeatedly for 90s without ever receiving a `handleAnswer`, rebuild fires, the NEW offer `goMfufW7wFWc` gets an answer within a second. Same code path, same peers — only the offer SDP differed. Root cause is in `offer-pool.mjs`: at room-join time, `pool.warmup()` pre-allocates 20 offer-peers via `peer_default(true, config)`, each running its own ICE gathering. Each peer's `getOffer()` returns SDP that bakes in the local candidates collected at gather time. The pool's cleanup timer only removes `isDead` peers; live peers with pre-swap IP candidates stay forever, and `encryptOffer` only calls `getOffer(true)` (which would `restartIce`) when the peer is older than `offerTtl = 57s`. So during the first ~57s after a network swap, every checkout from the pool hands out an offer whose SDP advertises our old IP. The remote receives it, ICE-checks our old IP, fails, the connection never establishes, and our side keeps re-sending the same dead offer until rebuild dumps the pool. **Fix:** add a `flushStaleOfferPool` helper in `strategy.mjs` that destroys all pre-cached peers in `offerPool.pool` (throttled to once per 10s). Wire it into the room's `onPeerLeave` callback — when a peer drops, that's the strongest signal that our local network may have changed, so we discard the pool. `OfferPool.checkout` already handles an empty pool by falling through to `if (missing > 0) peers.push(...alloc(missing, this.makeOffer))`, so the next handshake gets a fresh peer with current candidates. **Sibling work:** the previous diag overlay was logging every announce/offer/answer iteration and drowning the console — replaced with state-transition instrumentation in `signal-handler.mjs`. A per-peer session tracker (keyed by peerId, kept in a module-level Map) records the high-level lifecycle: `first seen → offering → connected → disconnected → recovering → connected`. Logs fire only on transitions or on periodic "stuck" thresholds (15s/30s/60s/120s since an unanswered offer). The raw firehose is gone; a typical successful swap-and-recover sequence now produces ~6 lines instead of ~6000. Patch entry points: `_momOfferStarted` on the first `signalPeer(offer)` for a given offerId (dedupes the per-relay copies), `_momOfferRetryCheck` on every send (logs only when a stuck-threshold has been crossed), `_momAnswerReceived` in `handleAnswer`, `_momConnected` in `attachSharedPeerToRoom`, `_momDisconnected` in `clearConnectedPeer`, `_momGraceStarted` when the transient-grace window opens, `_momOfferReceived` in `handleOffer`.
 - **Trystero subscription state lost on WebSocket reconnect — the load-bearing fix**: with all the above in place, field testing of `ad8a1b9` showed natural re-handshake STILL didn't engage after a laptop wifi → phone hotspot swap. The pool flush was firing (`offer-pool flushed 19 stale entries` in the trace, at the right moment), but the swap-side spent 90s with zero `_mom*` activity before `forceRediscovery`'s rebuild fired and reconnected in ~1s. Two clues finally cracked it: the user's framing ("starting a connection is so fast, but reconnecting is impossibly slow") and the discovery that the signaling diag is **change-gated** (it only re-logs when the fingerprint changes), so the absence of diag lines during the 90s gap meant "relay shape is stable" — not "relays are down." Root cause located in `@trystero-p2p/core@0.24.0`'s `utils.mjs::makeSocket`: Nostr relays drop subscription state when their underlying WebSocket closes (per NIP-01, subscriptions are per-connection). `makeSocket` reconnects WebSockets transparently inside `socket.onclose → setTimeout(init, …)`, but `strategy.mjs` calls the strategy's `subscribe()` callback exactly once at room init (line 222) and never re-runs it. After a swap, the new sockets reopen but the relay has no record of our REQs and forwards nothing — `readyState === 1` looks fine, our presence publishes go out, but zero inbound EVENTs ever arrive. Natural re-handshake silently stalls until `forceRediscovery` creates a fresh `joinRoom` (which calls `subscribe()` from scratch). **Fix:** patch `makeSocket` to intercept outgoing `["REQ", subId, …]` / `["CLOSE", subId]` in `client.send` and maintain an active-subscription map per WebSocket URL; on every `onopen` after the first, replay the active REQ set so the relay re-establishes its forward path. **Anti-flood:** replays share a per-socket backoff schedule of 5s / 10s / 15s / 30s / 60s sticky, with the attempt index resetting after 60s of quiet so a long-stable socket that finally blips doesn't sit at the cap; if a reconnect lands while a replay is already scheduled, the scheduler is a no-op (one in-flight replay per URL). Non-JSON or non-array payloads (EVENT publishes, future MQTT binary frames) fall through untouched. One state-transition log per replay event: `[trystero-patch] <host> replayed N subscription(s) on reconnect (attempt=M, next-eligible-in=Ks)`. With this hunk, the swap-side `onclose` burst followed by reconnect restores REQ-based event flow within seconds, and natural re-handshake completes inside the grace window — the heavy rebuild becomes a true backstop again rather than the primary recovery path. The prior round's `getConnectedPeerHealth` fix becomes the second half of a complete repair: subscriptions are restored AND the slow side correctly enters the 7.5s `disconnectedPeerGraceMs` window. The PROGRESS.md handoff doc was rewritten as a resolution-and-verification record at the same time.
+
+- **Trystero inbound-silence zombie clearing — third layer of the same family**: with the subscription-replay (`utils.mjs`) and `connectionState === "disconnected" → transient` (`shared-peer.mjs`) hunks merged, field testing surfaced another sticky pattern in adverse environments. One side's `connection.connectionState` lags the actual connectivity by 15-30s (WebRTC's ICE consent freshness timeout — `RTCPeerConnection` doesn't tip to `"disconnected"` until enough consent checks have failed). During that lag, `getConnectedPeerHealth` returns `"live"` because both `connectionState` AND `channel.readyState` look fine; `createSignalHandler` short-circuits on every fresh announce from the peer who is actively trying to reconnect. The user's framing was the right diagnosis: "as long as it thinks that it's already connected, it seems to not want to answer connection requests. This is not helpful logic for maintaining connections through adverse environments." And: "We already do identity validation." Both correct — Trystero's conservatism here is overkill in our deployment because our mesh layer's `auth_response` (ed25519 signature over both pubkeys + nonce) re-validates trust on every fresh handshake, so accepting a re-handshake from a peer we *think* we're connected to costs nothing. **Fix:** track the timestamp of the last inbound signaling message per peer in `signal-handler.mjs`'s module-level `_lastInboundAt: Map<peerId, ts>`. In `createSignalHandler`, read the prior timestamp BEFORE updating, then if `now - prevInbound > _STALE_INBOUND_MS` (25s, ~5× the 5.333s announce cadence), override `getConnectedPeerHealth` to `"stale"` instead of calling it. The existing `health === "stale"` branch calls `clearConnectedPeer` immediately — no 7.5s grace, no waiting — and the message proceeds through `handleAnnouncement`/`handleOffer`/`handleAnswer` naturally. `_lastInboundAt.delete(peerId)` runs from `clearConnectedPeer` so a future reconnect to the same peerId starts the staleness clock fresh. State-transition log: `<peerid> inbound silent <N>s — clearing zombie connectedPeer (identity will re-validate)`. The threshold sits well above the subscription-replay patch's worst-case recovery time (~5s) so a transient relay blip can't trip false positives; below the mesh layer's `HEARTBEAT_TIMEOUT_MS` (75s) so the heavy rebuild backstop is the last resort rather than the primary recovery.

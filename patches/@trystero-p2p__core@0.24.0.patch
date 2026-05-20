@@ -31,10 +31,10 @@ index 4fef72061c27829de77abd00fe0317393d12af2c..9ff6bb8a2f224ef5521dc0a35754179f
  };
  var SharedPeerManager = class {
 diff --git a/dist/signal-handler.mjs b/dist/signal-handler.mjs
-index d8841faba4ec9daf93b020967f13db5609148928..072b03e3d84c3900d754f6c671522adf2489f2d5 100644
+index d8841faba4ec9daf93b020967f13db5609148928..083bc26b05cfe74eacf4523343188153318ea8ad 100644
 --- a/dist/signal-handler.mjs
 +++ b/dist/signal-handler.mjs
-@@ -2,6 +2,115 @@ import { all, candidateType, fromJson, genId, mkErr, resetTimer, selfId, toJson,
+@@ -2,6 +2,144 @@ import { all, candidateType, fromJson, genId, mkErr, resetTimer, selfId, toJson,
  import { sha1 } from "./crypto.mjs";
  import { offerTtl } from "./offer-pool.mjs";
  import { getConnectedPeerHealth } from "./shared-peer.mjs";
@@ -147,10 +147,39 @@ index d8841faba4ec9daf93b020967f13db5609148928..072b03e3d84c3900d754f6c671522adf
 +	s.graceLoggedAt = Date.now();
 +	_momLog(_momKey(peerId) + " ICE health=transient — entered 7.5s grace");
 +};
++// MyOwnLLM patch (CONNECTION-ENGINE.md → Known upstream limitations):
++// Inbound-recency-based zombie clearing. The existing
++// `getConnectedPeerHealth` patch handles the case where
++// `connection.connectionState === "disconnected"` — but that state
++// only fires AFTER WebRTC's ICE consent freshness fails, which can
++// take 15-30s in default browser configs. During that lag the
++// connection looks "connected" from one side's perspective even
++// though the peer has actually gone away. `createSignalHandler`
++// short-circuits on every inbound presence-announce from the peer
++// (who, after recovery, IS sending fresh announces), refusing to
++// answer the reconnection request. The connection looks fine on
++// one side and is dead on the other; the side that thinks it's
++// still connected won't engage a re-handshake until consent
++// freshness finally tips state to "disconnected", and our patch's
++// 7.5s grace adds more on top of that. Total stuck-time can hit
++// 20-40s before recovery.
++//
++// Track the timestamp of the last inbound signaling message per
++// peer. If a fresh message arrives and the prior gap exceeds
++// _STALE_INBOUND_MS (25s — ~5× Trystero's 5.333s announce cadence,
++// well above any single-relay blip after the subscription-replay
++// patch in utils.mjs), the previous connection is treated as
++// zombie regardless of `connectionState`: clear immediately and let
++// the message proceed to handleAnnouncement / handleOffer /
++// handleAnswer. Mesh-level identity validation (auth_response
++// signed over both pubkeys + nonce) handles trust on the new
++// handshake, so no grace window is needed at this layer.
++const _lastInboundAt = new Map();
++const _STALE_INBOUND_MS = 25e3;
  //#region src/signal-handler.ts
  const offerPostAnswerTtlMs = 23333;
  const offerIdSize = 12;
-@@ -52,6 +161,12 @@ const clearConnectedPeer = (state, peerId, _reason) => {
+@@ -52,6 +190,15 @@ const clearConnectedPeer = (state, peerId, _reason) => {
  	if (!state.connectedPeer.isDead) state.connectedPeer.destroy();
  	state.connectedPeer = null;
  	state.connectedPeerUnhealthySinceMs = null;
@@ -159,11 +188,14 @@ index d8841faba4ec9daf93b020967f13db5609148928..072b03e3d84c3900d754f6c671522adf
 +	// attachSharedPeerToRoom clears it at connect time), but keeping
 +	// the clear costs nothing and protects against any edge case.
 +	state.offerAnswered = false;
++	// MyOwnLLM patch: drop the inbound-recency entry so a future
++	// reconnect to the same peerId starts the staleness clock fresh.
++	_lastInboundAt.delete(peerId);
 +	_momDisconnected(peerId, _reason);
  	updateStatus(state);
  };
  const clearOfferRelay = (state, relayId) => {
-@@ -188,6 +303,11 @@ const handleAnnouncement = async (ctx, relayId, peerId, shared, signalPeer) => {
+@@ -188,6 +335,11 @@ const handleAnnouncement = async (ctx, relayId, peerId, shared, signalPeer) => {
  			candidate: sdp
  		}), () => !state.connectedPeer && state.offerPeer === offerInfo.peer && state.offerId === offerInfo.offerId);
  	};
@@ -175,7 +207,7 @@ index d8841faba4ec9daf93b020967f13db5609148928..072b03e3d84c3900d754f6c671522adf
  	signalPeer(peerTopic, toJson({
  		peerId: selfId,
  		offerId: offerInfo.offerId,
-@@ -202,6 +322,7 @@ const handleOffer = async (ctx, relayId, peerId, offer, offerId, hasOutgoingOffe
+@@ -202,6 +354,7 @@ const handleOffer = async (ctx, relayId, peerId, offer, offerId, hasOutgoingOffe
  	const hasTrackedOutgoingOffer = Boolean(state.offerPeer || state.offerRelays.some(Boolean));
  	if ((hasTrackedOutgoingOffer || hasOutgoingOfferHint) && selfId < peerId) return;
  	if (hasTrackedOutgoingOffer) resetOfferState(state, ctx.offerPool);
@@ -183,7 +215,7 @@ index d8841faba4ec9daf93b020967f13db5609148928..072b03e3d84c3900d754f6c671522adf
  	const answerPeer = ctx.initPeer(false, ctx.config);
  	state.answeringPeer = answerPeer;
  	scheduleAnsweringExpiry(ctx, state, peerId, answerPeer);
-@@ -290,6 +411,7 @@ const handleAnswer = async (ctx, relayId, peerId, answer, offerId, peer) => {
+@@ -290,6 +443,7 @@ const handleAnswer = async (ctx, relayId, peerId, answer, offerId, peer) => {
  		return;
  	}
  	if (peer) {
@@ -191,7 +223,7 @@ index d8841faba4ec9daf93b020967f13db5609148928..072b03e3d84c3900d754f6c671522adf
  		ctx.offerPool.claimLeased(peer);
  		peer.setHandlers({
  			connect: () => ctx.connectPeer(peer, peerId, relayId),
-@@ -299,6 +421,7 @@ const handleAnswer = async (ctx, relayId, peerId, answer, offerId, peer) => {
+@@ -299,6 +453,7 @@ const handleAnswer = async (ctx, relayId, peerId, answer, offerId, peer) => {
  	} else {
  		const state = ctx.peerStates[peerId];
  		if (!state || !state.offerPeer || state.offerAnswered || offerId && state.offerId && offerId !== state.offerId || state.offerPeer.isDead) return;
@@ -199,7 +231,33 @@ index d8841faba4ec9daf93b020967f13db5609148928..072b03e3d84c3900d754f6c671522adf
  		state.offerAnswered = true;
  		scheduleOfferExpiry(ctx, state, peerId, offerPostAnswerTtlMs);
  		state.offerPeer.signal(plainAnswer);
-@@ -332,6 +455,9 @@ const createSignalHandler = (ctx) => (relayId) => async (topic, msg, signalPeer)
+@@ -320,18 +475,33 @@ const createSignalHandler = (ctx) => (relayId) => async (topic, msg, signalPeer)
+ 	const peer = payload["peer"];
+ 	const hasOutgoingOfferHint = payload["hasOutgoingOffer"] === true;
+ 	if (peerId === selfId) return;
++	// MyOwnLLM patch: read inbound-recency BEFORE updating it so we
++	// can override `getConnectedPeerHealth` when the prior gap proves
++	// the connection is zombie. The update lands after the
++	// decision; see the comment block on `_lastInboundAt` for the
++	// rationale.
++	const _now = Date.now();
++	const _prevInbound = _lastInboundAt.get(peerId);
++	const _isInboundStale = _prevInbound !== undefined && _now - _prevInbound > _STALE_INBOUND_MS;
++	_lastInboundAt.set(peerId, _now);
+ 	const state = ctx.peerStates[peerId];
+ 	const connectedPeer = state?.connectedPeer;
+ 	if (connectedPeer && state) {
+-		const health = getConnectedPeerHealth(connectedPeer);
++		const health = _isInboundStale ? "stale" : getConnectedPeerHealth(connectedPeer);
+ 		if (health === "live") {
+ 			state.connectedPeerUnhealthySinceMs = null;
+ 			return;
+ 		}
+-		if (health === "stale") clearConnectedPeer(state, peerId, "message-from-stale-peer");
++		if (health === "stale") {
++			if (_isInboundStale) _momLog(_momKey(peerId) + " inbound silent " + Math.round((_now - _prevInbound) / 1e3) + "s — clearing zombie connectedPeer (identity will re-validate)");
++			clearConnectedPeer(state, peerId, _isInboundStale ? "stale-inbound" : "message-from-stale-peer");
++		}
  		else {
  			const nowMs = Date.now();
  			const unhealthySinceMs = state.connectedPeerUnhealthySinceMs ?? nowMs;
@@ -209,7 +267,7 @@ index d8841faba4ec9daf93b020967f13db5609148928..072b03e3d84c3900d754f6c671522adf
  			state.connectedPeerUnhealthySinceMs = unhealthySinceMs;
  			if (nowMs - unhealthySinceMs < disconnectedPeerGraceMs) return;
  			clearConnectedPeer(state, peerId, "message-from-prolonged-disconnect");
-@@ -370,6 +496,8 @@ const createSignalHandler = (ctx) => (relayId) => async (topic, msg, signalPeer)
+@@ -370,6 +540,8 @@ const createSignalHandler = (ctx) => (relayId) => async (topic, msg, signalPeer)
  	if (answer) return handleAnswer(ctx, relayId, peerId, answer, offerId, peer);
  };
  //#endregion
