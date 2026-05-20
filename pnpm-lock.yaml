@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   '@trystero-p2p/core@0.24.0':
-    hash: 886138896632031583888bd984eb0428f488bc6e717780c1864b7bba2526f083
+    hash: 890515eb54da10eb3f02a930857908ab73a47a6afe688917185595ddbec59401
     path: patches/@trystero-p2p__core@0.24.0.patch
 
 importers:
@@ -951,12 +951,12 @@ snapshots:
     dependencies:
       '@tauri-apps/api': 2.11.0
 
-  '@trystero-p2p/core@0.24.0(patch_hash=886138896632031583888bd984eb0428f488bc6e717780c1864b7bba2526f083)': {}
+  '@trystero-p2p/core@0.24.0(patch_hash=890515eb54da10eb3f02a930857908ab73a47a6afe688917185595ddbec59401)': {}
 
   '@trystero-p2p/nostr@0.24.0':
     dependencies:
       '@noble/secp256k1': 3.1.0
-      '@trystero-p2p/core': 0.24.0(patch_hash=886138896632031583888bd984eb0428f488bc6e717780c1864b7bba2526f083)
+      '@trystero-p2p/core': 0.24.0(patch_hash=890515eb54da10eb3f02a930857908ab73a47a6afe688917185595ddbec59401)
 
   '@types/estree@1.0.8': {}
 
