@@ -64,6 +64,7 @@
         p.status === "shelved" ||
         (p.status === "active" && (p.local_shelved || p.remote_shelved)) ||
         p.status === "offline" ||
+        p.status === "reconnecting" ||
         p.status === "handshaking" ||
         p.status === "pending_remote",
     ),
@@ -71,6 +72,7 @@
 
   function indirectReason(p: (typeof meshClient.peers)[number]): string {
     if (p.status === "offline") return "offline";
+    if (p.status === "reconnecting") return "reconnecting";
     if (p.status === "handshaking") return "handshaking";
     if (p.status === "pending_remote") return "waiting for peer";
     // shelved or active+local_shelved/remote_shelved
@@ -97,6 +99,8 @@
         return "live";
       case "shelved":
         return "standby";
+      case "reconnecting":
+        return "reconnecting…";
       case "offline":
         return "offline";
       default:

@@ -196,6 +196,73 @@ function installRTCPeerConnectionDiag(): void {
 // `new RTCPeerConnection(...)` already goes through our subclass.
 installRTCPeerConnectionDiag();
 
+/** Mirror Trystero's `strToNum` (sum-of-charCodes mod limit) so we
+ *  can compute the same shuffle seed it does from our `appId`.
+ *  Trystero exports `strToNum` from its core but we replicate it
+ *  inline to keep this self-contained — the algorithm is trivial
+ *  and won't drift, and we'd otherwise need a runtime import path
+ *  just for one helper. */
+function trysteroStrToNum(str: string): number {
+  let sum = 0;
+  for (let i = 0; i < str.length; i++) sum += str.charCodeAt(i);
+  return sum % Number.MAX_SAFE_INTEGER;
+}
+
+/** Mirror Trystero's seeded Fisher-Yates shuffle (the one used by
+ *  `getRelays` to pick a deterministic top-N from the default relay
+ *  list). Same PRNG (`sin(seed) * 1e4`, fractional part), same swap
+ *  order, so the output for any (xs, seed) pair matches Trystero's
+ *  byte-for-byte. We use this in `pickFilteredSignalingRelays` to
+ *  reproduce the deterministic order EXCEPT with denylisted relays
+ *  removed before the slice. */
+function trysteroShuffle<T>(xs: readonly T[], seed: number): T[] {
+  const a = [...xs];
+  let s = seed;
+  const rand = () => {
+    const x = Math.sin(s++) * 1e4;
+    return x - Math.floor(x);
+  };
+  let i = a.length;
+  while (i) {
+    const j = Math.floor(rand() * i--);
+    const tmp = a[i];
+    a[i] = a[j];
+    a[j] = tmp;
+  }
+  return a;
+}
+
+/** Pick the signaling relay set Trystero would have picked (top-N
+ *  of the appId-deterministic shuffle of its `defaultRelayUrls`),
+ *  with `SIGNALING_RELAY_DENYLIST` entries removed BEFORE the slice
+ *  so the count we return is N quiet relays — not N-minus-the-noisy-
+ *  ones. Returns null when `defaultRelayUrls` can't be loaded (non-
+ *  Nostr strategy, missing export, dynamic import error); callers
+ *  should fall back to Trystero's own `redundancy` slice in that
+ *  case so the mesh still starts. */
+async function pickFilteredSignalingRelays(
+  appId: string,
+  denylist: readonly string[],
+  count: number,
+): Promise<string[] | null> {
+  if (TRYSTERO_STRATEGY !== "nostr") return null;
+  try {
+    const mod = (await import("trystero/nostr")) as {
+      defaultRelayUrls?: readonly string[];
+    };
+    const defaults = mod.defaultRelayUrls;
+    if (!Array.isArray(defaults) || defaults.length === 0) return null;
+    const seed = trysteroStrToNum(appId);
+    const shuffled = trysteroShuffle(defaults, seed);
+    const filtered = shuffled.filter(
+      (url) => !denylist.some((deny) => url.includes(deny)),
+    );
+    return filtered.slice(0, count);
+  } catch {
+    return null;
+  }
+}
+
 /** Resolve the Nostr strategy's `getRelaySockets` so we can peek at
  *  per-relay WebSocket readyState for diagnostics. Best-effort —
  *  returns null when the strategy isn't Nostr or the export is
@@ -279,14 +346,33 @@ async function loadJoinRoom(): Promise<typeof JoinRoomType> {
  *  timeout, because verifying a code with a peer out-of-band can
  *  easily take more than 30s. */
 const HANDSHAKE_TIMEOUT_MS = 30_000;
-/** During the handshake window we re-send `hello` on this cadence.
- *  Right after a Trystero room rejoin the data channel can be open
- *  (so onPeerJoin fires) but not yet ready for an immediate send,
- *  swallowing the very first hello and stranding both sides
- *  waiting on auth_response. Repeating the hello a few times
- *  across the window gives the channel time to settle without
- *  bloating the timeout. */
-const HANDSHAKE_HELLO_RETRY_INTERVAL_MS = 5_000;
+/** During the handshake window we re-send `hello` on this growing
+ *  schedule. The first retry is tight because right after a Trystero
+ *  room rejoin the data channel can be open (so onPeerJoin fires) but
+ *  not yet ready for an immediate send — that initial hello can be
+ *  swallowed by a still-settling channel. Subsequent retries grow
+ *  because if 5s wasn't enough to wake the peer, neither will 5s
+ *  later be; spacing them out cuts presence-relay pressure on
+ *  genuinely-dead peers while still covering the settle-race. Total
+ *  4 sends (initial + 3 retries) inside the 30s watchdog window. */
+const HANDSHAKE_HELLO_RETRY_SCHEDULE_MS = [5_000, 7_000, 10_000];
+/** Per-peer re-handshake jitter, applied as ±this fraction of the
+ *  scheduled backoff. When N peers go silent together (router
+ *  reboot, VPN reconnect, mass-wake from suspend) their backoff
+ *  schedules align without jitter and they all retry on the same
+ *  ticks — a thundering herd that hits relay anti-spam budgets and
+ *  drives the very rate-limiting we're trying to avoid. ±20% is
+ *  enough to desync 10-20 peers across each window without slowing
+ *  the median recovery noticeably. */
+const REHANDSHAKE_JITTER_FRACTION = 0.2;
+/** Coalescing window for OS lifecycle wake events. A single tab
+ *  switch or lid event on Tauri can fire visibilitychange + focus +
+ *  pageshow within ~50-100ms. Without coalescing, each fires its
+ *  own `handleWake`, which broadcasts a ping to every peer — a
+ *  visible burst on the wire (and a flood on the Activity log) for
+ *  what the user did once. 2s is well below any human-perceptible
+ *  reaction window but comfortably above the OS event clump. */
+const WAKE_COALESCE_MS = 2_000;
 /** App-level keepalive on each active connection. We send a ping
  *  every interval and also use the tick to check whether we've
  *  heard from the peer recently enough; if not, we enter the
@@ -323,6 +409,92 @@ const WAKE_DETECTION_THRESHOLD_MS = HEARTBEAT_INTERVAL_MS * 2;
  *  post-wake stall. Sized so a healthy peer's pong (sub-second
  *  RTT typical) lands comfortably inside the window. */
 const WAKE_PROBE_DELAY_MS = 1_500;
+/** After the wake probe reports all peers silent, give an ICE restart
+ *  this long to land a fresh candidate pair before falling back to a
+ *  Trystero room rejoin. Sized for: (a) Chrome's typical candidate-
+ *  gathering window on a freshly-up interface (~0.5–2s); (b) one
+ *  signal/answer roundtrip through the slowest healthy relay (~0.5–1s);
+ *  (c) one ping/pong over the freshly-rebuilt datachannel (sub-second).
+ *  4s comfortably covers a network swap (hotspot↔LAN), and the rejoin
+ *  fallback still fires fast enough — total wake-to-rejoin latency is
+ *  WAKE_PROBE_DELAY_MS + ICE_RESTART_RECOVERY_MS ≈ 5.5s — that a user
+ *  who really needs a full rebuild isn't left staring at a frozen UI. */
+const ICE_RESTART_RECOVERY_MS = 4_000;
+/** Per-peer watchdog: when ICE transitions to `disconnected` and
+ *  doesn't recover on its own within this window, fire a proactive
+ *  `pc.restartIce()` so a fresh candidate exchange has a chance to
+ *  pick up whatever path is currently live.
+ *
+ *  Sized aggressively to fire as early as possible BEFORE
+ *  Trystero's underlying datachannel-close timeout kills the PC.
+ *  Observed in the wild: Trystero fires `onPeerLeave` ~5s after
+ *  ICE goes `disconnected` (likely SCTP / negotiation-needed
+ *  timeout interaction). The Nostr-signaling renegotiation
+ *  required by `pc.restartIce()` (offer → answer → ICE re-gather)
+ *  takes 2-4s end-to-end across the public relay path, so the
+ *  watchdog needs to fire within the first second to have any
+ *  chance of completing before Trystero gives up. Empirically
+ *  at 3s and 6s we logged the watchdog firing but the connection
+ *  still dropped at 5s — every time. 1s gives WebRTC's natural
+ *  consult-and-retry only a brief look (most LAN flaps heal in
+ *  well under 500ms) and leaves ~4s for the restart renegotiation
+ *  to actually complete.
+ *
+ *  Note that even with the maximum window, `restartIce` does not
+ *  always save the connection — Trystero v0.24.0 has a separate
+ *  state-stickiness issue (the `offerAnswered` flag in
+ *  `signal-handler.mjs` never gets reset after a connection
+ *  death, blocking subsequent natural re-handshakes) that means
+ *  some connection drops genuinely require a full room rejoin
+ *  to recover. The watchdog covers the cases where restart CAN
+ *  win the race; the rejoin path covers the rest. See the
+ *  Trystero-state-stickiness note in CONNECTION-ENGINE.md for
+ *  the full rationale.
+ *
+ *  This is independent of the wake-probe ICE-restart path (Tier 3
+ *  in the ladder). Tier 3 fires when ALL peers are silent after a
+ *  wake event; this watchdog fires per-peer on observed ICE state.
+ *  Both call into Trystero's `negotiationneeded` path; either is
+ *  safe to fire on the same PC because Trystero's perfect-
+ *  negotiation handler dedupes back-to-back offers. */
+const ICE_DISCONNECTED_RESTART_MS = 1_000;
+/** How long an authenticated peer that just dropped stays in the
+ *  "reconnecting" UI bucket before it falls through to plain
+ *  "offline." The user-visible difference is small but important:
+ *  "reconnecting…" communicates "the system is actively working on
+ *  this — don't go fiddle with anything," "offline" communicates
+ *  "this peer isn't coming back without intervention."
+ *
+ *  Originally sized at 90s to overlap the first auto-rediscovery
+ *  window so natural Trystero discovery had a long runway to
+ *  reconnect the peer without our heavy rejoin firing. That
+ *  rationale broke once we realized Trystero v0.24.0 has a
+ *  state-stickiness bug (the `offerAnswered` flag in
+ *  `@trystero-p2p/core/dist/signal-handler.mjs` never clears
+ *  after a connection death once the post-answer expiry timer
+ *  has fired on a live connection): natural re-handshake is
+ *  blocked and a room rejoin is the only path back. Waiting 90s
+ *  is therefore 60s of dead time before the rejoin we always
+ *  end up needing. 30s keeps "reconnecting…" UI for a brief
+ *  flap-recovery window but kicks the rejoin sooner when it's
+ *  going to be needed.
+ *
+ *  Stable-identity matching means a peer who returns DURING this
+ *  window (via fresh peer_id from a Trystero rejoin on their
+ *  side) with the same `device_pubkey` reuses the existing
+ *  card — no `offline → handshaking → active` UI churn. */
+const RECONNECTING_GRACE_MS = 30_000;
+/** Cadence for pruning expired `recent_disconnects` entries. Cheap
+ *  iteration over what's typically a handful of entries; the only
+ *  cost of running it more often is one extra wakeup per tick. */
+const RECONNECT_PRUNE_INTERVAL_MS = 10_000;
+/** Heartbeat cadence for the signaling-status log: if the
+ *  fingerprint (relay-open set, author count, error set, PC count
+ *  tier) hasn't changed in this long, emit one line anyway so the
+ *  console shows the engine is alive. Without this, a stable mesh
+ *  goes silent forever between events; with it, you get one line
+ *  every ~5min as proof-of-life. */
+const SIGNALING_DIAG_HEARTBEAT_MS = 5 * 60 * 1000;
 /** Backoff schedule for app-level re-handshake attempts when a
  *  peer goes silent past HEARTBEAT_TIMEOUT_MS. Each attempt
  *  re-sends `hello`; if the underlying WebRTC channel is still
@@ -350,21 +522,33 @@ const REHANDSHAKE_RESCUE_ATTEMPTS = 3;
  *  peer successfully completes auth, so a peer that pops back
  *  online gets the next outage's full reactivity. */
 const REDISCOVERY_BACKOFF_SCHEDULE_MS = [
-  90_000, // 1.5m — first attempt after going offline
+  30_000, // 30s — first attempt: must fire immediately when
+          // grace expires, since (a) we've now demonstrated
+          // natural Trystero discovery can't recover from the
+          // state-stickiness bug without our help, and (b) the
+          // `SIGNALING_RELAY_DENYLIST` already removed the
+          // rate-limiting relays (Damus, chorus.pjv.me), so
+          // 30s no longer trips Nostr anti-spam.
+  90_000, // 1.5m — second attempt
   180_000, // 3m
-  300_000, // 5m
-  600_000, // 10m — final, repeated indefinitely
-  // Bumped from the prior [60s, 120s, 180s, 300s]: each forced
-  // rejoin publishes a fresh presence announce to every signaling
-  // relay, and on a flaky hotspot connection (where connections
-  // drop every couple of minutes) the old 60s first interval was
-  // tight enough that Nostr relays with anti-spam limits — Damus
-  // especially — would start rate-limiting us, which then makes
-  // the recovery worse, not better. 90s gives the channel a real
-  // window to recover on its own before we churn signaling. The
-  // 10m tail remains tolerable because
-  // `consecutive_rediscovery_attempts` resets on any onPeerJoin,
-  // so the schedule unwinds the moment a peer reappears.
+  300_000, // 5m — final, repeated indefinitely
+  // Schedule history: originally [60s, 120s, 180s, 300s], then
+  // bumped to [90s, 3m, 5m, 10m] when Damus rate-limiting was
+  // chronically blowing us up on flaky networks. The deny-filter
+  // commit removed Damus from the relay set entirely, which
+  // freed us to bring the first interval back down — and we want
+  // it as short as we can manage because of the Trystero
+  // state-stickiness bug: every drop of an authenticated peer
+  // is effectively guaranteed to require a rejoin to recover
+  // (natural Trystero re-handshake is blocked by the stuck
+  // `offerAnswered` flag in core/signal-handler.mjs), so the
+  // throttle is no longer protecting an actual recovery path,
+  // it's just gating how long the user stares at "reconnecting…"
+  // before we do the only thing that works. The 5m tail stays
+  // long enough that a genuinely-offline peer doesn't pull the
+  // mesh through an endless rejoin loop. `consecutive_rediscovery_attempts`
+  // resets on any onPeerJoin so the schedule unwinds the moment
+  // a peer reappears.
 ];
 /** Cadence at which we check whether any rostered peer is offline
  *  and, if so, ask for a rediscovery. Catches the asymmetric
@@ -433,12 +617,45 @@ const SIGNALING_DIAG_INTERVAL_MS = 10_000;
  *  presence-announce publishes with "you are noting too much") only
  *  costs us 1/8 of our signaling capacity instead of 1/5.
  *
+/** Default count of Trystero relays we attach when the user hasn't
+ *  set a custom signaling list. Matches Trystero's own out-of-the-
+ *  box redundancy (5). We used to run with 8 to dilute the impact
+ *  of any single misbehaving relay in the top-N, but that strategy
+ *  scaled the warmup-burst event load by 60% without actually
+ *  removing the misbehavers — `relay.damus.io` and `chorus.pjv.me`
+ *  still rate-limited us inside their top-5 slots. The targeted
+ *  fix is `SIGNALING_RELAY_DENYLIST` below: we skip the known-noisy
+ *  hosts in the deterministic shuffle entirely, so 5 relays is now
+ *  5 quiet relays.
+ *
  *  Crucially, Trystero's relay list is sliced with `redundancy` from
  *  the SAME deterministic shuffle for every client running against
  *  the same `appId`, so a peer on an older build that picked the
  *  first 5 still overlaps fully with a peer on this build that
  *  picked the first 8 — no flag-day for the mesh. */
-const DEFAULT_SIGNALING_REDUNDANCY = 8;
+const DEFAULT_SIGNALING_REDUNDANCY = 5;
+/** Hosts we always skip in the Trystero deterministic-shuffle slice,
+ *  identified by substring (each `defaultRelayUrls` entry is
+ *  `"wss://<host>[/path]"`, so the host suffices). These relays
+ *  rate-limit aggressively in the steady-state announce loop:
+ *
+ *   - `relay.damus.io` returns NOTICE "rate-limited: you are noting
+ *     too much" within seconds of the warmup burst. Free pubkeys
+ *     are throttled at ~1 EVENT/sec; our 8-relay × 4-warmup pattern
+ *     bursts way past that.
+ *   - `chorus.pjv.me` 429s the WebSocket handshake on reconnect
+ *     whenever it sees us in a rejoin loop.
+ *
+ *  Removing them is safe for mesh interoperability — they sit at
+ *  shuffle indices 2 and 3 in our app's deterministic order, and
+ *  the next-N relays we pick (schnorr.me, relay.nostrdice.com,
+ *  x.kojira.io, relay-can.zombi.cloudrodion.com) are also in the
+ *  old build's top-8, so old and new peers continue to overlap on
+ *  five common relays. */
+const SIGNALING_RELAY_DENYLIST = [
+  "relay.damus.io",
+  "chorus.pjv.me",
+];
 /** Globally-unique app identifier passed to Trystero so MyOwnLLM
  *  peers don't accidentally match peers from unrelated apps that
  *  happen to use the same `roomId`. Bump the suffix if we ever
@@ -452,6 +669,7 @@ const TRYSTERO_APP_ID = "myownllm-cloud-mesh-v1";
 const SCHED_HEARTBEAT = "heartbeat";
 const SCHED_OFFLINE_CHECK = "offline-check";
 const SCHED_CATALOG_REFRESH = "catalog-refresh";
+const SCHED_RECONNECT_PRUNE = "reconnect-prune";
 
 export type DiagLevel = "info" | "warn" | "error";
 export interface DiagEntry {
@@ -478,11 +696,18 @@ export interface DiagEntry {
  *    inbound, so the other peer's presence announces are
  *    arriving. WebRTC's offer/answer is in progress; ICE is
  *    checking candidate pairs.
- *  - `ice-failed-needs-turn` — ICE has reached `failed` at least
- *    once AND zero `relay` candidates were ever gathered. The
- *    unambiguous "TURN is missing or broken" state. Terminal
- *    until the user adds a working TURN server (which triggers
- *    `reconcile()` → Trystero rejoin → fresh ICE config).
+ *  - `ice-failed-no-turn` — ICE reached `failed` AND zero `relay`
+ *    candidates AND the user has NO TURN servers configured. The
+ *    actionable diagnosis is "you need a TURN server" — Settings
+ *    UI surfaces the fix link and the Add-TURN flow.
+ *  - `ice-failed-turn-unreachable` — ICE reached `failed` AND zero
+ *    `relay` candidates BUT the user does have TURN configured.
+ *    The actionable diagnosis is "your configured TURN server
+ *    isn't reachable" — either the URL/host is wrong, the
+ *    credentials are wrong, or the provider's having an outage.
+ *    Different fix from `ice-failed-no-turn` (look at the
+ *    config, not "add one"). Both transition out the moment a
+ *    fresh ICE round gathers any `relay` candidate.
  *  - `peer-active` — ≥1 connection has completed our app-level
  *    auth handshake and is exchanging mesh traffic.
  *  - `error` — terminal startup failure; `this.error` carries the
@@ -493,7 +718,8 @@ export type MeshPhase =
   | "signaling-connecting"
   | "signaling-up"
   | "peer-discovered"
-  | "ice-failed-needs-turn"
+  | "ice-failed-no-turn"
+  | "ice-failed-turn-unreachable"
   | "peer-active"
   | "error";
 
@@ -503,6 +729,7 @@ export type PeerStatus =
   | "pending_remote" // we've acted, OR we're waiting for the host's first move
   | "active" // both sides have approved and exchanged approve messages
   | "shelved" // ring topology has parked this peer; channel open for heartbeat only
+  | "reconnecting" // active peer dropped within the last RECONNECTING_GRACE_MS — same identity, link healing
   | "offline" // rostered peer not currently present in the Trystero room
   | "denied" // user denied; close imminent
   | "failed"; // protocol error; close imminent
@@ -581,11 +808,13 @@ interface ConnectionState {
    *  prompts the user / auto-approves and sends `approve`. */
   approver_role: boolean;
   handshake_timer: number | null;
-  /** setInterval handle for re-sending `hello` until the peer
-   *  responds with auth_response. Cleared on successful
-   *  authentication, on handshake timeout, and on drop. Separate
-   *  from handshake_timer (a one-shot timeout watchdog) so the
-   *  two roles stay legible. */
+  /** setTimeout handle for the next scheduled `hello` re-send while
+   *  we wait on auth_response. The retry loop self-reschedules
+   *  along HANDSHAKE_HELLO_RETRY_SCHEDULE_MS — the handle here
+   *  refers only to the NEXT pending fire, not the whole series.
+   *  Cleared on successful authentication, on handshake timeout,
+   *  and on drop. Separate from handshake_timer (a one-shot timeout
+   *  watchdog) so the two roles stay legible. */
   handshake_hello_retry_timer: number | null;
   /** Last time we received ANY message from this peer (ping,
    *  pong, protocol envelope). Used by the heartbeat tick to
@@ -631,6 +860,37 @@ interface ConnectionState {
   local_shelved: boolean;
   /** Has the peer shelved us? True on receive of their `shelve`. */
   remote_shelved: boolean;
+  /** Last `iceConnectionState` value observed for this peer's
+   *  RTCPeerConnection, recorded by `watchPeerIce`. Lets
+   *  `handlePeerLeave` log the cause-of-death — "ICE was
+   *  `failed` 8s before the leave" implicates the network /
+   *  TURN path, "ICE was `connected` right up until leave"
+   *  implicates the datachannel or the peer's app process.
+   *  Empty until the first observed transition. */
+  last_ice_state: string;
+  /** Wall-clock ms of the last `iceConnectionState` transition.
+   *  Paired with `last_ice_state` for the leave-cause log. */
+  last_ice_state_at: number;
+  /** Wall-clock ms the peer first reached the app-level `active`
+   *  status (auth done + both sides approved). Used to report
+   *  "lived for N minutes before drop" in the leave log.
+   *  0 if the peer never reached active. */
+  first_active_at: number;
+  /** Short tag for the most recently observed selected ICE
+   *  candidate pair (e.g. "host↔srflx", "relay↔relay"). Filled
+   *  by `recordSelectedCandidatePair` after each ICE transition
+   *  to `connected`/`completed`. Empty while we've never had a
+   *  working pair, or if `getStats()` failed. */
+  selected_candidate_summary: string;
+  /** setTimeout handle for the per-peer ICE-disconnected watchdog.
+   *  Set when this peer's ICE state transitions to `disconnected`;
+   *  cleared on `connected`/`completed`/`failed` or on drop. When
+   *  it fires, `proactiveIceRestart()` calls `pc.restartIce()` so a
+   *  fresh candidate exchange can pick up whatever path is still
+   *  reachable — recovers the TURN-via-TCP-pinhole-expiry case
+   *  before Trystero gives up on the datachannel. Null when no
+   *  watchdog is pending. See `ICE_DISCONNECTED_RESTART_MS`. */
+  ice_disconnected_watchdog: number | null;
 }
 
 class MeshClient {
@@ -643,7 +903,7 @@ class MeshClient {
    *  that just wants the off / starting / online / error axis,
    *  but the Status pill and any new code should read `phase`
    *  because it discriminates the user-actionable cases (e.g.
-   *  `ice-failed-needs-turn` vs the generic "online — no
+   *  `ice-failed-{no-turn,turn-unreachable}` vs the generic "online — no
    *  peers"). Updated by `updatePhase()` whenever signaling
    *  health, peer state, or WebRTC ICE state changes. */
   phase = $state<MeshPhase>("off");
@@ -678,6 +938,14 @@ class MeshClient {
    *  the Network sub-tab so it has something to render even when
    *  no peers are connected yet. */
   my_catalog = $state<CatalogEntry[]>([]);
+  /** Stable string fingerprint of `my_catalog`. Recomputed on every
+   *  successful refresh; `refreshLocalCatalog` short-circuits the
+   *  broadcast when the fingerprint matches the previous run. Cuts
+   *  the 60s safety-net tick from "blast a full snapshot at every
+   *  active peer regardless" down to "send only when something
+   *  actually changed externally" — typical steady-state is zero
+   *  outbound catalog bytes between user edits. */
+  private my_catalog_fingerprint = "";
   /** True when ring shelving / unshelving is mid-evaluation. Used
    *  by the Connections card to gate the "standby" badge from
    *  flickering on/off during a transient rebalance. */
@@ -797,6 +1065,20 @@ class MeshClient {
   private signaling_taps = new WeakSet<WebSocket>();
   private signaling_event_counts: Record<string, number> = {};
   private signaling_event_last_log = 0;
+  /** Last fingerprint of the SHAPE of the signaling snapshot (the
+   *  parts a human cares about: relay-open set, author count,
+   *  unique candidate-errors, PC count tier). Compared in
+   *  `logSignalingDiag` so we only re-emit when something
+   *  meaningful changed — the raw event counter ticking up by 12
+   *  with everything else identical is not a meaningful change,
+   *  and it's the dominant source of console spam. Empty until
+   *  the first poll. */
+  private last_signaling_fingerprint = "";
+  /** Wall-clock ms of the last signaling log. Paired with
+   *  SIGNALING_DIAG_HEARTBEAT_MS so a steady-state mesh emits at
+   *  least one status line every few minutes — proves the engine
+   *  is alive even when nothing changed. */
+  private last_signaling_log_at = 0;
   /** Distinct Nostr event-author pubkeys we've seen inbound on any
    *  relay socket, keyed by the first 8 hex chars. Each value is a
    *  hit count. Trystero's own pubkey appears here because relays
@@ -816,6 +1098,20 @@ class MeshClient {
   private identity: MeshIdentity | null = null;
   private network_id = "";
   private network_handle = "";
+  /** Transport config currently baked into the live Trystero room.
+   *  Recorded in `start()` after we resolve the active network's
+   *  address fields, and compared by `reconcile()` to detect when a
+   *  STUN / TURN / signaling edit warrants a stop+start cycle. Empty
+   *  arrays while no room is joined.
+   *
+   *  Without this snapshot, `reconcile()` only knew to restart when
+   *  the active *network* changed — STUN/TURN edits on the same
+   *  network silently fell through, leaving the iceServers from the
+   *  old config baked into Trystero's RTCPeerConnections until the
+   *  user manually relaunched the app. */
+  private applied_signaling: string[] = [];
+  private applied_stun: string[] = [];
+  private applied_turn: TurnServer[] = [];
   private connections = new Map<string, ConnectionState>();
   private roster_pubkeys = new Set<string>();
   /** Pubkey → friendly label, sourced from the roster file. Used to
@@ -886,6 +1182,28 @@ class MeshClient {
    *  or pick a different host. Lives in memory; relaunch reseeds
    *  on next hello. */
   private capabilities_cache = new Map<string, Capabilities>();
+  /** Rostered peers whose authenticated connection dropped within
+   *  the last RECONNECTING_GRACE_MS, keyed by device_pubkey. Drives
+   *  the "reconnecting…" UI state: a peer that flaps off-then-on
+   *  inside the grace window stays on the same card with the same
+   *  label/catalog/capabilities, no `offline → handshaking → active`
+   *  churn. Entries are added by `dropConnection` for peers that
+   *  ever reached `active`, removed when a fresh active connection
+   *  to the same pubkey lands, and pruned by the janitor tick once
+   *  they expire.
+   *
+   *  We don't stash capabilities/catalog here — those already live
+   *  in `capabilities_cache`/`catalog_cache` so they survive the
+   *  drop independently. This map just tracks the WHEN, so the UI
+   *  knows which of those "offline" entries to render with the
+   *  softer "reconnecting" framing. */
+  private recent_disconnects = new Map<
+    string,
+    { since: number; expires_at: number }
+  >();
+  /** setInterval handle for `pruneRecentDisconnects`. Cleared in
+   *  stop(). */
+  private reconnect_prune_timer: number | null = null;
   /** Queued requestAnimationFrame handle for batched file-resource
    *  UI refreshes. A multi-MB file transfer calls
    *  `scheduleRefreshFileResources` on every chunk; rAF coalesces
@@ -899,6 +1217,13 @@ class MeshClient {
    *  maybeForceRediscovery() — keeps any number of stuck peers
    *  from each triggering their own rejoin in quick succession. */
   private last_force_rediscovery_at = 0;
+  /** Wall-clock ms of the most recent "rediscovery throttled" log
+   *  emission, paired with the throttle-window snapshot below to
+   *  dedupe the throttle log within a single backoff cycle. The
+   *  user wants to know we're throttling once per cycle, not every
+   *  60s while the cycle runs out. */
+  private last_throttle_log_at = 0;
+  private last_throttle_log_window = 0;
   /** How many rediscoveries have fired since the last successful
    *  auth_response. Indexes into REDISCOVERY_BACKOFF_SCHEDULE_MS
    *  to grow the throttle window the longer we've been
@@ -911,6 +1236,21 @@ class MeshClient {
    *  to refresh its Trystero subscription when a rostered peer
    *  has been gone too long. */
   private offline_check_timer: number | null = null;
+  /** setInterval handle for the main-thread heartbeat tick in the
+   *  worker-spawn-failure fallback path. The scheduler worker is the
+   *  authoritative wake clock (see `last_global_tick_at` discussion);
+   *  this only runs when `new MeshSchedulerWorker()` throws — rare
+   *  enough that we noted it as a `warn` diag but real enough that
+   *  the fallback can't omit the heartbeat (the previous fallback
+   *  set up offline_check / catalog_refresh / reconnect_prune but
+   *  forgot heartbeat, which silently disabled wake detection,
+   *  rehandshake, and the whole per-peer liveness path in worker-
+   *  less environments). When this timer fires we pass
+   *  `performance.now()` as the tick stamp — main-thread time is
+   *  less reliable for the wake-gap math than the worker's clock,
+   *  but it's all we have when the worker is unavailable. Null
+   *  while the worker is alive. */
+  private heartbeat_timer: number | null = null;
   /** Bound lifecycle handlers, kept around so we can remove them
    *  in stop(). Each observable (visibility, focus, online,
    *  pageshow) is a hint that we may have just resumed from a
@@ -922,6 +1262,15 @@ class MeshClient {
     focus: () => void;
     pageshow: () => void;
   } | null = null;
+  /** Wall-clock ms of the most recent lifecycle-driven wake call.
+   *  A single tab switch on Tauri can fire visibility + focus +
+   *  pageshow within ~50ms; the coalescing gate in
+   *  installLifecycleHooks reads this so only the first event
+   *  inside WAKE_COALESCE_MS triggers a ping broadcast. Heartbeat-
+   *  tick-detected wake (the real OS-suspend signal) does NOT go
+   *  through this gate — that path is rate-limited by the tick
+   *  interval itself. */
+  private last_lifecycle_wake_at = 0;
   /** Pending remote inferences we initiated and are waiting on
    *  chunks for. Keyed by infer-id; values carry the per-chunk
    *  + done + error callbacks the caller registered. Cleared on
@@ -1153,16 +1502,30 @@ class MeshClient {
     }
 
     // Already running on the right network with the right identity?
-    // No-op.
-    if (
+    // One more thing to check: the transport address fields (relay
+    // list, STUN, TURN) live inside the same NetworkConfig as the
+    // network_id, so an in-place edit (the Settings → Networks →
+    // Settings panel persists then calls reconcile) keeps the same
+    // network_id but produces a meaningfully-different mesh. Without
+    // the address comparison here, those edits silently no-op until
+    // the user relaunches the app — the exact "set the relay, see it
+    // take effect" failure mode the UI promises against.
+    const same_identity =
       this.room &&
       this.network_id === active.network_id &&
-      this.identity?.device_id === identity.device_id
-    ) {
-      return;
-    }
-
-    if (this.room) {
+      this.identity?.device_id === identity.device_id;
+    if (same_identity) {
+      const transport_unchanged =
+        sameStringList(this.applied_signaling, active.signaling_servers) &&
+        sameStringList(this.applied_stun, active.stun_servers) &&
+        sameTurnList(this.applied_turn, active.turn_servers);
+      if (transport_unchanged) return;
+      this.logDiag(
+        "info",
+        "reconcile: transport config changed → restarting room with new STUN/TURN/relays",
+      );
+      await this.stop();
+    } else if (this.room) {
       this.logDiag("info", "reconcile: active network changed → restarting");
       await this.stop();
     }
@@ -1189,19 +1552,38 @@ class MeshClient {
     this.status = "starting";
     this.error = "";
     this.identity = opts.identity;
+    // Detect whether THIS start follows a network-change stop, or a
+    // same-network restart (the rediscovery stop+start cycle). The
+    // pubkey-keyed caches are network-scoped: cached catalogs and
+    // capability blobs from peers in a different network shouldn't
+    // leak in. But on a same-network restart they should SURVIVE —
+    // every doc invariant about "anything keyed by device_pubkey
+    // survives a peer-id reissue" implicitly relies on this, and
+    // before this gate the engine wiped them on every rediscovery,
+    // flashing offline-rostered sidebar peers to blank for the
+    // duration of the rejoin. `recent_disconnects` also gets the
+    // preserve treatment so the "reconnecting" grace markers
+    // survive a rediscovery — otherwise a peer that dropped JUST
+    // before the rejoin would skip straight to "offline" instead of
+    // showing as "reconnecting".
+    //
+    // `network_id === ""` means this is the very first start since
+    // module load, so the caches are already empty and clearing is
+    // a no-op — we treat that as "no network change" to keep the
+    // branch logic uniform.
+    const network_changed =
+      this.network_id !== "" && this.network_id !== opts.networkId;
     this.network_id = opts.networkId;
     this.connections.clear();
     this.last_open_relay_count = 0;
     this.updatePhase();
-    // Network-scoped caches: a different active network means a
-    // different roster, so the cached catalogs and capability blobs
-    // from peers in the old network shouldn't leak into the sidebar
-    // here. refreshRoster() will reseed roster_pubkeys / labels from
-    // disk below.
-    this.catalog_cache.clear();
-    this.capabilities_cache.clear();
-    this.roster_pubkeys.clear();
-    this.roster_labels.clear();
+    if (network_changed) {
+      this.catalog_cache.clear();
+      this.capabilities_cache.clear();
+      this.roster_pubkeys.clear();
+      this.roster_labels.clear();
+      this.recent_disconnects.clear();
+    }
     // Snapshot capabilities + persisted preferences (per-network
     // accepting, global diag_quiet) before any peer talks to us —
     // the very first hello we send to a freshly-joined peer should
@@ -1244,14 +1626,72 @@ class MeshClient {
     const ice_servers = buildIceServers(opts.stunServers, opts.turnServers);
     const room_id = this.network_handle;
     const custom_relays = opts.relayUrls.filter((r) => r.trim() !== "");
+    // Snapshot the transport config as applied — reconcile() compares
+    // against this on its next run to detect STUN/TURN/relay edits
+    // that warrant a stop+start cycle. Clone so a later mutation of
+    // the underlying NetworkConfig array doesn't retroactively make
+    // these look "unchanged".
+    this.applied_signaling = [...opts.relayUrls];
+    this.applied_stun = [...opts.stunServers];
+    this.applied_turn = opts.turnServers.map((t) => ({ ...t }));
+
+    // When the user hasn't provided a custom relay list, pre-compute
+    // our own deny-filtered slice of Trystero's default shuffle. We
+    // pass it via `relayConfig.urls` so Trystero uses exactly these
+    // hosts (no internal slicing), which lets us skip the known-
+    // noisy relays entirely. Null = couldn't load the defaults
+    // (non-Nostr strategy or import error); fallback path further
+    // down uses Trystero's redundancy slice instead.
+    let chosen_default_relays: string[] | null = null;
+    if (custom_relays.length === 0) {
+      chosen_default_relays = await pickFilteredSignalingRelays(
+        TRYSTERO_APP_ID,
+        SIGNALING_RELAY_DENYLIST,
+        DEFAULT_SIGNALING_REDUNDANCY,
+      );
+    }
 
     this.logDiag(
       "info",
       `joining mesh room ${room_id.slice(0, 12)}… (trystero/${TRYSTERO_STRATEGY}, app=${TRYSTERO_APP_ID}` +
         (custom_relays.length > 0
           ? `, ${custom_relays.length} custom relay${custom_relays.length === 1 ? "" : "s"})`
-          : `, trystero defaults ×${DEFAULT_SIGNALING_REDUNDANCY})`),
+          : chosen_default_relays
+            ? `, trystero defaults ×${chosen_default_relays.length} after deny-filter)`
+            : `, trystero defaults ×${DEFAULT_SIGNALING_REDUNDANCY})`),
     );
+    // Surface the actual STUN/TURN URLs we're handing to WebRTC so
+    // a misconfigured or unreachable server is visible at a glance.
+    // Without this, "ICE failed" leaves you guessing which TURN host
+    // even got tried. Credentials are intentionally omitted from
+    // the URL display but the username is shown so you can confirm
+    // the config landed; password length only as a sanity bit.
+    const stun_summary = opts.stunServers.length === 0
+      ? "STUN: (none — relying on browser defaults if any)"
+      : `STUN: ${opts.stunServers.join(", ")}`;
+    const turn_summary = opts.turnServers.length === 0
+      ? "TURN: (none — direct only; symmetric NAT on either side will fail)"
+      : `TURN: ${opts.turnServers
+          .map((t) => {
+            const auth = t.username
+              ? ` (user=${t.username}, cred=${t.credential ? `${t.credential.length}ch` : "empty"})`
+              : "";
+            return `${t.url}${auth}`;
+          })
+          .join(", ")}`;
+    this.logDiag("info", `${stun_summary}; ${turn_summary}`);
+    if (chosen_default_relays && chosen_default_relays.length > 0) {
+      // Print the actual relay hosts so a denylist tweak or a
+      // changed Trystero default list is visible. Strip the
+      // wss:// prefix; all entries have it and it's just clutter.
+      const relay_hosts = chosen_default_relays.map((u) =>
+        u.replace(/^wss?:\/\//, ""),
+      );
+      this.logDiag(
+        "info",
+        `signaling relays: ${relay_hosts.join(", ")}`,
+      );
+    }
 
     // Resolve the build-time-selected `joinRoom` once per session.
     // Awaited here so a missing / failed strategy bundle surfaces
@@ -1272,24 +1712,24 @@ class MeshClient {
         appId: TRYSTERO_APP_ID,
         rtcConfig: { iceServers: ice_servers },
       };
-      // Plumb the signaling relay set into Trystero. Both fields go
-      // under `relayConfig` (NOT a top-level `relayUrls` — a prior
-      // typo here silently fell through to Trystero's built-in
-      // defaults, so any URLs the user added in Settings were
-      // effectively ignored). When the user has custom relays we
-      // pass them as `urls`, which replaces Trystero's defaults
-      // entirely. Otherwise we leave `urls` unset and just bump
-      // `redundancy` from Trystero's default 5 to 8, which (a)
-      // keeps every existing peer compatible because Trystero's
-      // `redundancy` slices off the front of its deterministic
-      // appId-derived shuffle (the first 5 entries are identical
-      // either way) and (b) dilutes the impact of a single
-      // misbehaving relay in that top-N — most notably
-      // `relay.damus.io`, which sits in our top-5 and rate-limits
-      // presence-announce publishes with "you are noting too much".
+      // Plumb the signaling relay set into Trystero. `relayConfig.urls`
+      // wholly replaces Trystero's default selection — when set, every
+      // entry is used and `redundancy` is ignored. Three branches:
+      //
+      //   1. User has custom relays → pass those exactly.
+      //   2. We loaded the default list and computed a deny-filtered
+      //      slice → pass that, so the chosen N are quiet hosts.
+      //   3. We couldn't load defaultRelayUrls (non-Nostr strategy /
+      //      import error) → fall back to `redundancy`, which lets
+      //      Trystero pick its own top-N. Won't filter the noisy
+      //      hosts but at least keeps the mesh alive.
       if (custom_relays.length > 0) {
         (room_config as Record<string, unknown>).relayConfig = {
           urls: custom_relays,
+        };
+      } else if (chosen_default_relays && chosen_default_relays.length > 0) {
+        (room_config as Record<string, unknown>).relayConfig = {
+          urls: chosen_default_relays,
         };
       } else {
         (room_config as Record<string, unknown>).relayConfig = {
@@ -1359,6 +1799,7 @@ class MeshClient {
     // rejoin a few seconds later, defeating the throttle's whole
     // purpose. The value survives across rejoin cycles by design.
     this.installLifecycleHooks();
+    this.installConsoleNoiseFilter();
     // ICE-state polling lives outside the scheduler worker because
     // it needs DOM-side access to the RTCPeerConnection objects
     // Trystero hands out — those can't ride across the worker
@@ -1396,13 +1837,23 @@ class MeshClient {
       // Fallback: the old setInterval shape, kept so a worker-less
       // environment (rare — Tauri 2 / Chrome 105+ have full Worker
       // support) still gets liveness, just without the busy-main-
-      // thread immunity.
+      // thread immunity. The heartbeat timer fires the same
+      // `runHeartbeatTick` the worker would, passing
+      // `performance.now()` as the tick stamp — without this the
+      // engine had wake detection / rehandshake / per-peer
+      // liveness completely disabled in worker-less environments.
+      this.heartbeat_timer = window.setInterval(() => {
+        this.runHeartbeatTick(performance.now());
+      }, HEARTBEAT_INTERVAL_MS);
       this.offline_check_timer = window.setInterval(() => {
         this.offlineRosteredCheckTick();
       }, OFFLINE_ROSTERED_CHECK_INTERVAL_MS);
       this.catalog_refresh_timer = window.setInterval(() => {
         void this.refreshLocalCatalog();
       }, CATALOG_REFRESH_INTERVAL_MS);
+      this.reconnect_prune_timer = window.setInterval(() => {
+        this.pruneRecentDisconnects();
+      }, RECONNECT_PRUNE_INTERVAL_MS);
       return;
     }
     worker.onmessage = (e: MessageEvent<{ type: "tick"; id: string; t: number }>) => {
@@ -1418,6 +1869,9 @@ class MeshClient {
         case SCHED_CATALOG_REFRESH:
           void this.refreshLocalCatalog();
           break;
+        case SCHED_RECONNECT_PRUNE:
+          this.pruneRecentDisconnects();
+          break;
       }
     };
     worker.onerror = (e: ErrorEvent) => {
@@ -1427,6 +1881,7 @@ class MeshClient {
     this.scheduleTick(SCHED_HEARTBEAT, HEARTBEAT_INTERVAL_MS);
     this.scheduleTick(SCHED_OFFLINE_CHECK, OFFLINE_ROSTERED_CHECK_INTERVAL_MS);
     this.scheduleTick(SCHED_CATALOG_REFRESH, CATALOG_REFRESH_INTERVAL_MS);
+    this.scheduleTick(SCHED_RECONNECT_PRUNE, RECONNECT_PRUNE_INTERVAL_MS);
   }
 
   private scheduleTick(id: string, interval_ms: number): void {
@@ -1452,6 +1907,7 @@ class MeshClient {
   async stop(): Promise<void> {
     this.stopping = true;
     this.uninstallLifecycleHooks();
+    this.uninstallConsoleNoiseFilter();
     this.stopIcePolling();
     this.stopSignalingDiag();
     this.stopScheduler();
@@ -1461,6 +1917,10 @@ class MeshClient {
     }
     // Fallback-path timers — only set when the worker spawn failed.
     // The worker path tears down via stopScheduler() above.
+    if (this.heartbeat_timer !== null) {
+      clearInterval(this.heartbeat_timer);
+      this.heartbeat_timer = null;
+    }
     if (this.offline_check_timer !== null) {
       clearInterval(this.offline_check_timer);
       this.offline_check_timer = null;
@@ -1473,6 +1933,21 @@ class MeshClient {
       clearInterval(this.catalog_refresh_timer);
       this.catalog_refresh_timer = null;
     }
+    if (this.reconnect_prune_timer !== null) {
+      clearInterval(this.reconnect_prune_timer);
+      this.reconnect_prune_timer = null;
+    }
+    // NB: `recent_disconnects` intentionally not cleared here —
+    // a same-network rediscovery does stop+start, and clearing
+    // the bucket on stop would destroy the "reconnecting" grace
+    // markers for peers that dropped just before the rejoin. The
+    // markers stay live across the cycle so the UI shows
+    // `reconnecting…` continuously rather than flashing
+    // through `offline`. The cross-network branch in `start()`
+    // does clear it (different roster = different identities, no
+    // sense preserving). If `stop()` is called and `start()` is
+    // never called again, the next process restart wipes the
+    // in-memory state anyway.
     // Resolve every in-flight remote inference as failed so callers
     // unblock cleanly instead of hanging on a promise that will
     // never resolve.
@@ -1486,6 +1961,16 @@ class MeshClient {
     }
     this.pending_transcribes_out.clear();
     this.pending_transcribes_in.clear();
+    // Outbound moves: settle the on_complete callback so the
+    // initiating UI unblocks instead of waiting on a promise that'll
+    // never resolve. (`dropConnection` already does the per-peer
+    // case; `stop()` is the no-peer-left fallback that covers the
+    // mesh-wide teardown — without this `pending_moves_out` was the
+    // one map silently leaking across stop cycles.)
+    for (const [, pending] of this.pending_moves_out) {
+      pending.on_complete?.(false, "mesh stopped");
+    }
+    this.pending_moves_out.clear();
     this.pending_moves_in.clear();
     this.pending_move_guids.clear();
     for (const [, pending] of this.pending_pulls_out) {
@@ -1515,7 +2000,8 @@ class MeshClient {
     this.refreshResources();
     for (const c of this.connections.values()) {
       if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
-      if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
+      if (c.handshake_hello_retry_timer !== null) clearTimeout(c.handshake_hello_retry_timer);
+      if (c.ice_disconnected_watchdog !== null) clearTimeout(c.ice_disconnected_watchdog);
     }
     this.connections.clear();
     if (this.room) {
@@ -1532,6 +2018,21 @@ class MeshClient {
     this.last_global_tick_at = 0;
     this.recent_ice_failure_at = 0;
     this.last_open_relay_count = 0;
+    this.last_lifecycle_wake_at = 0;
+    // Normalize the rediscovery transient flag. `forceRediscovery`
+    // sets it in a try/finally that always resets it, so the common
+    // case doesn't need this reset — but anything that calls stop()
+    // from OUTSIDE that try block (a direct user-initiated stop,
+    // an error path in reconcile) would otherwise leave the flag
+    // stuck true, which the UI reads to render "rediscovering…"
+    // forever.
+    this.is_rediscovering = false;
+    // Clear the applied-transport snapshot so the next start() with
+    // any config is treated as a fresh apply, not a "no change since
+    // last time" no-op.
+    this.applied_signaling = [];
+    this.applied_stun = [];
+    this.applied_turn = [];
     this.updatePhase();
     settingsAttention.set("cloud-mesh", null);
     this.logDiag("info", "stopped");
@@ -1628,11 +2129,14 @@ class MeshClient {
       );
       this.sendHello(conn);
       // Counts as an attempt for UI purposes — clamps the user's
-      // ability to hammer the button into a tight loop.
+      // ability to hammer the button into a tight loop. Jittered
+      // for the same reason the auto path is: if the user has
+      // several offline peers and clicks reconnect on each in
+      // quick succession, we don't want their backoffs to align.
       conn.rehandshake_attempts += 1;
-      const backoff_ms = REHANDSHAKE_BACKOFF_MS_SCHEDULE[
+      const backoff_ms = jitterBackoff(REHANDSHAKE_BACKOFF_MS_SCHEDULE[
         Math.min(conn.rehandshake_attempts - 1, REHANDSHAKE_BACKOFF_MS_SCHEDULE.length - 1)
-      ];
+      ]);
       conn.rehandshake_backoff_until = Date.now() + backoff_ms;
       this.republishPeers();
       return;
@@ -1793,30 +2297,39 @@ class MeshClient {
     const conn = this.createConnState(peer_id);
     this.connections.set(peer_id, conn);
     this.sendHello(conn);
-    // Re-send hello on a tight interval until the peer
-    // reciprocates with auth_response. Right after a Trystero
-    // room rejoin the very first hello tends to be sent before
-    // the underlying data channel is fully ready and gets
-    // silently dropped — without a retry both sides sit on a
-    // dead handshake until the watchdog fires. Cleared in
-    // handleAuthResponse / handshake_timer / dropConnection.
-    conn.handshake_hello_retry_timer = window.setInterval(() => {
-      if (conn.peer_authenticated) {
-        if (conn.handshake_hello_retry_timer !== null) {
-          clearInterval(conn.handshake_hello_retry_timer);
-          conn.handshake_hello_retry_timer = null;
-        }
-        return;
-      }
-      this.logDiag(
-        "info",
-        `re-sending hello to ${peer_id.slice(0, 8)}… (no auth_response yet)`,
-      );
-      this.sendHello(conn);
-    }, HANDSHAKE_HELLO_RETRY_INTERVAL_MS);
+    // Re-send hello on a growing schedule until the peer reciprocates
+    // with auth_response. Right after a Trystero room rejoin the very
+    // first hello tends to be sent before the underlying data channel
+    // is fully ready and gets silently dropped — without a retry both
+    // sides sit on a dead handshake until the watchdog fires.
+    //
+    // We use self-rescheduling setTimeouts instead of a fixed
+    // setInterval so the cadence can grow (5s, 7s, 10s = 4 sends
+    // total inside the 30s window) — a peer that's genuinely dead
+    // doesn't deserve a hello every 5s burning relay budgets on
+    // every signaling hop. Cleared in handleAuthResponse /
+    // handshake_timer / dropConnection.
+    let retry_index = 0;
+    const scheduleNextHelloRetry = () => {
+      if (conn.peer_authenticated) return;
+      if (retry_index >= HANDSHAKE_HELLO_RETRY_SCHEDULE_MS.length) return;
+      const delay = HANDSHAKE_HELLO_RETRY_SCHEDULE_MS[retry_index];
+      retry_index += 1;
+      conn.handshake_hello_retry_timer = window.setTimeout(() => {
+        conn.handshake_hello_retry_timer = null;
+        if (conn.peer_authenticated) return;
+        this.logDiag(
+          "info",
+          `re-sending hello to ${peer_id.slice(0, 8)}… (no auth_response yet, attempt ${retry_index})`,
+        );
+        this.sendHello(conn);
+        scheduleNextHelloRetry();
+      }, delay);
+    };
+    scheduleNextHelloRetry();
     conn.handshake_timer = window.setTimeout(() => {
       if (conn.handshake_hello_retry_timer !== null) {
-        clearInterval(conn.handshake_hello_retry_timer);
+        clearTimeout(conn.handshake_hello_retry_timer);
         conn.handshake_hello_retry_timer = null;
       }
       // Only fire if we never made it past the cryptographic
@@ -1913,10 +2426,13 @@ class MeshClient {
     // so we never re-handshake faster than the 30s cap but also
     // never give up — Phase 2 routing needs the loop to keep
     // running so a peer that wakes back up an hour later still
-    // recovers without manual intervention.
-    const next_backoff_ms = REHANDSHAKE_BACKOFF_MS_SCHEDULE[
+    // recovers without manual intervention. Jittered so N peers
+    // that went silent together don't all retry on identical ticks
+    // — that synchronized burst is what tipped relay anti-spam
+    // limits in the original report.
+    const next_backoff_ms = jitterBackoff(REHANDSHAKE_BACKOFF_MS_SCHEDULE[
       Math.min(conn.rehandshake_attempts - 1, REHANDSHAKE_BACKOFF_MS_SCHEDULE.length - 1)
-    ];
+    ]);
     conn.rehandshake_backoff_until = now + next_backoff_ms;
     const reason = newly_stale
       ? post_wake_silent
@@ -1948,28 +2464,37 @@ class MeshClient {
    *  REDISCOVERY_BACKOFF_SCHEDULE_MS window. Logged either
    *  way so the Activity panel shows what's been suppressed. */
   private maybeForceRediscovery(reason: string): void {
-    // Gate #1: if the signaling layer is healthy, a Trystero
-    // leave/rejoin accomplishes nothing — it just tears down 20
-    // pre-warmed RTCPeerConnections + 8 relay sockets and reopens
-    // them with identical config. Worse, the new round of
-    // presence-announce publishes pushes us deeper into the
-    // anti-spam budgets of rate-limited relays. The historical
-    // assumption "rostered peer offline → rejoin to refresh
-    // signaling" only made sense before we could observe that
-    // signaling itself is fine; now we can (`isSignalingHealthy`)
-    // and we skip.
+    // Gate #1: don't churn a working mesh. If at least one peer
+    // is currently `active`, the underlying transport (signaling +
+    // WebRTC) is working end-to-end for that peer. A leave/rejoin
+    // would tear down their datachannel for no benefit and push
+    // a fresh round of presence-announces through every relay,
+    // which is the failure mode that drove the original gate (a
+    // flaky-hotspot user kept burning Damus's anti-spam budget).
+    //
+    // The earlier gate keyed off `isSignalingHealthy()` was too
+    // aggressive in the opposite direction: it skipped EVERY
+    // rejoin while relays were OPEN, even when the actionable
+    // case was "signaling sees the other peer's announces but our
+    // local Trystero peer-table is stuck on a dead PC and won't
+    // produce a fresh onPeerJoin." The cure for that IS a rejoin;
+    // refusing one stranded the mesh in `peer-discovered` with no
+    // path forward. The new gate fires only when we have evidence
+    // (an active peer) that the whole stack is working.
     //
     // The phase machine still surfaces the underlying problem
-    // (`signaling-up` / `peer-discovered` / `ice-failed-needs-turn`),
-    // so the user knows what's actually happening even though
-    // we're not churning the room.
-    if (this.isSignalingHealthy()) {
+    // (`signaling-up` / `peer-discovered` / `ice-failed-{no-turn,turn-unreachable}`)
+    // so the Status pill shows what's happening; the throttle
+    // (90s, 3m, 5m, 10m) paces the actual leave/rejoin to keep
+    // anti-spam happy.
+    if (this.hasActivePeer()) {
       this.logDiag(
         "info",
-        `rediscovery skipped (signaling healthy: ${this.last_open_relay_count} relays open, phase=${this.phase}) — ${reason}`,
+        `rediscovery skipped (peer-active connection holds, phase=${this.phase}) — ${reason}`,
       );
-      // Reset the attempt counter so a real signaling outage
-      // later gets the full fast-rejoin schedule from the top.
+      // Reset the attempt counter so a later genuine outage gets
+      // the fast first-rejoin window, not whatever stretched
+      // schedule we'd worked our way up to before recovery.
       this.consecutive_rediscovery_attempts = 0;
       return;
     }
@@ -1984,10 +2509,21 @@ class MeshClient {
       const wait_s = Math.ceil(
         (min_interval - (now - this.last_force_rediscovery_at)) / 1000,
       );
-      this.logDiag(
-        "info",
-        `rediscovery throttled (${reason}) — next rejoin allowed in ${wait_s}s`,
-      );
+      // Dedupe within a single throttle window — the user gets one
+      // line per cycle telling them "we're waiting Xs," not one per
+      // poll tick. We log once when the current window starts
+      // (window stamp differs from what we last logged) and stay
+      // silent the rest of the cycle. The window stamp is
+      // `last_force_rediscovery_at` so a new rediscovery firing
+      // resets the dedupe.
+      if (this.last_throttle_log_window !== this.last_force_rediscovery_at) {
+        this.logDiag(
+          "info",
+          `rediscovery throttled (${reason}) — next rejoin allowed in ${wait_s}s`,
+        );
+        this.last_throttle_log_at = now;
+        this.last_throttle_log_window = this.last_force_rediscovery_at;
+      }
       return;
     }
     this.last_force_rediscovery_at = now;
@@ -2014,9 +2550,24 @@ class MeshClient {
     for (const conn of this.connections.values()) {
       if (conn.device_pubkey) active_pubkeys.add(conn.device_pubkey);
     }
+    const now = Date.now();
     let offline = 0;
     for (const pk of this.roster_pubkeys) {
-      if (!active_pubkeys.has(pk)) offline += 1;
+      if (active_pubkeys.has(pk)) continue;
+      // Skip peers currently in the reconnecting-grace window.
+      // Trystero's natural discovery (presence-announce every
+      // 5.333s) has RECONNECTING_GRACE_MS = 90s to find them
+      // again, and during that window the UI is already showing
+      // "reconnecting…" continuously. Firing a heavy rediscovery
+      // mid-grace tears down our own room and rebuilds it — the
+      // exact tear-down/rebuild churn the user feels as
+      // "fragile." If grace expires without recovery, the
+      // janitor in `pruneRecentDisconnects` kicks rediscovery
+      // immediately as a backstop, so we don't lose recovery
+      // latency by waiting for the next tick.
+      const dc = this.recent_disconnects.get(pk);
+      if (dc && now <= dc.expires_at) continue;
+      offline += 1;
     }
     if (offline === 0) return;
     this.maybeForceRediscovery(
@@ -2042,14 +2593,42 @@ class MeshClient {
       this.send(conn, { kind: "ping", t: now });
     }
     window.setTimeout(() => {
+      // Bail if the mesh was stopped while we were waiting. Without
+      // this guard the rest of the callback iterates a cleared
+      // `connections` map (no-op), but then it can also fire
+      // `maybeForceRediscovery` which schedules a rejoin AGAINST a
+      // freshly-stopped engine, and the nested setTimeout below
+      // can call `heartbeatTickConn` on stale references. Cheaper
+      // to short-circuit at the top.
+      if (this.status === "off" || !this.room) return;
       // Count peers that didn't reply to the wake ping. If none
       // responded the WebRTC channels are almost certainly dead
-      // (the laptop-slept-while-home-office-stayed-on case) and
-      // we need a fresh discovery pass — Trystero keeps the
-      // peer ids in its room state until it notices the
-      // half-closed datachannels itself, which can take minutes.
-      // Short-circuiting to a rejoin here gets us reconnected
-      // in seconds instead.
+      // (the laptop-slept-while-home-office-stayed-on case, OR
+      // a network swap that killed the candidate pairs out from
+      // under us — hotspot↔LAN is the canonical case).
+      //
+      // The room-rejoin nuke used to be the only recovery here.
+      // That's the heaviest hammer in the engine: 8 relay sockets
+      // torn down + ~20 RTCPeerConnections discarded + every
+      // authenticated peer demoted to handshaking. Most network
+      // swaps don't need any of that — the relay sockets reconnect
+      // on their own through the new interface, the auth state on
+      // both ends is fine, and the only thing actually broken is
+      // the ICE candidate pairs (the local IPs they were anchored
+      // to no longer exist). For that, an ICE restart is the right
+      // tool: pc.restartIce() re-gathers candidates on the new
+      // interface, Trystero's `onnegotiationneeded` hook ferries
+      // the renegotiation through the still-up signaling, and the
+      // datachannel resumes on the new transport with app state
+      // preserved.
+      //
+      // So: try ICE restart first. If everyone's STILL silent after
+      // ICE_RESTART_RECOVERY_MS, fall back to the room rejoin.
+      // Three-device case the user worried about: device B's
+      // network swap fires ICE restart on its two PCs; A and C
+      // each see a renegotiation arrive (no peer-leave, no auth
+      // reset), keep their state, and recover their channel to B
+      // alone. A↔C never blinks.
       let unresponsive = 0;
       let total = 0;
       for (const conn of this.connections.values()) {
@@ -2057,6 +2636,47 @@ class MeshClient {
         if (conn.wake_probe_pending) unresponsive++;
       }
       if (total > 0 && unresponsive === total) {
+        const ice_restarted = this.restartIceForUnresponsivePeers();
+        if (ice_restarted > 0) {
+          // Re-ping the same peers — if any pong inside the
+          // recovery window we know ICE restart did its job and
+          // we can skip the room rejoin entirely.
+          const reping_t = Date.now();
+          for (const conn of this.connections.values()) {
+            if (!conn.wake_probe_pending) continue;
+            this.send(conn, { kind: "ping", t: reping_t });
+          }
+          window.setTimeout(() => {
+            // Same post-stop guard as the outer setTimeout: if the
+            // mesh was torn down during the ICE-restart recovery
+            // window, none of the followup actions make sense.
+            if (this.status === "off" || !this.room) return;
+            let still_silent = 0;
+            let still_total = 0;
+            for (const conn of this.connections.values()) {
+              still_total++;
+              if (conn.wake_probe_pending) still_silent++;
+            }
+            if (still_total > 0 && still_silent === still_total) {
+              this.maybeForceRediscovery(
+                `wake + ICE restart: ${still_total} peer(s) still silent`,
+              );
+              return;
+            }
+            const recovered = still_total - still_silent;
+            this.logDiag(
+              "info",
+              `ICE restart recovered ${recovered}/${still_total} peer(s) — no room rejoin needed`,
+            );
+            for (const conn of this.connections.values()) {
+              this.heartbeatTickConn(conn);
+            }
+          }, ICE_RESTART_RECOVERY_MS);
+          return;
+        }
+        // No restart kicked off (room torn down, no PCs accessible,
+        // or every restartIce() call threw). Fall through to the
+        // original rejoin path.
         this.maybeForceRediscovery(
           `wake probe: all ${total} peer(s) unresponsive`,
         );
@@ -2068,6 +2688,111 @@ class MeshClient {
     }, WAKE_PROBE_DELAY_MS);
   }
 
+  /** Trigger an ICE restart on every still-silent peer's
+   *  RTCPeerConnection. Returns the count of peers we actually
+   *  kicked, so the caller can tell "we did something, give it a
+   *  moment" from "nothing to do, fall back."
+   *
+   *  Trystero exposes the live PC map via room.getPeers(); calling
+   *  pc.restartIce() sets the restart-hint on the next offer and
+   *  fires `negotiationneeded`. Trystero's own handler picks up
+   *  the event, sends the offer through the room signal protocol
+   *  (which has perfect-negotiation glare handling), the remote
+   *  side answers, and new candidate pairs form on whatever
+   *  interface is now reachable. The datachannel and all app-level
+   *  state survive — that's the whole point of using ICE restart
+   *  instead of the room-rejoin sledgehammer. */
+  private restartIceForUnresponsivePeers(): number {
+    const room = this.room;
+    if (!room) return 0;
+    let peers: Record<string, RTCPeerConnection>;
+    try {
+      peers = room.getPeers() as Record<string, RTCPeerConnection>;
+    } catch {
+      // Older Trystero builds or a torn-down room — nothing to do.
+      return 0;
+    }
+    let kicked = 0;
+    let no_pc = 0;
+    let closed = 0;
+    let unsupported = 0;
+    let threw = 0;
+    for (const conn of this.connections.values()) {
+      if (!conn.wake_probe_pending) continue;
+      const pc = peers[conn.peer_id];
+      if (!pc) { no_pc++; continue; }
+      if (pc.connectionState === "closed") { closed++; continue; }
+      if (typeof pc.restartIce !== "function") { unsupported++; continue; }
+      try {
+        pc.restartIce();
+        kicked++;
+      } catch {
+        threw++;
+      }
+    }
+    if (kicked > 0) {
+      // One line, terse — the wake-probe log just above already
+      // explained the trigger. Diag readers can correlate by the
+      // adjacent timestamps.
+      const skipped_parts: string[] = [];
+      if (no_pc) skipped_parts.push(`${no_pc} no-pc`);
+      if (closed) skipped_parts.push(`${closed} closed`);
+      if (unsupported) skipped_parts.push(`${unsupported} unsupported`);
+      if (threw) skipped_parts.push(`${threw} threw`);
+      const skipped = skipped_parts.length
+        ? ` (skipped: ${skipped_parts.join(", ")})`
+        : "";
+      this.logDiag(
+        "info",
+        `ICE restart triggered on ${kicked} peer connection(s) — waiting ${Math.round(ICE_RESTART_RECOVERY_MS / 1000)}s for new candidates${skipped}`,
+      );
+    }
+    return kicked;
+  }
+
+  /** Per-peer ICE-disconnected watchdog action: fired by the
+   *  setTimeout scheduled in `watchPeerIce` when a peer's ICE state
+   *  stayed at `disconnected` past ICE_DISCONNECTED_RESTART_MS.
+   *  Kicks `pc.restartIce()` so a fresh candidate exchange picks up
+   *  the live path before the datachannel dies underneath us.
+   *
+   *  Sibling of `restartIceForUnresponsivePeers` (the wake-probe
+   *  Tier-3 path) but scoped to one peer and triggered by observed
+   *  ICE state rather than wake. Both paths can safely fire on the
+   *  same PC because Trystero's perfect-negotiation handler dedupes
+   *  back-to-back offers. */
+  private proactiveIceRestart(peer_id: string): void {
+    const conn = this.connections.get(peer_id);
+    if (!conn) return;
+    conn.ice_disconnected_watchdog = null;
+    // Re-check ICE state. The watchdog races with normal ICE
+    // recovery — if the path healed in the last ~6s the state is
+    // back to `connected`, and there's nothing to restart.
+    const room = this.room;
+    if (!room) return;
+    let pc: RTCPeerConnection | undefined;
+    try {
+      pc = (room.getPeers() as Record<string, RTCPeerConnection>)[peer_id];
+    } catch {
+      return;
+    }
+    if (!pc) return;
+    if (pc.connectionState === "closed") return;
+    if (pc.iceConnectionState !== "disconnected") return;
+    if (typeof pc.restartIce !== "function") return;
+    try {
+      pc.restartIce();
+      this.logDiag(
+        "info",
+        `ICE disconnected >${Math.round(ICE_DISCONNECTED_RESTART_MS / 1000)}s for ${peer_id.slice(0, 8)}… — kicking restartIce() to try a fresh candidate pair`,
+      );
+    } catch {
+      // Best-effort. A throw here is unusual (restartIce is sync
+      // and rarely fails) and there's nothing actionable beyond
+      // letting the natural ICE timeout escalate to `failed`.
+    }
+  }
+
   /** Bind OS lifecycle observables that signal the JS runtime may
    *  have just resumed from a paused state — laptop opened,
    *  network came back, tab refocused. Each one funnels into
@@ -2076,15 +2801,129 @@ class MeshClient {
    *  hooks because no single event covers every platform: e.g.
    *  Tauri webview doesn't always fire `visibilitychange` on lid
    *  events, and `online` only fires on actual network toggles. */
+  /** Saved references to the original console methods so the noise
+   *  filter can be uninstalled cleanly on `stop()`. Null while
+   *  the filter isn't active — typical lifetime is "from start() to
+   *  stop()" but the references survive a network change too. */
+  private original_console_warn: typeof console.warn | null = null;
+  private original_console_error: typeof console.error | null = null;
+  /** Rolling per-pattern dedupe state: first time we see a known-
+   *  noisy upstream warning, we emit it normally with a "(further
+   *  occurrences suppressed)" trailer; subsequent hits within
+   *  CONSOLE_NOISE_SUPPRESS_MS get swallowed and counted. When the
+   *  window expires (or we hit a count milestone) we log a one-
+   *  liner summary so the user knows it kept happening. */
+  private console_noise_state = new Map<
+    string,
+    { last_emit_at: number; suppressed: number }
+  >();
+
+  /** Install a console.warn/console.error tap that dedupes the
+   *  high-frequency upstream warnings drowning out our own diag
+   *  output. Targets — by substring match, no regex perf cost —
+   *  the patterns we've actually seen flood the console:
+   *
+   *    - Trystero relay-failure / rate-limit warnings (one per
+   *      relay per second when a relay throttles us; Trystero
+   *      will reconnect on its own).
+   *    - Nostr-tools WebSocket failure logs (429 / 502 from
+   *      relays — same root cause, same recovery).
+   *
+   *  Anything that doesn't match falls through unchanged. The
+   *  filter is purely about volume control; we don't change the
+   *  semantics of upstream messages, and our own `[mesh]` logs
+   *  go through `logDiag` directly and bypass this entirely. */
+  private installConsoleNoiseFilter(): void {
+    if (typeof window === "undefined") return;
+    if (this.original_console_warn !== null) return;
+    const NOISY_PATTERNS = [
+      "Trystero: relay failure",
+      "WebSocket connection to ",
+    ];
+    const matchPattern = (args: unknown[]): string | null => {
+      // We only need to look at the FIRST arg — both Trystero and
+      // the nostr WS error path stick the full description there
+      // and use later args for objects we don't care to inspect.
+      const first = args[0];
+      if (typeof first !== "string") return null;
+      for (const p of NOISY_PATTERNS) {
+        if (first.includes(p)) return p;
+      }
+      return null;
+    };
+    const SUPPRESS_WINDOW_MS = 30_000;
+    const dedupe = (
+      orig: (...args: unknown[]) => void,
+      args: unknown[],
+    ): void => {
+      const pattern = matchPattern(args);
+      if (pattern === null) {
+        orig.apply(console, args);
+        return;
+      }
+      const state = this.console_noise_state.get(pattern);
+      const now = Date.now();
+      if (!state || now - state.last_emit_at > SUPPRESS_WINDOW_MS) {
+        // First emission in this window — let it through with a
+        // hint so the user knows we'll suppress repeats.
+        const suppressed = state?.suppressed ?? 0;
+        if (suppressed > 0) {
+          orig.call(
+            console,
+            `${args[0]} (+ ${suppressed} suppressed in the last window)`,
+            ...args.slice(1),
+          );
+        } else {
+          orig.apply(console, args);
+        }
+        this.console_noise_state.set(pattern, {
+          last_emit_at: now,
+          suppressed: 0,
+        });
+        return;
+      }
+      state.suppressed += 1;
+    };
+    this.original_console_warn = console.warn.bind(console);
+    this.original_console_error = console.error.bind(console);
+    const saved_warn = this.original_console_warn;
+    const saved_error = this.original_console_error;
+    console.warn = (...args: unknown[]) => dedupe(saved_warn, args);
+    console.error = (...args: unknown[]) => dedupe(saved_error, args);
+  }
+
+  private uninstallConsoleNoiseFilter(): void {
+    if (this.original_console_warn !== null) {
+      console.warn = this.original_console_warn;
+      this.original_console_warn = null;
+    }
+    if (this.original_console_error !== null) {
+      console.error = this.original_console_error;
+      this.original_console_error = null;
+    }
+    this.console_noise_state.clear();
+  }
+
   private installLifecycleHooks(): void {
     if (this.lifecycle_handlers !== null) return;
     if (typeof window === "undefined") return;
     const wake = () => {
+      // Coalesce the wake-event clump that Tauri can emit on a
+      // single tab switch — visibilitychange + focus + pageshow
+      // routinely fire within ~50ms of each other. Without the
+      // gate, each one broadcasts a ping to every peer, which is
+      // both a small wire burst and a noisy Activity log for what
+      // the user did once. Heartbeat-tick wake detection (which
+      // sees a real OS suspend) does NOT go through this gate —
+      // the tick interval already paces it.
+      const now = Date.now();
+      if (now - this.last_lifecycle_wake_at < WAKE_COALESCE_MS) return;
+      this.last_lifecycle_wake_at = now;
       // Reset the inter-tick clock so the heartbeat tick that
       // runs immediately after doesn't also fire its own wake
       // detection on the same event.
-      this.last_global_tick_at = Date.now();
-      this.handleWake(Date.now());
+      this.last_global_tick_at = now;
+      this.handleWake(now);
     };
     const handlers = {
       visibility: () => {
@@ -2176,6 +3015,8 @@ class MeshClient {
       this.signaling_diag_timer = null;
     }
     this.last_signaling_summary = "";
+    this.last_signaling_fingerprint = "";
+    this.last_signaling_log_at = 0;
     this.signaling_event_counts = {};
     this.signaling_event_pubkeys = {};
     this.signaling_event_last_log = 0;
@@ -2236,10 +3077,6 @@ class MeshClient {
       total_events += count;
       per_relay.push(`${relay}=${count}`);
     }
-    const events_changed = total_events !== this.signaling_event_last_log;
-    if (summary === this.last_signaling_summary && !events_changed) return;
-    this.last_signaling_summary = summary;
-    this.signaling_event_last_log = total_events;
 
     // Author breakdown — the most informative line. One pubkey =
     // we're alone in the room (or all events are our own echoes).
@@ -2250,6 +3087,31 @@ class MeshClient {
     const authors_str = author_entries
       .map(([k, c]) => `${k}…=${c}`)
       .join(", ");
+
+    // Build a fingerprint over the SHAPE of the signaling state —
+    // the parts a human looking at the console cares about. Skip
+    // the raw event counter: it ticks every few seconds in steady
+    // state and isn't a meaningful change. PC count is bucketed to
+    // a tier so "78 PCs → 79 PCs" doesn't trigger a re-log, but
+    // "78 PCs → 100 PCs" (a fresh round of attempts) does.
+    const cand_err_set = webrtcDiagState.candidateErrors.slice(-3).join("|");
+    const pc_tier = Math.floor(webrtcDiagState.pcCount / 20);
+    const fingerprint = [
+      summary,
+      `auth=${distinct_authors}`,
+      `pcTier=${pc_tier}`,
+      `err=${cand_err_set}`,
+    ].join("§");
+    const now = Date.now();
+    const fingerprint_changed = fingerprint !== this.last_signaling_fingerprint;
+    const heartbeat_due =
+      this.last_signaling_log_at > 0 &&
+      now - this.last_signaling_log_at >= SIGNALING_DIAG_HEARTBEAT_MS;
+    if (!fingerprint_changed && !heartbeat_due) return;
+    this.last_signaling_summary = summary;
+    this.last_signaling_fingerprint = fingerprint;
+    this.signaling_event_last_log = total_events;
+    this.last_signaling_log_at = now;
 
     const events_suffix =
       total_events > 0
@@ -2373,14 +3235,24 @@ class MeshClient {
 
     // Peer traffic visible → WebRTC negotiation should be
     // happening. Did ICE try and fail without ever gathering a
-    // relay candidate? That's the unambiguous "TURN is missing"
-    // fingerprint and it's terminal until the user adds one.
+    // relay candidate? Branch by whether the user has TURN
+    // configured at all:
+    //   - 0 TURN servers → `ice-failed-no-turn` (actionable: add one)
+    //   - ≥1 TURN configured → `ice-failed-turn-unreachable`
+    //     (actionable: check the URL / credentials / provider)
+    // Both are terminal until something changes the ICE config
+    // (user edits Settings → `reconcile()` triggers a restart
+    // with fresh ICE servers).
     const ice_failed = webrtcDiagState.iceStateChanges.some((s) =>
       s.endsWith(":failed"),
     );
     const has_relay_candidate =
       (webrtcDiagState.candidateTypes["relay"] ?? 0) > 0;
-    if (ice_failed && !has_relay_candidate) return "ice-failed-needs-turn";
+    if (ice_failed && !has_relay_candidate) {
+      return this.applied_turn.length === 0
+        ? "ice-failed-no-turn"
+        : "ice-failed-turn-unreachable";
+    }
 
     return "peer-discovered";
   }
@@ -2398,21 +3270,32 @@ class MeshClient {
   }
 
   /** True when the signaling layer can carry presence + WebRTC
-   *  signaling for us right now. Used by
-   *  `maybeForceRediscovery()` to skip a Trystero leave/rejoin
-   *  when there's nothing wrong with signaling — re-joining tears
-   *  down 20 pre-warmed peer connections + every relay socket and
-   *  re-opens them with identical config, which only adds churn
-   *  and burns through anti-spam budgets on rate-limited relays.
-   *
-   *  The bar is intentionally low (≥1 relay open). If even one
-   *  relay is delivering EVENTs, Trystero's per-relay subscribe
-   *  + announce machinery is doing its job; the failure causing
-   *  "rostered peer offline" is downstream (the other peer isn't
-   *  running, or WebRTC can't establish a candidate pair). A
-   *  rejoin fixes neither. */
+   *  signaling for us right now (≥1 relay socket OPEN). Kept as a
+   *  pure observable for diag logging and future use — the gating
+   *  decision in `maybeForceRediscovery()` now uses `hasActivePeer`
+   *  instead because "signaling healthy" alone doesn't tell us the
+   *  WebRTC half is alive (see the comment there). */
   private isSignalingHealthy(): boolean {
     return this.last_open_relay_count > 0;
+  }
+
+  /** True when at least one peer is in app-level `active` (or its
+   *  ring-shelved variant) status — i.e. fully authenticated and
+   *  exchanging mesh traffic. The "we have a working connection
+   *  somewhere" signal that the auto-rediscovery gate keys off:
+   *  if this is true, the whole stack (signaling + ICE + handshake)
+   *  is demonstrably working for that peer, so a leave/rejoin would
+   *  tear down a healthy datachannel for no benefit.
+   *
+   *  Returns false when every connection is mid-handshake, pending
+   *  approval, denied, or absent — the cases where a stuck
+   *  Trystero peer-table can actually be unblocked by a rejoin. */
+  private hasActivePeer(): boolean {
+    for (const conn of this.connections.values()) {
+      const status = this.peerStatus(conn);
+      if (status === "active" || status === "shelved") return true;
+    }
+    return false;
   }
 
   private pollIceStates(): void {
@@ -2452,37 +3335,123 @@ class MeshClient {
     this.logDiag(
       "warn",
       `peer ${details.peerId.slice(0, 8)}… handshake failed: ${details.error}. ` +
-        `Most often: symmetric NAT (phone hotspot, CGNAT, restrictive carrier) ` +
-        `on one or both sides — STUN can't punch through and no TURN relay is ` +
-        `configured. Add a TURN server in Settings → Networks → Settings ` +
-        `(Cloudflare Calls free tier or self-hosted Coturn).`,
+        this.iceFailureGuidance(),
     );
     this.recent_ice_failure_at = Date.now();
     this.updatePhase();
   }
 
+  /** Build the actionable guidance string we append to ICE-failed
+   *  diag log lines. Branches on whether TURN is configured because
+   *  the user's next step differs sharply:
+   *
+   *   - No TURN configured: "Add a TURN server" — the failure mode
+   *     is symmetric NAT / blocked UDP and direct WebRTC has no
+   *     remaining strategies. The user needs a relay.
+   *   - TURN configured but no `relay` candidate was ever gathered:
+   *     "Check your configured TURN — the host isn't reachable, or
+   *     the credentials are wrong." Their TURN URL string parses
+   *     but the server isn't responding. Different fix.
+   *
+   *  Single source of truth for the message — used by both
+   *  `handleJoinError` and the `watchPeerIce` failed-state branch
+   *  so the two log lines never drift apart. */
+  private iceFailureGuidance(): string {
+    if (this.applied_turn.length === 0) {
+      return (
+        `Most often: symmetric NAT (phone hotspot, CGNAT, restrictive carrier) ` +
+        `on one or both sides — STUN can't punch through and no TURN relay is ` +
+        `configured. Add a TURN server in Settings → Networks → Settings ` +
+        `(Cloudflare Calls free tier or self-hosted Coturn).`
+      );
+    }
+    const turn_hosts = Array.from(
+      new Set(
+        this.applied_turn.map((t) => {
+          // Extract the host from "turn:HOST:PORT" or "turns:HOST:PORT?..."
+          // for the user-readable hint. Best-effort string parsing; if it
+          // doesn't match expectations, fall back to the full URL.
+          const m = t.url.match(/^turns?:([^:?/]+)/);
+          return m ? m[1] : t.url;
+        }),
+      ),
+    );
+    return (
+      `TURN is configured (${turn_hosts.join(", ")}) but no relay candidate was ` +
+      `gathered — your TURN server isn't reachable. Likely causes: the host ` +
+      `doesn't resolve (DNS-level ad-blocker intercepting it, provider outage), ` +
+      `the credentials are wrong (a 401 from TURN looks the same as host unreachable ` +
+      `from ICE's perspective), or UDP is blocked end-to-end (try a TCP/TLS TURN URL ` +
+      `like 'turns:host:443?transport=tcp'). Check Settings → Networks → Settings.`
+    );
+  }
+
   private watchPeerIce(peerId: string, pc: RTCPeerConnection): void {
-    const onChange = () => {
+    // `is_initial=true` runs once synchronously below to catch peers
+    // that already passed through the state transition by the time
+    // we attached. The flag exists to suppress the "clear banner on
+    // success" side effect during that initial inspection — we don't
+    // know whether the connected state we're observing is fresh (so
+    // clearing makes sense) or has been the steady state for minutes
+    // while a different peer was failing. Letting the synchronous
+    // call clear the banner would cause it to flicker every poll
+    // tick as new peers came into the watch set. Real transitions
+    // come through the listener with is_initial=false and update
+    // both directions cleanly.
+    const onChange = (is_initial: boolean) => {
       const state = pc.iceConnectionState;
+      // Record the transition on the per-peer ConnectionState so
+      // `handlePeerLeave` can log a cause-of-death summary later.
+      // The leave callback fires AFTER Trystero has closed the PC
+      // (datachannel onclose), so by then `pc.iceConnectionState`
+      // and `pc.getStats()` are no longer useful — we have to
+      // capture the live state here while it's still observable.
+      const conn = this.connections.get(peerId);
+      if (conn && !is_initial) {
+        conn.last_ice_state = state;
+        conn.last_ice_state_at = Date.now();
+      }
+      // Any transition out of `disconnected` (recovered to connected,
+      // or progressed to failed) cancels the proactive-restart
+      // watchdog. We clear on `failed` too because at that point
+      // restartIce won't help — the candidate pool already exhausted.
+      if (
+        conn &&
+        conn.ice_disconnected_watchdog !== null &&
+        state !== "disconnected"
+      ) {
+        clearTimeout(conn.ice_disconnected_watchdog);
+        conn.ice_disconnected_watchdog = null;
+      }
       if (state === "failed") {
         // The actionable case: ICE candidates never reached a
         // working pair. Surface as warn (always visible, even with
         // Quiet logs) and stamp `recent_ice_failure_at` so the
-        // Settings UI banner can light up.
+        // Settings UI banner can light up. `iceFailureGuidance()`
+        // branches on whether the user has TURN configured so we
+        // give different next-steps for "add TURN" vs "your TURN
+        // isn't reachable."
         this.logDiag(
           "warn",
           `ICE failed for ${peerId.slice(0, 8)}… — direct WebRTC didn't connect. ` +
-            `Most often: symmetric NAT (phone hotspot, CGNAT, restrictive carrier) on one ` +
-            `or both sides. Add a TURN server in Settings → Networks → Settings ` +
-            `(Cloudflare Calls free tier or self-hosted Coturn).`,
+            this.iceFailureGuidance(),
         );
         this.recent_ice_failure_at = Date.now();
         this.updatePhase();
       } else if (state === "connected" || state === "completed") {
-        // A successful candidate pair clears the banner — either the
-        // user has fixed their TURN config or the offending peer is
-        // no longer the active one.
+        // A successful candidate pair clears the banner — but only
+        // on a real transition we observed live. The initial
+        // synchronous read sees a snapshot that may have been
+        // "connected" for minutes; another peer that failed in the
+        // meantime is the one we'd be wrongly silencing here.
         this.updatePhase();
+        // Inspect getStats to capture which candidate pair Chrome
+        // picked. Async — we don't block the state listener, and
+        // we don't care if the answer arrives a beat late; it
+        // just needs to land before the eventual leave so the
+        // diagnostic log has something useful to print.
+        void this.recordSelectedCandidatePair(peerId, pc);
+        if (is_initial) return;
         if (this.recent_ice_failure_at !== 0) {
           this.logDiag(
             "info",
@@ -2491,11 +3460,30 @@ class MeshClient {
         }
         this.recent_ice_failure_at = 0;
       }
-      // `disconnected` is transient (ICE consult-and-retry) — no
-      // log. If it ages into `failed`, the next event lands above.
+      // `disconnected` is the ICE state machine's "lost a check;
+      // trying to recover" — sometimes self-heals back to
+      // `connected`, sometimes ages into `failed` after a longer
+      // timeout (~30s default in Chromium). Historically we did
+      // nothing on this transition, which was fine for fast LAN
+      // flaps but cost us the TURN-via-TCP case: a NAT pinhole on
+      // the relay path closes, ICE state goes disconnected, the
+      // SCTP datachannel times out long before ICE escalates to
+      // `failed`, and Trystero fires `onPeerLeave` with all auth
+      // state lost. The watchdog kicks `pc.restartIce()` after
+      // ICE_DISCONNECTED_RESTART_MS so a fresh candidate exchange
+      // gets a shot at finding a live path before the datachannel
+      // dies underneath us.
+      else if (state === "disconnected" && conn && !is_initial) {
+        if (conn.ice_disconnected_watchdog !== null) {
+          clearTimeout(conn.ice_disconnected_watchdog);
+        }
+        conn.ice_disconnected_watchdog = window.setTimeout(() => {
+          this.proactiveIceRestart(peerId);
+        }, ICE_DISCONNECTED_RESTART_MS);
+      }
     };
     try {
-      pc.addEventListener("iceconnectionstatechange", onChange);
+      pc.addEventListener("iceconnectionstatechange", () => onChange(false));
     } catch {
       // Some test doubles for RTCPeerConnection don't expose
       // addEventListener; ignore so the watcher doesn't crash the
@@ -2503,13 +3491,130 @@ class MeshClient {
     }
     // If the peer was already past the transition by the time we
     // attached (likely — `getPeers()` only surfaces connected
-    // peers in steady state), run the handler once synchronously
-    // so a freshly-connected peer still clears any prior banner.
-    onChange();
+    // peers in steady state), inspect synchronously so a freshly-
+    // failed peer still flags the banner. The is_initial guard
+    // inside onChange suppresses the "clear on success" side of
+    // this — see the comment there.
+    onChange(true);
+  }
+
+  /** Walks getStats() for a peer's PC to figure out which candidate
+   *  pair Chrome actually selected, and records a short tag on the
+   *  ConnectionState (e.g. "host↔srflx", "relay↔relay"). The tag
+   *  surfaces in the leave-cause log so we can see whether drops
+   *  cluster around TURN-relayed paths (TURN server flakiness) vs.
+   *  direct paths (network swap / app sleep / NAT pinhole expiry).
+   *
+   *  This is observability only — no behavior change. getStats() is
+   *  expensive enough that we don't call it per-poll; we only run it
+   *  when ICE transitions to `connected`/`completed`, which fires at
+   *  most a handful of times per peer over the lifetime of a
+   *  connection. Failures are silent — getStats() can race against
+   *  PC teardown and throw, and that's fine: the leave log just
+   *  prints whatever tag we last had (or empty). */
+  private async recordSelectedCandidatePair(
+    peer_id: string,
+    pc: RTCPeerConnection,
+  ): Promise<void> {
+    let stats: RTCStatsReport;
+    try {
+      stats = await pc.getStats();
+    } catch {
+      return;
+    }
+    const conn = this.connections.get(peer_id);
+    if (!conn) return; // peer left while we were awaiting
+    type CandidateStats = {
+      id?: string;
+      candidateType?: string;
+      type?: string;
+    };
+    type PairStats = {
+      id?: string;
+      type?: string;
+      state?: string;
+      nominated?: boolean;
+      selected?: boolean;
+      localCandidateId?: string;
+      remoteCandidateId?: string;
+    };
+    const pairs: PairStats[] = [];
+    const candidates = new Map<string, CandidateStats>();
+    stats.forEach((report: unknown) => {
+      const r = report as PairStats & CandidateStats;
+      if (r.type === "candidate-pair") {
+        pairs.push(r as PairStats);
+      } else if (
+        r.type === "local-candidate" ||
+        r.type === "remote-candidate"
+      ) {
+        if (typeof r.id === "string") candidates.set(r.id, r as CandidateStats);
+      }
+    });
+    // Browsers expose the "active" pair differently — Chromium sets
+    // `nominated` + state="succeeded", Firefox sets `selected` on the
+    // pair. Accept either.
+    const active = pairs.find(
+      (p) =>
+        (p.nominated && p.state === "succeeded") ||
+        p.selected === true,
+    );
+    if (!active || !active.localCandidateId || !active.remoteCandidateId)
+      return;
+    const local = candidates.get(active.localCandidateId);
+    const remote = candidates.get(active.remoteCandidateId);
+    const local_tag = local?.candidateType ?? "?";
+    const remote_tag = remote?.candidateType ?? "?";
+    conn.selected_candidate_summary = `${local_tag}↔${remote_tag}`;
   }
 
   private handlePeerLeave(peer_id: string): void {
-    this.logDiag("info", `peer left: ${peer_id.slice(0, 8)}…`);
+    // Cause-of-death log. Build a compact "what was happening at the
+    // moment of leave" summary so we can tell apart the leave modes
+    // that look identical from the outside:
+    //
+    //   "ICE was `failed` 8s ago" → network / TURN path broke
+    //   "ICE was `connected` right up until leave" → datachannel
+    //       died independently (most often: peer app process killed,
+    //       browser/Tauri crashed, asymmetric NAT pinhole expired)
+    //   "ICE was `disconnected`" → typical mid-transition; Trystero
+    //       gave up before the consult-and-retry could rescue it
+    //
+    // Paired with the selected-candidate tag (host/srflx/relay) so
+    // a leave through TURN points at the TURN server, a leave on a
+    // direct host pair points at the OS/network, etc.
+    const c = this.connections.get(peer_id);
+    if (c && (c.peer_authenticated || c.last_ice_state)) {
+      const now = Date.now();
+      const parts: string[] = [];
+      if (c.last_ice_state) {
+        const age_ms = c.last_ice_state_at ? now - c.last_ice_state_at : 0;
+        const age_s = Math.round(age_ms / 1000);
+        parts.push(`ICE=${c.last_ice_state}${age_s > 0 ? ` (${age_s}s ago)` : ""}`);
+      }
+      if (c.selected_candidate_summary) {
+        parts.push(`pair=${c.selected_candidate_summary}`);
+      }
+      if (c.first_active_at) {
+        const lived_ms = now - c.first_active_at;
+        // For sub-minute connections show seconds; otherwise minutes.
+        // The boundary matters: <60s suggests a connection that never
+        // really stabilized, ≥60s suggests a connection that broke
+        // mid-conversation.
+        const lived = lived_ms < 60_000
+          ? `${Math.round(lived_ms / 1000)}s`
+          : `${Math.round(lived_ms / 60_000)}m`;
+        parts.push(`lived=${lived}`);
+      } else if (c.peer_authenticated) {
+        // Authenticated but never reached active — peer disconnected
+        // mid-handshake, before approve roundtrip. Worth flagging.
+        parts.push(`never-active`);
+      }
+      const summary = parts.length ? ` — ${parts.join(", ")}` : "";
+      this.logDiag("info", `peer left: ${peer_id.slice(0, 8)}…${summary}`);
+    } else {
+      this.logDiag("info", `peer left: ${peer_id.slice(0, 8)}…`);
+    }
     this.dropConnection(peer_id);
   }
 
@@ -2538,6 +3643,11 @@ class MeshClient {
       catalog: [],
       local_shelved: false,
       remote_shelved: false,
+      last_ice_state: "",
+      last_ice_state_at: 0,
+      first_active_at: 0,
+      selected_candidate_summary: "",
+      ice_disconnected_watchdog: null,
     };
   }
 
@@ -2949,7 +4059,7 @@ class MeshClient {
       conn.handshake_timer = null;
     }
     if (conn.handshake_hello_retry_timer !== null) {
-      clearInterval(conn.handshake_hello_retry_timer);
+      clearTimeout(conn.handshake_hello_retry_timer);
       conn.handshake_hello_retry_timer = null;
     }
     this.logDiag(
@@ -3230,6 +4340,24 @@ class MeshClient {
         clearTimeout(conn.handshake_timer);
         conn.handshake_timer = null;
       }
+      // Stamp once. Stays set across heartbeats / shelve cycles so
+      // handlePeerLeave can report a true "lived for N minutes"
+      // even if the peer was briefly shelved by the ring selector.
+      if (conn.first_active_at === 0) {
+        conn.first_active_at = Date.now();
+      }
+      // Stable-identity rejoin: this peer is back. If they were in
+      // the reconnecting bucket (i.e. they were `active` very recently
+      // and dropped within RECONNECTING_GRACE_MS), drop the marker so
+      // computePeers stops rendering the "reconnecting" framing. The
+      // UI sees a single state transition (reconnecting → active),
+      // not the offline→handshaking→active churn.
+      if (this.recent_disconnects.delete(conn.device_pubkey)) {
+        this.logDiag(
+          "info",
+          `peer ${conn.device_pubkey.slice(0, 8)}… reconnected within grace window — same identity, link healed`,
+        );
+      }
       this.logDiag("info", `peer active: ${conn.device_pubkey.slice(0, 8)}…`);
       // Phase 2: send our current catalog so the peer can render it
       // in the Network view without waiting for a mutation, and
@@ -3253,7 +4381,8 @@ class MeshClient {
     const c = this.connections.get(peer_id);
     if (!c) return;
     if (c.handshake_timer !== null) clearTimeout(c.handshake_timer);
-    if (c.handshake_hello_retry_timer !== null) clearInterval(c.handshake_hello_retry_timer);
+    if (c.handshake_hello_retry_timer !== null) clearTimeout(c.handshake_hello_retry_timer);
+    if (c.ice_disconnected_watchdog !== null) clearTimeout(c.ice_disconnected_watchdog);
     // Preserve the catalog from this connection so the offline
     // sidebar render still shows the peer's conversations dimmed
     // instead of going blank. Only worth caching for peers we'd
@@ -3261,6 +4390,29 @@ class MeshClient {
     // strangers shouldn't leak into the sidebar.
     if (c.device_pubkey && c.catalog.length > 0 && this.roster_pubkeys.has(c.device_pubkey)) {
       this.catalog_cache.set(c.device_pubkey, c.catalog);
+    }
+    // Stable-identity bookkeeping: if this peer was actively working
+    // (reached `peer-active` at some point in its lifetime) and is
+    // rostered, mark it as "reconnecting" rather than letting it
+    // fall straight to "offline." computePeers picks this up and
+    // renders the gentler framing; a fresh active connection to the
+    // same device_pubkey within RECONNECTING_GRACE_MS clears the
+    // marker via maybePromoteToActive, and the janitor sweeps stale
+    // entries. We gate on `first_active_at` rather than
+    // `peer_authenticated` so a peer that failed mid-handshake
+    // doesn't get the soft framing — those failures are user-
+    // actionable (denied, malformed hello, etc.) and shouldn't
+    // pretend recovery is just around the corner.
+    if (
+      c.device_pubkey &&
+      c.first_active_at > 0 &&
+      this.roster_pubkeys.has(c.device_pubkey)
+    ) {
+      const now = Date.now();
+      this.recent_disconnects.set(c.device_pubkey, {
+        since: now,
+        expires_at: now + RECONNECTING_GRACE_MS,
+      });
     }
     this.connections.delete(peer_id);
     for (const [guid, pending] of this.pending_moves_out) {
@@ -3424,6 +4576,7 @@ class MeshClient {
     const active_pubkeys = new Set(
       active.filter((p) => p.device_pubkey !== "").map((p) => p.device_pubkey),
     );
+    const now = Date.now();
     const offline: PeerEntry[] = [];
     for (const pubkey of this.roster_pubkeys) {
       if (active_pubkeys.has(pubkey)) continue;
@@ -3434,13 +4587,24 @@ class MeshClient {
       // is currently away. EMPTY_CAPABILITIES otherwise — a peer
       // we've never connected to (roster entry only) reads blank.
       const cachedCap = this.capabilities_cache.get(pubkey);
+      // Stable-identity: was this peer just here? If a previously
+      // active connection to this pubkey dropped within
+      // RECONNECTING_GRACE_MS, render the soft "reconnecting"
+      // framing instead of "offline." When the peer comes back
+      // their new connection lands in `active` and replaces this
+      // synthesized entry — the UI sees `reconnecting → active`
+      // without a visit to `offline → handshaking`. The "since"
+      // stamp powers a countdown if any UI surfaces it; the actual
+      // expiry check is `now > expires_at`.
+      const disconnect = this.recent_disconnects.get(pubkey);
+      const reconnecting = disconnect !== undefined && now <= disconnect.expires_at;
       offline.push({
         peer_id: `offline:${pubkey}`,
         device_pubkey: pubkey,
         device_suffix: suffix,
         device_id_display: suffix ? `${pubkey}-${suffix}` : pubkey,
         label: this.roster_labels.get(pubkey) ?? "",
-        status: "offline",
+        status: reconnecting ? "reconnecting" : "offline",
         authorized: true,
         approver_role: false,
         local_approved: false,
@@ -3461,6 +4625,62 @@ class MeshClient {
       });
     }
     return [...active, ...offline];
+  }
+
+  /** Periodic janitor: prune `recent_disconnects` entries that have
+   *  aged past their grace window. Mostly a memory-hygiene measure
+   *  — the map is bounded by roster size so it can't grow without
+   *  bound — but also triggers a peers republish whenever an entry
+   *  actually expired, so the UI flips from "reconnecting" to
+   *  "offline" without waiting for the next unrelated event to
+   *  rebuild the list. */
+  private pruneRecentDisconnects(): void {
+    if (this.recent_disconnects.size === 0) return;
+    const now = Date.now();
+    let expired = 0;
+    const expired_pubkeys: string[] = [];
+    for (const [pubkey, entry] of this.recent_disconnects) {
+      if (now > entry.expires_at) {
+        this.recent_disconnects.delete(pubkey);
+        expired_pubkeys.push(pubkey);
+        expired++;
+      }
+    }
+    if (expired > 0) {
+      // One log line per sweep so the activity panel records the
+      // transition. Cheaper than per-pubkey logging and the user
+      // doesn't need to know WHICH pubkey timed out — the peer card
+      // flipping from reconnecting to offline conveys that.
+      this.logDiag(
+        "info",
+        `${expired} peer(s) aged out of reconnecting grace — now offline`,
+      );
+      this.republishPeers();
+      // Backstop: if any of the expired peers are STILL rostered and
+      // STILL not active, kick a rediscovery NOW. Without this, the
+      // user waits up to OFFLINE_ROSTERED_CHECK_INTERVAL_MS (60s)
+      // for the next periodic tick to notice and trigger
+      // `maybeForceRediscovery` itself — meaning the worst-case
+      // recovery latency adds the offline-check cadence on top of
+      // the grace window. The whole point of suppressing
+      // mid-grace rediscovery was to let natural Trystero
+      // discovery work without interference; that's the same
+      // reason firing it the moment grace ends is correct (natural
+      // discovery had its 90s shot and didn't recover, so the
+      // heavier hammer is now appropriate).
+      const active_pubkeys = new Set<string>();
+      for (const conn of this.connections.values()) {
+        if (conn.device_pubkey) active_pubkeys.add(conn.device_pubkey);
+      }
+      const still_offline = expired_pubkeys.filter(
+        (pk) => this.roster_pubkeys.has(pk) && !active_pubkeys.has(pk),
+      );
+      if (still_offline.length > 0) {
+        this.maybeForceRediscovery(
+          `${still_offline.length} peer(s) aged out of grace and still offline — kicking rediscovery`,
+        );
+      }
+    }
   }
 
   /** Drop a peer's cached catalog. Wired to the sidebar's right-
@@ -3704,13 +4924,17 @@ class MeshClient {
   // ---- catalog gossip --------------------------------------------------
 
   /** Walk the local conversation tree and update `my_catalog`. Sends
-   *  a fresh `catalog_announce` to every active peer afterwards.
-   *  Safe to call frequently — internally debounced so a rapid
-   *  series of mutations collapses to one announce. */
+   *  a fresh `catalog_announce` to every active peer afterwards
+   *  ONLY when the catalog actually changed since the last refresh —
+   *  the fingerprint compare keeps the 60s safety-net tick silent
+   *  in steady state. Safe to call frequently — the broadcast itself
+   *  is debounced and the no-change short-circuit makes worst case
+   *  cheap. */
   async refreshLocalCatalog(): Promise<void> {
+    let next: CatalogEntry[];
     try {
       const { conversations } = await listConversations();
-      this.my_catalog = conversations.map((c) => ({
+      next = conversations.map((c) => ({
         guid: c.id,
         title: c.title,
         mode: c.mode,
@@ -3729,7 +4953,44 @@ class MeshClient {
       this.logDiag("warn", `catalog refresh failed: ${String(e)}`);
       return;
     }
+    // Stable string form keyed by guid order, so two refreshes with
+    // identical underlying data produce the same fingerprint
+    // regardless of `listConversations` ordering. Cheap — bounded
+    // by roster size and conversation count, runs at most every 60s
+    // on the safety-net path (per-mutation pushes don't go through
+    // this short-circuit; they already know something changed).
+    const fingerprint = this.computeCatalogFingerprint(next);
+    if (fingerprint === this.my_catalog_fingerprint && this.my_catalog.length === next.length) {
+      // No change since the last walk — and we already broadcast the
+      // current fingerprint to whoever was active at the time. Skip
+      // the wire activity. New peers that come online get the
+      // current snapshot via `maybePromoteToActive`, so this skip
+      // doesn't leave joiners stale.
+      return;
+    }
+    this.my_catalog = next;
+    this.my_catalog_fingerprint = fingerprint;
     this.broadcastCatalogDebounced();
+  }
+
+  /** Build the stable fingerprint for a catalog snapshot. The format
+   *  is intentionally simple — we just need to detect change with
+   *  high probability, not protect against adversaries. Sort by guid
+   *  so two snapshots with identical content always produce the
+   *  same string. Include every wire-relevant field so a title edit
+   *  or path move triggers a re-broadcast even when the guid set is
+   *  unchanged. */
+  private computeCatalogFingerprint(catalog: CatalogEntry[]): string {
+    if (catalog.length === 0) return "0";
+    const sorted = [...catalog].sort((a, b) => (a.guid < b.guid ? -1 : 1));
+    // Tab-separated tuples + newline-separated rows. Cheap to build,
+    // cheap to compare, identical bytes for identical inputs.
+    return sorted
+      .map(
+        (c) =>
+          `${c.guid}\t${c.updated_at}\t${c.mode}\t${c.title}\t${c.path ?? ""}\t${c.pending_move ? "1" : "0"}`,
+      )
+      .join("\n");
   }
 
   /** Public notify hook for code paths that just mutated the
@@ -5034,6 +6295,38 @@ function buildIceServers(
         credential: t.credential,
       })),
   ];
+}
+
+/** Apply ±REHANDSHAKE_JITTER_FRACTION to a backoff value so peers
+ *  that went silent together don't all retry on the same tick.
+ *  Pure function — caller decides where to apply jitter. */
+function jitterBackoff(ms: number): number {
+  const span = ms * REHANDSHAKE_JITTER_FRACTION;
+  const offset = (Math.random() * 2 - 1) * span;
+  return Math.max(0, Math.round(ms + offset));
+}
+
+/** True when two transport-config arrays describe the same set
+ *  (same length, same elements in the same order). Order matters
+ *  for STUN/relay lists because Trystero / WebRTC try them in
+ *  declared order — a reorder is a meaningful user change. */
+function sameStringList(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** Same as `sameStringList` for the TURN array. Compares url +
+ *  username + credential because changing any of them is a real
+ *  change the user expects to take effect. */
+function sameTurnList(a: TurnServer[], b: TurnServer[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].url !== b[i].url) return false;
+    if ((a[i].username ?? "") !== (b[i].username ?? "")) return false;
+    if ((a[i].credential ?? "") !== (b[i].credential ?? "")) return false;
+  }
+  return true;
 }
 
 function shortLabel(label: string, pubkey: string): string {

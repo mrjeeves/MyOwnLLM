@@ -98,10 +98,15 @@ import { APP_VERSION } from "../../mesh-capabilities";
           tone: "amber",
           text: `Peer found on ${handle} — establishing WebRTC connection…`,
         };
-      case "ice-failed-needs-turn":
+      case "ice-failed-no-turn":
         return {
           tone: "red",
           text: `ICE failed on ${handle} — TURN server required (see Settings)`,
+        };
+      case "ice-failed-turn-unreachable":
+        return {
+          tone: "red",
+          text: `ICE failed on ${handle} — configured TURN isn't reachable`,
         };
       case "peer-active":
         return {
@@ -137,8 +142,11 @@ import { APP_VERSION } from "../../mesh-capabilities";
     if (meshClient.phase === "error") {
       return "The mesh hit an error. Open the Activity tab for diagnostics, then switch networks to retry.";
     }
-    if (meshClient.phase === "ice-failed-needs-turn") {
+    if (meshClient.phase === "ice-failed-no-turn") {
       return `Both ends of "${active.network_id}" need a TURN server (Settings → Networks → Settings → TURN servers). On a phone hotspot or behind CGNAT, STUN can't punch a hole — TURN relays the traffic for you. Cloudflare Calls has a free tier; Coturn self-hosts in five minutes.`;
+    }
+    if (meshClient.phase === "ice-failed-turn-unreachable") {
+      return `Your configured TURN servers aren't reachable. Three likely causes: (1) the TURN host doesn't resolve from this machine — DNS-level ad/tracker blocking can intercept provider hostnames (NextDNS, Pi-hole, AdGuard DNS commonly block trafficmanager.net, which several TURN providers CNAME through). (2) The credentials are wrong — TURN returns 401 which from ICE's view looks identical to "host unreachable." (3) UDP is blocked end-to-end — try a TCP/TLS URL like 'turns:host:443?transport=tcp'. Open Settings → Networks → Settings → TURN servers to check the configuration.`;
     }
     if (meshClient.phase === "off" || meshClient.phase === "starting") {
       return ""; // transient
