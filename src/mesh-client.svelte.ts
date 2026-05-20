@@ -387,13 +387,22 @@ const WAKE_COALESCE_MS = 2_000;
  *  the budget has to absorb a real model-load pause. */
 const HEARTBEAT_INTERVAL_MS = 30_000;
 /** Consider the channel stale (start re-handshaking) if no message
- *  has arrived in this window. ~2.5 missed pings of grace before
- *  we enter the reconnect loop; chosen to be tolerant of a brief
- *  network jitter and the longest main-thread stalls we see in
- *  practice (model load) without burying real stalls. Post-wake
- *  detection is much faster via WAKE_PROBE_DELAY_MS — this window
- *  only governs steady-state stalls. */
-const HEARTBEAT_TIMEOUT_MS = 75_000;
+ *  has arrived in this window. Sized to match the ping cadence
+ *  exactly: a healthy connection sees at least one message per
+ *  interval (the pong we ourselves elicit, plus any organic
+ *  protocol traffic). One full interval of silence is already
+ *  abnormal — by the time the second interval would fire we
+ *  should already be re-handshaking, not still waiting. The old
+ *  75s value was nominally "2.5 missed pings of grace" but in
+ *  practice it just blanketed real network-swap zombies for a
+ *  full minute past when they were detectable. Combined with the
+ *  Trystero-patch hunks (subscription replay, transient-on-
+ *  disconnected, inbound-silence zombie clear), 30s timeout
+ *  gives the swap-side a hard deadline to notice its own
+ *  one-sided-connected state instead of riding WebRTC's consent
+ *  freshness lag. Post-wake detection still runs faster via
+ *  WAKE_PROBE_DELAY_MS. */
+const HEARTBEAT_TIMEOUT_MS = 30_000;
 /** When the gap between two heartbeat ticks is larger than this,
  *  assume the device just woke from sleep / suspend. setInterval
  *  pauses while the JS engine is frozen, so a gap much greater
