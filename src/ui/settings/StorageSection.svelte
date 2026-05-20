@@ -21,6 +21,17 @@
     exists: boolean;
   }
 
+  /** Mirror of `models::ModelInfo` — the shape `asr_models_list` and
+   *  `diarize_models_list` return. We pull both and add their
+   *  installed entries to the Installed-models summary so the count
+   *  here matches what the Models tab actually lists. */
+  interface ModelInfo {
+    name: string;
+    kind: string;
+    installed: boolean;
+    installed_size_bytes: number | null;
+  }
+
   /** Mirror of `transcribe::OrphanStream`. */
   interface OrphanStream {
     stream_id: string;
@@ -129,9 +140,11 @@
   let purgeError = $state("");
 
   async function refreshStorage(): Promise<void> {
-    const [pulled, hw, config, orphans, legacy, updateList, modelTargets, convOrphans] =
+    const [pulled, asrList, diarizeList, hw, config, orphans, legacy, updateList, modelTargets, convOrphans] =
       await Promise.all([
         invoke<OllamaModel[]>("ollama_list_models").catch(() => [] as OllamaModel[]),
+        invoke<ModelInfo[]>("asr_models_list").catch(() => [] as ModelInfo[]),
+        invoke<ModelInfo[]>("diarize_models_list").catch(() => [] as ModelInfo[]),
         invoke<HardwareProfile>("detect_hardware").catch(() => null),
         loadConfig(),
         invoke<OrphanStream[]>("transcribe_buffer_orphans").catch(() => [] as OrphanStream[]),
@@ -141,9 +154,18 @@
         listConversationOrphans().catch(() => [] as ConversationOrphan[]),
       ]);
 
+    // Tally everything the Models tab lists in one go: Ollama pulls
+    // plus installed ASR + diarize artifacts. Otherwise the Storage
+    // summary says "1 model pulled" while Models shows 4 (one Ollama
+    // tag + moonshine + the two diarize components).
     const ollamaBytes = pulled.reduce((acc, m) => acc + m.size, 0);
-    totalBytes = ollamaBytes;
-    modelCount = pulled.length;
+    const localInstalled = [...asrList, ...diarizeList].filter((m) => m.installed);
+    const localBytes = localInstalled.reduce(
+      (acc, m) => acc + (m.installed_size_bytes ?? 0),
+      0,
+    );
+    totalBytes = ollamaBytes + localBytes;
+    modelCount = pulled.length + localInstalled.length;
     diskFreeGb = hw?.disk_free_gb ?? null;
 
     modelsReclaim = {

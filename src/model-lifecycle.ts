@@ -157,6 +157,24 @@ export async function keepModel(tag: string): Promise<void> {
   }
 }
 
+/** Auto-pin a model the user just chose to download. Splits diarize
+ *  composites (`pyannote-seg-3.0+wespeaker-r34`) into components so
+ *  each on-disk file gets its own kept_models entry — `keepModel`
+ *  records by exact tag, and the cleanup pass would otherwise evict
+ *  the components since nobody stores the composite string.
+ *
+ *  Anything the user actively initiated should land here: tier
+ *  downloads from FamilyDetail, the gated DownloadOverlay, the
+ *  TranscribeView model-pulls that fire when they hit Record. Pinning
+ *  means provider manifest changes (which silently shift the
+ *  recommended set) don't cleanup the model the user just picked. */
+export async function pinDownloadedModel(tag: string): Promise<void> {
+  const parts = tag.includes("+") ? tag.split("+").filter(Boolean) : [tag];
+  for (const part of parts) {
+    await keepModel(part);
+  }
+}
+
 export async function unkeepModel(tag: string): Promise<void> {
   const config = await loadConfig();
   config.kept_models = config.kept_models.filter((m) => m !== tag);
