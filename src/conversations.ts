@@ -47,6 +47,12 @@ export interface StoredMessage {
    *  result, and the id of the tool_call it pairs with. */
   name?: string;
   tool_call_id?: string;
+  /** Wall-clock duration of this assistant turn, in ms, measured from
+   *  the moment the turn was requested to the moment the model finished
+   *  streaming. Surfaced under the bubble so users can eyeball how
+   *  long the model is taking. Optional — absent on legacy messages
+   *  and on non-assistant rows. */
+  duration_ms?: number;
 }
 
 /** One unit of transcribed speech. Mirrors `transcribe::EmittedSegment`

@@ -22,6 +22,7 @@
   } from "./chat-slot.svelte";
   import { transcribeUi } from "./transcribe-state.svelte";
   import { stickToBottom } from "./stick-to-bottom";
+  import { renderMarkdown } from "./markdown";
   import { meshClient } from "../mesh-client.svelte";
   import { routingPins, setTextPin } from "./routing-pins.svelte";
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
@@ -751,6 +752,39 @@
       return raw;
     }
   }
+
+  /** Index of the assistant bubble whose Copy button was just pressed.
+   *  Drives the transient "Copied" label that flips back to "Copy"
+   *  after ~1.4s. We key by message index rather than id because
+   *  StoredMessage has no id; the array is stable within a single
+   *  render pass. */
+  let copiedIdx = $state<number | null>(null);
+  let copiedTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function copyMessage(idx: number, raw: string) {
+    try {
+      await navigator.clipboard.writeText(raw);
+    } catch {
+      // Clipboard can fail in some Tauri webview contexts (no user
+      // gesture, sandbox quirks). Silent — the user can still
+      // hand-select and copy the rendered text as a fallback.
+      return;
+    }
+    copiedIdx = idx;
+    if (copiedTimer) clearTimeout(copiedTimer);
+    copiedTimer = setTimeout(() => {
+      if (copiedIdx === idx) copiedIdx = null;
+      copiedTimer = null;
+    }, 1400);
+  }
+
+  /** Human-friendly duration label for the bubble footer. Sub-second
+   *  times render in ms ("420 ms") so quick replies don't all look
+   *  like 0.0s; everything else collapses to one decimal of seconds. */
+  function formatDuration(ms: number): string {
+    if (ms < 1000) return `${ms} ms`;
+    return `${(ms / 1000).toFixed(1)} s`;
+  }
 </script>
 
 <div class="chat-shell">
@@ -832,7 +866,16 @@
               </details>
             {/if}
             {#if msg.content}
-              <span class="content">{msg.content}</span>
+              {#if msg.role === "assistant"}
+                <!-- Markdown render only on assistant turns. The raw
+                     text stays on `msg.content` so the Copy button
+                     below can ship the original markdown, while
+                     hand-selection grabs the rendered (plain-text)
+                     reading copy. -->
+                <div class="content rendered">{@html renderMarkdown(msg.content)}</div>
+              {:else}
+                <span class="content">{msg.content}</span>
+              {/if}
             {:else if msg.streaming && !msg.thinking && (!msg.tool_calls || msg.tool_calls.length === 0)}
               <span class="dots"><span></span><span></span><span></span></span>
             {/if}
@@ -868,6 +911,23 @@
               </div>
             {/if}
           </div>
+          {#if msg.role === "assistant" && !msg.streaming && msg.content}
+            <div class="bubble-actions">
+              <button
+                type="button"
+                class="bubble-action"
+                onclick={() => copyMessage(i, msg.content)}
+                title="Copy original markdown"
+              >
+                {copiedIdx === i ? "Copied" : "Copy"}
+              </button>
+              {#if msg.duration_ms != null}
+                <span class="bubble-timing" title="Time to generate this reply">
+                  {formatDuration(msg.duration_ms)}
+                </span>
+              {/if}
+            </div>
+          {/if}
         </div>
       {/if}
     {/each}
@@ -1018,6 +1078,13 @@
   }
   .message { display: flex; }
   .message.user { justify-content: flex-end; }
+  /* Assistant messages stack the bubble and the action row vertically
+     so Copy / timing can hang below the bubble without breaking the
+     left alignment the user expects. */
+  .message.assistant {
+    flex-direction: column;
+    align-items: flex-start;
+  }
   .bubble {
     max-width: 72%;
     padding: .6rem .85rem;
@@ -1032,6 +1099,119 @@
      between sibling elements (e.g. content → tool-calls div) also
      rendering as a visible blank line. */
   .bubble .content { white-space: pre-wrap; }
+  /* Markdown-rendered assistant content. The renderer emits real
+     block elements (<p>, <ul>, <pre>, …) so we drop pre-wrap on the
+     container itself and let those elements lay themselves out.
+     The first/last child margin trim keeps a single-paragraph reply
+     from looking padded inside the bubble. */
+  .bubble .content.rendered { white-space: normal; }
+  .bubble .content.rendered :global(p) { margin: 0; }
+  .bubble .content.rendered :global(p + p),
+  .bubble .content.rendered :global(p + ul),
+  .bubble .content.rendered :global(p + ol),
+  .bubble .content.rendered :global(p + pre),
+  .bubble .content.rendered :global(ul + p),
+  .bubble .content.rendered :global(ol + p),
+  .bubble .content.rendered :global(pre + p),
+  .bubble .content.rendered :global(h1 + *),
+  .bubble .content.rendered :global(h2 + *),
+  .bubble .content.rendered :global(h3 + *),
+  .bubble .content.rendered :global(h4 + *),
+  .bubble .content.rendered :global(h5 + *),
+  .bubble .content.rendered :global(h6 + *) { margin-top: .55rem; }
+  .bubble .content.rendered :global(h1),
+  .bubble .content.rendered :global(h2),
+  .bubble .content.rendered :global(h3),
+  .bubble .content.rendered :global(h4),
+  .bubble .content.rendered :global(h5),
+  .bubble .content.rendered :global(h6) {
+    margin: 0;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+  .bubble .content.rendered :global(h1) { font-size: 1.1rem; }
+  .bubble .content.rendered :global(h2) { font-size: 1.0rem; }
+  .bubble .content.rendered :global(h3),
+  .bubble .content.rendered :global(h4),
+  .bubble .content.rendered :global(h5),
+  .bubble .content.rendered :global(h6) { font-size: .95rem; }
+  .bubble .content.rendered :global(ul),
+  .bubble .content.rendered :global(ol) {
+    margin: 0;
+    padding-left: 1.25rem;
+  }
+  .bubble .content.rendered :global(li) { margin: .1rem 0; }
+  .bubble .content.rendered :global(code) {
+    background: #0f0f0f;
+    border: 1px solid #2a2a2a;
+    border-radius: 4px;
+    padding: 0 .25em;
+    font-family: monospace;
+    font-size: .85em;
+  }
+  .bubble .content.rendered :global(pre) {
+    margin: 0;
+    padding: .5rem .65rem;
+    background: #0f0f0f;
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    overflow-x: auto;
+  }
+  /* Code inside <pre> is the block payload — neutralise the inline
+     pill styling so it doesn't double up with the wrapping <pre>. */
+  .bubble .content.rendered :global(pre code) {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: .8rem;
+    line-height: 1.5;
+    white-space: pre;
+  }
+  .bubble .content.rendered :global(a) {
+    color: #b9b9ee;
+    text-decoration: underline;
+  }
+  .bubble .content.rendered :global(strong) { font-weight: 600; }
+  .bubble .content.rendered :global(em) { font-style: italic; }
+  /* Action row under each assistant bubble: Copy + timing. Sits in
+     the .75rem gap the .messages flex column already leaves between
+     bubbles — small padding above keeps it visually attached to its
+     bubble without eating the gap to the next message. */
+  .bubble-actions {
+    display: flex;
+    align-items: center;
+    gap: .75rem;
+    padding: .25rem .35rem 0 .35rem;
+    font-size: .7rem;
+    color: #666;
+    line-height: 1;
+  }
+  /* Selector includes the `button` type tag so we out-specify the
+     generic Send/Stop `button` rules further down — otherwise their
+     `:hover:not(:disabled)` would repaint the action with the brand
+     purple on hover. */
+  button.bubble-action {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    color: #888;
+    cursor: pointer;
+    font-size: .7rem;
+    font-family: inherit;
+    font-weight: 400;
+    border-radius: 4px;
+  }
+  button.bubble-action:hover:not(:disabled) {
+    color: #ddd;
+    background: none;
+  }
+  .bubble-timing {
+    font-family: monospace;
+    font-size: .68rem;
+    color: #555;
+    user-select: none;
+  }
   .thinking-block {
     margin-bottom: .5rem;
     border-left: 2px solid #444;

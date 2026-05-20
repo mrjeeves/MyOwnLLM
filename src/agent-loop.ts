@@ -118,6 +118,7 @@ export async function runAgent(args: AgentRunArgs): Promise<void> {
     }
 
     let turn: { content: string; thinking: string; tool_calls: ToolCall[]; cancelled: boolean };
+    const turnStart = Date.now();
     try {
       turn = await runSingleTurn({
         messages,
@@ -143,6 +144,7 @@ export async function runAgent(args: AgentRunArgs): Promise<void> {
     const assistant: StoredMessage = {
       role: "assistant",
       content: turn.content,
+      duration_ms: Date.now() - turnStart,
     };
     if (turn.thinking) assistant.thinking = turn.thinking;
     if (turn.tool_calls.length > 0) assistant.tool_calls = turn.tool_calls;
