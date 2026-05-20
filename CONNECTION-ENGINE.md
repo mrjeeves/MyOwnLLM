@@ -328,22 +328,60 @@ count). Instrumented sites:
 - `strategy.attachSharedPeerToRoom` entry — confirms the
   state-reset moment on (re)connect
 
-Workflow: ship this patch, reproduce a LAN↔WAN swap in the wild
-with the dev tools open, filter the console for
-`[trystero-patch:diag]`, and look for what `handleAnnouncement`
-does (or fails to do) for the dropped peer's `peer_id` between
-the `strategy.onPeerLeave` event and the eventual `post-rebuild`
-reconnect. The trace should make the structural blocker visible.
+**Root cause, found via diag trace:** the trace from a real
+LAN↔WAN swap (peer mFjKyTVP, May 2026) showed our side's
+state going perfectly clean after `strategy.onPeerLeave`
+(`cp=0 oa=0 op=0 ap=0 or=0`), and our `createSignalHandler`
+correctly responding to the dropped peer's presence
+announces with `announce-send-back-id` — for 90 straight
+seconds — without ever receiving a `handleOffer:entry` back.
+The leading peer (the one with the smaller `selfId`, in this
+case the Pi at the other end) was supposed to reply with a
+fresh offer once it saw our send-back-id, but never did.
 
-While we hunt the real bug, grace stays at the
-backstop-sized 90s and the rediscovery schedule stays
-`[90s, 3m, 5m, 10m]`. `ICE_DISCONNECTED_RESTART_MS` stays at
-1s — that's about beating Trystero's 5s data-channel close
-timer for restartIce, independent of whatever is blocking
-natural recovery. UX cost: a network swap that should
-recover in seconds via natural re-handshake currently waits
-~90s for the rebuild backstop. Acceptable while we
-instrument; not acceptable as a steady state.
+The structural blocker is asymmetric WebRTC failure
+detection. Our side (the one that physically swapped
+networks) gets its data channel closed within ~5s because
+the OS network-change event and ICE consent freshness
+together push the local `RTCPeerConnection` into `failed`
+fast. The remote side just sees stalled traffic and waits
+for ICE consent freshness to time out — 15-30 seconds in
+Chrome/WebView defaults — during which time
+`channel.readyState` is still `"open"`. So upstream
+`getConnectedPeerHealth(peer)` in `shared-peer.mjs`
+short-circuits to `"live"`, and `createSignalHandler` on
+the slow side early-returns on every incoming announce
+from us, never reaching the `handleAnnouncement` /
+`ensureOffer` path. By the time the slow side finally
+declares the channel stale, our rebuild backstop has
+already taken over.
+
+**Fix:** the patch also modifies `getConnectedPeerHealth`
+to return `"transient"` when `connection.connectionState
+=== "disconnected"`, even if `channel.readyState` is still
+`"open"`. The existing 7.5s `disconnectedPeerGraceMs`
+window in `createSignalHandler` then picks up — it has
+been there all along, but was unreachable because the
+channel-readyState gate was too forgiving. With this
+change, the slow side clears its `state.connectedPeer`
+~7.5s after our announce-back-ids start arriving, and the
+next announce after that triggers a real
+`handleAnnouncement` → `ensureOffer` → offer-send. Natural
+re-handshake completes inside ~10s instead of waiting 90s
+for the rebuild.
+
+A real network blip that recovers within the 7.5s grace
+window doesn't trigger a teardown — the next message sees
+`connectionState` back to `"connected"`, `getConnectedPeerHealth`
+returns `"live"`, and `connectedPeerUnhealthySinceMs` is
+reset to null.
+
+Grace stays at the backstop-sized 90s and the
+rediscovery schedule stays `[90s, 3m, 5m, 10m]` — the
+rebuild remains a real backstop for cases where natural
+discovery genuinely can't recover (peer shut down,
+extended outage). `ICE_DISCONNECTED_RESTART_MS` stays at
+1s for our fast-side ICE rekick.
 
 **Upstream PR.** A one-line equivalent of this patch belongs
 upstream in `dmotz/trystero` so every Trystero user benefits and
@@ -402,3 +440,4 @@ The Activity panel surfaces the same data the diag log holds; Quiet logs suppres
    Net UX: visible churn during recovery drops from "tearing down and building up over and over" to "reconnecting…" displayed continuously for up to 90s, with the heavy hammer firing only as a real fallback when natural discovery genuinely fails.
 - **`pnpm patch` for Trystero `offerAnswered` + revert grace/throttle to backstop sizing**: the previous round documented the upstream `offerAnswered` stickiness as unfixable from outside the library and shortened `RECONNECTING_GRACE_MS` (90s → 30s) and the first `REDISCOVERY_BACKOFF_SCHEDULE_MS` interval (90s → 30s) so the unavoidable rebuild fired fast. Reassessment: the patch IS reachable from outside via pnpm-patches. `patches/@trystero-p2p__core@0.24.0.patch` adds `state.offerAnswered = false` to both paths that clear `state.connectedPeer` — the `clearConnectedPeer` helper in `signal-handler.mjs` AND the strategy's `onPeerLeave` room callback in `strategy.mjs`. `package.json`'s `pnpm.patchedDependencies` field re-applies it on every install. Each path emits a `[trystero-patch]` console.warn so we can verify in the wild that the patch is engaging; the mesh-side `peer … reconnected within grace (Ns) — natural Trystero re-handshake (no rebuild)` log distinguishes patch-driven recovery from rebuild-driven recovery (compares `last_force_rediscovery_at` against the original disconnect timestamp). With the patch in place, natural Trystero discovery (presence announces every 5.333s) re-handshakes a dropped peer in seconds rather than being structurally blocked, so the heavy rebuild returns to backstop duty. Grace reverted to 90s, throttle first interval reverted to 90s, schedule extended to `[90s, 3m, 5m, 10m]`. `ICE_DISCONNECTED_RESTART_MS` stays at 1s — that's about beating Trystero's 5s data-channel close timer for restartIce renegotiation, independent of the `offerAnswered` bug. Companion upstream PR for `dmotz/trystero` so every Trystero user benefits and we can drop the patch on the next release.
 - **`offerAnswered` hypothesis disproved + diagnostic patch overlay for the real bug**: live testing of the prior patched build with `[trystero-patch]` instrumentation showed `[trystero-patch]` never fires in the wild AND natural re-handshake still doesn't work — every reconnect after a swap is `post-rebuild`, never natural. Re-reading the code: `attachSharedPeerToRoom` calls `resetOfferState(state, pool)` at connection time (strategy.mjs line 116), which sets `state.offerAnswered = false`. So by the time `clearConnectedPeer` or the strategy's `onPeerLeave` runs on disconnect, `offerAnswered` is already false. The guarded `if (state.offerAnswered)` in both patch sites is always false; the patch is structurally a no-op. The `offerAnswered`-stickiness theory was wrong, but the symptom (natural re-handshake refusing to engage after a peer drop) is still real and reproducible. Trace says state IS clean post-drop: `state.connectedPeer = null` (cleared by strategy.onPeerLeave), `state.offerAnswered = false`, `state.offerPeer = null`, `state.answeringPeer = null`, `state.offerRelays = []`. `handleAnnouncement` on the next presence event SHOULD start a fresh offer and doesn't. Patch reframed as a **diagnostic overlay**: keep the defensive `state.offerAnswered = false` clears, but make every interesting choke point emit a one-line `[trystero-patch:diag]` log with the current state flags (`cp`, `oa`, `op`, `ap`, `or`, `orp`). Instrumented sites: `clearConnectedPeer` (entry / no-op / cleared-offerAnswered), `handleAnnouncement` (entry, all early-return reasons, sending-offer), `handleOffer` (entry, skip-busy), `handleAnswer` (entry, skip with specific reason), `createSignalHandler` (unhealthy branches, announce-block decision tree), `strategy.onPeerLeave` (unconditional entry), `strategy.connectPeer` (entry), `strategy.attachSharedPeerToRoom` (entry). Volume is bounded — the per-message early-return on `health === "live"` is skipped silently so steady-state traffic stays quiet. Grace stays at backstop-sized 90s while we capture the trace; cost is ~90s of "broken-feeling" UX per swap until we find the real blocker. Next step: reproduce LAN↔WAN swap with dev tools open, filter `[trystero-patch:diag]`, look at what `handleAnnouncement` does (or fails to do) for the dropped peer's `peer_id` between `strategy.onPeerLeave` and the eventual `post-rebuild` reconnect.
+- **Asymmetric WebRTC failure detection + `getConnectedPeerHealth` patch + Windows pnpm-patch reliability work**: the diag trace from a real LAN↔WAN swap exposed the real blocker. After the desktop swapped networks, our side (the swap-side) hit `strategy.onPeerLeave` within ~5s — OS network-change events plus ICE consent freshness pushed the local `RTCPeerConnection` to `failed` fast. Our state went clean (`cp=0 oa=0 op=0 ap=0 or=0`), and our `createSignalHandler` correctly responded to the dropped peer's presence announces with `announce-send-back-id` — once per relay every ~5s, for 90 straight seconds — without ever seeing a `handleOffer:entry` come back. The leading peer (the Pi at the other end, the side that didn't swap) was supposed to reply with a fresh offer once it saw our send-back-id, but didn't. Root cause traced to `shared-peer.mjs::getConnectedPeerHealth`: when the local `RTCPeerConnection` enters `connectionState === "disconnected"` but `channel.readyState` is still `"open"` (the typical state for the side whose remote peer vanished), the upstream function short-circuits to `"live"`. The slow side's `createSignalHandler` early-returns on every incoming announce from us — never reaching the announce-block / `handleAnnouncement` / `ensureOffer` path — for the full 15-30s it takes Chrome/WebView to escalate the connection from `disconnected` to `failed`. By the time the slow side finally declares the channel stale, our rebuild backstop has already taken over. Patch: return `"transient"` when `connectionState === "disconnected"` even if the channel is still open. The existing 7.5s `disconnectedPeerGraceMs` window in `createSignalHandler` then engages — it has been there all along but was unreachable because the channel-readyState gate was too forgiving — and the slow side clears its `state.connectedPeer` ~7.5s after our announce-back-ids start arriving. The next announce after that triggers a real `handleAnnouncement` → `ensureOffer` → offer-send, and natural re-handshake completes inside ~10s instead of waiting 90s for the rebuild. Real network blips that recover within the 7.5s window don't trigger a teardown — next message sees `connectionState` back to `connected`, health goes back to `"live"`, `connectedPeerUnhealthySinceMs` resets to null. Sibling reliability work in the same iteration: `vite.config.ts` `optimizeDeps.exclude` for `trystero`, `@trystero-p2p/core`, `@trystero-p2p/nostr` so pnpm-patch changes always reach the dev bundle without manual cache wipes; `package.json` `postinstall` script that nukes `node_modules/.vite` after every `pnpm install` for the same reason on machines whose vite cache invalidation is flaky (Windows in particular); module-load `[trystero-patch] signal-handler.mjs loaded (diag overlay v2)` markers in both patched files so the patch's presence in the running bundle can be confirmed at a glance instead of requiring a swap to verify.

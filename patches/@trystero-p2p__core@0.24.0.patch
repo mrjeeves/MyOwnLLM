@@ -1,3 +1,35 @@
+diff --git a/dist/shared-peer.mjs b/dist/shared-peer.mjs
+index 4fef72061c27829de77abd00fe0317393d12af2c..9ff6bb8a2f224ef5521dc0a35754179f52c12d28 100644
+--- a/dist/shared-peer.mjs
++++ b/dist/shared-peer.mjs
+@@ -51,8 +51,26 @@ const isPeerUnderlyingStale = (peer) => {
+ };
+ const getConnectedPeerHealth = (peer) => {
+ 	if (isPeerUnderlyingStale(peer)) return "stale";
+-	const { channel } = peer;
++	const { connection, channel } = peer;
+ 	if (!channel || channel.readyState !== "open") return "transient";
++	// MyOwnLLM patch (CONNECTION-ENGINE.md → Known upstream limitations):
++	// also treat `connectionState === "disconnected"` as transient. The
++	// data channel readyState can linger at "open" for 15-30s after a
++	// peer's network actually vanishes (e.g. when their device swaps
++	// Wi-Fi → ethernet, the local connection enters "disconnected"
++	// but does not transition to "failed" until ICE consent freshness
++	// finally times out). During that window `getConnectedPeerHealth`
++	// returns "live", which makes createSignalHandler early-return on
++	// every presence-announce from the dropped peer and blocks the
++	// natural re-handshake on the side that hasn't itself swapped
++	// networks. Returning "transient" instead lets the existing 7.5s
++	// `disconnectedPeerGraceMs` window in createSignalHandler clear
++	// the stuck state automatically, so the next announce after the
++	// grace expires triggers a fresh handshake. If the connection
++	// recovers within the grace (a real network blip), the next
++	// message sees `live` again and `connectedPeerUnhealthySinceMs`
++	// resets — no premature teardown.
++	if (connection.connectionState === "disconnected") return "transient";
+ 	return "live";
+ };
+ var SharedPeerManager = class {
 diff --git a/dist/signal-handler.mjs b/dist/signal-handler.mjs
 index d8841faba4ec9daf93b020967f13db5609148928..b3d0365ef235386989378f5c72d45dd0ccdb561e 100644
 --- a/dist/signal-handler.mjs
