@@ -3282,20 +3282,42 @@ class MeshClient {
   }
 
   /** True when at least one peer is in app-level `active` (or its
-   *  ring-shelved variant) status — i.e. fully authenticated and
-   *  exchanging mesh traffic. The "we have a working connection
-   *  somewhere" signal that the auto-rediscovery gate keys off:
-   *  if this is true, the whole stack (signaling + ICE + handshake)
-   *  is demonstrably working for that peer, so a leave/rejoin would
-   *  tear down a healthy datachannel for no benefit.
+   *  ring-shelved variant) status AND its data channel is
+   *  demonstrably alive right now — i.e. fully authenticated AND
+   *  hasn't burned through the per-peer rescue loop. The "we have
+   *  a working connection somewhere" signal that the
+   *  auto-rediscovery gate keys off.
+   *
+   *  Note: `peerStatus === "active"` alone is not enough. The status
+   *  reflects the last successful handshake; it stays "active" even
+   *  after the data channel goes silent because we don't clear
+   *  `state.connectedPeer` or the auth flag on each missed pong.
+   *  A peer that has hit `REHANDSHAKE_RESCUE_ATTEMPTS` of failed
+   *  hello-retries has proven the underlying channel is dead — we
+   *  shouldn't let its stale "active" status block the
+   *  forceRediscovery backstop, which is the only mechanism that
+   *  can actually unstick the situation. Without this carve-out,
+   *  the rescue-loop escalation at the end of
+   *  `runPerPeerRehandshake` calls `maybeForceRediscovery` only to
+   *  have it immediately skipped because the same peer it's trying
+   *  to rescue is the one gating it. Field-observed: laptop swap
+   *  to hotspot kills TURN reachability, host-only candidates fail
+   *  for symmetric NAT, re-handshake hellos go into the void, and
+   *  we sit in attempt 4 / 5 / 6 / … forever instead of rejoining.
    *
    *  Returns false when every connection is mid-handshake, pending
-   *  approval, denied, or absent — the cases where a stuck
-   *  Trystero peer-table can actually be unblocked by a rejoin. */
+   *  approval, denied, absent, or in a failed rescue loop — the
+   *  cases where a stuck Trystero peer-table CAN be unblocked by
+   *  a rejoin. */
   private hasActivePeer(): boolean {
     for (const conn of this.connections.values()) {
       const status = this.peerStatus(conn);
-      if (status === "active" || status === "shelved") return true;
+      if (status !== "active" && status !== "shelved") continue;
+      // Carve-out: a peer mid-rescue with all attempts exhausted
+      // isn't really "active" — the data channel has had 3+
+      // chances to prove itself and didn't.
+      if (conn.rehandshake_attempts >= REHANDSHAKE_RESCUE_ATTEMPTS) continue;
+      return true;
     }
     return false;
   }

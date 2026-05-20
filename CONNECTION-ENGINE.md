@@ -118,13 +118,28 @@ escalates to `maybeForceRediscovery`. Total wake-to-rejoin latency stays
 short (~5.5s) so a user who really does need a full rebuild isn't left
 staring at a frozen UI.
 
-**Tier 5 is gated by `hasActivePeer()`.** If at least one peer is in
-`active` status, the whole stack (signaling + ICE + handshake) is
-demonstrably working — a rejoin would tear down that peer's datachannel
-for no benefit and push a fresh round of presence-announces through every
-relay, which is the failure mode that drove the original gate (flaky
-hotspot + Damus rate-limiting). When no peer is active, the throttle
-(90s/3m/5m/10m) paces actual rejoins to keep anti-spam happy.
+**Tier 5 is gated by `hasActivePeer()` — with a rescue-loop carve-out.**
+If at least one peer is in `active` status AND that peer hasn't burned
+through `REHANDSHAKE_RESCUE_ATTEMPTS` (3) of failed hello-retries, the
+whole stack (signaling + ICE + handshake) is demonstrably working for
+that peer. A rejoin would tear down its datachannel for no benefit and
+push a fresh round of presence-announces through every relay, which is
+the failure mode that drove the original gate (flaky hotspot + Damus
+rate-limiting). When no peer is active OR every "active" peer has
+already exhausted its rescue loop, the throttle (90s/3m/5m/10m) paces
+actual rejoins to keep anti-spam happy.
+
+The rescue-loop carve-out is what unsticks the field-observed pattern
+where a laptop swap kills TURN reachability (host-only candidates can't
+traverse hotspot CGNAT), re-handshake hellos go into the void because
+the data channel is silently dead, and the rescue-loop escalation at
+the end of `runPerPeerRehandshake` ends up calling
+`maybeForceRediscovery` only to have it skipped — because the same
+peer being rescued is the one gating the rejoin. The peer's
+`peerStatus` stayed at `"active"` because it reflects the *last*
+successful handshake, not current liveness; we don't clear
+`state.connectedPeer` on missed pongs. The carve-out makes "active"
+mean "active right now" rather than "active sometime in the past."
 
 An earlier version of the gate keyed off `isSignalingHealthy()` (≥1 relay
 OPEN). That turned out to be too aggressive in the opposite direction:
@@ -133,8 +148,8 @@ case was "signaling sees the other peer's announces but our local Trystero
 peer-table is stuck on a dead `RTCPeerConnection` and won't produce a
 fresh `onPeerJoin`." The cure for that case IS a rejoin; refusing one
 stranded the mesh in `peer-discovered` with no path forward. The current
-gate fires only when we have evidence (an active peer) that the whole
-stack is working.
+gate fires only when we have evidence (an active peer with a live rescue
+state) that the whole stack is working.
 
 **Tier 6's transport comparison** lives in `reconcile()`. We snapshot the
 applied signaling/STUN/TURN arrays into `applied_signaling`, `applied_stun`,
@@ -516,3 +531,5 @@ The Activity panel surfaces the same data the diag log holds; Quiet logs suppres
 - **Trystero inbound-silence zombie clearing — third layer of the same family**: with the subscription-replay (`utils.mjs`) and `connectionState === "disconnected" → transient` (`shared-peer.mjs`) hunks merged, field testing surfaced another sticky pattern in adverse environments. One side's `connection.connectionState` lags the actual connectivity by 15-30s (WebRTC's ICE consent freshness timeout — `RTCPeerConnection` doesn't tip to `"disconnected"` until enough consent checks have failed). During that lag, `getConnectedPeerHealth` returns `"live"` because both `connectionState` AND `channel.readyState` look fine; `createSignalHandler` short-circuits on every fresh announce from the peer who is actively trying to reconnect. The user's framing was the right diagnosis: "as long as it thinks that it's already connected, it seems to not want to answer connection requests. This is not helpful logic for maintaining connections through adverse environments." And: "We already do identity validation." Both correct — Trystero's conservatism here is overkill in our deployment because our mesh layer's `auth_response` (ed25519 signature over both pubkeys + nonce) re-validates trust on every fresh handshake, so accepting a re-handshake from a peer we *think* we're connected to costs nothing. **Fix:** track the timestamp of the last inbound signaling message per peer in `signal-handler.mjs`'s module-level `_lastInboundAt: Map<peerId, ts>`. In `createSignalHandler`, read the prior timestamp BEFORE updating, then if `now - prevInbound > _STALE_INBOUND_MS` (25s, ~5× the 5.333s announce cadence), override `getConnectedPeerHealth` to `"stale"` instead of calling it. The existing `health === "stale"` branch calls `clearConnectedPeer` immediately — no 7.5s grace, no waiting — and the message proceeds through `handleAnnouncement`/`handleOffer`/`handleAnswer` naturally. `_lastInboundAt.delete(peerId)` runs from `clearConnectedPeer` so a future reconnect to the same peerId starts the staleness clock fresh. State-transition log: `<peerid> inbound silent <N>s — clearing zombie connectedPeer (identity will re-validate)`. The threshold sits well above the subscription-replay patch's worst-case recovery time (~5s) so a transient relay blip can't trip false positives; below the mesh layer's `HEARTBEAT_TIMEOUT_MS` (75s) so the heavy rebuild backstop is the last resort rather than the primary recovery.
 
 - **`HEARTBEAT_TIMEOUT_MS` 75s → 30s — match the interval**: the prior value carried 2.5 intervals of grace on the rationale "tolerate brief network jitter and the longest main-thread stalls". Field testing of the post-PR-#186 build showed that grace was the load-bearing reason network-swap zombies stayed undetected for so long on the swapping side: ICE consent freshness alone takes 15-30s to tip `connectionState` away from `connected`, and the heartbeat had another 45s on top before noticing. The user's diagnosis closed the loop: "heartbeat timeout can't be longer than the heartbeat itself. 30 sec beat, 30 sec timeout." A healthy connection sees at least one inbound message per interval (the pong we elicit + any organic protocol traffic), so a full interval of silence is already past the point where we should be re-handshaking — by interval+1 we should be doing the recovery work, not still waiting for the data channel to confess. The Trystero-patch hunks (subscription replay, `connectionState === "disconnected" → transient`, inbound-silence zombie clear) handle the relay/peer-side detection paths fast; this matches their tempo at the application layer. The scheduler worker stalls under heavy main-thread load are handled separately by `performance.now()`-stamped tick gaps — the heartbeat doesn't mis-fire under model load.
+
+- **`hasActivePeer()` rescue-loop carve-out — the gate that gated itself**: with `HEARTBEAT_TIMEOUT_MS` lowered to 30s and the Trystero-patch hunks shipped, field testing surfaced one more scenario where the laptop got into a state it couldn't escape. After multiple network swaps on the same session, TURN reachability degraded (metered.ca host-lookup errors intermittent on hotspot; host-only ICE candidates can't traverse symmetric NAT). The laptop's re-handshake hellos went into the void because the data channel was silently dead. The rescue-loop escalation at the end of `runPerPeerRehandshake` fired `maybeForceRediscovery` after 3 failed attempts as designed — and `maybeForceRediscovery` skipped because `hasActivePeer()` returned true. The "active" peer it was deferring to was the same unresponsive one we were trying to rescue. `peerStatus()` returns `"active"` based on the LAST successful handshake; we never clear `state.connectedPeer` or the auth flag on missed pongs. So once a peer was auth'd, its status stayed "active" indefinitely, gating the only mechanism that could unstick it. The user's diagnosis closed the loop: "why are we gating connections?" — we were gating against ourselves. **Fix:** `hasActivePeer()` now ignores peers with `rehandshake_attempts >= REHANDSHAKE_RESCUE_ATTEMPTS`. The peerStatus UI label stays as "active" (no display churn) but the internal gating treats them as not-active. The rehandshake counter resets when a peer is successfully re-established (line 3700-3701), so a peer that recovers via natural Trystero re-handshake goes back to gating rediscovery as before. Net effect: a peer that exhausts the per-peer rescue loop NO LONGER blocks the room-rebuild backstop that the rescue-loop ITSELF was supposed to escalate to. Worst-case recovery for the "all paths failed" case drops from "indefinitely stuck" to "one rebuild after 30s + 2+5+10s + 1.5s wake-probe = ~50s, capped by the rediscovery throttle".
