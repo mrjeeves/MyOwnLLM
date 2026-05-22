@@ -819,6 +819,43 @@ fn main() {
             agent_io::agent_host_info,
         ])
         .setup(|app| {
+            // Linux WebKitGTK: flip `enable-webrtc` on at WebView creation
+            // time. WebKitGTK 2.38+ ships WebRTC behind a feature flag
+            // that's off by default — wry doesn't opt in, so the
+            // bundled binary's WebView lacks `RTCPeerConnection` and the
+            // mesh client errors out with "Can't find variable:
+            // RTCPeerConnection" before Trystero can even join a room.
+            // The fix has to land BEFORE the page loads (settings are
+            // read once at WebView init), which `with_webview` runs
+            // inside `setup()` satisfies. macOS WKWebView and Windows
+            // WebView2 expose WebRTC out of the box, so this is a
+            // Linux-only opt-in.
+            #[cfg(target_os = "linux")]
+            {
+                use tauri::Manager;
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.with_webview(|webview| {
+                        use webkit2gtk::{SettingsExt, WebViewExt};
+                        let wv = webview.inner();
+                        if let Some(settings) = WebViewExt::settings(&wv) {
+                            settings.set_enable_webrtc(true);
+                            // `enable-media-stream` gates getUserMedia /
+                            // getDisplayMedia, which Trystero itself
+                            // doesn't use but the data-channel-only
+                            // RTCPeerConnection path still needs the
+                            // surrounding WebRTC subsystem initialised.
+                            // Cheap to enable; off-by-default mirrors
+                            // upstream's caution around camera/mic
+                            // permissions but we have no live media
+                            // capture from the WebView, so the user-
+                            // facing impact is zero.
+                            settings.set_enable_media_stream(true);
+                            settings.set_enable_mediasource(true);
+                        }
+                    });
+                }
+            }
+
             // If the configured 800x600 window can't fit on this monitor —
             // e.g. the official 7" Pi DSI screen at 800x480 — start
             // maximized so the user doesn't lose the bottom of the UI off

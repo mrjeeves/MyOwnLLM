@@ -135,7 +135,29 @@ function installRTCPeerConnectionDiag(): void {
   if (webrtcDiagInstalled) return;
   if (typeof window === "undefined") return;
   const Original = window.RTCPeerConnection;
-  if (typeof Original !== "function") return;
+  if (typeof Original !== "function") {
+    // Log loudly — this is the failure mode that surfaces downstream
+    // as "trystero init failed: ReferenceError: Can't find variable:
+    // RTCPeerConnection" with no obvious cause. Without a hint here,
+    // the user blames Trystero (or assumes our pnpm patch isn't
+    // applied — it's the easy-to-form hypothesis from the error
+    // text). The real cause is the WebView shipping without WebRTC:
+    // WebKitGTK 2.38+ gates `RTCPeerConnection` behind an
+    // `enable-webrtc` setting that defaults to off. The Rust setup
+    // in src-tauri/src/main.rs flips that on at WebView creation —
+    // if you still see this log in a bundled build, either the
+    // setup hook didn't run (rare, would also break other Tauri
+    // commands) or the host's WebKitGTK is too old (<2.38) to
+    // expose the setting at all.
+    console.warn(
+      "[mesh] RTCPeerConnection is not defined on `window` — the WebView lacks WebRTC support. " +
+        "On Linux, this happens when WebKitGTK ships with WebRTC disabled. The bundled app enables it at " +
+        "startup; if you're seeing this in a dev session (`pnpm tauri dev`), the same `with_webview` hook " +
+        "runs there too, so an older WebKitGTK runtime (<2.38) is the most likely cause. " +
+        "Mesh features will refuse to start.",
+    );
+    return;
+  }
   webrtcDiagInstalled = true;
 
   // Wrap, don't replace — we still need every method and property

@@ -141,6 +141,18 @@ jobs:
             echo "::error::dist bundle contains Svelte SSR runtime — mount() would throw in the browser. Check vite.config.ts resolve.conditions."
             exit 1
           fi
+          # Guard against the pnpm-patch regression: if patches/@trystero-p2p__core
+          # silently stops being applied (frozen-lockfile drift, pnpm version
+          # change, etc.) the bundled Trystero loses the connection-engine
+          # fixes documented in CONNECTION-ENGINE.md. The patch inserts a
+          # load-time `console.warn("[trystero-patch] signal-handler.mjs loaded")`
+          # marker — check that string survives into the production bundle.
+          # Searches every .js because vite chunks Trystero into its own file
+          # whose name carries a content hash (`nostr-*.js`).
+          if ! grep -q 'trystero-patch' dist/assets/*.js; then
+            echo "::error::patches/@trystero-p2p__core@0.24.0.patch did NOT make it into dist/. pnpm install --frozen-lockfile likely skipped patchedDependencies (lockfile hash drift, pnpm version mismatch). Re-run \`pnpm install\` locally, commit the resulting pnpm-lock.yaml, and re-tag."
+            exit 1
+          fi
           echo "dist/ OK:"
           ls -la dist/ dist/assets/
 

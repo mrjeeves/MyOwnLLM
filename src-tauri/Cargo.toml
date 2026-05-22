@@ -113,6 +113,20 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = "0.4"
 
+# WebKitGTK Rust bindings — Linux only. Tauri / wry already pulls this
+# in transitively (the WebView is a `webkit2gtk::WebView` under the
+# hood), but we depend on it explicitly so we can flip `enable-webrtc`
+# on the WebKitSettings at startup. WebKitGTK 2.38+ ships WebRTC
+# support but leaves it off by default — without this opt-in,
+# `window.RTCPeerConnection` is undefined and Trystero's `joinRoom`
+# errors with "Can't find variable: RTCPeerConnection". Pinned to the
+# same major as the version wry resolves so the type passed to
+# `with_webview(...)` lines up. macOS WKWebView and Windows WebView2
+# both expose RTCPeerConnection out of the box, so no equivalent
+# fixup is needed there.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = "2"
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

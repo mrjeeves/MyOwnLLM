@@ -235,14 +235,6 @@
     }
   }
 
-  function openImportFromClipboard() {
-    closeMenu();
-    // Open the AddNetwork modal with no preloaded blob — the modal
-    // runs its own clipboard auto-detect on mount, which is exactly
-    // what the user wants here ("import what I just copied").
-    addModalState = { initialImport: null };
-  }
-
   function openAddNetworkModal() {
     closeMenu();
     addModalState = { initialImport: null };
@@ -1868,12 +1860,6 @@
         title="Pick a .json file exported from another device"
       >
         From .json file…
-      </button>
-      <button
-        onclick={openImportFromClipboard}
-        title="Open the Add network modal — it auto-detects network settings on your clipboard"
-      >
-        From clipboard
       </button>
     {/if}
   </div>
