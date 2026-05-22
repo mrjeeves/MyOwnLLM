@@ -1173,6 +1173,52 @@
   }
   .bubble .content.rendered :global(strong) { font-weight: 600; }
   .bubble .content.rendered :global(em) { font-style: italic; }
+  .bubble .content.rendered :global(del) {
+    text-decoration: line-through;
+    opacity: .75;
+  }
+  .bubble .content.rendered :global(blockquote) {
+    margin: 0;
+    padding: .15rem .65rem;
+    border-left: 3px solid #3a3a55;
+    color: #bbb;
+    font-style: italic;
+  }
+  .bubble .content.rendered :global(blockquote p) { margin: 0; }
+  .bubble .content.rendered :global(hr) {
+    margin: .25rem 0;
+    border: none;
+    border-top: 1px solid #2a2a2a;
+  }
+  /* GFM tables. Keep them readable inside the 72%-wide bubble: scroll
+     horizontally when the data overflows rather than forcing the
+     bubble to grow past max-width. */
+  .bubble .content.rendered :global(table) {
+    border-collapse: collapse;
+    display: block;
+    overflow-x: auto;
+    max-width: 100%;
+  }
+  .bubble .content.rendered :global(th),
+  .bubble .content.rendered :global(td) {
+    border: 1px solid #2a2a2a;
+    padding: .25rem .55rem;
+    text-align: left;
+  }
+  .bubble .content.rendered :global(th) {
+    background: #161616;
+    font-weight: 600;
+  }
+  /* Task list checkboxes (`- [ ]` / `- [x]`). Marked wraps the <input>
+     inside the <li>; flatten the bullet so the checkbox sits flush. */
+  .bubble .content.rendered :global(li > input[type="checkbox"]) {
+    margin-right: .35rem;
+    transform: translateY(1px);
+  }
+  .bubble .content.rendered :global(ul:has(> li > input[type="checkbox"])) {
+    list-style: none;
+    padding-left: .25rem;
+  }
   /* Action row under each assistant bubble: Copy + timing. Sits in
      the .75rem gap the .messages flex column already leaves between
      bubbles — small padding above keeps it visually attached to its
