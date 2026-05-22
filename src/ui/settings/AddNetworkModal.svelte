@@ -16,12 +16,10 @@
    *       (office-mesh on a private relay, hotspot peer with TURN)
    *       doesn't require creating, then re-editing.
    *
-   *    3. Import (collapsed by default). Accepts a JSON file or
-   *       pasted text in the network-settings envelope shape.
-   *       Disclosed manually — both paths (file picker + paste
-   *       textarea) live inside the modal, so the user has one
-   *       place to import from rather than a clipboard-driven
-   *       pop-up that fires before they've even decided to import.
+   *    3. Import (collapsed by default). Accepts a JSON file in the
+   *       network-settings envelope shape. File picker only — paste
+   *       was removed because every export path writes a file by
+   *       default and the paste textarea felt redundant.
    *
    *  Save runs through `addNetwork` (no advanced overrides) or
    *  `importNetworkSettings` (when the advanced/import path has
@@ -66,7 +64,6 @@
   // when nothing has been provided.
   let importDraft = $state<NetworkSettingsExport | null>(null);
   let importExpanded = $state(false);
-  let pasteText = $state("");
   let fileInput = $state<HTMLInputElement | null>(null);
 
   // True once the user has touched any advanced/import field. Drives
@@ -104,17 +101,6 @@
     }
   }
 
-  function onPasteApply() {
-    const parsed = tryParseNetworkSettings(pasteText);
-    if (!parsed) {
-      error =
-        "Pasted text isn't a MyOwnLLM network-settings blob (missing the 'kind: \"myownllm.network-settings\"' marker).";
-      return;
-    }
-    error = "";
-    adoptImport(parsed);
-  }
-
   function onFilePicked(e: Event) {
     const input = e.currentTarget as HTMLInputElement;
     const file = input.files && input.files.length > 0 ? input.files[0] : null;
@@ -139,7 +125,6 @@
 
   function clearImport() {
     importDraft = null;
-    pasteText = "";
     // Don't wipe networkIdDraft — the user might have typed before
     // applying the import. Leave the advanced overrides too so
     // toggling import on/off isn't a destructive operation.
@@ -410,9 +395,10 @@
           </div>
         {:else}
           <p class="advanced-hint">
-            Paste a JSON envelope or pick a <code>.json</code> file. The
-            envelope must carry <code>"kind": "myownllm.network-settings"</code>
-            so we don't try to import an unrelated blob by accident.
+            Pick a <code>.json</code> file exported from another
+            device. The envelope must carry
+            <code>"kind": "myownllm.network-settings"</code> so we
+            don't try to import an unrelated blob by accident.
           </p>
           <div class="import-actions">
             <button class="btn-small" onclick={() => fileInput?.click()}>
@@ -426,16 +412,6 @@
               onchange={onFilePicked}
             />
           </div>
-          <textarea
-            class="paste-area"
-            bind:value={pasteText}
-            placeholder={`{\n  "kind": "myownllm.network-settings",\n  "version": 1,\n  "network_id": "home-mesh",\n  ...\n}`}
-            spellcheck="false"
-            rows="4"
-          ></textarea>
-          <button class="btn-small" disabled={!pasteText.trim()} onclick={onPasteApply}>
-            Apply pasted JSON
-          </button>
         {/if}
       </div>
     {/if}
@@ -674,18 +650,6 @@
     gap: 0.4rem;
     align-items: center;
   }
-  .paste-area {
-    background: #0d0d0d;
-    border: 1px solid #222;
-    color: #e8e8e8;
-    font-family: monospace;
-    font-size: 0.78rem;
-    padding: 0.45rem 0.6rem;
-    border-radius: 5px;
-    resize: vertical;
-    min-height: 5rem;
-  }
-  .paste-area:focus { outline: none; border-color: #3a3a55; }
   .import-card {
     background: #0e0e12;
     border: 1px solid #1e1e2a;

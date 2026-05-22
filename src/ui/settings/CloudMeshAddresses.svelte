@@ -212,26 +212,6 @@
     }
   }
 
-  async function pasteImport() {
-    error = "";
-    if (!navigator.clipboard?.readText) {
-      error = "Clipboard read not supported in this browser.";
-      return;
-    }
-    try {
-      const raw = await navigator.clipboard.readText();
-      const parsed = tryParseNetworkSettings(raw);
-      if (!parsed) {
-        error =
-          "Clipboard doesn't contain a MyOwnLLM network-settings blob. Copy a network's settings first, or use 'From .json file…' to pick a file.";
-        return;
-      }
-      await applyImport(parsed);
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
   async function onImportFileChosen(e: Event) {
     const inp = e.currentTarget as HTMLInputElement;
     const file = inp.files && inp.files.length > 0 ? inp.files[0] : null;
@@ -357,9 +337,6 @@
         <span class="export-spacer"></span>
         <button class="btn-small ghost" onclick={openImportPicker}>
           Import from file…
-        </button>
-        <button class="btn-small ghost" onclick={pasteImport}>
-          Paste from clipboard
         </button>
         <input
           bind:this={importInput}
