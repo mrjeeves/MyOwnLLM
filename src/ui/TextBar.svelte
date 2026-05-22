@@ -19,6 +19,7 @@
     streaming = false,
     routeLockedToRemote = false,
     remoteHostLabel = "",
+    routePinUnavailable = false,
   } = $props<{
     activeModel: string;
     activeFamily: string;
@@ -65,9 +66,24 @@
      *  user knows where their messages are going. */
     routeLockedToRemote?: boolean;
     remoteHostLabel?: string;
+    /** True when the routing pin is set but the peer isn't currently
+     *  reachable. We still render the running token count (the
+     *  tracker must never fully disappear just because the remote is
+     *  unavailable) — just dimmed, to signal that the denominator
+     *  can't be resolved right now. */
+    routePinUnavailable?: boolean;
   }>();
 
-  const ratio = $derived(contextSize > 0 ? Math.min(1, tokensUsed / contextSize) : 0);
+  /** Show the tracker whenever there's anything to track: a local
+   *  model is active, or routing is pointed at a peer (even if the
+   *  peer hasn't told us its context window). The numerator is a
+   *  client-side estimate, so it stays meaningful in either case. */
+  const showTracker = $derived(!!activeModel || !!viaDevicePubkey || routeLockedToRemote);
+  /** Saturation ratio only makes sense when we know the total. For
+   *  remote routes contextSize is 0 (unknown) — we render a neutral
+   *  ring without coloring it red/orange. */
+  const knownContext = $derived(contextSize > 0);
+  const ratio = $derived(knownContext ? Math.min(1, tokensUsed / contextSize) : 0);
 
   // SVG ring geometry: circumference = 2πr. r=6 on a 16x16 canvas keeps
   // the stroke from clipping the bbox while leaving a 1px stroke ring
@@ -77,7 +93,9 @@
   const dash = $derived(CIRC * ratio);
 
   const ringColor = $derived(
-    ratio < 0.6 ? "#4caf50" : ratio < 0.85 ? "#d49a3b" : "#e35a5a",
+    !knownContext
+      ? "#555"
+      : ratio < 0.6 ? "#4caf50" : ratio < 0.85 ? "#d49a3b" : "#e35a5a",
   );
 
   /** 1234 → "1.2k". Keeps the bar at a roughly fixed width as the
@@ -154,29 +172,38 @@
     </button>
   {/if}
 
-  {#if contextSize > 0}
+  {#if showTracker}
     <div
       class="ctx"
-      title="Context: {tokensUsed} / {contextSize} tokens"
-      aria-label="Context saturation: {tokensUsed} of {contextSize} tokens"
+      class:dim={routePinUnavailable}
+      title={knownContext
+        ? `Context: ${tokensUsed} / ${contextSize} tokens`
+        : routePinUnavailable
+          ? `Context: ${tokensUsed} tokens used · remote host unavailable, total unknown`
+          : `Context: ${tokensUsed} tokens used · remote model total unknown`}
+      aria-label={knownContext
+        ? `Context saturation: ${tokensUsed} of ${contextSize} tokens`
+        : `Context: ${tokensUsed} tokens used, total unknown`}
     >
       <svg class="ring" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
         <circle cx="8" cy="8" r={RADIUS} fill="none" stroke="#2a2a2a" stroke-width="2" />
-        <circle
-          cx="8"
-          cy="8"
-          r={RADIUS}
-          fill="none"
-          stroke={ringColor}
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-dasharray="{dash} {CIRC}"
-          transform="rotate(-90 8 8)"
-        />
+        {#if knownContext}
+          <circle
+            cx="8"
+            cy="8"
+            r={RADIUS}
+            fill="none"
+            stroke={ringColor}
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-dasharray="{dash} {CIRC}"
+            transform="rotate(-90 8 8)"
+          />
+        {/if}
       </svg>
       <span class="num">{fmt(tokensUsed)}</span>
       <span class="sep">/</span>
-      <span class="den">{fmt(contextSize)}</span>
+      <span class="den">{knownContext ? fmt(contextSize) : "?"}</span>
     </div>
   {/if}
 </div>
@@ -206,6 +233,7 @@
   .num { color: #aaa; }
   .sep { color: #444; }
   .den { color: #666; }
+  .ctx.dim { opacity: .55; }
 
   .prompt-picker {
     display: inline-flex;

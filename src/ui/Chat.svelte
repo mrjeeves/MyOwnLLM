@@ -268,11 +268,12 @@
   // Routing pin changes ALSO retrigger this: when pinned to a peer
   // the user's "active model" is whatever the peer resolves (we
   // don't get told the exact tag — only that they advertise the
-  // family). Capabilities don't carry per-model context size today,
-  // so the indicator hides while pinned to a peer rather than
-  // showing a stale local number that would mis-describe what
-  // the user is sending. Failures (model missing, daemon not yet
-  // up) also leave the indicator hidden.
+  // family), and capabilities don't carry per-model context size
+  // today. We zero `contextSize` in that case so the TextBar knows
+  // the total is unknown — it still renders the running token
+  // count beside a neutral ring, just without a denominator or
+  // saturation color. Local models with a known window keep the
+  // full `used / total` saturation display.
   $effect(() => {
     const model = activeModel;
     // Reads of `routeViaDevicePubkey` and `remoteOpen` register
@@ -1296,6 +1297,7 @@
     {streaming}
     routeLockedToRemote={!!remoteOpen}
     remoteHostLabel={remoteOpen?.peer_label ?? ""}
+    {routePinUnavailable}
   />
 
   {#if !tpHoldsSlot}
