@@ -1,6 +1,6 @@
 <script lang="ts">
   import ModelSelector from "./ModelSelector.svelte";
-  import type { Mode } from "../types";
+  import type { Mode, Prompt } from "../types";
 
   let {
     activeModel,
@@ -13,6 +13,9 @@
     viaDevicePubkey,
     onViaChange,
     onThinkingChange,
+    promptsAvailable = [],
+    activePromptId = null,
+    onPromptChange,
     streaming = false,
     routeLockedToRemote = false,
     remoteHostLabel = "",
@@ -38,6 +41,21 @@
     viaDevicePubkey: string | null;
     onViaChange: (devicePubkey: string | null) => void;
     onThinkingChange: (next: boolean) => void;
+    /** All prompts known across every saved network — the union
+     *  exposed by `agentPrompts.all`. The dropdown shows them all
+     *  so the user can pick a prompt authored on a different
+     *  network; selecting and sending propagates it into the
+     *  active network. Empty = no prompts authored anywhere. */
+    promptsAvailable?: Prompt[];
+    /** The currently-selected prompt id, or null for the built-in
+     *  default. Stored on the conversation so each chat remembers
+     *  its prompt across reloads. */
+    activePromptId?: string | null;
+    /** Notify the parent of a new selection. Parent persists onto
+     *  the active conversation and re-builds the agent payload on
+     *  the next send. Omitted when this surface doesn't support
+     *  per-conversation prompts (e.g. transcribe). */
+    onPromptChange?: (id: string | null) => void;
     /** While a chat stream is in flight we lock the routing pin —
      *  switching mid-stream would orphan the in-flight response. */
     streaming?: boolean;
@@ -88,6 +106,30 @@
   {/if}
 
   <div class="spacer"></div>
+
+  {#if onPromptChange && thinkingAvailable}
+    <!-- System-prompt picker. Lists every named prompt the user
+         has authored across any saved network; "Default" sends
+         the built-in baseline. Selecting a prompt authored on a
+         different network propagates it onto the active network
+         on the next send via `agentPrompts.propagateToActive`. -->
+    <label class="prompt-picker" title="System prompt selector — pick a named prompt to apply on the next send.">
+      <span class="prompt-label">Prompt</span>
+      <select
+        value={activePromptId ?? ""}
+        onchange={(e) => {
+          const v = (e.currentTarget as HTMLSelectElement).value;
+          onPromptChange(v ? v : null);
+        }}
+        disabled={streaming}
+      >
+        <option value="">Default</option>
+        {#each promptsAvailable as p (p.id)}
+          <option value={p.id}>{p.name || "Untitled prompt"}</option>
+        {/each}
+      </select>
+    </label>
+  {/if}
 
   {#if thinkingAvailable}
     <!-- Thinking toggle: flips the per-conversation `think` flag.
@@ -165,6 +207,41 @@
   .sep { color: #444; }
   .den { color: #666; }
 
+  .prompt-picker {
+    display: inline-flex;
+    align-items: center;
+    gap: .3rem;
+    color: #777;
+    font-size: .72rem;
+    flex-shrink: 0;
+  }
+  .prompt-label {
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    font-size: .65rem;
+  }
+  .prompt-picker select {
+    background: #0c0c0c;
+    border: 1px solid #2a2a2a;
+    color: #ddd;
+    border-radius: 5px;
+    padding: .15rem .3rem;
+    font-size: .72rem;
+    cursor: pointer;
+    max-width: 12rem;
+  }
+  .prompt-picker select:hover:not(:disabled) {
+    border-color: #3a3a55;
+  }
+  .prompt-picker select:focus {
+    outline: none;
+    border-color: #3a3a55;
+  }
+  .prompt-picker select:disabled {
+    cursor: not-allowed;
+    opacity: .5;
+  }
   .brain-toggle {
     background: none;
     border: 1px solid transparent;

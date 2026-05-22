@@ -51,6 +51,8 @@ import type { TurnServer } from "./types";
 import { loadConfig, updateConfig, activeNetwork, updateNetwork } from "./config";
 import { settingsAttention } from "./settings-attention.svelte";
 import { agentPermissions } from "./agent-permissions.svelte";
+import { agentPrompts } from "./agent-prompts.svelte";
+import type { Prompt } from "./types";
 import {
   loadConversation,
   saveConversation,
@@ -1585,6 +1587,12 @@ class MeshClient {
       this.roster_pubkeys.clear();
       this.roster_labels.clear();
       this.recent_disconnects.clear();
+      // Permissions + prompts are per-network now; refresh the
+      // in-memory caches so the Settings tabs and TextBar dropdown
+      // reflect the new network's policy / prompt list rather than
+      // the previous network's stale snapshot.
+      void agentPermissions.refresh();
+      void agentPrompts.refresh();
     }
     // Snapshot capabilities + persisted preferences (per-network
     // accepting, global diag_quiet) before any peer talks to us —
@@ -3983,6 +3991,13 @@ class MeshClient {
         if (this.peerStatus(conn) !== "active") break;
         void this.handlePermissionsSnapshot(msg.tools);
         break;
+      case "prompts_snapshot":
+        // Same authorization check as `permissions_snapshot` — only
+        // approved peers on the active network can mutate our
+        // local prompts.
+        if (this.peerStatus(conn) !== "active") break;
+        void this.handlePromptsSnapshot(msg.prompts);
+        break;
     }
   }
 
@@ -4408,6 +4423,10 @@ class MeshClient {
       // on `AGENT_PERMISSIONS_GOSSIP` — peers without it just see
       // an unknown message kind and drop it.
       this.sendPermissionsSnapshotTo(conn);
+      // Same idea for the per-network prompts list — ship our
+      // current snapshot so the new peer picks up everything we've
+      // authored on this network.
+      this.sendPromptsSnapshotTo(conn);
       this.reevaluateRing();
     }
     if (this.computePeers().every((p) => p.status !== "pending_approval")) {
@@ -5083,10 +5102,32 @@ class MeshClient {
     });
   }
 
+  /** Ship our current prompts snapshot to one peer. Mirror of
+   *  `sendPermissionsSnapshotTo` for the per-network prompts list.
+   *  Gated on `PROMPTS_GOSSIP` so older peers (and headless serve
+   *  builds without prompts wired up) drop the frame quietly. */
+  private sendPromptsSnapshotTo(conn: ConnectionState): void {
+    if (!peerSupportsFeature(conn.capabilities, FEATURES.PROMPTS_GOSSIP)) return;
+    const snap = agentPrompts.snapshot();
+    this.send(conn, {
+      kind: "prompts_snapshot",
+      prompts: snap.map((p) => ({
+        id: p.id,
+        name: p.name,
+        system_prompt: p.system_prompt,
+        tools: [...p.tools],
+        user_prompt: p.user_prompt,
+        updated_at: p.updated_at,
+      })),
+    });
+  }
+
   /** Broadcast the current snapshot to every active peer. Called by
    *  the broadcaster registered with `agentPermissions` every time
    *  the user mutates policy locally (either through the modal or
-   *  the Settings → Permissions tab). */
+   *  the Settings → Permissions tab). The gossip is naturally scoped
+   *  to the active network — `this.connections` only contains peers
+   *  that handshaked through the active network's Trystero room. */
   private broadcastPermissionsSnapshot(snapshot: {
     shell: { mode: "ask" | "accept_all" | "denied"; always_accept: string[]; updated_at: number };
     write_file: { mode: "ask" | "accept_all" | "denied"; always_accept: string[]; updated_at: number };
@@ -5102,14 +5143,38 @@ class MeshClient {
     }
   }
 
+  /** Broadcast the current prompts list to every active peer. Same
+   *  scoping as the permissions broadcast — only peers in the
+   *  currently-active network see it. */
+  private broadcastPromptsSnapshot(prompts: Prompt[]): void {
+    for (const conn of this.connections.values()) {
+      if (this.peerStatus(conn) !== "active") continue;
+      if (!peerSupportsFeature(conn.capabilities, FEATURES.PROMPTS_GOSSIP)) continue;
+      this.send(conn, {
+        kind: "prompts_snapshot",
+        prompts: prompts.map((p) => ({
+          id: p.id,
+          name: p.name,
+          system_prompt: p.system_prompt,
+          tools: [...p.tools],
+          user_prompt: p.user_prompt,
+          updated_at: p.updated_at,
+        })),
+      });
+    }
+  }
+
   /** Merge an inbound `permissions_snapshot` from `conn`. Delegates
-   *  to the in-process store, which decides per-tool LWW. Re-broadcast
-   *  isn't needed: every other active peer either also received this
-   *  snapshot directly (the sender broadcasts to all), or will pick
-   *  it up via its own gossip when they become active. */
+   *  to the in-process store, which decides per-tool LWW. The merge
+   *  is scoped to the active network — `permissions_snapshot` is
+   *  network-bound, and the local store needs the network id to
+   *  pick the right NetworkConfig slot to write into. */
   private async handlePermissionsSnapshot(
     tools: Record<string, { mode?: string; always_accept?: string[]; updated_at?: number }>,
   ): Promise<void> {
+    const cfg = await loadConfig();
+    const activeId = cfg.cloud_mesh.active_network_id;
+    if (!activeId) return;
     const incoming: {
       shell?: { mode: "ask" | "accept_all" | "denied"; always_accept: string[]; updated_at: number };
       write_file?: {
@@ -5135,12 +5200,51 @@ class MeshClient {
       incoming[tool] = { mode, always_accept: allow, updated_at: ts };
     }
     try {
-      const changed = await agentPermissions.mergeIncoming(incoming);
+      const changed = await agentPermissions.mergeIncoming(incoming, activeId);
       if (changed) {
         this.logDiag("info", "agent permissions updated from peer gossip");
       }
     } catch (e) {
       this.logDiag("warn", `permissions merge failed: ${String(e)}`);
+    }
+  }
+
+  /** Merge an inbound `prompts_snapshot` from `conn`. Same active-
+   *  network-scoping as `handlePermissionsSnapshot` — prompts are
+   *  per-network, and a snapshot arrives on the network's data
+   *  channel so we land it in that network's slot. */
+  private async handlePromptsSnapshot(prompts: unknown): Promise<void> {
+    if (!Array.isArray(prompts)) return;
+    const cfg = await loadConfig();
+    const activeId = cfg.cloud_mesh.active_network_id;
+    if (!activeId) return;
+    const coerced: Prompt[] = [];
+    for (const raw of prompts) {
+      if (!raw || typeof raw !== "object") continue;
+      const obj = raw as Partial<Prompt>;
+      if (typeof obj.id !== "string" || !obj.id) continue;
+      const name = typeof obj.name === "string" ? obj.name : "";
+      const system_prompt = typeof obj.system_prompt === "string" ? obj.system_prompt : "";
+      const user_prompt = typeof obj.user_prompt === "string" ? obj.user_prompt : "";
+      const tools = Array.isArray(obj.tools)
+        ? obj.tools.filter(
+            (t): t is "networks" | "read_file" | "write_file" | "shell" =>
+              t === "networks" || t === "read_file" || t === "write_file" || t === "shell",
+          )
+        : [];
+      const updated_at =
+        typeof obj.updated_at === "number" && Number.isFinite(obj.updated_at)
+          ? Math.max(0, Math.floor(obj.updated_at))
+          : 0;
+      coerced.push({ id: obj.id, name, system_prompt, tools, user_prompt, updated_at });
+    }
+    try {
+      const changed = await agentPrompts.mergeIncoming(coerced, activeId);
+      if (changed) {
+        this.logDiag("info", "prompts updated from peer gossip");
+      }
+    } catch (e) {
+      this.logDiag("warn", `prompts merge failed: ${String(e)}`);
     }
   }
 
@@ -6520,4 +6624,13 @@ agentPermissions.setBroadcaster((snap) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (meshClient as unknown as { broadcastPermissionsSnapshot: (s: typeof snap) => void })
     .broadcastPermissionsSnapshot(snap);
+});
+
+// Same wiring for prompts. Local mutations gossip out on the
+// active network's channel; the mesh client filters by feature
+// flag and active-peer status.
+agentPrompts.setBroadcaster((prompts) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (meshClient as unknown as { broadcastPromptsSnapshot: (p: Prompt[]) => void })
+    .broadcastPromptsSnapshot(prompts);
 });

@@ -7,6 +7,7 @@
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import CloudMeshSection from "./settings/CloudMeshSection.svelte";
   import PermissionsSection from "./settings/PermissionsSection.svelte";
+  import PromptsSection from "./settings/PromptsSection.svelte";
   import { updateUi } from "../update-state.svelte";
   import { settingsAttention } from "../settings-attention.svelte";
   import type { CloudMeshSubTab } from "./settings-route.svelte";
@@ -14,6 +15,7 @@
   type Tab =
     | "families"
     | "models"
+    | "prompts"
     | "permissions"
     | "hardware"
     | "storage"
@@ -71,6 +73,7 @@
   const tabs: Array<{ id: Exclude<Tab, "providers" | "transcription" | "remote">; label: string }> = [
     { id: "families", label: "Family" },
     { id: "models", label: "Models" },
+    { id: "prompts", label: "Prompts" },
     { id: "permissions", label: "Permissions" },
     { id: "hardware", label: "Hardware" },
     { id: "storage", label: "Storage" },
@@ -137,6 +140,8 @@
         <UsageSection />
       {:else if active === "cloud-mesh"}
         <CloudMeshSection initialSubTab={initialMeshSubTab} />
+      {:else if active === "prompts"}
+        <PromptsSection />
       {:else if active === "permissions"}
         <PermissionsSection />
       {:else if active === "updates"}

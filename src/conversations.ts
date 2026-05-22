@@ -117,6 +117,16 @@ export interface Conversation {
    *  doing that across reloads. Optional — undefined = off, the
    *  pre-thinking-toggle default. */
   thinking_enabled?: boolean;
+  /** Stable id of the user-authored Prompt selected for this
+   *  conversation, or null/absent for the built-in default. The
+   *  TextBar dropdown sets this; the send path uses it to compose
+   *  the system prompt + filter the tool list + prepend the
+   *  user-prompt prefix. The Prompt itself lives in one of the
+   *  saved networks (see `agent-prompts.svelte.ts`); the id is
+   *  stable across networks so a propagation step in `Chat.svelte`
+   *  can copy it into the active network on first use if it isn't
+   *  there yet. */
+  active_prompt_id?: string | null;
   talking_points?: string[];
   /** One-step undo buffer for talking points. Populated when the user
    *  regenerates: the prior `talking_points` array is stashed here so the

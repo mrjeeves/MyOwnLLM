@@ -142,6 +142,13 @@ export const FEATURES = {
    *  network-wide policy — they fall back to whatever's on their own
    *  disk, which is the prior single-device behavior. */
   AGENT_PERMISSIONS_GOSSIP: "agent_permissions_v1",
+  /** Sender broadcasts `prompts_snapshot` on every local change to
+   *  the per-network prompt list, and on becoming active to a new
+   *  peer. Receivers merge by `id`, last-write-wins on
+   *  `updated_at`. Peers without this feature ignore the message
+   *  and keep their local prompts (or none, falling back to the
+   *  built-in default system prompt). */
+  PROMPTS_GOSSIP: "prompts_v1",
 } as const;
 
 /** The full set of feature ids this build advertises. Sent inside
@@ -162,6 +169,7 @@ export const ADVERTISED_FEATURES: string[] = [
   FEATURES.SESSION_VIEW,
   FEATURES.INFER_TOOLS,
   FEATURES.AGENT_PERMISSIONS_GOSSIP,
+  FEATURES.PROMPTS_GOSSIP,
 ];
 
 /** Features a Phase 2.0 peer would have implicitly supported even
@@ -281,7 +289,8 @@ export type MeshMessage =
   | SessionFetchResponseMessage
   | SessionSaveRequestMessage
   | SessionSaveResponseMessage
-  | PermissionsSnapshotMessage;
+  | PermissionsSnapshotMessage
+  | PromptsSnapshotMessage;
 
 // ---- capabilities --------------------------------------------------------
 
@@ -1195,4 +1204,28 @@ export interface PermissionsSnapshotMessage {
    *  gated tools just get new keys. Receivers ignore keys they don't
    *  recognise. */
   tools: Record<string, ToolPermissionSnapshot>;
+}
+
+/** Wire shape for one prompt entry. Mirror of `Prompt` in
+ *  `src/types.ts`; kept separate so the protocol can move
+ *  independently of the on-disk shape if they ever need to. The
+ *  `tools` array carries tool-id strings — receivers filter to the
+ *  set they recognize. */
+export interface PromptSnapshot {
+  id: string;
+  name: string;
+  system_prompt: string;
+  tools: string[];
+  user_prompt: string;
+  updated_at: number;
+}
+
+export interface PromptsSnapshotMessage {
+  kind: "prompts_snapshot";
+  /** Full list of prompts on the sender's active network. The
+   *  receiver merges by `id`, last-write-wins on `updated_at` — a
+   *  prompt missing from the snapshot is NOT treated as a deletion
+   *  (tombstones aren't surfaced over the wire yet; a deletion on
+   *  one device just stays local until the user mirrors it). */
+  prompts: PromptSnapshot[];
 }
