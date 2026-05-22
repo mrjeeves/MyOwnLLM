@@ -1703,20 +1703,24 @@
   }
   .input-row {
     display: flex;
-    gap: .5rem;
-    padding: .75rem;
+    gap: .4rem;
+    /* Left padding is a touch tighter than the right because the + button
+       reads as a control, not as content — leaving the same .75rem on
+       both sides made the icon float in a noticeably wider gutter. */
+    padding: .65rem .75rem .65rem .55rem;
     border-top: 1px solid #1e1e1e;
     background: #0f0f0f;
-    align-items: flex-end;
+    /* No `align-items` — the default `stretch` lets the Send and + buttons
+       match the textarea's rendered height (driven by its content + padding
+       + border). Setting flex-end here previously was the bug that made
+       Send look "flat" because Send has no explicit height. */
   }
-  /* + button on the left of the textarea. Square-ish so it sits as
-     the visual sibling to Send on the right; muted by default and
-     accent-coloured on hover so the user can spot it without it
-     competing with the primary action. */
+  /* + button on the left of the textarea. Square footprint (width is fixed;
+     height stretches with the row), accent-coloured on hover so the user
+     can spot it without it competing with the primary action. */
   .attach-btn {
     flex-shrink: 0;
-    width: 38px;
-    height: 38px;
+    width: 36px;
     padding: 0;
     background: #1a1a1a;
     color: #888;
