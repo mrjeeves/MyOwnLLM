@@ -107,7 +107,6 @@
   });
 </script>
 
-<div class="overlay" onclick={onClose} role="presentation"></div>
 <div class="panel" role="dialog" aria-label="Settings">
   <div class="panel-header">
     <h2>Settings</h2>
@@ -156,29 +155,22 @@
 </div>
 
 <style>
-  /* Sits above the per-surface DownloadOverlay (z-index: 30) so the
-     user can change family/tier/runtime before kicking off a pull. */
-  .overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.65);
-    z-index: 40;
-  }
+  /* Settings takes over the whole window — no overlay dim, no
+     centered card. Sizing the panel to the viewport gives the
+     inner sections (tab content, prompt list / editor split,
+     etc.) the room they need; the previous 820x620 fixed card
+     left users squinting at any non-trivial form. The window
+     itself is the resize handle. */
   .panel {
     position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    width: min(820px, 92vw);
-    height: min(620px, 88vh);
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
     background: #111;
-    border: 1px solid #222;
-    border-radius: 12px;
     z-index: 41;
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
   }
   .panel-header {
     display: flex;
@@ -211,7 +203,7 @@
     min-height: 0;
   }
   .v-tabs {
-    width: 160px;
+    width: 180px;
     border-right: 1px solid #1e1e1e;
     background: #0d0d0d;
     display: flex;
