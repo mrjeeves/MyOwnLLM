@@ -957,39 +957,65 @@ fn main() {
             agent_io::agent_host_info,
         ])
         .setup(|app| {
-            // Linux WebKitGTK: flip `enable-webrtc` on at WebView creation
-            // time. WebKitGTK 2.38+ ships WebRTC behind a feature flag
-            // that's off by default — wry doesn't opt in, so the
-            // bundled binary's WebView lacks `RTCPeerConnection` and the
-            // mesh client errors out with "Can't find variable:
-            // RTCPeerConnection" before Trystero can even join a room.
-            // The fix has to land BEFORE the page loads (settings are
-            // read once at WebView init), which `with_webview` runs
-            // inside `setup()` satisfies. macOS WKWebView and Windows
-            // WebView2 expose WebRTC out of the box, so this is a
-            // Linux-only opt-in.
+            // Linux WebKitGTK: diagnostic probe for the persistent
+            // "Can't find variable: RTCPeerConnection" error.
+            //
+            // #198 added `set_enable_webrtc(true)` here, on the theory
+            // that WebKitGTK 2.38+ defaults it off and wry doesn't opt
+            // in. That didn't fix the error in the field, so before
+            // throwing more "maybe this" fixes at the wall, we need
+            // ground truth on what's actually happening. This block:
+            //
+            //   1. Confirms the `with_webview` hook fires at all on
+            //      the user's build (silence = it didn't, which is
+            //      itself a finding).
+            //   2. Reads the current value of every WebRTC-adjacent
+            //      WebKitSetting BEFORE we touch anything. If
+            //      enable_webrtc is already true, the setter is a
+            //      no-op and the cause lives somewhere else
+            //      entirely — most likely WebKit compiled without
+            //      WebRTC support, or missing gstreamer plugins.
+            //   3. Writes the same settings (so the prior fix is
+            //      preserved), then reads them back. If the after-
+            //      value doesn't match what we wrote, the property
+            //      is read-only or absent in this build.
+            //
+            // No reload, no other speculative remediation. Once the
+            // user runs this and shares the stderr output we can
+            // pick a targeted fix.
+            //
+            // macOS WKWebView and Windows WebView2 expose WebRTC out
+            // of the box, so this stays Linux-only.
             #[cfg(target_os = "linux")]
             {
                 use tauri::Manager;
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.with_webview(|webview| {
                         use webkit2gtk::{SettingsExt, WebViewExt};
+                        eprintln!("[webrtc-probe] with_webview callback entered");
                         let wv = webview.inner();
-                        if let Some(settings) = WebViewExt::settings(&wv) {
-                            settings.set_enable_webrtc(true);
-                            // `enable-media-stream` gates getUserMedia /
-                            // getDisplayMedia, which Trystero itself
-                            // doesn't use but the data-channel-only
-                            // RTCPeerConnection path still needs the
-                            // surrounding WebRTC subsystem initialised.
-                            // Cheap to enable; off-by-default mirrors
-                            // upstream's caution around camera/mic
-                            // permissions but we have no live media
-                            // capture from the WebView, so the user-
-                            // facing impact is zero.
-                            settings.set_enable_media_stream(true);
-                            settings.set_enable_mediasource(true);
-                        }
+                        let Some(settings) = WebViewExt::settings(&wv) else {
+                            eprintln!("[webrtc-probe] WebKit settings unavailable");
+                            return;
+                        };
+                        eprintln!(
+                            "[webrtc-probe] BEFORE: enable_webrtc={} enable_media_stream={} enable_mediasource={} enable_media_capabilities={}",
+                            settings.enables_webrtc(),
+                            settings.enables_media_stream(),
+                            settings.enables_mediasource(),
+                            settings.enables_media_capabilities(),
+                        );
+                        settings.set_enable_webrtc(true);
+                        settings.set_enable_media_stream(true);
+                        settings.set_enable_mediasource(true);
+                        settings.set_enable_media_capabilities(true);
+                        eprintln!(
+                            "[webrtc-probe] AFTER:  enable_webrtc={} enable_media_stream={} enable_mediasource={} enable_media_capabilities={}",
+                            settings.enables_webrtc(),
+                            settings.enables_media_stream(),
+                            settings.enables_mediasource(),
+                            settings.enables_media_capabilities(),
+                        );
                     });
                 }
             }
