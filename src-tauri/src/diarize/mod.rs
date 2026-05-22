@@ -176,14 +176,20 @@ impl DiarizeBackend for PyannoteOrtBackend {
             voiced.len()
         );
 
-        // Embed + cluster each voiced slice ≥ 0.5 s.
+        // Embed + cluster each voiced slice. Skip slices shorter than
+        // MIN_SLICE_MS: embeddings from very short windows are noisy
+        // and were a major source of phantom-speaker churn at the old
+        // 500 ms floor. Overlap slices are clustered (so the UI still
+        // gets a turn) but locked from updating any centroid — a
+        // mixture of two voices would corrupt the running mean.
+        const MIN_SLICE_MS: u64 = 1000;
         let mut turns = Vec::new();
         let mut filtered_short = 0usize;
         for slice in voiced {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
-            if slice.end_ms <= slice.start_ms + 500 {
+            if slice.end_ms <= slice.start_ms + MIN_SLICE_MS {
                 filtered_short += 1;
                 continue;
             }
@@ -199,7 +205,11 @@ impl DiarizeBackend for PyannoteOrtBackend {
             }
             let slice_pcm = &window[s_idx..e_idx];
             let embedding = self.embedder.embed(slice_pcm)?;
-            let (speaker, sim) = self.clusterer.assign(&embedding, slice.end_ms);
+            let (speaker, sim) = self.clusterer.assign(
+                &embedding,
+                slice.end_ms,
+                /*lock_centroid=*/ slice.overlap,
+            );
             turns.push(SpeakerTurn {
                 start_ms: slice.start_ms,
                 end_ms: slice.end_ms,

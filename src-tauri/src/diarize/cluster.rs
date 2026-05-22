@@ -3,14 +3,22 @@
 //! As speaker embeddings stream in, group them into "speakers" without
 //! knowing the count ahead of time. Each cluster is a running-mean
 //! centroid on the unit hypersphere (embeddings are L2-normalized
-//! before they reach us). A new embedding either joins the nearest
-//! centroid (if cosine distance is below the per-embedder threshold)
-//! or opens a new cluster.
+//! before they reach us).
 //!
-//! Pure Rust, no model files, fully unit-testable. Kept deliberately
-//! simple — agglomerative re-clustering, embedding-history rewrite,
-//! and the cold-start re-label pass live elsewhere if and when they're
-//! needed.
+//! Assignment uses a two-threshold hysteresis (Schmitt trigger) to
+//! resist phantom-speaker churn from small vocal variations:
+//!
+//! * `join_threshold` (loose): cosine distance ≤ this → join nearest
+//!   centroid *and* fold the embedding into the running mean.
+//! * `create_threshold` (strict): cosine distance > this *to every*
+//!   existing centroid → open a new cluster.
+//! * Deadband in between → join the nearest centroid but **lock** it
+//!   (don't update the mean). The speaker is provisionally identified
+//!   but the noisy embedding doesn't pollute the centroid.
+//!
+//! Pure Rust, no model files, fully unit-testable. Agglomerative
+//! re-clustering, embedding-history rewrite, and the cold-start
+//! re-label pass live elsewhere if and when they're needed.
 //!
 //! Operating-point thresholds: wespeaker's published EER suggests
 //! cosine ≤ 0.45 for same-speaker on out-of-domain audio; CAM++ small
@@ -25,13 +33,19 @@ use std::time::Duration;
 #[allow(dead_code)] // `stale_after` is wired in for the cold-start re-label
                     // pass that lands with the ort wire-up — see PROGRESS.md.
 pub struct ClusterConfig {
-    /// Cosine *distance* (1 - cosine similarity) under which a new
-    /// embedding joins an existing cluster. Above this, a new
-    /// cluster is opened.
-    pub threshold: f32,
+    /// Loose threshold: cosine *distance* (1 - cosine similarity) at
+    /// or under which an embedding joins the nearest centroid *and*
+    /// updates its running mean.
+    pub join_threshold: f32,
+    /// Strict threshold: cosine distance strictly greater than this
+    /// to *every* existing centroid opens a new cluster.
+    /// Must be ≥ `join_threshold`. Distance in the deadband
+    /// `(join_threshold, create_threshold]` joins the nearest centroid
+    /// but locks it (no mean update).
+    pub create_threshold: f32,
     /// Hard cap on simultaneously active clusters. Beyond this we
     /// force-merge the nearest pair (if their distance is below
-    /// `threshold * 0.8`); otherwise the new embedding joins the
+    /// `join_threshold * 0.8`); otherwise the new embedding joins the
     /// nearest cluster anyway.
     pub max_clusters: usize,
     /// Clusters quieter than this go stale and become eligible for
@@ -43,20 +57,27 @@ impl ClusterConfig {
     /// Tuned defaults per embedder. The manifest's diarize tier picks
     /// the embedder by name (`wespeaker-r34` vs `campp-small`); the
     /// composite is split in `PyannoteOrtBackend::new`.
+    ///
+    /// `join_threshold` is kept at the historical operating point;
+    /// `create_threshold` adds a stricter band so vocal hiccups don't
+    /// spawn phantom speakers.
     pub fn for_embedder(name: &str) -> Self {
         match name {
             "wespeaker-r34" => Self {
-                threshold: 0.45,
+                join_threshold: 0.45,
+                create_threshold: 0.60,
                 max_clusters: 12,
                 stale_after: Duration::from_secs(20 * 60),
             },
             "campp-small" => Self {
-                threshold: 0.55,
+                join_threshold: 0.55,
+                create_threshold: 0.70,
                 max_clusters: 12,
                 stale_after: Duration::from_secs(20 * 60),
             },
             _ => Self {
-                threshold: 0.50,
+                join_threshold: 0.50,
+                create_threshold: 0.65,
                 max_clusters: 12,
                 stale_after: Duration::from_secs(20 * 60),
             },
@@ -115,7 +136,13 @@ impl OnlineClusterer {
     /// Assign an L2-normalized embedding to a speaker. Returns the
     /// `(speaker_id, similarity)` pair — similarity is `1 - cosine
     /// distance` so 1.0 is identical and 0.0 is orthogonal.
-    pub fn assign(&mut self, embedding: &[f32], now_ms: u64) -> (u32, f32) {
+    ///
+    /// `lock_centroid`: when `true`, never fold this embedding into
+    /// the matched centroid's running mean (and never open a new
+    /// cluster from it — fall back to nearest). The caller passes
+    /// `true` for low-trust embeddings such as overlap slices, whose
+    /// audio is a mixture of two voices and would corrupt the mean.
+    pub fn assign(&mut self, embedding: &[f32], now_ms: u64, lock_centroid: bool) -> (u32, f32) {
         // Find nearest centroid by cosine similarity.
         let mut best: Option<(usize, f32)> = None;
         for (i, c) in self.centroids.iter().enumerate() {
@@ -125,38 +152,60 @@ impl OnlineClusterer {
             }
         }
 
-        let join_threshold_sim = 1.0 - self.cfg.threshold;
-        match best {
-            Some((idx, sim)) if sim >= join_threshold_sim => {
+        // Hysteresis bands. sim = 1 - distance, so larger sim is more
+        // similar. join_sim ≥ create_sim by construction.
+        let join_sim = 1.0 - self.cfg.join_threshold;
+        let create_sim = 1.0 - self.cfg.create_threshold;
+
+        // 1) Strong match → join + update (unless locked).
+        if let Some((idx, sim)) = best {
+            if sim >= join_sim {
                 let c = &mut self.centroids[idx];
-                update_centroid(c, embedding, now_ms);
-                (c.id, sim)
-            }
-            _ => {
-                // Open a new cluster (or force-merge if capped).
-                if self.centroids.len() >= self.cfg.max_clusters {
-                    self.force_merge_if_close();
-                }
-                if self.centroids.len() >= self.cfg.max_clusters {
-                    // Still capped after merge attempt: join nearest
-                    // anyway rather than silently drop the embedding.
-                    let (idx, sim) = best.unwrap_or((0, 0.0));
-                    let c = &mut self.centroids[idx];
+                if !lock_centroid {
                     update_centroid(c, embedding, now_ms);
-                    (c.id, sim)
                 } else {
-                    let id = self.next_id;
-                    self.next_id += 1;
-                    let centroid = Centroid {
-                        id,
-                        mean: embedding.to_vec(),
-                        count: 1,
-                        last_seen_ms: now_ms,
-                    };
-                    self.centroids.push(centroid);
-                    (id, 1.0)
+                    c.last_seen_ms = c.last_seen_ms.max(now_ms);
                 }
+                return (c.id, sim);
             }
+        }
+
+        // 2) Deadband match → join nearest, lock the centroid.
+        //    Also taken when `lock_centroid` is set: we never open
+        //    a new cluster from a low-trust embedding.
+        if let Some((idx, sim)) = best {
+            if sim >= create_sim || lock_centroid {
+                let c = &mut self.centroids[idx];
+                c.last_seen_ms = c.last_seen_ms.max(now_ms);
+                return (c.id, sim);
+            }
+        }
+
+        // 3) Far from every centroid → open a new cluster (or
+        //    force-merge if capped).
+        if self.centroids.len() >= self.cfg.max_clusters {
+            self.force_merge_if_close();
+        }
+        if self.centroids.len() >= self.cfg.max_clusters {
+            // Still capped after merge attempt: join nearest anyway
+            // rather than silently drop the embedding. Lock the
+            // centroid — the assignment is low-confidence by
+            // definition.
+            let (idx, sim) = best.unwrap_or((0, 0.0));
+            let c = &mut self.centroids[idx];
+            c.last_seen_ms = c.last_seen_ms.max(now_ms);
+            (c.id, sim)
+        } else {
+            let id = self.next_id;
+            self.next_id += 1;
+            let centroid = Centroid {
+                id,
+                mean: embedding.to_vec(),
+                count: 1,
+                last_seen_ms: now_ms,
+            };
+            self.centroids.push(centroid);
+            (id, 1.0)
         }
     }
 
@@ -175,7 +224,7 @@ impl OnlineClusterer {
             }
         }
         if let Some((i, j, sim)) = best {
-            let merge_threshold = 1.0 - self.cfg.threshold * 0.8;
+            let merge_threshold = 1.0 - self.cfg.join_threshold * 0.8;
             if sim >= merge_threshold {
                 let (src_count, src_mean) =
                     (self.centroids[j].count, self.centroids[j].mean.clone());
@@ -228,7 +277,8 @@ mod tests {
 
     fn cfg() -> ClusterConfig {
         ClusterConfig {
-            threshold: 0.45,
+            join_threshold: 0.45,
+            create_threshold: 0.60,
             max_clusters: 4,
             stale_after: Duration::from_secs(60),
         }
@@ -244,7 +294,7 @@ mod tests {
     fn first_embedding_opens_cluster_zero() {
         let mut c = OnlineClusterer::new(cfg());
         let e = norm(vec![1.0, 0.0, 0.0]);
-        let (id, sim) = c.assign(&e, 100);
+        let (id, sim) = c.assign(&e, 100, false);
         assert_eq!(id, 0);
         assert!((sim - 1.0).abs() < 1e-6);
         assert_eq!(c.len(), 1);
@@ -255,8 +305,8 @@ mod tests {
         let mut c = OnlineClusterer::new(cfg());
         let a = norm(vec![1.0, 0.0, 0.0]);
         let a2 = norm(vec![0.95, 0.05, 0.0]); // very close to a
-        c.assign(&a, 100);
-        let (id, _) = c.assign(&a2, 200);
+        c.assign(&a, 100, false);
+        let (id, _) = c.assign(&a2, 200, false);
         assert_eq!(id, 0);
         assert_eq!(c.len(), 1);
     }
@@ -266,10 +316,56 @@ mod tests {
         let mut c = OnlineClusterer::new(cfg());
         let a = norm(vec![1.0, 0.0, 0.0]);
         let b = norm(vec![0.0, 1.0, 0.0]); // orthogonal
-        c.assign(&a, 100);
-        let (id, _) = c.assign(&b, 200);
+        c.assign(&a, 100, false);
+        let (id, _) = c.assign(&b, 200, false);
         assert_eq!(id, 1);
         assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn deadband_embedding_joins_nearest_without_updating_centroid() {
+        // join_threshold=0.45 → join_sim=0.55
+        // create_threshold=0.60 → create_sim=0.40
+        // An embedding with sim in (0.40, 0.55) must join nearest
+        // *and* leave the centroid mean untouched.
+        let mut c = OnlineClusterer::new(cfg());
+        let a = norm(vec![1.0, 0.0, 0.0]);
+        c.assign(&a, 100, false);
+        let mean_before = c.centroids[0].mean.clone();
+        // 60° off from a (cos = 0.5), squarely in the deadband.
+        // Unit vector (0.5, √3/2, 0) → dot with (1,0,0) = 0.5.
+        let drift = norm(vec![1.0, 3f32.sqrt(), 0.0]);
+        let (id, sim) = c.assign(&drift, 200, false);
+        assert_eq!(id, 0, "deadband embedding must join nearest");
+        assert!(sim > 0.40 && sim < 0.55, "sim={sim} not in deadband");
+        assert_eq!(c.len(), 1, "deadband must not open a new cluster");
+        assert_eq!(
+            c.centroids[0].mean, mean_before,
+            "deadband assignment must not move the centroid"
+        );
+        assert_eq!(
+            c.centroids[0].count, 1,
+            "deadband assignment must not bump the count"
+        );
+    }
+
+    #[test]
+    fn locked_assignment_does_not_update_centroid_or_open_cluster() {
+        let mut c = OnlineClusterer::new(cfg());
+        let a = norm(vec![1.0, 0.0, 0.0]);
+        c.assign(&a, 100, false);
+        let mean_before = c.centroids[0].mean.clone();
+        // Even an embedding that *would* normally join + update is
+        // not allowed to move the centroid when locked.
+        let close = norm(vec![0.99, 0.14, 0.0]);
+        let (_, _) = c.assign(&close, 200, /*lock_centroid=*/ true);
+        assert_eq!(c.centroids[0].mean, mean_before);
+        // And an orthogonal embedding under lock joins nearest
+        // instead of spawning a new cluster.
+        let ortho = norm(vec![0.0, 1.0, 0.0]);
+        let (id, _) = c.assign(&ortho, 300, /*lock_centroid=*/ true);
+        assert_eq!(id, 0);
+        assert_eq!(c.len(), 1);
     }
 
     #[test]
@@ -281,12 +377,12 @@ mod tests {
         let a_drift = norm(vec![0.9, 0.4, 0.0]);
         let b = norm(vec![0.0, 1.0, 0.0]);
         let new = norm(vec![0.0, 0.0, 1.0]);
-        c.assign(&a, 100);
-        c.assign(&b, 200);
+        c.assign(&a, 100, false);
+        c.assign(&b, 200, false);
         // Push a-cluster towards a_drift so it stays closer to a
         // than the new orthogonal embedding.
-        c.assign(&a_drift, 300);
-        let (id, _) = c.assign(&new, 400);
+        c.assign(&a_drift, 300, false);
+        let (id, _) = c.assign(&new, 400, false);
         // At cap: we either merged (≤ 2) and got id 2, or stayed at 2
         // clusters and joined nearest. Either way len ≤ 2.
         assert!(c.len() <= 2);
@@ -297,12 +393,12 @@ mod tests {
     #[test]
     fn reset_clears_centroids_and_resets_id_counter() {
         let mut c = OnlineClusterer::new(cfg());
-        c.assign(&norm(vec![1.0, 0.0, 0.0]), 100);
-        c.assign(&norm(vec![0.0, 1.0, 0.0]), 200);
+        c.assign(&norm(vec![1.0, 0.0, 0.0]), 100, false);
+        c.assign(&norm(vec![0.0, 1.0, 0.0]), 200, false);
         assert_eq!(c.len(), 2);
         c.reset();
         assert_eq!(c.len(), 0);
-        let (id, _) = c.assign(&norm(vec![0.0, 0.0, 1.0]), 300);
+        let (id, _) = c.assign(&norm(vec![0.0, 0.0, 1.0]), 300, false);
         assert_eq!(id, 0);
     }
 
@@ -311,8 +407,8 @@ mod tests {
         let mut c = OnlineClusterer::new(cfg());
         let a = norm(vec![1.0, 0.0, 0.0]);
         let a_drift = norm(vec![0.9, 0.4, 0.0]);
-        c.assign(&a, 100);
-        c.assign(&a_drift, 200);
+        c.assign(&a, 100, false);
+        c.assign(&a_drift, 200, false);
         let mag: f32 = c.centroids[0]
             .mean
             .iter()
