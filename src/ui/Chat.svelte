@@ -28,11 +28,14 @@
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
   import { runAgent, type AgentEvent } from "../agent-loop";
   import {
-    buildAgentSystemPrompt,
     buildChatTools,
+    composeSystemPrompt,
+    DEFAULT_SYSTEM_PROMPT_BASE,
     getAgentHostInfo,
     type AgentHostInfo,
   } from "../agent-tools";
+  import { agentPrompts } from "../agent-prompts.svelte";
+  import { PROMPT_ALL_TOOLS, type PromptToolId } from "../types";
 
   let {
     activeModel,
@@ -218,6 +221,13 @@
    *  it as `think` to both the local `ollama_chat_stream` and the
    *  mesh's `infer_request.think`. */
   let thinkingEnabled = $state(false);
+  /** Currently-selected system prompt id for this conversation, or
+   *  null for the built-in default. Hydrated from
+   *  `activeConversation.active_prompt_id` like `thinkingEnabled`;
+   *  the TextBar dropdown writes through this state and the send
+   *  path looks it up in `agentPrompts.all` to compose the system
+   *  prompt + tool filter + user-prompt prefix. */
+  let activePromptId = $state<string | null>(null);
 
   // -----------------------------------------------------------------------
   // Token estimation. Chars/4 is the standard rough-cut estimate for
@@ -300,6 +310,7 @@
       activeConversation = null;
       messages = [];
       thinkingEnabled = false;
+      activePromptId = null;
       meshClient
         .fetchRemoteSession(remote.peer_id, remote.guid)
         .then((c) => {
@@ -307,6 +318,7 @@
           activeConversation = c;
           messages = c.messages.map((m) => ({ ...m }));
           thinkingEnabled = !!c.thinking_enabled;
+          activePromptId = c.active_prompt_id ?? null;
         })
         .catch((e) => {
           if (cancelled) return;
@@ -324,6 +336,7 @@
       // TextBar surfaces this; the user's first toggle persists once
       // saveConversation runs after the first send.
       thinkingEnabled = false;
+      activePromptId = null;
       return;
     }
     let cancelled = false;
@@ -333,11 +346,13 @@
         activeConversation = null;
         messages = [];
         thinkingEnabled = false;
+        activePromptId = null;
         return;
       }
       activeConversation = c;
       messages = c.messages.map((m) => ({ ...m }));
       thinkingEnabled = !!c.thinking_enabled;
+      activePromptId = c.active_prompt_id ?? null;
     });
     return () => {
       cancelled = true;
@@ -417,6 +432,11 @@
     // pointless `false` line on first save under the new build.
     if (thinkingEnabled) conv.thinking_enabled = true;
     else delete conv.thinking_enabled;
+    // Persist the per-conversation prompt selection. null/absent =
+    // built-in default; an id ties the chat to the named prompt
+    // wherever it lives across the mesh.
+    if (activePromptId) conv.active_prompt_id = activePromptId;
+    else delete conv.active_prompt_id;
     if (remoteOpen) {
       conv.updated_at = new Date().toISOString();
       await meshClient.saveRemoteSession(remoteOpen.peer_id, conv);
@@ -453,6 +473,36 @@
       }
     }
   }
+
+  /** Prompt-picker handler wired from TextBar's `<select>`. Same
+   *  persistence pattern as `setThinkingEnabled` — write through
+   *  immediately when there's already a conversation on disk so
+   *  the choice sticks across reloads; otherwise the next save
+   *  folds it in. */
+  async function setActivePromptId(next: string | null) {
+    activePromptId = next;
+    if (activeConversation) {
+      const conv = activeConversation;
+      if (next) conv.active_prompt_id = next;
+      else delete conv.active_prompt_id;
+      try {
+        if (remoteOpen) {
+          conv.updated_at = new Date().toISOString();
+          await meshClient.saveRemoteSession(remoteOpen.peer_id, conv);
+        } else {
+          await saveConversation(conv);
+        }
+      } catch (e) {
+        console.warn("persist prompt selection failed:", e);
+      }
+    }
+  }
+
+  // Make sure the prompts cache is warm so the TextBar dropdown
+  // renders with the right options on first mount.
+  $effect(() => {
+    void agentPrompts.ensureLoaded();
+  });
 
   function openFilePicker() {
     if (streaming) return;
@@ -670,20 +720,68 @@
       };
     }
 
+    // Resolve the active Prompt (if any). The user's selection in
+    // the TextBar dropdown points at a Prompt by stable id; we look
+    // it up in the cross-network union (`agentPrompts.all`) so a
+    // prompt authored on a different network is still usable here.
+    // Selecting a prompt that exists on a non-active network triggers
+    // a propagation step further down — the prompt is copied onto
+    // the active network so it starts gossiping like a local one.
+    let activePrompt = activePromptId
+      ? agentPrompts.resolve(activePromptId)
+      : null;
+    if (activePromptId && !activePrompt) {
+      // Cache might be stale on a fresh boot; one explicit refresh
+      // is worth more than failing silently to the default.
+      await agentPrompts.refresh();
+      activePrompt = agentPrompts.resolve(activePromptId);
+    }
+    // Propagate-on-use: if the user has picked a prompt that isn't
+    // in the currently-active network's list yet, push it there so
+    // it begins propagating on this network too — the spec is "act
+    // as though it had been created here".
+    if (activePrompt) {
+      try {
+        await agentPrompts.propagateToActive(activePrompt.id);
+      } catch (e) {
+        console.warn("prompt propagation failed:", e);
+      }
+    }
+    // Compose the actual system message from the prompt's system
+    // body + host info + selected tools' snippets + the prompt's
+    // user_prompt addition. The user_prompt sits at the END of the
+    // system message (after the tool snippets) so the model reads
+    // role + capabilities first, then the user's task-shaped
+    // framing — once at the start of the conversation, not
+    // prepended to every turn.
+    const enabledTools: PromptToolId[] = activePrompt
+      ? (activePrompt.tools as PromptToolId[])
+      : [...PROMPT_ALL_TOOLS];
+    const systemBody = activePrompt
+      ? activePrompt.system_prompt
+      : DEFAULT_SYSTEM_PROMPT_BASE;
+    const sentSystemPrompt = composeSystemPrompt({
+      systemPromptBody: systemBody,
+      host: hostInfo,
+      enabledTools,
+      userPromptAddition: activePrompt?.user_prompt,
+    });
     // `working` is the agent loop's source-of-truth array. The loop
     // appends assistant turns (with any tool_calls), tool results, and
     // continuation turns to it as it runs. We mirror it into `messages`
     // on each event so Svelte paints the transcript incrementally.
     //
     // The system prompt is rebuilt per send so the live host info
-    // (OS, shell, path separator) always reflects the current
-    // device. If a previous send left a system turn at index 0 we
-    // overwrite it rather than stacking — keeps the prompt single,
-    // current, and not ballooning.
+    // (OS, shell, path separator) and any prompt edits since the last
+    // send are reflected. If a previous send left a system turn at
+    // index 0 we overwrite it rather than stacking — keeps the prompt
+    // single, current, and not ballooning.
     const working: Message[] = messages
       .filter((m) => m.role !== "system")
       .map((m) => ({ ...m }));
-    working.unshift({ role: "system", content: buildAgentSystemPrompt(hostInfo) });
+    if (sentSystemPrompt) {
+      working.unshift({ role: "system", content: sentSystemPrompt });
+    }
     const userTurn: Message = { role: "user", content: text };
     if (images.length > 0) userTurn.images = images;
     working.push(userTurn);
@@ -724,10 +822,20 @@
       });
     }
 
+    // Filter the tool roster down to the prompt's selected tools so
+    // the model can't call something the user deselected. The default
+    // (no prompt) keeps every tool available — equivalent to the
+    // pre-prompts behavior.
+    const allTools = buildChatTools(hostInfo);
+    const enabledToolSet = new Set<string>(enabledTools);
+    const filteredTools = allTools.filter((t) =>
+      enabledToolSet.has(t.definition.function.name),
+    );
+
     try {
       await runAgent({
         messages: working,
-        tools: buildChatTools(hostInfo),
+        tools: filteredTools,
         model: activeModel,
         family: activeFamily,
         mode: activeMode,
@@ -1182,6 +1290,9 @@
       routeBlockedReason = "";
     }}
     onThinkingChange={setThinkingEnabled}
+    promptsAvailable={agentPrompts.all}
+    {activePromptId}
+    onPromptChange={setActivePromptId}
     {streaming}
     routeLockedToRemote={!!remoteOpen}
     remoteHostLabel={remoteOpen?.peer_label ?? ""}

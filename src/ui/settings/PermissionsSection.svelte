@@ -25,9 +25,31 @@
     type GatedTool,
   } from "../../agent-permissions.svelte";
   import type { ToolPermission } from "../../types";
+  import { loadConfig } from "../../config";
 
   let loading = $state(true);
   let error = $state("");
+  let activeNetworkLabel = $state<string>("");
+  let activeNetworkAbsent = $state(false);
+
+  async function refreshActiveLabel(): Promise<void> {
+    try {
+      const cfg = await loadConfig();
+      const active = cfg.cloud_mesh.networks.find(
+        (n) => n.id === cfg.cloud_mesh.active_network_id,
+      );
+      if (active) {
+        activeNetworkLabel = active.network_id;
+        activeNetworkAbsent = false;
+      } else {
+        activeNetworkLabel = "";
+        activeNetworkAbsent = true;
+      }
+    } catch {
+      activeNetworkLabel = "";
+      activeNetworkAbsent = true;
+    }
+  }
 
   const GATED_TOOLS: { id: GatedTool; label: string; description: string }[] = [
     {
@@ -97,6 +119,7 @@
     void (async () => {
       try {
         await agentPermissions.ensureLoaded();
+        await refreshActiveLabel();
       } catch (e) {
         error = String(e instanceof Error ? e.message : e);
       } finally {
@@ -111,10 +134,15 @@
     <h3>Agent permissions</h3>
     <p class="hint">
       The agent's `shell` and `write_file` tools prompt before running.
-      Choices made here are shared across every device on your mesh —
-      whichever device you sit at, the same policy applies, and edits
-      gossip out to the others automatically. Read-only tools
-      (`read_file`, `networks`) aren't gated.
+      Choices made here apply on the currently-active network and
+      gossip only to peers on that network — switching networks loads
+      a different policy. Read-only tools (`read_file`, `networks`)
+      aren't gated.
+      {#if activeNetworkAbsent}
+        <strong class="warn">No active network — activate one in Networks to configure permissions.</strong>
+      {:else if activeNetworkLabel}
+        <span class="net-chip">on <code>{activeNetworkLabel}</code></span>
+      {/if}
     </p>
   </header>
 
@@ -197,6 +225,21 @@
     color: #888;
     font-size: 0.78rem;
     line-height: 1.55;
+  }
+  .hint .warn {
+    color: #f0b070;
+    margin-left: 0.4rem;
+  }
+  .net-chip {
+    margin-left: 0.4rem;
+    color: #aaa;
+  }
+  .net-chip code {
+    background: #1a1a1a;
+    padding: 0.05rem 0.3rem;
+    border-radius: 4px;
+    color: #cdeaff;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
   }
   .loading {
     color: #888;

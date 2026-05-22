@@ -7,6 +7,7 @@
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import CloudMeshSection from "./settings/CloudMeshSection.svelte";
   import PermissionsSection from "./settings/PermissionsSection.svelte";
+  import PromptsSection from "./settings/PromptsSection.svelte";
   import { updateUi } from "../update-state.svelte";
   import { settingsAttention } from "../settings-attention.svelte";
   import type { CloudMeshSubTab } from "./settings-route.svelte";
@@ -14,6 +15,7 @@
   type Tab =
     | "families"
     | "models"
+    | "prompts"
     | "permissions"
     | "hardware"
     | "storage"
@@ -71,11 +73,16 @@
   const tabs: Array<{ id: Exclude<Tab, "providers" | "transcription" | "remote">; label: string }> = [
     { id: "families", label: "Family" },
     { id: "models", label: "Models" },
+    // Networks sits above Prompts + Permissions because both of
+    // those scopes live INSIDE a network (per-network prompt list,
+    // per-network permission policy) — surfacing the network
+    // picker first keeps the hierarchy legible.
+    { id: "cloud-mesh", label: "Networks" },
+    { id: "prompts", label: "Prompts" },
     { id: "permissions", label: "Permissions" },
     { id: "hardware", label: "Hardware" },
     { id: "storage", label: "Storage" },
     { id: "usage", label: "Usage" },
-    { id: "cloud-mesh", label: "Networks" },
     { id: "updates", label: "Updates" },
   ];
 
@@ -100,9 +107,20 @@
   });
 </script>
 
-<div class="overlay" onclick={onClose} role="presentation"></div>
 <div class="panel" role="dialog" aria-label="Settings">
   <div class="panel-header">
+    <button class="back" onclick={onClose} aria-label="Back" title="Back">
+      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <path
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          d="M15 18l-6-6 6-6"
+        />
+      </svg>
+    </button>
     <h2>Settings</h2>
     <button class="close" onclick={onClose} aria-label="Close">✕</button>
   </div>
@@ -137,6 +155,8 @@
         <UsageSection />
       {:else if active === "cloud-mesh"}
         <CloudMeshSection initialSubTab={initialMeshSubTab} />
+      {:else if active === "prompts"}
+        <PromptsSection />
       {:else if active === "permissions"}
         <PermissionsSection />
       {:else if active === "updates"}
@@ -147,54 +167,60 @@
 </div>
 
 <style>
-  /* Sits above the per-surface DownloadOverlay (z-index: 30) so the
-     user can change family/tier/runtime before kicking off a pull. */
-  .overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.65);
-    z-index: 40;
-  }
+  /* Settings takes over the whole window — no overlay dim, no
+     centered card. Sizing the panel to the viewport gives the
+     inner sections (tab content, prompt list / editor split,
+     etc.) the room they need; the previous 820x620 fixed card
+     left users squinting at any non-trivial form. The window
+     itself is the resize handle. */
   .panel {
     position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    width: min(820px, 92vw);
-    height: min(620px, 88vh);
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
     background: #111;
-    border: 1px solid #222;
-    border-radius: 12px;
     z-index: 41;
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
   }
   .panel-header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    padding: 0.75rem 1rem;
+    gap: 0.5rem;
+    padding: 0.6rem 0.85rem;
     border-bottom: 1px solid #1e1e1e;
     flex-shrink: 0;
   }
   h2 {
+    flex: 1;
+    margin: 0;
     font-size: 0.95rem;
     font-weight: 600;
   }
+  .back,
   .close {
     background: none;
     border: none;
-    color: #666;
-    font-size: 1rem;
+    color: #888;
     cursor: pointer;
-    padding: 0.2rem 0.4rem;
+    padding: 0.3rem 0.4rem;
     border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    line-height: 0;
+    transition: color 0.12s, background 0.12s;
   }
+  .back {
+    color: #aaa;
+  }
+  .back:hover,
   .close:hover {
-    color: #ccc;
+    color: #e8e8e8;
     background: #1a1a1a;
+  }
+  .close {
+    font-size: 1rem;
   }
   .body {
     flex: 1;
@@ -202,7 +228,7 @@
     min-height: 0;
   }
   .v-tabs {
-    width: 160px;
+    width: 180px;
     border-right: 1px solid #1e1e1e;
     background: #0d0d0d;
     display: flex;

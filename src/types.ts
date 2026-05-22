@@ -205,6 +205,23 @@ export interface NetworkConfig {
    *  peers. Per-network so you can be "available" at home and
    *  "busy" on a shared office mesh simultaneously. */
   accepting: "available" | "limited" | "busy";
+  /** Per-network agent-tool permission policy. Each network owns
+   *  its own gated-tool policy: changes you make while joined to
+   *  the office mesh don't bleed onto the home mesh, and only
+   *  peers on the network where the change was made hear the
+   *  gossiped update. Optional for backwards compat — absent =
+   *  fresh `ask` everywhere. */
+  agent_permissions?: AgentPermissionsConfig;
+  /** Prompts authored or imported on this network. Like
+   *  permissions, prompts gossip only to peers on the network
+   *  where they live. Empty / absent = no per-network prompts.
+   *
+   *  Propagation rule: when the user selects a prompt that
+   *  doesn't exist on the currently-active network and sends a
+   *  message with it, the prompt is copied into this list (with
+   *  a fresh `updated_at`) so it begins to gossip on the new
+   *  network too. */
+  prompts?: Prompt[];
 }
 
 /** Cloud Mesh — peer-to-peer substrate that lets multiple MyOwnLLM
@@ -304,10 +321,83 @@ export interface ToolPermission {
  *  to re-grant "always accept `ls /tmp`" on every machine on their
  *  mesh. Devices broadcast this blob when they change anything and
  *  when a peer becomes active; the highest `updated_at` per tool
- *  wins on merge. Missing tools default to fresh (`mode: "ask"`). */
+ *  wins on merge. Missing tools default to fresh (`mode: "ask"`).
+ *
+ *  Lives inside each `NetworkConfig` so the policy is per-network:
+ *  permissions configured on Network A don't apply to Network B,
+ *  and gossiped updates only reach peers on the network where the
+ *  change was made. */
 export interface AgentPermissionsConfig {
   shell: ToolPermission;
   write_file: ToolPermission;
+}
+
+/** Tool ids selectable on a Prompt. The names match the tool
+ *  registry in `agent-tools.ts` — turning one off in the Prompt
+ *  drops it from the model's `tools` array for that send, hiding
+ *  the function entirely so the model can't call it. */
+export type PromptToolId = "networks" | "read_file" | "write_file" | "shell";
+
+/** Every available tool, surfaced as a fixed list so the Prompts
+ *  editor can render check-marks in a stable order without round-
+ *  tripping the agent-tools registry. */
+export const PROMPT_ALL_TOOLS: PromptToolId[] = [
+  "networks",
+  "read_file",
+  "write_file",
+  "shell",
+];
+
+/** One named prompt the user has authored. The TextBar's "System
+ *  prompt" dropdown picks one of these to apply on the next send.
+ *  Sent with the model's chat completion as:
+ *    - `system_prompt` is the system message body. New prompts
+ *      pre-fill it with the built-in default so the user starts
+ *      from a working baseline.
+ *    - `tools` filters the model's tool array down to the selected
+ *      ids; each selected tool's documentation snippet is appended
+ *      to the system prompt at send time so the model knows about
+ *      the tools it can call.
+ *    - `user_prompt` (if non-empty) is appended to the system
+ *      message body AFTER the tool snippets — i.e. it acts as the
+ *      user's personal system-level instructions, seen by the
+ *      model once at the start of the conversation rather than
+ *      prepended to every typed message.
+ *
+ *  Prompts gossip on the network they live on, last-write-wins by
+ *  `updated_at`. Stable `id` lets receivers merge edits across
+ *  devices without duplicating entries. */
+export interface Prompt {
+  /** Stable id minted at create time. Travels with the prompt
+   *  across networks so propagation onto a foreign network
+   *  doesn't spawn a fork. */
+  id: string;
+  /** Display name shown in the TextBar dropdown + the Prompts
+   *  settings sidebar. Defaults to "Untitled prompt" so an empty
+   *  field doesn't render blank. */
+  name: string;
+  /** The system prompt body sent to the model. Pre-filled with
+   *  the built-in default on create; the user can edit it but is
+   *  discouraged from doing so — the recommended path is to leave
+   *  the system prompt alone and customize via `user_prompt`. */
+  system_prompt: string;
+  /** Tools the model is allowed to call while this prompt is
+   *  active. New prompts start with every tool selected; deselect
+   *  to hide a tool from the model for that prompt. The selected
+   *  tools' documentation snippets are concatenated onto
+   *  `system_prompt` at send time so the model knows how to use
+   *  them. */
+  tools: PromptToolId[];
+  /** The user's personal system-level instructions. Appended to
+   *  the system message after the tool snippets at send time, so
+   *  the model reads role → host → tools → user-task-framing
+   *  once at the start of the conversation. Recommended over
+   *  editing `system_prompt` because it doesn't risk breaking the
+   *  agent's tool / shell conventions baked into the default
+   *  system prompt. */
+  user_prompt: string;
+  /** Unix-ms timestamp of the last local edit. LWW merge key. */
+  updated_at: number;
 }
 
 export interface Config {
@@ -344,9 +434,13 @@ export interface Config {
   cloud_mesh: CloudMeshConfig;
   mic: MicConfig;
   providers: Provider[];
-  /** Per-device agent-tool permissions. Defaults to "ask" everywhere
-   *  on fresh installs so the user is always in the loop the first
-   *  time a tool fires. */
+  /** Legacy field: pre-multi-network installs stored a single
+   *  `agent_permissions` blob shared across every (then-singular)
+   *  network. The loader migrates this onto each saved
+   *  `NetworkConfig.agent_permissions` on first read and clears
+   *  the field. Left in the schema as optional so the
+   *  migration's `delete` operation type-checks; new code should
+   *  read permissions off the active network. */
   agent_permissions?: AgentPermissionsConfig;
 }
 

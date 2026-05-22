@@ -906,70 +906,172 @@ export const TOOLS_BY_NAME: Record<string, Tool> = Object.fromEntries(
   ]),
 );
 
-/** Build the system prompt for one chat send. Injects the live host
- *  info (OS + arch + which shell `shell` will invoke + path separator)
- *  so the model picks platform-appropriate idioms on the first try
- *  rather than guessing or having to call `shell` once just to learn
- *  what's on the other side. */
-export function buildAgentSystemPrompt(host: AgentHostInfo): string {
-  const hostLine =
+/** Base system prompt — the framing the model sees regardless of
+ *  which tools are enabled for the current send. Includes role +
+ *  general style guidance. Per-tool documentation is appended at
+ *  send time via `toolSystemPromptSnippet` so deselecting a tool in
+ *  the prompt editor drops both the tool from the model's tool array
+ *  AND its documentation from the prompt body. */
+export const DEFAULT_SYSTEM_PROMPT_BASE: string =
+  "You are MyOwnLLM's built-in IT support assistant. You have hands-on " +
+  "tools for managing the user's Cloud Mesh (\"Networks\") and acting on " +
+  "the host filesystem and shell.\n\n" +
+  "Style:\n" +
+  "- Be direct. Quote tool results back to the user in plain English; don't dump JSON.\n" +
+  "- When you take an action, say what you did and what the result was.\n" +
+  "- If the user just wants information, answer the question and stop — don't " +
+  "fire actions speculatively.\n" +
+  "- If a tool call fails (including permission denials), surface the error " +
+  "message and suggest the next step.\n" +
+  "- Before changing anything destructive (forgetting a network, denying a " +
+  "pending request, switching active network mid-session, writing a file, " +
+  "running a shell command), confirm with the user. They'll see a permission " +
+  "prompt for shell / write_file, but a quick \"I'm about to run X — okay?\" " +
+  "in chat first is better UX than a surprise modal.";
+
+/** Host environment line. Injected verbatim into the system prompt
+ *  at send time so the model knows which shell + path separator it's
+ *  targeting before its first tool call. Lives outside the per-tool
+ *  snippets because it's always relevant whenever any tool is
+ *  enabled (the model needs to know what host it's on). */
+export function hostInfoSnippet(host: AgentHostInfo): string {
+  return (
     `Host environment for tool calls on this device: ${host.os} (${host.arch}). ` +
     `The \`shell\` tool runs \`${host.shell}\` so use ${
       host.family === "windows" ? "Windows cmd" : "POSIX sh"
     } syntax. ` +
-    `Filesystem path separator is \`${host.path_separator}\`, though both \`/\` and \`\\\` work in paths passed to read_file / write_file on either family.`;
-  return (
-    "You are MyOwnLLM's built-in IT support assistant. You have hands-on " +
-    "tools for managing the user's Cloud Mesh (\"Networks\") and acting on " +
-    "the host filesystem and shell.\n\n" +
-    hostLine +
-    "\n\n" +
-    "Tools available:\n" +
-    "- `networks` — inspect / mutate Cloud Mesh state (status, peers, saved " +
-    "networks, accepting policy, diagnostic log, signaling/STUN/TURN servers, " +
-    "import/export of portable settings).\n" +
-    "- `read_file` — read a text file (non-destructive, no prompt).\n" +
-    "- `write_file` — write or append text to a file (prompts the user).\n" +
-    "- `shell` — run a shell command (prompts the user).\n\n" +
-    "How the mesh works:\n" +
-    "- Devices that share a Network ID find each other through public Nostr relays " +
-    "(or a self-hosted one) and connect peer-to-peer over WebRTC.\n" +
-    "- Joining still requires explicit approval per device, gated by a 6-char " +
-    "verification code that both sides should read out and confirm.\n" +
-    "- The user can save multiple networks; exactly one is active at a time.\n" +
-    "- Pinned peers that go offline pause the work tied to them (chat / Talking " +
-    "Points) rather than silently downgrading — restoring the peer or unpinning " +
-    "fixes it.\n\n" +
-    "Diagnosing connection problems:\n" +
-    "1. Always call `networks` with action='status' first to get the lay of the land.\n" +
-    "2. If no network is active, walk the user through adding one (suggest " +
-    "`generate_network_id` for a unique handle).\n" +
-    "3. If peers should be there but aren't, check `list_peers` + " +
-    "`list_pending_requests` before suggesting `force_rediscovery` (the heavy hammer).\n" +
-    "4. If a peer is offline-rostered, `reconnect_peer` for that specific peer is " +
-    "lighter than rediscovering the whole room.\n" +
-    "5. Before changing anything destructive (forgetting a network, denying a " +
-    "pending request, switching active network mid-session, writing a file, " +
-    "running a shell command), confirm with the user. They'll see a permission " +
-    "prompt for shell / write_file, but a quick \"I'm about to run X — okay?\" " +
-    "in chat first is better UX than a surprise modal.\n\n" +
-    "Network settings & imports:\n" +
-    "- Network settings travel as a portable JSON envelope carrying " +
-    "`kind: \"myownllm.network-settings\"`. The user can paste one into chat or " +
-    "attach a .json file — when you see this shape, offer to import it via " +
-    "`action='import_settings'` (pass the parsed object as `settings`, or the " +
-    "raw string as `json`). Confirm the network_id with the user before applying.\n" +
-    "- `action='export_settings'` returns the same envelope for the active (or " +
-    "named) network, ready to share to another device.\n" +
-    "- `action='set_signaling_servers' / 'set_stun_servers' / 'set_turn_servers'` " +
-    "replace the respective list on a network. Empty array restores defaults " +
-    "(Trystero public Nostr relays / Google STUN / no TURN).\n\n" +
-    "Style:\n" +
-    "- Be direct. Quote tool results back to the user in plain English; don't dump JSON.\n" +
-    "- When you take an action, say what you did and what the result was.\n" +
-    "- If the user just wants information, answer the question and stop — don't " +
-    "fire actions speculatively.\n" +
-    "- If a tool call fails (including permission denials), surface the error " +
-    "message and suggest the next step."
+    `Filesystem path separator is \`${host.path_separator}\`, though both \`/\` and \`\\\` work in paths passed to read_file / write_file on either family.`
   );
+}
+
+/** Per-tool prompt snippets. Each block describes what the tool
+ *  does, when to use it, and any specific guidance the model needs.
+ *  Concatenated onto the base system prompt at send time based on
+ *  the selected `tools` list of the active Prompt. New tools added
+ *  later get a new entry here. */
+const NETWORKS_TOOL_SNIPPET: string =
+  "## `networks` tool — Cloud Mesh management\n\n" +
+  "Use this tool to inspect or mutate the user's Cloud Mesh state " +
+  "(status, peers, saved networks, accepting policy, diagnostic log, " +
+  "signaling/STUN/TURN servers, import/export of portable settings).\n\n" +
+  "How the mesh works:\n" +
+  "- Devices that share a Network ID find each other through public Nostr relays " +
+  "(or a self-hosted one) and connect peer-to-peer over WebRTC.\n" +
+  "- Joining still requires explicit approval per device, gated by a 6-char " +
+  "verification code that both sides should read out and confirm.\n" +
+  "- The user can save multiple networks; exactly one is active at a time.\n" +
+  "- Pinned peers that go offline pause the work tied to them (chat / Talking " +
+  "Points) rather than silently downgrading — restoring the peer or unpinning " +
+  "fixes it.\n\n" +
+  "Diagnosing connection problems:\n" +
+  "1. Always call `networks` with action='status' first to get the lay of the land.\n" +
+  "2. If no network is active, walk the user through adding one (suggest " +
+  "`generate_network_id` for a unique handle).\n" +
+  "3. If peers should be there but aren't, check `list_peers` + " +
+  "`list_pending_requests` before suggesting `force_rediscovery` (the heavy hammer).\n" +
+  "4. If a peer is offline-rostered, `reconnect_peer` for that specific peer is " +
+  "lighter than rediscovering the whole room.\n\n" +
+  "Network settings & imports:\n" +
+  "- Network settings travel as a portable JSON envelope carrying " +
+  "`kind: \"myownllm.network-settings\"`. The user can paste one into chat or " +
+  "attach a .json file — when you see this shape, offer to import it via " +
+  "`action='import_settings'` (pass the parsed object as `settings`, or the " +
+  "raw string as `json`). Confirm the network_id with the user before applying.\n" +
+  "- `action='export_settings'` returns the same envelope for the active (or " +
+  "named) network, ready to share to another device.\n" +
+  "- `action='set_signaling_servers' / 'set_stun_servers' / 'set_turn_servers'` " +
+  "replace the respective list on a network. Empty array restores defaults " +
+  "(Trystero public Nostr relays / Google STUN / no TURN).";
+
+const READ_FILE_TOOL_SNIPPET: string =
+  "## `read_file` tool — read a file from disk\n\n" +
+  "Reads a text file on the user's device and returns its contents. " +
+  "Non-destructive — runs without prompting the user. Use it to inspect " +
+  "logs, config files, or any text artifact before deciding what to do " +
+  "next. Pass an absolute path when possible; relative paths resolve " +
+  "against the agent's working directory which may not match what the " +
+  "user expects.";
+
+const WRITE_FILE_TOOL_SNIPPET: string =
+  "## `write_file` tool — create or modify a file\n\n" +
+  "Writes (or appends) text to a file on the user's device. The user is " +
+  "prompted for permission on every call unless they've previously " +
+  "granted blanket trust for the exact path. State your intent in chat " +
+  "before calling — a surprise permission modal is worse UX than a " +
+  "heads-up sentence describing what you're about to write and where.";
+
+const SHELL_TOOL_SNIPPET: string =
+  "## `shell` tool — run a shell command\n\n" +
+  "Runs a shell command on the user's device. The user is prompted for " +
+  "permission on every call unless they've granted blanket trust for the " +
+  "exact command string. Use the shell family indicated in the host line " +
+  "above (POSIX sh on Unix, Windows cmd on Windows). State your intent " +
+  "in chat before invoking destructive commands — confirmation first " +
+  "beats a surprise modal.";
+
+/** Lookup of the per-tool prompt snippet by tool id. Exposed so the
+ *  Prompts settings UI can preview the snippet next to each tool's
+ *  checkbox — the user sees exactly what gets added when they select
+ *  a tool. */
+export const TOOL_PROMPT_SNIPPETS: Record<string, string> = {
+  networks: NETWORKS_TOOL_SNIPPET,
+  read_file: READ_FILE_TOOL_SNIPPET,
+  write_file: WRITE_FILE_TOOL_SNIPPET,
+  shell: SHELL_TOOL_SNIPPET,
+};
+
+/** Compose the actual system prompt body sent to the model. Glues
+ *  the user-editable `systemPromptBody` (defaults to
+ *  `DEFAULT_SYSTEM_PROMPT_BASE` for new Prompts) together with the
+ *  host info line, the snippets for each selected tool, and an
+ *  optional trailing user-prompt addition. Layout:
+ *
+ *      <system body>
+ *
+ *      <host info>
+ *
+ *      <tool 1 snippet>
+ *      <tool 2 snippet>
+ *      …
+ *
+ *      <user prompt addition>
+ *
+ *  The user-prompt sits after the tools because it's the user's
+ *  task-shaped framing — the model reads role + capabilities first,
+ *  then "and here's what I'm trying to accomplish in this chat". */
+export function composeSystemPrompt(args: {
+  systemPromptBody: string;
+  host: AgentHostInfo;
+  enabledTools: string[];
+  /** Optional trailing addition from the active Prompt's
+   *  `user_prompt` field. Appended after the tool snippets so the
+   *  user's task framing comes last. Empty / whitespace = skipped. */
+  userPromptAddition?: string;
+}): string {
+  const parts: string[] = [];
+  const body = args.systemPromptBody.trim();
+  if (body) parts.push(body);
+  if (args.enabledTools.length > 0) {
+    parts.push(hostInfoSnippet(args.host));
+    for (const t of args.enabledTools) {
+      const snippet = TOOL_PROMPT_SNIPPETS[t];
+      if (snippet) parts.push(snippet);
+    }
+  }
+  const addition = args.userPromptAddition?.trim();
+  if (addition) parts.push(addition);
+  return parts.join("\n\n");
+}
+
+/** Back-compat wrapper for callers that haven't migrated to the
+ *  Prompt-aware composition path. Reproduces the historical default
+ *  system prompt (all tools enabled, default base) for a host. New
+ *  call sites should use `composeSystemPrompt` so per-Prompt
+ *  selections take effect. */
+export function buildAgentSystemPrompt(host: AgentHostInfo): string {
+  return composeSystemPrompt({
+    systemPromptBody: DEFAULT_SYSTEM_PROMPT_BASE,
+    host,
+    enabledTools: ["networks", "read_file", "write_file", "shell"],
+  });
 }

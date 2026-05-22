@@ -12,7 +12,10 @@ import type {
   AgentPermissionsConfig,
   ToolPermission,
   TurnServer,
+  Prompt,
+  PromptToolId,
 } from "./types";
+import { PROMPT_ALL_TOOLS } from "./types";
 
 async function configPath(): Promise<string> {
   const home = await homeDir();
@@ -123,7 +126,6 @@ const DEFAULT_CONFIG: Config = {
     active_network_id: null,
     diag_quiet: false,
   },
-  agent_permissions: freshAgentPermissions(),
   mic: { ...DEFAULT_MIC },
   providers: [
     {
@@ -144,6 +146,24 @@ export async function loadConfig(): Promise<Config> {
       _cached = mergeDefaults(raw);
       if (!_cached.conversation_dir) {
         _cached.conversation_dir = await defaultConversationDir();
+      }
+      // One-time migration: pre-multi-network permissions lived on
+      // the top-level Config. Now they live inside each
+      // NetworkConfig so the gossip can stay scoped to "peers on
+      // the network where the change was made". Clone the legacy
+      // blob onto every saved network so existing always-accept
+      // entries carry over wherever the user might be working.
+      if (_cached.agent_permissions) {
+        const legacy = _cached.agent_permissions;
+        _cached.cloud_mesh = {
+          ..._cached.cloud_mesh,
+          networks: _cached.cloud_mesh.networks.map((n) =>
+            n.agent_permissions
+              ? n
+              : { ...n, agent_permissions: structuredClone(legacy) },
+          ),
+        };
+        delete _cached.agent_permissions;
       }
       // Persist any defaults we filled in so subsequent loads are consistent.
       await saveConfig(_cached);
@@ -178,9 +198,17 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
     cloud_mesh: mergeCloudMesh(
       (raw as { cloud_mesh?: Partial<CloudMeshConfig> }).cloud_mesh,
     ),
-    agent_permissions: mergeAgentPermissions(
-      (raw as { agent_permissions?: Partial<AgentPermissionsConfig> }).agent_permissions,
-    ),
+    // Legacy: pre-multi-network installs stored a global
+    // `agent_permissions`. Preserved here only so the migration in
+    // loadConfig has something to clone onto each network — after
+    // the clone runs the field is deleted. Absent on fresh
+    // installs and on already-migrated configs.
+    agent_permissions: (raw as { agent_permissions?: Partial<AgentPermissionsConfig> })
+      .agent_permissions
+      ? mergeAgentPermissions(
+          (raw as { agent_permissions?: Partial<AgentPermissionsConfig> }).agent_permissions,
+        )
+      : undefined,
     mic: {
       ...DEFAULT_MIC,
       ...((raw as { mic?: Partial<MicConfig> & { whisper_model?: string } }).mic ?? {}),
@@ -260,7 +288,7 @@ function mergeNetwork(
   // as-is, and users who need TURN now point at a working server
   // (Cloudflare Calls, self-hosted Coturn) via the UI.
   void raw.use_public_turn_fallback;
-  return {
+  const net: NetworkConfig = {
     id: raw.id || newNetworkInternalId(),
     network_id: raw.network_id || "",
     signaling_servers: cleanSignaling(raw.signaling_servers),
@@ -268,6 +296,15 @@ function mergeNetwork(
     turn_servers: raw.turn_servers ?? [],
     accepting: coerceAccepting(raw.accepting),
   };
+  if (raw.agent_permissions) {
+    net.agent_permissions = mergeAgentPermissions(raw.agent_permissions);
+  }
+  if (Array.isArray(raw.prompts)) {
+    net.prompts = raw.prompts
+      .map((p) => coercePrompt(p))
+      .filter((p): p is Prompt => p !== null);
+  }
+  return net;
 }
 
 /** Merge a partial cloud_mesh config from a saved file with
@@ -668,21 +705,111 @@ function mergeAgentPermissions(
   };
 }
 
-/** Read the network-wide permissions, returning fresh defaults when
- *  no record has been persisted yet. */
+/** Read the active network's permissions. Returns fresh defaults
+ *  when no network is active, when the network has no recorded
+ *  policy yet, or when the file's missing the field entirely. */
 export function getAgentPermissions(cfg: Config): AgentPermissionsConfig {
-  return cfg.agent_permissions ?? freshAgentPermissions();
+  const active = activeNetwork(cfg);
+  return active?.agent_permissions ?? freshAgentPermissions();
 }
 
-/** Mutate the network-wide permissions and persist. The patcher
+/** Mutate the active network's permissions and persist. The patcher
  *  returns the updated record; callers are responsible for bumping
  *  `updated_at` on tools they're actually changing (the gossip layer
- *  decides whose record wins by that timestamp). */
+ *  decides whose record wins by that timestamp). No-ops (returns the
+ *  current config unchanged) when no network is active — there's no
+ *  network to scope the permissions to, so the caller's mutation has
+ *  nowhere to land.
+ *
+ *  When the optional `networkId` is passed, mutates that specific
+ *  network even if it isn't the active one — used by the inbound
+ *  gossip merge path so a `permissions_snapshot` arriving from a
+ *  peer on Network B doesn't accidentally overwrite Network A's
+ *  policy. */
 export async function updateAgentPermissions(
   patcher: (current: AgentPermissionsConfig) => AgentPermissionsConfig,
+  networkId?: string,
 ): Promise<Config> {
   const cfg = await loadConfig();
-  const current = getAgentPermissions(cfg);
+  const targetId = networkId ?? cfg.cloud_mesh.active_network_id;
+  if (!targetId) return cfg;
+  const target = cfg.cloud_mesh.networks.find((n) => n.id === targetId);
+  if (!target) return cfg;
+  const current = target.agent_permissions ?? freshAgentPermissions();
   const next = patcher(current);
-  return await updateConfig({ agent_permissions: next });
+  return await updateNetwork(target.id, { agent_permissions: next });
+}
+
+// ---- prompts -------------------------------------------------------------
+
+/** Coerce a possibly-hand-edited prompt blob into a strict `Prompt`.
+ *  Returns null when the shape is unsalvageable (no id, no name) so
+ *  the caller drops it rather than spawning a record with empty
+ *  identifying fields. */
+function coercePrompt(raw: unknown): Prompt | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Partial<Prompt>;
+  const id = typeof obj.id === "string" && obj.id ? obj.id : "";
+  if (!id) return null;
+  const name = typeof obj.name === "string" ? obj.name : "";
+  const system_prompt = typeof obj.system_prompt === "string" ? obj.system_prompt : "";
+  const user_prompt = typeof obj.user_prompt === "string" ? obj.user_prompt : "";
+  const tools: PromptToolId[] = Array.isArray(obj.tools)
+    ? obj.tools.filter((t): t is PromptToolId =>
+        typeof t === "string" && (PROMPT_ALL_TOOLS as readonly string[]).includes(t),
+      )
+    : [...PROMPT_ALL_TOOLS];
+  const updated_at =
+    typeof obj.updated_at === "number" && Number.isFinite(obj.updated_at)
+      ? Math.max(0, Math.floor(obj.updated_at))
+      : 0;
+  return { id, name, system_prompt, tools, user_prompt, updated_at };
+}
+
+/** Mint a fresh `id` for a new prompt. Prefixed so a stray id
+ *  doesn't collide with conversation / network identifiers. */
+export function newPromptId(): string {
+  return "prm-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+}
+
+/** Read the active network's prompts, or an empty list when no
+ *  network is active / the network has none yet. */
+export function getPrompts(cfg: Config): Prompt[] {
+  const active = activeNetwork(cfg);
+  return active?.prompts ?? [];
+}
+
+/** All prompts known to this device across every saved network.
+ *  Used by the TextBar's dropdown so the user can pick any prompt
+ *  they've authored regardless of which network is currently
+ *  active — picking a foreign prompt later triggers the
+ *  propagation step that copies it into the active network on
+ *  next use. */
+export function getAllPrompts(cfg: Config): Prompt[] {
+  const seen = new Map<string, Prompt>();
+  for (const net of cfg.cloud_mesh.networks) {
+    for (const p of net.prompts ?? []) {
+      const prior = seen.get(p.id);
+      if (!prior || p.updated_at > prior.updated_at) seen.set(p.id, p);
+    }
+  }
+  return Array.from(seen.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Replace the active network's prompts list and persist. Used by
+ *  both the Prompts settings tab (CRUD) and the inbound-gossip
+ *  merge path. The patcher receives the current array and returns
+ *  the next one — callers stamp `updated_at` on records they
+ *  changed so LWW gossip merges land correctly. */
+export async function updatePrompts(
+  patcher: (current: Prompt[]) => Prompt[],
+  networkId?: string,
+): Promise<Config> {
+  const cfg = await loadConfig();
+  const targetId = networkId ?? cfg.cloud_mesh.active_network_id;
+  if (!targetId) return cfg;
+  const target = cfg.cloud_mesh.networks.find((n) => n.id === targetId);
+  if (!target) return cfg;
+  const next = patcher(target.prompts ?? []);
+  return await updateNetwork(target.id, { prompts: next });
 }

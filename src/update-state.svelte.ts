@@ -13,6 +13,7 @@ export type SettingsTab =
   | "hardware"
   | "cloud-mesh"
   | "permissions"
+  | "prompts"
   | "transcription"
   | "updates"
   // Legacy deep-link target. The Providers tab was retired and now
