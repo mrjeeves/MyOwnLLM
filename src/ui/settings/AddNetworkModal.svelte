@@ -18,10 +18,10 @@
    *
    *    3. Import (collapsed by default). Accepts a JSON file or
    *       pasted text in the network-settings envelope shape.
-   *       Clipboard auto-detect runs once when the modal opens —
-   *       if the user just copied a settings blob the import
-   *       section preopens with the parsed preview, one click
-   *       from applying.
+   *       Disclosed manually — both paths (file picker + paste
+   *       textarea) live inside the modal, so the user has one
+   *       place to import from rather than a clipboard-driven
+   *       pop-up that fires before they've even decided to import.
    *
    *  Save runs through `addNetwork` (no advanced overrides) or
    *  `importNetworkSettings` (when the advanced/import path has
@@ -63,13 +63,9 @@
   let turnEntry = $state<TurnServer>({ url: "", username: "", credential: "" });
 
   // Import flow state. Either a parsed blob ready to apply or null
-  // when nothing has been provided. The flag tracks whether the
-  // current draft came from the clipboard auto-detect so we can
-  // show a softer "we noticed JSON on your clipboard" hint vs. the
-  // user actively pasting / picking a file.
+  // when nothing has been provided.
   let importDraft = $state<NetworkSettingsExport | null>(null);
   let importExpanded = $state(false);
-  let importFromClipboard = $state(false);
   let pasteText = $state("");
   let fileInput = $state<HTMLInputElement | null>(null);
 
@@ -86,36 +82,13 @@
 
   onMount(() => {
     if (initialImport) {
-      adoptImport(initialImport, false);
+      adoptImport(initialImport);
       importExpanded = true;
-      return;
     }
-    // Clipboard auto-detect: if the user copied a settings blob
-    // before opening the modal, surface it as a preopened import
-    // section with the parsed network_id visible. We don't apply
-    // anything yet — the user still clicks a button to commit.
-    void detectClipboard();
   });
 
-  async function detectClipboard() {
-    if (!navigator.clipboard?.readText) return;
-    try {
-      const raw = await navigator.clipboard.readText();
-      const parsed = tryParseNetworkSettings(raw);
-      if (parsed) {
-        adoptImport(parsed, true);
-        importExpanded = true;
-      }
-    } catch {
-      // Clipboard access can fail silently in unfocused windows or
-      // when the user hasn't granted permission. Not worth a banner —
-      // the user can still paste manually below.
-    }
-  }
-
-  function adoptImport(blob: NetworkSettingsExport, fromClipboard: boolean) {
+  function adoptImport(blob: NetworkSettingsExport) {
     importDraft = blob;
-    importFromClipboard = fromClipboard;
     networkIdDraft = blob.network_id;
     signalingDraft = [...blob.signaling_servers];
     stunDraft = blob.stun_servers.length > 0 ? [...blob.stun_servers] : [...DEFAULT_NETWORK_STUN];
@@ -139,7 +112,7 @@
       return;
     }
     error = "";
-    adoptImport(parsed, false);
+    adoptImport(parsed);
   }
 
   function onFilePicked(e: Event) {
@@ -157,7 +130,7 @@
           return;
         }
         error = "";
-        adoptImport(parsed, false);
+        adoptImport(parsed);
       })
       .catch((e) => {
         error = `Couldn't read file: ${String(e)}`;
@@ -166,11 +139,10 @@
 
   function clearImport() {
     importDraft = null;
-    importFromClipboard = false;
     pasteText = "";
     // Don't wipe networkIdDraft — the user might have typed before
-    // we auto-detected. Leave the advanced overrides too so toggling
-    // import on/off isn't a destructive operation.
+    // applying the import. Leave the advanced overrides too so
+    // toggling import on/off isn't a destructive operation.
   }
 
   function addSignaling() {
@@ -414,14 +386,8 @@
     {#if importExpanded}
       <div class="advanced">
         {#if importDraft}
-          <div class="import-card" class:from-clipboard={importFromClipboard}>
-            {#if importFromClipboard}
-              <div class="import-card-head">
-                Detected MyOwnLLM network settings on your clipboard
-              </div>
-            {:else}
-              <div class="import-card-head">Imported network settings</div>
-            {/if}
+          <div class="import-card">
+            <div class="import-card-head">Imported network settings</div>
             <dl class="import-summary">
               <dt>network_id</dt>
               <dd><code>{importDraft.network_id}</code></dd>
@@ -729,7 +695,6 @@
     flex-direction: column;
     gap: 0.4rem;
   }
-  .import-card.from-clipboard { border-color: #2a4a2a; background: #0e120e; }
   .import-card-head {
     font-size: 0.75rem;
     color: #c0c0c0;
