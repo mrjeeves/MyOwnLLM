@@ -333,6 +333,30 @@ import { APP_VERSION } from "../../mesh-capabilities";
             <option value="busy">busy</option>
           </select>
         </label>
+        <!-- Per-network auto-gossip toggle. When off, this device
+             stops auto-syncing agent permissions and prompts with
+             peers on the active network: local edits don't broadcast,
+             inbound snapshots are dropped. Reflected in the
+             Permissions and Prompts tabs so the user sees the
+             isolation state there too. -->
+        <label
+          class="gossip-toggle"
+          class:dimmed={!active}
+          title={active
+            ? "When on, permissions and prompts edited on this device sync to peers on this network (and theirs sync back). Off keeps this network's settings isolated to each device."
+            : "No active network — pick one to enable."}
+        >
+          <input
+            type="checkbox"
+            checked={active?.auto_gossip ?? true}
+            disabled={!active}
+            onchange={async (e) => {
+              await meshClient.setAutoGossip((e.target as HTMLInputElement).checked);
+              await reloadFromConfig();
+            }}
+          />
+          auto-gossip settings
+        </label>
       </div>
       {#if coachmark}
         <!-- Coachmark: "what to do next" derived from the same state
@@ -752,6 +776,25 @@ import { APP_VERSION } from "../../mesh-capabilities";
     padding: 0.15rem 0.4rem;
     cursor: pointer;
   }
+  /* Mirror of `.accepting-toggle` so the two per-active-network
+     controls line up consistently in the status row. */
+  .gossip-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.72rem;
+    color: #888;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .gossip-toggle.dimmed { opacity: 0.5; cursor: default; }
+  .gossip-toggle input[type="checkbox"] {
+    cursor: pointer;
+    margin: 0;
+  }
+  .gossip-toggle.dimmed input[type="checkbox"] { cursor: default; }
 
   /* Saved networks list */
   .network-list { display: flex; flex-direction: column; gap: 0.3rem; }

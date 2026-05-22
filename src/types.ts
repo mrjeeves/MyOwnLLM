@@ -222,6 +222,20 @@ export interface NetworkConfig {
    *  a fresh `updated_at`) so it begins to gossip on the new
    *  network too. */
   prompts?: Prompt[];
+  /** Whether agent permissions and prompts auto-propagate
+   *  ("gossip") between devices on this network. When true
+   *  (default), local edits broadcast to peers and inbound
+   *  snapshots are merged via LWW — the legacy behavior. When
+   *  false, this device stays isolated on this network: outbound
+   *  permission/prompt snapshots are suppressed (both the
+   *  on-peer-active push and the on-local-edit broadcast) and
+   *  inbound snapshots are dropped without merging. Other
+   *  network features (catalogs, conversations, inference,
+   *  transfers) are unaffected — only the settings-level gossip
+   *  is gated. Per-network so a noisy office mesh can be
+   *  isolated while the home mesh keeps auto-syncing. Optional
+   *  for backwards compat — absent = enabled. */
+  auto_gossip?: boolean;
 }
 
 /** Cloud Mesh — peer-to-peer substrate that lets multiple MyOwnLLM
