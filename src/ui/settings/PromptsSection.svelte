@@ -33,6 +33,11 @@
   let toolsOpen = $state(false);
   let activeNetworkLabel = $state<string>("");
   let activeNetworkAbsent = $state(false);
+  // Mirror of the active network's `auto_gossip` flag for the header
+  // chip — same intent as in PermissionsSection. Defaults to true
+  // so legacy networks (saved before the field existed) read as
+  // gossip-on, matching `mergeNetwork`'s coercion.
+  let activeNetworkGossip = $state(true);
 
   const TOOL_LABELS: Record<PromptToolId, string> = {
     networks: "Networks",
@@ -64,13 +69,16 @@
       if (active) {
         activeNetworkLabel = active.network_id;
         activeNetworkAbsent = false;
+        activeNetworkGossip = active.auto_gossip ?? true;
       } else {
         activeNetworkLabel = "";
         activeNetworkAbsent = true;
+        activeNetworkGossip = true;
       }
     } catch {
       activeNetworkLabel = "";
       activeNetworkAbsent = true;
+      activeNetworkGossip = true;
     }
   }
 
@@ -153,13 +161,18 @@
       Author reusable prompts for the chat agent. Each prompt holds a
       system prompt body, a set of tools the model is allowed to call,
       and an optional user-prompt prefix injected before your typed
-      message. Prompts gossip only to peers on the network where they
-      live; using a prompt on a different active network copies it
-      there too so it begins propagating on the new network.
+      message. When auto-gossip is on for the active network, prompts
+      sync to peers on it; using a prompt on a different active network
+      copies it there too so it begins propagating on the new network.
       {#if activeNetworkAbsent}
         <strong class="warn">No active network — activate one in Networks to create prompts.</strong>
       {:else if activeNetworkLabel}
         <span class="net-chip">on <code>{activeNetworkLabel}</code></span>
+        {#if activeNetworkGossip}
+          <span class="gossip-chip on" title="Prompts edited here sync to peers on this network and theirs sync back. Toggle in Networks → Status.">auto-gossip on</span>
+        {:else}
+          <span class="gossip-chip off" title="Auto-gossip is off for this network — prompts edited here stay on this device, and inbound peer snapshots are ignored. Toggle in Networks → Status.">isolated · no peer sync</span>
+        {/if}
       {/if}
     </p>
   </header>
@@ -371,6 +384,25 @@
     border-radius: 4px;
     color: #cdeaff;
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  /* Mirrors `.gossip-chip` in PermissionsSection so the two tabs
+     render the auto-gossip state identically. `.on` is muted (the
+     default) and `.off` is amber to flag the unusual mode. */
+  .gossip-chip {
+    margin-left: 0.4rem;
+    padding: 0.05rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.72rem;
+  }
+  .gossip-chip.on {
+    background: #14211a;
+    color: #8acfa1;
+    border: 1px solid #1e3a24;
+  }
+  .gossip-chip.off {
+    background: #221a10;
+    color: #f0b070;
+    border: 1px solid #3a2f10;
   }
   .loading {
     color: #888;

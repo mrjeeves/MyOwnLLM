@@ -31,6 +31,11 @@
   let error = $state("");
   let activeNetworkLabel = $state<string>("");
   let activeNetworkAbsent = $state(false);
+  // Mirror of the active network's `auto_gossip` flag so the header
+  // can tell the user whether edits made here propagate to peers.
+  // Default `true` matches the merged-config default for networks
+  // that predate the toggle.
+  let activeNetworkGossip = $state(true);
 
   async function refreshActiveLabel(): Promise<void> {
     try {
@@ -41,13 +46,16 @@
       if (active) {
         activeNetworkLabel = active.network_id;
         activeNetworkAbsent = false;
+        activeNetworkGossip = active.auto_gossip ?? true;
       } else {
         activeNetworkLabel = "";
         activeNetworkAbsent = true;
+        activeNetworkGossip = true;
       }
     } catch {
       activeNetworkLabel = "";
       activeNetworkAbsent = true;
+      activeNetworkGossip = true;
     }
   }
 
@@ -134,14 +142,19 @@
     <h3>Agent permissions</h3>
     <p class="hint">
       The agent's `shell` and `write_file` tools prompt before running.
-      Choices made here apply on the currently-active network and
-      gossip only to peers on that network — switching networks loads
-      a different policy. Read-only tools (`read_file`, `networks`)
-      aren't gated.
+      Choices made here apply on the currently-active network and —
+      when auto-gossip is on for that network — sync to peers on it.
+      Switching networks loads a different policy. Read-only tools
+      (`read_file`, `networks`) aren't gated.
       {#if activeNetworkAbsent}
         <strong class="warn">No active network — activate one in Networks to configure permissions.</strong>
       {:else if activeNetworkLabel}
         <span class="net-chip">on <code>{activeNetworkLabel}</code></span>
+        {#if activeNetworkGossip}
+          <span class="gossip-chip on" title="Edits here sync to peers on this network and theirs sync back. Toggle in Networks → Status.">auto-gossip on</span>
+        {:else}
+          <span class="gossip-chip off" title="Auto-gossip is off for this network — edits stay on this device, and inbound peer snapshots are ignored. Toggle in Networks → Status.">isolated · no peer sync</span>
+        {/if}
       {/if}
     </p>
   </header>
@@ -240,6 +253,27 @@
     border-radius: 4px;
     color: #cdeaff;
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  /* Pill that mirrors the active network's auto_gossip flag so the
+     user can see at a glance whether the policy on this tab is
+     propagating. `.on` is muted — it's the default state, no need
+     to shout — and `.off` is amber to draw attention since
+     isolation is the unusual mode. */
+  .gossip-chip {
+    margin-left: 0.4rem;
+    padding: 0.05rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.72rem;
+  }
+  .gossip-chip.on {
+    background: #14211a;
+    color: #8acfa1;
+    border: 1px solid #1e3a24;
+  }
+  .gossip-chip.off {
+    background: #221a10;
+    color: #f0b070;
+    border: 1px solid #3a2f10;
   }
   .loading {
     color: #888;

@@ -958,6 +958,14 @@ class MeshClient {
    *  on the next snapshot. Defaults to `available`; persisted via
    *  `cloud_mesh.accepting`. */
   accepting = $state<AcceptingPolicy>("available");
+  /** Cached `auto_gossip` flag for the currently-active network.
+   *  Gates outbound permission/prompt broadcasts and inbound
+   *  snapshot merges so an "isolated" network never sees its
+   *  settings drift from peer pressure. Refreshed alongside
+   *  `accepting` on network swap, and by `setAutoGossip`. Default
+   *  `true` matches the legacy behavior (gossip on) for any
+   *  saved network missing the field. */
+  auto_gossip = $state(true);
   /** True while an outbound `infer_request` is in flight via the
    *  mesh — surfaced on the Chat view so the "via" picker can show
    *  a spinner instead of letting the user fire a second request
@@ -1039,6 +1047,23 @@ class MeshClient {
       // Persist failure is non-fatal — value still in memory.
     }
     void this.refreshCapabilities();
+  }
+
+  /** Toggle auto-gossip of permissions / prompts for the currently-
+   *  active network. When flipped on, the next local edit (or any
+   *  inbound snapshot) will start syncing again; we don't push a
+   *  catch-up snapshot here on purpose — the user opted into
+   *  isolation, and re-enabling shouldn't retroactively leak edits
+   *  that landed while isolated. No-op when no network is active. */
+  async setAutoGossip(next: boolean): Promise<void> {
+    this.auto_gossip = next;
+    try {
+      const cfg = await loadConfig();
+      const active = activeNetwork(cfg);
+      if (active) await updateNetwork(active.id, { auto_gossip: next });
+    } catch {
+      // Persist failure is non-fatal — value still in memory.
+    }
   }
 
   // ---- internal --------------------------------------------------------
@@ -1604,6 +1629,12 @@ class MeshClient {
       const cfg = await loadConfig();
       const active = activeNetwork(cfg);
       if (active) this.accepting = active.accepting;
+      // Mirror auto_gossip so the gates on snapshot send / merge can
+      // read the flag synchronously (the gates fire from
+      // `maybePromoteToActive` and from inbound `permissions_snapshot`
+      // / `prompts_snapshot` handlers, neither of which wants to
+      // await a config load). Absent on legacy configs → default on.
+      this.auto_gossip = active?.auto_gossip ?? true;
       const persistedQuiet = cfg.cloud_mesh.diag_quiet;
       if (typeof persistedQuiet === "boolean") this.diag_quiet = persistedQuiet;
     } catch {
@@ -5093,6 +5124,10 @@ class MeshClient {
    *  mutation. Gated on `AGENT_PERMISSIONS_GOSSIP` so older peers
    *  don't get a message they'll just drop. */
   private sendPermissionsSnapshotTo(conn: ConnectionState): void {
+    // Isolation gate: the active network may have opted out of
+    // settings auto-sync, in which case we don't ship our snapshot
+    // even on first handshake. The peer keeps whatever they had.
+    if (!this.auto_gossip) return;
     if (!peerSupportsFeature(conn.capabilities, FEATURES.AGENT_PERMISSIONS_GOSSIP))
       return;
     const snap = agentPermissions.snapshot();
@@ -5107,6 +5142,9 @@ class MeshClient {
    *  Gated on `PROMPTS_GOSSIP` so older peers (and headless serve
    *  builds without prompts wired up) drop the frame quietly. */
   private sendPromptsSnapshotTo(conn: ConnectionState): void {
+    // Same isolation gate as the permissions snapshot — opt-out
+    // networks don't push their prompt library to new peers.
+    if (!this.auto_gossip) return;
     if (!peerSupportsFeature(conn.capabilities, FEATURES.PROMPTS_GOSSIP)) return;
     const snap = agentPrompts.snapshot();
     this.send(conn, {
@@ -5132,6 +5170,10 @@ class MeshClient {
     shell: { mode: "ask" | "accept_all" | "denied"; always_accept: string[]; updated_at: number };
     write_file: { mode: "ask" | "accept_all" | "denied"; always_accept: string[]; updated_at: number };
   }): void {
+    // Isolation gate: skip the broadcast entirely on networks the
+    // user has flipped to "no auto-sync". Local edits still persist
+    // and reflect in the UI; they just don't propagate.
+    if (!this.auto_gossip) return;
     for (const conn of this.connections.values()) {
       if (this.peerStatus(conn) !== "active") continue;
       if (!peerSupportsFeature(conn.capabilities, FEATURES.AGENT_PERMISSIONS_GOSSIP))
@@ -5147,6 +5189,9 @@ class MeshClient {
    *  scoping as the permissions broadcast — only peers in the
    *  currently-active network see it. */
   private broadcastPromptsSnapshot(prompts: Prompt[]): void {
+    // Mirror of the permissions broadcast — isolation gate first,
+    // peer-fanout second.
+    if (!this.auto_gossip) return;
     for (const conn of this.connections.values()) {
       if (this.peerStatus(conn) !== "active") continue;
       if (!peerSupportsFeature(conn.capabilities, FEATURES.PROMPTS_GOSSIP)) continue;
@@ -5172,6 +5217,11 @@ class MeshClient {
   private async handlePermissionsSnapshot(
     tools: Record<string, { mode?: string; always_accept?: string[]; updated_at?: number }>,
   ): Promise<void> {
+    // Isolation gate: when auto-gossip is off, drop the snapshot
+    // outright rather than merging. "Isolation" means our local
+    // policy is the source of truth on this network — accepting an
+    // inbound merge would silently undo that.
+    if (!this.auto_gossip) return;
     const cfg = await loadConfig();
     const activeId = cfg.cloud_mesh.active_network_id;
     if (!activeId) return;
@@ -5214,6 +5264,9 @@ class MeshClient {
    *  per-network, and a snapshot arrives on the network's data
    *  channel so we land it in that network's slot. */
   private async handlePromptsSnapshot(prompts: unknown): Promise<void> {
+    // Same isolation gate as `handlePermissionsSnapshot` — opt-out
+    // networks ignore inbound prompt snapshots entirely.
+    if (!this.auto_gossip) return;
     if (!Array.isArray(prompts)) return;
     const cfg = await loadConfig();
     const activeId = cfg.cloud_mesh.active_network_id;

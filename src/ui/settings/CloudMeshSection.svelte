@@ -12,10 +12,18 @@
 
   /** Sub-tab strip mirrors the pattern Models uses.
    *
+   *  Order is intentional: Status (the everyday surface) sits first,
+   *  Settings (per-network signaling / STUN / TURN, accessed alongside
+   *  Status when configuring a network) sits immediately after so the
+   *  two configuration tabs are adjacent, then the diagnostic tabs
+   *  (Connections, Activity) and the HTTP server are last.
+   *
    *  - **Status** is the home view: identity card, status pill +
-   *    accepting policy, saved networks list (with add / switch /
-   *    forget / lock), and pending Network requests when present.
-   *    The wizard for adding/locking a network all happens here.
+   *    accepting policy + auto-gossip toggle, saved networks list
+   *    (with add / switch / forget / lock), and pending Network
+   *    requests when present. The wizard for adding/locking a
+   *    network all happens here.
+   *  - **Settings** is per-network signaling / STUN / TURN config.
    *  - **Connections** lists the ring (currently routed peers,
    *    auto-healed on every join/leave), indirect peers we know
    *    about but aren't actively routing through (shelved or
@@ -24,7 +32,6 @@
    *  - **Activity** is the ring-buffered diagnostic log with a
    *    quiet-mode toggle. Moved off the Status tab so steady-state
    *    chatter doesn't crowd the controllable surfaces.
-   *  - **Settings** is per-network signaling / STUN / TURN config.
    *  - **HTTP** (previously "LAN") is the local axum-served
    *    browser UI for phone/tablet access. */
   // svelte-ignore state_referenced_locally
@@ -34,9 +41,9 @@
 <div class="section">
   <div class="h-tabs">
     <button class:active={tab === "status"} onclick={() => (tab = "status")}>Status</button>
+    <button class:active={tab === "settings"} onclick={() => (tab = "settings")}>Settings</button>
     <button class:active={tab === "connections"} onclick={() => (tab = "connections")}>Connections</button>
     <button class:active={tab === "activity"} onclick={() => (tab = "activity")}>Activity</button>
-    <button class:active={tab === "settings"} onclick={() => (tab = "settings")}>Settings</button>
     <button class:active={tab === "http"} onclick={() => (tab = "http")}>HTTP</button>
   </div>
 

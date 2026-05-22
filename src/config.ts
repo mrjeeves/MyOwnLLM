@@ -295,6 +295,10 @@ function mergeNetwork(
     stun_servers: raw.stun_servers ?? [...DEFAULT_NETWORK_STUN],
     turn_servers: raw.turn_servers ?? [],
     accepting: coerceAccepting(raw.accepting),
+    // Default to enabled so existing networks (saved before this
+    // field existed) keep their pre-toggle "auto-sync everywhere"
+    // behavior. Only an explicit `false` on disk disables gossip.
+    auto_gossip: typeof raw.auto_gossip === "boolean" ? raw.auto_gossip : true,
   };
   if (raw.agent_permissions) {
     net.agent_permissions = mergeAgentPermissions(raw.agent_permissions);
