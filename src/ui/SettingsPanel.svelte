@@ -109,6 +109,18 @@
 
 <div class="panel" role="dialog" aria-label="Settings">
   <div class="panel-header">
+    <button class="back" onclick={onClose} aria-label="Back" title="Back">
+      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <path
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          d="M15 18l-6-6 6-6"
+        />
+      </svg>
+    </button>
     <h2>Settings</h2>
     <button class="close" onclick={onClose} aria-label="Close">✕</button>
   </div>
@@ -175,27 +187,40 @@
   .panel-header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    padding: 0.75rem 1rem;
+    gap: 0.5rem;
+    padding: 0.6rem 0.85rem;
     border-bottom: 1px solid #1e1e1e;
     flex-shrink: 0;
   }
   h2 {
+    flex: 1;
+    margin: 0;
     font-size: 0.95rem;
     font-weight: 600;
   }
+  .back,
   .close {
     background: none;
     border: none;
-    color: #666;
-    font-size: 1rem;
+    color: #888;
     cursor: pointer;
-    padding: 0.2rem 0.4rem;
+    padding: 0.3rem 0.4rem;
     border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    line-height: 0;
+    transition: color 0.12s, background 0.12s;
   }
+  .back {
+    color: #aaa;
+  }
+  .back:hover,
   .close:hover {
-    color: #ccc;
+    color: #e8e8e8;
     background: #1a1a1a;
+  }
+  .close {
+    font-size: 1rem;
   }
   .body {
     flex: 1;
