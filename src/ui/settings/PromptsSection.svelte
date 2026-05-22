@@ -30,6 +30,7 @@
   let error = $state("");
   let selectedId = $state<string | null>(null);
   let systemPromptOpen = $state(false);
+  let toolsOpen = $state(false);
   let activeNetworkLabel = $state<string>("");
   let activeNetworkAbsent = $state(false);
 
@@ -39,6 +40,15 @@
     write_file: "Write file",
     shell: "Shell",
   };
+
+  /** Summarize the selected tools for the collapsed Tools section
+   *  header. "all" when every tool is on; otherwise the labels
+   *  comma-joined; "none" when nothing is selected. */
+  function toolsSummary(selected: readonly PromptToolId[]): string {
+    if (selected.length === 0) return "none";
+    if (selected.length === PROMPT_ALL_TOOLS.length) return "all";
+    return selected.map((t) => TOOL_LABELS[t]).join(", ");
+  }
 
   const prompts = $derived(agentPrompts.current);
   const selected = $derived(
@@ -70,6 +80,7 @@
       const p = await agentPrompts.create({ name: "Untitled prompt" });
       selectedId = p.id;
       systemPromptOpen = false;
+      toolsOpen = false;
     } catch (e) {
       error = String(e instanceof Error ? e.message : e);
     }
@@ -187,6 +198,7 @@
                   onclick={() => {
                     selectedId = p.id;
                     systemPromptOpen = false;
+                    toolsOpen = false;
                   }}
                 >
                   <span class="prompt-name">{p.name || "Untitled prompt"}</span>
@@ -245,33 +257,38 @@
           </div>
 
           <div class="field">
-            <span class="label">Tools</span>
-            <p class="muted small">
-              Selected tools are exposed to the model. Each tool's
-              documentation snippet is appended to the system prompt
-              so the model knows when to use it.
-            </p>
-            <div class="tools">
-              {#each PROMPT_ALL_TOOLS as tool (tool)}
-                {@const checked = sel.tools.includes(tool)}
-                <div class="tool-row" class:checked>
-                  <label class="tool-head">
-                    <input
-                      type="checkbox"
-                      {checked}
-                      onchange={() => toggleTool(sel.id, tool)}
-                    />
-                    <span class="tool-name">{TOOL_LABELS[tool]}</span>
-                  </label>
-                  {#if checked}
-                    <details class="tool-snippet">
-                      <summary class="muted small">Snippet added when selected</summary>
-                      <pre>{TOOL_PROMPT_SNIPPETS[tool] ?? ""}</pre>
-                    </details>
-                  {/if}
+            <details class="collapse" bind:open={toolsOpen}>
+              <summary>
+                <span>Tools</span>
+                <span class="muted">— {toolsSummary(sel.tools)}</span>
+              </summary>
+              <div class="collapse-body">
+                <p class="muted small">
+                  Selected tools are exposed to the model. Each
+                  tool's documentation snippet is appended to the
+                  system prompt below the tool list so the model
+                  knows when to use it.
+                </p>
+                <div class="tools">
+                  {#each PROMPT_ALL_TOOLS as tool (tool)}
+                    {@const checked = sel.tools.includes(tool)}
+                    <div class="tool-row" class:checked>
+                      <label class="tool-head">
+                        <input
+                          type="checkbox"
+                          {checked}
+                          onchange={() => toggleTool(sel.id, tool)}
+                        />
+                        <span class="tool-name">{TOOL_LABELS[tool]}</span>
+                      </label>
+                      {#if checked}
+                        <pre class="tool-snippet">{TOOL_PROMPT_SNIPPETS[tool] ?? ""}</pre>
+                      {/if}
+                    </div>
+                  {/each}
                 </div>
-              {/each}
-            </div>
+              </div>
+            </details>
           </div>
 
           <div class="field">
@@ -466,8 +483,7 @@
     flex-direction: column;
     gap: 0.35rem;
   }
-  .field label,
-  .field .label {
+  .field label {
     color: #ccc;
     font-size: 0.8rem;
     font-weight: 500;
@@ -593,22 +609,11 @@
     font-weight: 500;
   }
   .tool-snippet {
-    margin-top: 0.35rem;
-  }
-  .tool-snippet > summary {
-    cursor: pointer;
-    list-style: none;
-    padding-left: 1.5rem;
-  }
-  .tool-snippet > summary::-webkit-details-marker {
-    display: none;
-  }
-  .tool-snippet pre {
     background: #0a0a0a;
     border: 1px solid #1e1e1e;
     border-radius: 4px;
     padding: 0.4rem 0.55rem;
-    margin: 0.3rem 0 0 1.5rem;
+    margin: 0.35rem 0 0 1.5rem;
     color: #aaa;
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
     font-size: 0.72rem;

@@ -73,12 +73,16 @@
   const tabs: Array<{ id: Exclude<Tab, "providers" | "transcription" | "remote">; label: string }> = [
     { id: "families", label: "Family" },
     { id: "models", label: "Models" },
+    // Networks sits above Prompts + Permissions because both of
+    // those scopes live INSIDE a network (per-network prompt list,
+    // per-network permission policy) — surfacing the network
+    // picker first keeps the hierarchy legible.
+    { id: "cloud-mesh", label: "Networks" },
     { id: "prompts", label: "Prompts" },
     { id: "permissions", label: "Permissions" },
     { id: "hardware", label: "Hardware" },
     { id: "storage", label: "Storage" },
     { id: "usage", label: "Usage" },
-    { id: "cloud-mesh", label: "Networks" },
     { id: "updates", label: "Updates" },
   ];
 

@@ -747,25 +747,24 @@
         console.warn("prompt propagation failed:", e);
       }
     }
-    // Compose the actual system message: either the user's prompt
-    // body + selected tools' snippets, or the built-in default when
-    // the user hasn't picked anything. The Prompt's `user_prompt` is
-    // appended to the system body as additional framing so it
-    // influences every turn without polluting the visible
-    // transcript or the persisted conversation history.
+    // Compose the actual system message from the prompt's system
+    // body + host info + selected tools' snippets + the prompt's
+    // user_prompt addition. The user_prompt sits at the END of the
+    // system message (after the tool snippets) so the model reads
+    // role + capabilities first, then the user's task-shaped
+    // framing — once at the start of the conversation, not
+    // prepended to every turn.
     const enabledTools: PromptToolId[] = activePrompt
       ? (activePrompt.tools as PromptToolId[])
       : [...PROMPT_ALL_TOOLS];
     const systemBody = activePrompt
       ? activePrompt.system_prompt
       : DEFAULT_SYSTEM_PROMPT_BASE;
-    const userPromptSuffix = activePrompt?.user_prompt.trim()
-      ? `\n\nAdditional user-provided guidance for this conversation:\n${activePrompt.user_prompt.trim()}`
-      : "";
     const sentSystemPrompt = composeSystemPrompt({
-      systemPromptBody: systemBody + userPromptSuffix,
+      systemPromptBody: systemBody,
       host: hostInfo,
       enabledTools,
+      userPromptAddition: activePrompt?.user_prompt,
     });
     // `working` is the agent loop's source-of-truth array. The loop
     // appends assistant turns (with any tool_calls), tool results, and

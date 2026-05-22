@@ -1020,14 +1020,33 @@ export const TOOL_PROMPT_SNIPPETS: Record<string, string> = {
   shell: SHELL_TOOL_SNIPPET,
 };
 
-/** Compose the actual system prompt body sent to the model. Glues the
- *  user-editable `systemPromptBody` (defaults to `DEFAULT_SYSTEM_PROMPT_BASE`
- *  for new Prompts) together with the host info line and the snippets
- *  for each selected tool. */
+/** Compose the actual system prompt body sent to the model. Glues
+ *  the user-editable `systemPromptBody` (defaults to
+ *  `DEFAULT_SYSTEM_PROMPT_BASE` for new Prompts) together with the
+ *  host info line, the snippets for each selected tool, and an
+ *  optional trailing user-prompt addition. Layout:
+ *
+ *      <system body>
+ *
+ *      <host info>
+ *
+ *      <tool 1 snippet>
+ *      <tool 2 snippet>
+ *      …
+ *
+ *      <user prompt addition>
+ *
+ *  The user-prompt sits after the tools because it's the user's
+ *  task-shaped framing — the model reads role + capabilities first,
+ *  then "and here's what I'm trying to accomplish in this chat". */
 export function composeSystemPrompt(args: {
   systemPromptBody: string;
   host: AgentHostInfo;
   enabledTools: string[];
+  /** Optional trailing addition from the active Prompt's
+   *  `user_prompt` field. Appended after the tool snippets so the
+   *  user's task framing comes last. Empty / whitespace = skipped. */
+  userPromptAddition?: string;
 }): string {
   const parts: string[] = [];
   const body = args.systemPromptBody.trim();
@@ -1039,6 +1058,8 @@ export function composeSystemPrompt(args: {
       if (snippet) parts.push(snippet);
     }
   }
+  const addition = args.userPromptAddition?.trim();
+  if (addition) parts.push(addition);
   return parts.join("\n\n");
 }
 
