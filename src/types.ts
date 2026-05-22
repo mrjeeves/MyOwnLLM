@@ -358,8 +358,11 @@ export const PROMPT_ALL_TOOLS: PromptToolId[] = [
  *      ids; each selected tool's documentation snippet is appended
  *      to the system prompt at send time so the model knows about
  *      the tools it can call.
- *    - `user_prompt` (if non-empty) is prepended to the user's
- *      typed message as an additional `role: "user"` turn.
+ *    - `user_prompt` (if non-empty) is appended to the system
+ *      message body AFTER the tool snippets — i.e. it acts as the
+ *      user's personal system-level instructions, seen by the
+ *      model once at the start of the conversation rather than
+ *      prepended to every typed message.
  *
  *  Prompts gossip on the network they live on, last-write-wins by
  *  `updated_at`. Stable `id` lets receivers merge edits across
@@ -385,10 +388,13 @@ export interface Prompt {
    *  `system_prompt` at send time so the model knows how to use
    *  them. */
   tools: PromptToolId[];
-  /** Pre-prompt prepended to the user's typed message on each
-   *  send. The recommended way to customize behavior because it
-   *  doesn't risk breaking the agent's tool / shell conventions
-   *  baked into the default system prompt. */
+  /** The user's personal system-level instructions. Appended to
+   *  the system message after the tool snippets at send time, so
+   *  the model reads role → host → tools → user-task-framing
+   *  once at the start of the conversation. Recommended over
+   *  editing `system_prompt` because it doesn't risk breaking the
+   *  agent's tool / shell conventions baked into the default
+   *  system prompt. */
   user_prompt: string;
   /** Unix-ms timestamp of the last local edit. LWW merge key. */
   updated_at: number;

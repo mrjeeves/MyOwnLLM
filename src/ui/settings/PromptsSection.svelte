@@ -294,10 +294,12 @@
           <div class="field">
             <label for="prompt-user">User prompt</label>
             <p class="muted small">
-              Prepended to your typed message on every send. Use this
-              to inject persona, style, or task framing — the
-              recommended way to customize the assistant without
-              touching the system prompt.
+              Your personal system-level instructions for this prompt.
+              Appended to the system message after the tool snippets,
+              once at the start of the conversation — not prepended to
+              every typed message. This is the recommended place to
+              put persona, style, or task framing without touching the
+              system prompt above.
             </p>
             <textarea
               id="prompt-user"
