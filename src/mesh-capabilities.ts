@@ -37,6 +37,29 @@ interface OllamaTag {
   name: string;
 }
 
+/** Per-tag context-window cache. `/api/show` is cheap but not free,
+ *  and a snapshot can rebuild many times per session (model pull,
+ *  policy toggle, hardware redetect). Keyed by exact tag string — a
+ *  tag never changes its window once pulled, so this is safe to keep
+ *  for the life of the renderer. */
+const tagContextCache = new Map<string, number>();
+
+async function resolveTagContext(tag: string): Promise<number | undefined> {
+  const cached = tagContextCache.get(tag);
+  if (cached !== undefined) return cached || undefined;
+  try {
+    const n = await invoke<number>("ollama_model_context", { model: tag });
+    if (n && n > 0) {
+      tagContextCache.set(tag, n);
+      return n;
+    }
+  } catch {
+    // Ollama down, model missing, or model_info lookup failed. Don't
+    // cache a failure — next snapshot retries.
+  }
+  return undefined;
+}
+
 interface AsrModelInfo {
   name: string;
   installed: boolean;
@@ -100,7 +123,14 @@ export async function snapshotCapabilities(
     } catch {
       // Manifest unavailable — fall through with empty index.
     }
-    for (const t of tags) {
+    // Resolve context windows in parallel — `/api/show` is per-tag,
+    // and on a host with several pulled models the snapshot would
+    // otherwise serialize them. Cached after the first lookup, so
+    // subsequent snapshots are essentially free.
+    const contextLengths = await Promise.all(
+      tags.map((t) => resolveTagContext(t.name)),
+    );
+    tags.forEach((t, i) => {
       let family = "";
       let mode = "";
       for (const [familyName, modeMap] of Object.entries(manifestModes)) {
@@ -110,8 +140,13 @@ export async function snapshotCapabilities(
           break;
         }
       }
-      cap.llms.push({ tag: t.name, family, mode });
-    }
+      const context_length = contextLengths[i];
+      cap.llms.push(
+        context_length !== undefined
+          ? { tag: t.name, family, mode, context_length }
+          : { tag: t.name, family, mode },
+      );
+    });
   } catch {
     // No ollama or it's down — leave llms empty.
   }
@@ -184,6 +219,31 @@ export function canServeInference(
   if (cap.llms.some((m) => m.family === family && m.mode === mode)) return true;
   if (cap.llms.some((m) => m.mode === mode)) return true;
   return true;
+}
+
+/** Predict which LLM entry the peer will pick when serving an
+ *  `infer_request` for `family`/`mode`. Mirrors the resolution in
+ *  `handleInferRequest` (mesh-client) — exact family+mode wins,
+ *  otherwise any LLM in the right mode, otherwise the peer's first
+ *  advertised LLM. Returns `null` when the peer has no LLMs to
+ *  serve. Used by the chat surface to surface the predicted
+ *  context window in the saturation tracker.
+ *
+ *  Keep this in lockstep with `handleInferRequest`'s selection — if
+ *  the peer's logic changes, this estimate would start showing a
+ *  number that doesn't match what the peer actually uses. */
+export function resolvePeerLlm(
+  cap: Capabilities,
+  family: string,
+  mode: Mode,
+): Capabilities["llms"][number] | null {
+  if (cap.llms.length === 0) return null;
+  return (
+    cap.llms.find((m) => m.family === family && m.mode === mode) ??
+    cap.llms.find((m) => m.mode === mode) ??
+    cap.llms[0] ??
+    null
+  );
 }
 
 /** True when `cap` could serve a remote transcribe session — i.e. the
