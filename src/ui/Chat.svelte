@@ -24,6 +24,7 @@
   import { stickToBottom } from "./stick-to-bottom";
   import { renderMarkdown } from "./markdown";
   import { meshClient } from "../mesh-client.svelte";
+  import { resolvePeerLlm } from "../mesh-capabilities";
   import { routingPins, setTextPin } from "./routing-pins.svelte";
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
   import { runAgent, type AgentEvent } from "../agent-loop";
@@ -266,23 +267,27 @@
 
   // Refresh context window whenever the active model changes.
   // Routing pin changes ALSO retrigger this: when pinned to a peer
-  // the user's "active model" is whatever the peer resolves (we
-  // don't get told the exact tag — only that they advertise the
-  // family), and capabilities don't carry per-model context size
-  // today. We zero `contextSize` in that case so the TextBar knows
-  // the total is unknown — it still renders the running token
-  // count beside a neutral ring, just without a denominator or
-  // saturation color. Local models with a known window keep the
-  // full `used / total` saturation display.
+  // (or in a remote session) the model that actually runs is on
+  // the host, so we use their advertised `context_length` for the
+  // predicted tag instead of our local one. Peers on older builds
+  // don't include `context_length`; in that case `contextSize`
+  // stays 0 and the TextBar renders the running token count with
+  // a `?` denominator and a neutral ring.
   $effect(() => {
     const model = activeModel;
-    // Reads of `routeViaDevicePubkey` and `remoteOpen` register
-    // them as dependencies so the indicator re-evaluates the
-    // moment the user picks a different host (or opens a remote
-    // session).
     const pinned = routeViaDevicePubkey;
     const remote = remoteOpen;
-    if (!model || pinned || remote) {
+    const peer = routedPeer;
+    if (pinned || remote) {
+      if (peer) {
+        const picked = resolvePeerLlm(peer.capabilities, activeFamily, "text");
+        contextSize = picked?.context_length ?? 0;
+      } else {
+        contextSize = 0;
+      }
+      return;
+    }
+    if (!model) {
       contextSize = 0;
       return;
     }

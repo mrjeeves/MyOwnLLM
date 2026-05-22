@@ -317,8 +317,14 @@ export interface Capabilities {
   /** LLM tags this peer can serve via `infer_request`. One entry per
    *  resolved model the peer has locally pulled; the router matches
    *  by `family` + `mode` to find candidates. Empty when ollama isn't
-   *  installed or no models are present. */
-  llms: Array<{ tag: string; family: string; mode: string }>;
+   *  installed or no models are present.
+   *
+   *  `context_length` is the model's reported context window in
+   *  tokens, looked up locally via Ollama's `/api/show` at snapshot
+   *  time. Optional on the wire — peers on older builds omit it and
+   *  the receiver treats it as "unknown" (and renders the context
+   *  tracker without a denominator). */
+  llms: Array<{ tag: string; family: string; mode: string; context_length?: number }>;
   /** ASR backends this peer has loaded (or is configured to load on
    *  demand). The `tier` is the resolver's tier name, surfaced for
    *  the UI to pick the most-capable host when several peers can
