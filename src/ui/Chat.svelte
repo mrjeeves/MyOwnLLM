@@ -115,6 +115,29 @@
   let messages = $state<Message[]>([]);
   let input = $state("");
   let streaming = $state(false);
+
+  /** One pending attachment staged for the next send. Images become
+   *  Ollama-style `images: [base64]` array entries on the user
+   *  message; text-like files (JSON, configs, source, plain text)
+   *  get inlined as fenced code blocks prepended to the user's
+   *  typed text. Both paths share the same chip UI above the
+   *  textarea so the user knows what they're about to send.
+   *
+   *  We intentionally don't pre-validate "is this file something the
+   *  model can read" — the user said "general file uploads, as long
+   *  as the AI supports it." Best-effort routing: anything image/*
+   *  goes as an image; anything else gets inlined as text when it's
+   *  decodable, otherwise we surface a hint and let the user decide. */
+  type PendingAttachment =
+    | { kind: "image"; name: string; mime: string; base64: string; size: number }
+    | { kind: "text"; name: string; mime: string; content: string; size: number };
+  let pendingAttachments = $state<PendingAttachment[]>([]);
+  let attachmentError = $state<string>("");
+  let chatFileInput = $state<HTMLInputElement | null>(null);
+  /** Cap any single text-attachment at ~256 KiB so a stray log dump
+   *  doesn't blow the context window. The user can paste larger
+   *  things explicitly if they want; this is just the file-pick guard. */
+  const MAX_TEXT_ATTACH_BYTES = 256 * 1024;
   /** Abort controller for the in-flight agent loop, or null when idle.
    *  The TopBar's Stop button (`stop()` below + `forceStopChat()` from
    *  the chat slot) fires it; the agent loop then unwinds at the next
@@ -336,6 +359,8 @@
     activeConversation = null;
     messages = [];
     input = "";
+    pendingAttachments = [];
+    attachmentError = "";
   });
 
   /** Sync `messages` from the agent's working array (single source of
@@ -383,6 +408,7 @@
       if (m.tool_calls && m.tool_calls.length > 0) out.tool_calls = m.tool_calls;
       if (m.name) out.name = m.name;
       if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
+      if (m.images && m.images.length > 0) out.images = m.images;
       return out;
     });
     // Persist the per-conversation thinking preference so a re-open
@@ -428,9 +454,165 @@
     }
   }
 
+  function openFilePicker() {
+    if (streaming) return;
+    attachmentError = "";
+    if (chatFileInput) {
+      chatFileInput.value = "";
+      chatFileInput.click();
+    }
+  }
+
+  function removeAttachment(idx: number) {
+    pendingAttachments = pendingAttachments.filter((_, i) => i !== idx);
+  }
+
+  /** Convert an ArrayBuffer to a base64 string. Used for image
+   *  attachments (Ollama's `images` field on a message expects
+   *  base64-encoded bytes). chunked to avoid the "max-call-stack" trap
+   *  on large blobs (`btoa(String.fromCharCode(...big-array))` blows
+   *  past the spread-argument cap somewhere around 50–100k). */
+  function arrayBufferToBase64(buf: ArrayBuffer): string {
+    const bytes = new Uint8Array(buf);
+    const CHUNK = 0x8000;
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      bin += String.fromCharCode.apply(
+        null,
+        Array.from(bytes.subarray(i, i + CHUNK)),
+      );
+    }
+    return btoa(bin);
+  }
+
+  /** Best-effort text-decode of a binary blob. Returns null when the
+   *  bytes don't look like plausible text — we treat that as the
+   *  "the model probably can't read this on a non-vision build" cue
+   *  and surface a friendly error rather than dumping garbage into
+   *  the prompt. */
+  function decodeAsTextIfPlausible(buf: ArrayBuffer, mime: string): string | null {
+    // application/* JSON, source code, and configs all come through
+    // with mime types like application/json, text/plain, text/csv,
+    // text/x-shellscript, etc. Anything containing 'text', 'json',
+    // 'xml', 'yaml', or empty mime is worth attempting.
+    const looksTextual =
+      mime === "" ||
+      mime.startsWith("text/") ||
+      mime.includes("json") ||
+      mime.includes("xml") ||
+      mime.includes("yaml") ||
+      mime.includes("javascript") ||
+      mime.includes("ecmascript") ||
+      mime === "application/x-sh";
+    try {
+      // strict TextDecoder rejects bytes that don't decode as valid
+      // UTF-8 — exactly what we want for the "is this readable?" check.
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      const text = decoder.decode(buf);
+      // Last-ditch guard: if the decoder accepted it but the content
+      // is mostly NULs / control bytes, it's still not useful. Cheap
+      // sniff: count control chars outside the usual whitespace set.
+      if (!looksTextual) {
+        let ctrl = 0;
+        for (let i = 0; i < Math.min(text.length, 4096); i += 1) {
+          const c = text.charCodeAt(i);
+          if (c < 0x20 && c !== 0x09 && c !== 0x0a && c !== 0x0d) ctrl += 1;
+        }
+        if (ctrl > text.length / 64) return null;
+      }
+      return text;
+    } catch {
+      return null;
+    }
+  }
+
+  async function onChatFilesPicked(e: Event) {
+    const inputEl = e.currentTarget as HTMLInputElement;
+    const files = inputEl.files ? Array.from(inputEl.files) : [];
+    inputEl.value = "";
+    if (files.length === 0) return;
+    attachmentError = "";
+    const next: PendingAttachment[] = [];
+    for (const file of files) {
+      try {
+        const buf = await file.arrayBuffer();
+        const mime = (file.type || "").toLowerCase();
+        if (mime.startsWith("image/")) {
+          next.push({
+            kind: "image",
+            name: file.name,
+            mime,
+            base64: arrayBufferToBase64(buf),
+            size: buf.byteLength,
+          });
+          continue;
+        }
+        if (buf.byteLength > MAX_TEXT_ATTACH_BYTES) {
+          attachmentError =
+            `"${file.name}" is too large (${Math.round(buf.byteLength / 1024)} KB). Files over 256 KB risk overflowing the context — pick a smaller chunk or paste the relevant slice into the message body.`;
+          continue;
+        }
+        const text = decodeAsTextIfPlausible(buf, mime);
+        if (text === null) {
+          attachmentError =
+            `"${file.name}" doesn't look like text and isn't an image. Attaching binary files needs a vision-capable model that recognises that format — try Settings → Families to pick one.`;
+          continue;
+        }
+        next.push({
+          kind: "text",
+          name: file.name,
+          mime,
+          content: text,
+          size: buf.byteLength,
+        });
+      } catch (err) {
+        attachmentError = `Couldn't read "${file.name}": ${String(err)}`;
+      }
+    }
+    if (next.length > 0) {
+      pendingAttachments = [...pendingAttachments, ...next];
+    }
+  }
+
+  /** Compose the outgoing user message: text attachments fold into
+   *  the message text as fenced blocks before the typed prompt;
+   *  image attachments ride on the message's `images` field so
+   *  Ollama hands them straight to the vision model. */
+  function buildOutgoingUserMessage(text: string): {
+    content: string;
+    images: string[];
+  } {
+    const textParts: string[] = [];
+    const images: string[] = [];
+    for (const att of pendingAttachments) {
+      if (att.kind === "image") {
+        images.push(att.base64);
+        continue;
+      }
+      // Text inline. Use a triple-tick fence keyed on the extension
+      // when we have one so syntax highlighting picks up after the
+      // markdown renderer rolls through.
+      const ext = att.name.includes(".") ? att.name.split(".").pop() ?? "" : "";
+      const fence = "```" + (ext ? ext : "");
+      textParts.push(`Attachment: ${att.name}\n${fence}\n${att.content}\n\`\`\``);
+    }
+    const composed = textParts.length > 0 ? `${textParts.join("\n\n")}\n\n${text}` : text;
+    return { content: composed, images };
+  }
+
+  function formatAttachSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
   function send() {
     const text = input.trim();
-    if (!text || streaming) return;
+    // Allow sending pure-attachment messages (e.g. "here's a JSON
+    // file" with no typed prompt) — useful for the "import this for
+    // me" flow the user wants.
+    const hasContent = text || pendingAttachments.length > 0;
+    if (!hasContent || streaming) return;
     // Refuse the send when the pinned peer is offline — surface why
     // and let the user decide rather than silently fall back to local
     // and route their message to a model they didn't pick.
@@ -440,6 +622,16 @@
       return;
     }
     routeBlockedReason = "";
+    // Compose the outgoing message *now* (synchronously) so the user
+    // turn includes any attachments staged at click time even if they
+    // tinker with the staged list during the route-through.
+    const composed = buildOutgoingUserMessage(text);
+    const stagedImages = composed.images;
+    const stagedContent = composed.content;
+    // Clear staged attachments immediately so a follow-on send doesn't
+    // re-include them. (input is cleared inside doSend.)
+    pendingAttachments = [];
+    attachmentError = "";
     // Singleton: if the chat slot belongs to another conversation, route
     // through App so the conflict modal can prompt the user before we
     // mutate any local state.
@@ -449,13 +641,13 @@
       chatSlot.conversationId &&
       chatSlot.conversationId !== ourId
     ) {
-      onRequestSendChat(() => doSend(text));
+      onRequestSendChat(() => doSend(stagedContent, stagedImages));
       return;
     }
-    void doSend(text);
+    void doSend(stagedContent, stagedImages);
   }
 
-  async function doSend(text: string) {
+  async function doSend(text: string, images: string[] = []) {
     if (streaming) return;
     input = "";
     const wasFreshChat = messages.length === 0;
@@ -492,7 +684,9 @@
       .filter((m) => m.role !== "system")
       .map((m) => ({ ...m }));
     working.unshift({ role: "system", content: buildAgentSystemPrompt(hostInfo) });
-    working.push({ role: "user", content: text });
+    const userTurn: Message = { role: "user", content: text };
+    if (images.length > 0) userTurn.images = images;
+    working.push(userTurn);
     syncFromWorking(working);
     streaming = true;
     inFlightToolCallIds = new Set();
@@ -856,6 +1050,23 @@
       {:else}
         <div class="message {msg.role}">
           <div class="bubble">
+            {#if msg.images && msg.images.length > 0}
+              <!-- User-uploaded images. Inlined as data: URLs because
+                   the base64 is already in memory; no extra fetch
+                   round-trip and no need to track temporary blob
+                   URLs across reloads. Mime guess of png because
+                   we don't persist the original mime (vision models
+                   only need the bytes; the data: prefix is a hint). -->
+              <div class="user-images">
+                {#each msg.images as img, ii (ii)}
+                  <img
+                    class="user-image"
+                    src={"data:image/png;base64," + img}
+                    alt="user attachment {ii + 1}"
+                  />
+                {/each}
+              </div>
+            {/if}
             {#if msg.thinking}
               {@const isThinking = msg.streaming && !msg.content}
               <details class="thinking-block">
@@ -991,7 +1202,59 @@
     {:else if routeBlockedReason}
       <div class="route-blocked" role="status">{routeBlockedReason}</div>
     {/if}
+    {#if pendingAttachments.length > 0 || attachmentError}
+      <!-- Staged-attachments row, mounted above the textarea so the
+           user can see what they're about to ship before pressing
+           Send. Each chip carries a × to drop the attachment without
+           cancelling the typed prompt. Errors from picks (file too
+           large, undecodable bytes) surface inline here so they sit
+           next to the upload affordance that produced them. -->
+      <div class="attach-row" role="status" aria-live="polite">
+        {#each pendingAttachments as att, i (i)}
+          <div class="attach-chip" class:image={att.kind === "image"}>
+            <span class="attach-kind">
+              {att.kind === "image" ? "🖼" : "📄"}
+            </span>
+            <span class="attach-name" title={att.name}>{att.name}</span>
+            <span class="attach-size">{formatAttachSize(att.size)}</span>
+            <button
+              class="attach-remove"
+              onclick={() => removeAttachment(i)}
+              title="Remove attachment"
+              aria-label="Remove attachment"
+            >×</button>
+          </div>
+        {/each}
+        {#if attachmentError}
+          <div class="attach-error">
+            {attachmentError}
+            <button class="attach-error-dismiss" onclick={() => (attachmentError = "")}>✕</button>
+          </div>
+        {/if}
+      </div>
+    {/if}
     <div class="input-row">
+      <button
+        class="attach-btn"
+        onclick={openFilePicker}
+        disabled={streaming || (textModelMissing && !routeViaDevicePubkey)}
+        title="Attach a file. Images go to vision models inline; text/JSON/config files inline as readable blocks. You can also paste network-settings JSON here and ask the AI to apply it."
+        aria-label="Attach file"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path
+            fill="currentColor"
+            d="M12 5a1 1 0 0 1 1 1v5h5a1 1 0 1 1 0 2h-5v5a1 1 0 1 1-2 0v-5H6a1 1 0 1 1 0-2h5V6a1 1 0 0 1 1-1z"
+          />
+        </svg>
+      </button>
+      <input
+        bind:this={chatFileInput}
+        type="file"
+        multiple
+        style="display:none"
+        onchange={onChatFilesPicked}
+      />
       <textarea
         bind:value={input}
         onkeydown={onKeydown}
@@ -1002,7 +1265,10 @@
       {#if streaming}
         <button class="stop" onclick={stop} title="Stop generating">Stop</button>
       {:else}
-        <button onclick={send} disabled={!input.trim() || (textModelMissing && !routeViaDevicePubkey)}>Send</button>
+        <button
+          onclick={send}
+          disabled={(!input.trim() && pendingAttachments.length === 0) || (textModelMissing && !routeViaDevicePubkey)}
+        >Send</button>
       {/if}
     </div>
   {/if}
@@ -1094,6 +1360,24 @@
   }
   .user .bubble { background: #6e6ef7; color: #fff; border-bottom-right-radius: 4px; }
   .assistant .bubble { background: #1e1e1e; color: #e8e8e8; border-bottom-left-radius: 4px; }
+
+  /* User-uploaded images render as a horizontal strip above the
+     message content. Capped height so a tall screenshot doesn't
+     fill the viewport; the user can right-click to open at full
+     size if they need. */
+  .user-images {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .35rem;
+    margin-bottom: .45rem;
+  }
+  .user-image {
+    max-width: 100%;
+    max-height: 200px;
+    border-radius: 8px;
+    display: block;
+    background: rgba(0, 0, 0, 0.25);
+  }
   /* `pre-wrap` lives on the content span (not the bubble) so model
      output preserves user-typed newlines without the whitespace
      between sibling elements (e.g. content → tool-calls div) also
@@ -1423,7 +1707,106 @@
     padding: .75rem;
     border-top: 1px solid #1e1e1e;
     background: #0f0f0f;
+    align-items: flex-end;
   }
+  /* + button on the left of the textarea. Square-ish so it sits as
+     the visual sibling to Send on the right; muted by default and
+     accent-coloured on hover so the user can spot it without it
+     competing with the primary action. */
+  .attach-btn {
+    flex-shrink: 0;
+    width: 38px;
+    height: 38px;
+    padding: 0;
+    background: #1a1a1a;
+    color: #888;
+    border: 1px solid #2a2a2a;
+    border-radius: 8px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 0;
+  }
+  .attach-btn:hover:not(:disabled) {
+    background: #232323;
+    color: #cdeaff;
+    border-color: #3a3a55;
+  }
+  .attach-btn:disabled { opacity: .35; cursor: default; }
+
+  /* Staged-attachment row above the textarea. Wraps when the user
+     adds enough chips to overflow horizontally; the textarea is
+     kept full-width below. */
+  .attach-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .35rem;
+    padding: .5rem .75rem .15rem .75rem;
+    background: #0f0f0f;
+    border-top: 1px solid #1e1e1e;
+  }
+  .attach-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: .35rem;
+    background: #1a1a22;
+    border: 1px solid #2a2a3a;
+    color: #c9c9d8;
+    border-radius: 999px;
+    padding: .25rem .6rem;
+    font-size: .72rem;
+    max-width: 100%;
+  }
+  .attach-chip.image {
+    background: #182018;
+    border-color: #2a4a2a;
+    color: #cfeacf;
+  }
+  .attach-kind { font-size: .8rem; line-height: 1; }
+  .attach-name {
+    max-width: 16rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .attach-size { color: #777; font-size: .67rem; }
+  .attach-remove {
+    background: none;
+    border: none;
+    color: #888;
+    padding: 0;
+    font-size: .9rem;
+    cursor: pointer;
+    line-height: 1;
+    width: 1rem;
+    height: 1rem;
+    border-radius: 50%;
+  }
+  .attach-remove:hover { color: #f88; background: transparent; }
+  .attach-error {
+    flex: 1 1 100%;
+    color: #f0c47a;
+    font-size: .72rem;
+    background: #2a1f0e;
+    border: 1px solid #5a4220;
+    border-radius: 5px;
+    padding: .3rem .55rem;
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+  }
+  .attach-error-dismiss {
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: .8rem;
+    padding: 0 .25rem;
+    opacity: .7;
+  }
+  .attach-error-dismiss:hover { opacity: 1; }
   textarea {
     flex: 1;
     background: #1a1a1a;

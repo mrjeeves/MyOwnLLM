@@ -11,6 +11,7 @@ import type {
   MicConfig,
   AgentPermissionsConfig,
   ToolPermission,
+  TurnServer,
 } from "./types";
 
 async function configPath(): Promise<string> {
@@ -447,6 +448,154 @@ export async function setActiveNetwork(id: string | null): Promise<Config> {
   return await updateConfig({
     cloud_mesh: { ...cfg.cloud_mesh, active_network_id: id },
   });
+}
+
+// ---- network settings export / import -----------------------------------
+//
+// Portable JSON shape for sharing a network's transport config across
+// devices or onboarding a new install in one paste. The `kind` field
+// is the on-the-wire marker — the AddNetwork modal's paste-detect and
+// the LLM's import tool both look for it before treating a blob as
+// settings (vs. some unrelated JSON the user happened to paste).
+//
+// Stable internal `id` is deliberately omitted: a fresh local id gets
+// minted on import so the same export can be applied to multiple
+// devices without collision. `network_id` IS shared — that's the
+// rendezvous handle.
+
+export const NETWORK_SETTINGS_KIND = "myownllm.network-settings";
+export const NETWORK_SETTINGS_VERSION = 1;
+
+export interface NetworkSettingsExport {
+  kind: typeof NETWORK_SETTINGS_KIND;
+  version: number;
+  network_id: string;
+  signaling_servers: string[];
+  stun_servers: string[];
+  turn_servers: TurnServer[];
+  accepting: NetworkConfig["accepting"];
+}
+
+/** Build a shareable JSON envelope from a saved network. The
+ *  internal `id` is dropped so the same blob can be applied on
+ *  multiple devices without colliding on import. */
+export function exportNetworkSettings(net: NetworkConfig): NetworkSettingsExport {
+  return {
+    kind: NETWORK_SETTINGS_KIND,
+    version: NETWORK_SETTINGS_VERSION,
+    network_id: net.network_id,
+    signaling_servers: [...net.signaling_servers],
+    stun_servers: [...net.stun_servers],
+    turn_servers: net.turn_servers.map((t) => ({
+      url: t.url,
+      ...(t.username ? { username: t.username } : {}),
+      ...(t.credential ? { credential: t.credential } : {}),
+    })),
+    accepting: net.accepting,
+  };
+}
+
+/** Recognise a parsed value as a network-settings envelope. Returns
+ *  null when the shape doesn't match — callers use this to decide
+ *  whether a pasted/uploaded blob should trigger the import flow. */
+export function isNetworkSettingsExport(raw: unknown): raw is NetworkSettingsExport {
+  if (!raw || typeof raw !== "object") return false;
+  const obj = raw as Record<string, unknown>;
+  return obj.kind === NETWORK_SETTINGS_KIND && typeof obj.network_id === "string";
+}
+
+/** Try to parse a JSON string as a network-settings envelope.
+ *  Returns null when the input isn't JSON, isn't an object, or
+ *  doesn't carry the kind marker. */
+export function tryParseNetworkSettings(text: string): NetworkSettingsExport | null {
+  try {
+    const v = JSON.parse(text);
+    return isNetworkSettingsExport(v) ? coerceImport(v) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Coerce a (possibly hand-edited) import blob into a strict
+ *  NetworkSettingsExport. Drops unknown / malformed fields rather
+ *  than throwing — the user expects "import a JSON" to be tolerant
+ *  of light edits and stray comments-converted-to-fields. */
+function coerceImport(raw: NetworkSettingsExport): NetworkSettingsExport {
+  const signaling = Array.isArray(raw.signaling_servers)
+    ? raw.signaling_servers.filter((s): s is string => typeof s === "string")
+    : [];
+  const stun = Array.isArray(raw.stun_servers)
+    ? raw.stun_servers.filter((s): s is string => typeof s === "string")
+    : [];
+  const turn: TurnServer[] = Array.isArray(raw.turn_servers)
+    ? raw.turn_servers
+        .filter(
+          (t): t is TurnServer =>
+            !!t && typeof t === "object" && typeof (t as TurnServer).url === "string",
+        )
+        .map((t) => ({
+          url: t.url,
+          ...(typeof t.username === "string" && t.username ? { username: t.username } : {}),
+          ...(typeof t.credential === "string" && t.credential
+            ? { credential: t.credential }
+            : {}),
+        }))
+    : [];
+  return {
+    kind: NETWORK_SETTINGS_KIND,
+    version: NETWORK_SETTINGS_VERSION,
+    network_id: String(raw.network_id ?? ""),
+    signaling_servers: cleanSignaling(signaling),
+    stun_servers: stun,
+    turn_servers: turn,
+    accepting: coerceAccepting(raw.accepting),
+  };
+}
+
+/** Apply a network-settings envelope: create the network if its
+ *  `network_id` isn't already saved, or overwrite the transport
+ *  fields of the matching existing entry. The `accepting` field is
+ *  applied on both paths. `network_id` is assumed already
+ *  normalized by the caller — the AddNetwork modal and the LLM
+ *  tool both run `normalizeNetworkId` before reaching here.
+ *
+ *  Returns the resulting NetworkConfig (with its stable internal id),
+ *  along with a flag indicating whether a new entry was created. */
+export async function importNetworkSettings(
+  blob: NetworkSettingsExport,
+  options?: { activate?: boolean },
+): Promise<{ network: NetworkConfig; created: boolean }> {
+  const cfg = await loadConfig();
+  const existing = cfg.cloud_mesh.networks.find(
+    (n) => n.network_id === blob.network_id,
+  );
+  if (existing) {
+    const updated = await updateNetwork(existing.id, {
+      signaling_servers: blob.signaling_servers,
+      stun_servers: blob.stun_servers,
+      turn_servers: blob.turn_servers,
+      accepting: blob.accepting,
+    });
+    if (options?.activate) {
+      await setActiveNetwork(existing.id);
+    }
+    const network =
+      updated.cloud_mesh.networks.find((n) => n.id === existing.id) ?? existing;
+    return { network, created: false };
+  }
+  const fresh: NetworkConfig = mergeNetwork({
+    network_id: blob.network_id,
+    signaling_servers: blob.signaling_servers,
+    stun_servers: blob.stun_servers,
+    turn_servers: blob.turn_servers,
+    accepting: blob.accepting,
+  });
+  const networks = [...cfg.cloud_mesh.networks, fresh];
+  const active_network_id = options?.activate ? fresh.id : cfg.cloud_mesh.active_network_id;
+  await updateConfig({
+    cloud_mesh: { ...cfg.cloud_mesh, networks, active_network_id },
+  });
+  return { network: fresh, created: true };
 }
 
 // ---- agent permissions ---------------------------------------------------

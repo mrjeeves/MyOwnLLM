@@ -1,7 +1,16 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { activeNetwork, loadConfig, updateNetwork } from "../../config";
+  import {
+    activeNetwork,
+    exportNetworkSettings,
+    importNetworkSettings,
+    loadConfig,
+    tryParseNetworkSettings,
+    updateNetwork,
+    type NetworkSettingsExport,
+  } from "../../config";
   import { meshClient } from "../../mesh-client.svelte";
+  import { normalizeNetworkId } from "../../mesh";
   import type { NetworkConfig, TurnServer } from "../../types";
 
   /** All saved networks + which one is currently active. The
@@ -155,6 +164,109 @@
       editingId !== null &&
       editingId === activeNetworkId,
   );
+
+  /** Transient confirmation banner after Copy / Save .json / Import.
+   *  Auto-clears so the user doesn't have to dismiss. */
+  let infoToast = $state<string>("");
+  let importInput = $state<HTMLInputElement | null>(null);
+
+  function flashInfo(msg: string) {
+    infoToast = msg;
+    setTimeout(() => {
+      if (infoToast === msg) infoToast = "";
+    }, 2400);
+  }
+
+  async function copyEditingSettings() {
+    if (!editing) return;
+    const blob = exportNetworkSettings(editing);
+    const text = JSON.stringify(blob, null, 2);
+    try {
+      await navigator.clipboard.writeText(text);
+      flashInfo(`Copied "${editing.network_id}" settings to clipboard`);
+    } catch (e) {
+      error = `Couldn't copy: ${String(e)}`;
+    }
+  }
+
+  function downloadEditingSettings() {
+    if (!editing) return;
+    const blob = exportNetworkSettings(editing);
+    const text = JSON.stringify(blob, null, 2);
+    const file = new Blob([text], { type: "application/json" });
+    const url = URL.createObjectURL(file);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${editing.network_id}.network.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    flashInfo(`Exported "${editing.network_id}.network.json"`);
+  }
+
+  function openImportPicker() {
+    if (importInput) {
+      importInput.value = "";
+      importInput.click();
+    }
+  }
+
+  async function pasteImport() {
+    error = "";
+    if (!navigator.clipboard?.readText) {
+      error = "Clipboard read not supported in this browser.";
+      return;
+    }
+    try {
+      const raw = await navigator.clipboard.readText();
+      const parsed = tryParseNetworkSettings(raw);
+      if (!parsed) {
+        error =
+          "Clipboard doesn't contain a MyOwnLLM network-settings blob. Copy a network's settings first, or use 'From .json file…' to pick a file.";
+        return;
+      }
+      await applyImport(parsed);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function onImportFileChosen(e: Event) {
+    const inp = e.currentTarget as HTMLInputElement;
+    const file = inp.files && inp.files.length > 0 ? inp.files[0] : null;
+    inp.value = "";
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = tryParseNetworkSettings(text);
+      if (!parsed) {
+        error =
+          "File doesn't contain a MyOwnLLM network-settings blob (missing 'kind' marker).";
+        return;
+      }
+      await applyImport(parsed);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function applyImport(blob: NetworkSettingsExport) {
+    // Re-normalize the network_id so a hand-edited blob gets coerced
+    // into the canonical form before lookup / save.
+    const normalized = await normalizeNetworkId(blob.network_id);
+    const result = await importNetworkSettings({ ...blob, network_id: normalized });
+    if (result.network.id === activeNetworkId) {
+      meshClient.reconcile().catch(() => {});
+    }
+    await reload();
+    selectEditing(result.network.id);
+    flashInfo(
+      result.created
+        ? `Imported new network "${result.network.network_id}"`
+        : `Updated settings on "${result.network.network_id}"`,
+    );
+  }
 </script>
 
 <div class="root">
@@ -187,6 +299,46 @@
         </div>
       </section>
     {/if}
+
+    <!-- Portable settings: Copy / Save .json / Import. The whole
+         signaling+STUN+TURN block exports as a single JSON envelope,
+         so onboarding a new device is paste-and-go instead of typing
+         every URL twice. -->
+    <section class="block">
+      <h3>Portable settings</h3>
+      <div class="block-hint">
+        Export this network's signaling / STUN / TURN config as a JSON
+        envelope to share to another device, or import an envelope to
+        adopt someone else's setup. The envelope carries
+        <code>"kind": "myownllm.network-settings"</code> so an unrelated
+        JSON paste can't accidentally clobber your config.
+      </div>
+      <div class="export-row">
+        <button class="btn-small" onclick={copyEditingSettings} disabled={!editing}>
+          Copy as JSON
+        </button>
+        <button class="btn-small" onclick={downloadEditingSettings} disabled={!editing}>
+          Save .json file…
+        </button>
+        <span class="export-spacer"></span>
+        <button class="btn-small ghost" onclick={openImportPicker}>
+          Import from file…
+        </button>
+        <button class="btn-small ghost" onclick={pasteImport}>
+          Paste from clipboard
+        </button>
+        <input
+          bind:this={importInput}
+          type="file"
+          accept=".json,application/json"
+          style="display:none"
+          onchange={onImportFileChosen}
+        />
+      </div>
+      {#if infoToast}
+        <div class="info-toast" role="status" aria-live="polite">{infoToast}</div>
+      {/if}
+    </section>
 
     <section class="block">
       <h3>Signaling relays</h3>
@@ -451,6 +603,30 @@
     font-size: 0.73rem;
     color: #666;
     line-height: 1.5;
+    max-width: 36rem;
+  }
+  .block-hint code {
+    font-family: monospace;
+    font-size: 0.72rem;
+    background: #1a1a22;
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+    color: #b9b9ee;
+  }
+  .export-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+  .export-spacer { flex: 1; min-width: 0.5rem; }
+  .info-toast {
+    color: #aeeaae;
+    font-size: 0.72rem;
+    background: #1a2a1a;
+    border: 1px solid #2a4a2a;
+    border-radius: 5px;
+    padding: 0.3rem 0.55rem;
     max-width: 36rem;
   }
 

@@ -1,34 +1,126 @@
 <script lang="ts">
-  /** Inline modal for "Add a new saved network". Used both from
-   *  the Sidebar's "+ Add Network" button and from the Status
-   *  tab's Saved networks section.
+  /** "Add a new saved network" modal. Used from the Sidebar's
+   *  context menu, from the Status tab's "+ Add network" button,
+   *  and from the right-click → Import flow.
    *
-   *  One input: the Network ID itself (or Generate). That ID
-   *  doubles as the display name throughout the app — there's
-   *  no separate label field, because two parallel names would
-   *  just be confusing.
+   *  Three blocks, top-to-bottom:
    *
-   *  Two save modes:
-   *    - **Save**: add the network to the saved list without
-   *      activating. The user can switch to it later from the
-   *      sidebar / Status tab.
-   *    - **Save & activate**: add and switch to it right away.
-   *      The mesh joins on the next reconcile.
+   *    1. Lede + Network ID input. Unique-handle messaging lives
+   *       beside the field, not as a wall of prose above it, so
+   *       the user can scan "Network ID = how devices find each
+   *       other = ought to be unique" in one beat.
    *
-   *  Save runs through `addNetwork` from config.ts which
-   *  generates a stable internal id, normalizes the network_id,
-   *  and persists. Errors (invalid network_id, etc.) surface
-   *  inline; the modal stays open until the user dismisses. */
+   *    2. Advanced (collapsed by default). Lets the user override
+   *       signaling relays, STUN, and TURN at create time. Most
+   *       users won't expand this; it's there so the power case
+   *       (office-mesh on a private relay, hotspot peer with TURN)
+   *       doesn't require creating, then re-editing.
+   *
+   *    3. Import (collapsed by default). Accepts a JSON file or
+   *       pasted text in the network-settings envelope shape.
+   *       Clipboard auto-detect runs once when the modal opens —
+   *       if the user just copied a settings blob the import
+   *       section preopens with the parsed preview, one click
+   *       from applying.
+   *
+   *  Save runs through `addNetwork` (no advanced overrides) or
+   *  `importNetworkSettings` (when the advanced/import path has
+   *  populated transport fields). Errors stay inline. */
 
-  import { addNetwork } from "../../config";
+  import { onMount } from "svelte";
+  import {
+    addNetwork,
+    DEFAULT_NETWORK_STUN,
+    importNetworkSettings,
+    tryParseNetworkSettings,
+    type NetworkSettingsExport,
+  } from "../../config";
   import { generateNetworkId, normalizeNetworkId } from "../../mesh";
   import { meshClient } from "../../mesh-client.svelte";
+  import type { TurnServer } from "../../types";
 
-  let { onClose } = $props<{ onClose: () => void }>();
+  let { onClose, initialImport = null } = $props<{
+    onClose: () => void;
+    /** Caller-supplied settings blob. Pre-fills the modal as if the
+     *  user had just pasted JSON — used by the sidebar context-menu
+     *  "Import settings…" path so the import flow lands in the same
+     *  surface the New Network button uses. */
+    initialImport?: NetworkSettingsExport | null;
+  }>();
 
   let networkIdDraft = $state("");
   let saving = $state(false);
   let error = $state("");
+
+  // Advanced overrides — when the user expands the disclosure and
+  // edits any of these, save routes through `importNetworkSettings`
+  // (which carries transport fields end-to-end) instead of the
+  // simple `addNetwork` path.
+  let advancedExpanded = $state(false);
+  let signalingDraft = $state<string[]>([]);
+  let stunDraft = $state<string[]>([...DEFAULT_NETWORK_STUN]);
+  let turnDraft = $state<TurnServer[]>([]);
+  let turnEntry = $state<TurnServer>({ url: "", username: "", credential: "" });
+
+  // Import flow state. Either a parsed blob ready to apply or null
+  // when nothing has been provided. The flag tracks whether the
+  // current draft came from the clipboard auto-detect so we can
+  // show a softer "we noticed JSON on your clipboard" hint vs. the
+  // user actively pasting / picking a file.
+  let importDraft = $state<NetworkSettingsExport | null>(null);
+  let importExpanded = $state(false);
+  let importFromClipboard = $state(false);
+  let pasteText = $state("");
+  let fileInput = $state<HTMLInputElement | null>(null);
+
+  // True once the user has touched any advanced/import field. Drives
+  // the save-button label so the user knows whether they're saving
+  // a plain new network or applying transport overrides.
+  let hasOverrides = $derived(
+    importDraft !== null ||
+      signalingDraft.some((s) => s.trim() !== "") ||
+      // Custom STUN list = different from defaults.
+      JSON.stringify(stunDraft) !== JSON.stringify(DEFAULT_NETWORK_STUN) ||
+      turnDraft.length > 0,
+  );
+
+  onMount(() => {
+    if (initialImport) {
+      adoptImport(initialImport, false);
+      importExpanded = true;
+      return;
+    }
+    // Clipboard auto-detect: if the user copied a settings blob
+    // before opening the modal, surface it as a preopened import
+    // section with the parsed network_id visible. We don't apply
+    // anything yet — the user still clicks a button to commit.
+    void detectClipboard();
+  });
+
+  async function detectClipboard() {
+    if (!navigator.clipboard?.readText) return;
+    try {
+      const raw = await navigator.clipboard.readText();
+      const parsed = tryParseNetworkSettings(raw);
+      if (parsed) {
+        adoptImport(parsed, true);
+        importExpanded = true;
+      }
+    } catch {
+      // Clipboard access can fail silently in unfocused windows or
+      // when the user hasn't granted permission. Not worth a banner —
+      // the user can still paste manually below.
+    }
+  }
+
+  function adoptImport(blob: NetworkSettingsExport, fromClipboard: boolean) {
+    importDraft = blob;
+    importFromClipboard = fromClipboard;
+    networkIdDraft = blob.network_id;
+    signalingDraft = [...blob.signaling_servers];
+    stunDraft = blob.stun_servers.length > 0 ? [...blob.stun_servers] : [...DEFAULT_NETWORK_STUN];
+    turnDraft = blob.turn_servers.map((t) => ({ ...t }));
+  }
 
   async function onGenerate() {
     error = "";
@@ -37,6 +129,78 @@
     } catch (e) {
       error = String(e);
     }
+  }
+
+  function onPasteApply() {
+    const parsed = tryParseNetworkSettings(pasteText);
+    if (!parsed) {
+      error =
+        "Pasted text isn't a MyOwnLLM network-settings blob (missing the 'kind: \"myownllm.network-settings\"' marker).";
+      return;
+    }
+    error = "";
+    adoptImport(parsed, false);
+  }
+
+  function onFilePicked(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files && input.files.length > 0 ? input.files[0] : null;
+    input.value = "";
+    if (!file) return;
+    file
+      .text()
+      .then((text) => {
+        const parsed = tryParseNetworkSettings(text);
+        if (!parsed) {
+          error =
+            "File doesn't contain a MyOwnLLM network-settings blob (missing the 'kind: \"myownllm.network-settings\"' marker).";
+          return;
+        }
+        error = "";
+        adoptImport(parsed, false);
+      })
+      .catch((e) => {
+        error = `Couldn't read file: ${String(e)}`;
+      });
+  }
+
+  function clearImport() {
+    importDraft = null;
+    importFromClipboard = false;
+    pasteText = "";
+    // Don't wipe networkIdDraft — the user might have typed before
+    // we auto-detected. Leave the advanced overrides too so toggling
+    // import on/off isn't a destructive operation.
+  }
+
+  function addSignaling() {
+    signalingDraft = [...signalingDraft, ""];
+  }
+  function removeSignaling(i: number) {
+    signalingDraft = signalingDraft.filter((_, idx) => idx !== i);
+  }
+
+  function addStun() {
+    stunDraft = [...stunDraft, ""];
+  }
+  function removeStun(i: number) {
+    stunDraft = stunDraft.filter((_, idx) => idx !== i);
+  }
+
+  function addTurn() {
+    if (!turnEntry.url.trim()) return;
+    turnDraft = [
+      ...turnDraft,
+      {
+        url: turnEntry.url.trim(),
+        username: turnEntry.username?.trim() || undefined,
+        credential: turnEntry.credential?.trim() || undefined,
+      },
+    ];
+    turnEntry = { url: "", username: "", credential: "" };
+  }
+  function removeTurn(i: number) {
+    turnDraft = turnDraft.filter((_, idx) => idx !== i);
   }
 
   async function save(mode: "save" | "activate") {
@@ -49,13 +213,23 @@
     error = "";
     try {
       const normalized = await normalizeNetworkId(trimmed);
-      await addNetwork(
-        { network_id: normalized },
-        { activate: mode === "activate" },
-      );
+      if (hasOverrides) {
+        await importNetworkSettings(
+          {
+            kind: "myownllm.network-settings",
+            version: 1,
+            network_id: normalized,
+            signaling_servers: signalingDraft.filter((s) => s.trim() !== ""),
+            stun_servers: stunDraft.filter((s) => s.trim() !== ""),
+            turn_servers: turnDraft.filter((t) => t.url.trim() !== ""),
+            accepting: importDraft?.accepting ?? "available",
+          },
+          { activate: mode === "activate" },
+        );
+      } else {
+        await addNetwork({ network_id: normalized }, { activate: mode === "activate" });
+      }
       if (mode === "activate") {
-        // Fire reconcile so the mesh switches to the new active
-        // network without waiting for the user to click around.
         await meshClient.reconcile();
       }
       onClose();
@@ -89,39 +263,216 @@
 <div class="overlay" onclick={onClose} role="presentation"></div>
 <div class="modal" role="dialog" aria-label="Add network">
   <div class="head">
-    <h3>Add network</h3>
+    <h3>Add a network</h3>
     <button class="close" onclick={onClose} aria-label="Close">✕</button>
   </div>
 
   <div class="body" onclick={stopBubble} role="presentation">
-    <p class="hint">
-      Same Network ID on two devices = same mesh. The ID isn't a
-      password — it's a rendezvous handle and the display name. If
-      another device picks the same handle by accident you'll see
-      their join requests; just don't approve them. <strong>Pick
-      something unique</strong> if you don't want to field
-      knocks from strangers — random words, your name + a number,
-      or click Generate for a 52-char hash.
-    </p>
-
+    <!-- Section 1 — Network ID. The lede, not buried.
+         One-line tagline beside the input does the explanation. -->
     <label class="field">
-      <span class="field-label">network id</span>
+      <span class="field-label">Network ID</span>
       <div class="id-row">
         <input
           type="text"
           bind:value={networkIdDraft}
-          placeholder="e.g. home-mesh, dave-laptop-2024, or click Generate"
+          placeholder="home-mesh, dave-laptop-2024, or click Generate"
           maxlength="64"
           disabled={saving}
           spellcheck="false"
           autocomplete="off"
           class="text-input mono"
         />
-        <button class="btn-small" onclick={onGenerate} disabled={saving} title="Generate a random 52-char Network ID — unique by construction, no collision risk">
+        <button
+          class="btn-small"
+          onclick={onGenerate}
+          disabled={saving}
+          title="Generate a random 52-char Network ID — unique by construction, no collision risk"
+        >
           Generate
         </button>
       </div>
+      <p class="tagline">
+        The rendezvous handle two devices use to find each other.
+        <strong>Pick something unique</strong> — anyone typing the same
+        ID lands in the same room, so common words ("home", "family")
+        will field knocks from strangers. Random words + a number, or
+        Generate for a guaranteed-unique 52-char hash.
+      </p>
     </label>
+
+    <!-- Section 2 — Advanced. Signaling / STUN / TURN overrides
+         the user can set BEFORE the network is saved. Collapsed
+         by default; expanding is the cue to switch to the
+         transport-aware save path. -->
+    <button
+      class="disclosure"
+      onclick={() => (advancedExpanded = !advancedExpanded)}
+      aria-expanded={advancedExpanded}
+      disabled={saving}
+    >
+      <span class="disclosure-chevron">{advancedExpanded ? "▾" : "▸"}</span>
+      Advanced — signaling, STUN, TURN
+    </button>
+    {#if advancedExpanded}
+      <div class="advanced">
+        <p class="advanced-hint">
+          Optional. Leave blank to use Trystero's public Nostr relays
+          and Google's STUN pool. Override here when you want a
+          private relay, a custom STUN, or TURN for symmetric-NAT
+          peers (phone hotspot / CGNAT).
+        </p>
+
+        <div class="adv-block">
+          <div class="adv-label">Signaling relays</div>
+          {#each signalingDraft as _, i (i)}
+            <div class="adv-row">
+              <input
+                class="text-input mono"
+                type="text"
+                bind:value={signalingDraft[i]}
+                placeholder="wss://relay.example.com"
+                spellcheck="false"
+                autocomplete="off"
+              />
+              <button class="btn-small ghost" onclick={() => removeSignaling(i)}>Remove</button>
+            </div>
+          {/each}
+          <button class="btn-small" onclick={addSignaling}>+ Add relay</button>
+        </div>
+
+        <div class="adv-block">
+          <div class="adv-label">STUN servers</div>
+          {#each stunDraft as _, i (i)}
+            <div class="adv-row">
+              <input
+                class="text-input mono"
+                type="text"
+                bind:value={stunDraft[i]}
+                placeholder="stun:stun.example.com:3478"
+                spellcheck="false"
+                autocomplete="off"
+              />
+              <button class="btn-small ghost" onclick={() => removeStun(i)}>Remove</button>
+            </div>
+          {/each}
+          <button class="btn-small" onclick={addStun}>+ Add STUN</button>
+        </div>
+
+        <div class="adv-block">
+          <div class="adv-label">TURN servers</div>
+          {#each turnDraft as t, i (i)}
+            <div class="adv-row turn-row">
+              <code class="turn-url">{t.url}</code>
+              {#if t.username}<span class="turn-meta">user: <code>{t.username}</code></span>{/if}
+              <button class="btn-small ghost" onclick={() => removeTurn(i)}>Remove</button>
+            </div>
+          {/each}
+          <div class="turn-draft">
+            <input
+              class="text-input mono"
+              type="text"
+              bind:value={turnEntry.url}
+              placeholder="turn:turn.example.com:3478"
+              spellcheck="false"
+              autocomplete="off"
+            />
+            <input
+              class="text-input narrow"
+              type="text"
+              bind:value={turnEntry.username}
+              placeholder="username (optional)"
+              autocomplete="off"
+            />
+            <input
+              class="text-input narrow"
+              type="password"
+              bind:value={turnEntry.credential}
+              placeholder="credential (optional)"
+              autocomplete="new-password"
+            />
+            <button class="btn-small" onclick={addTurn} disabled={!turnEntry.url.trim()}>Add</button>
+          </div>
+        </div>
+      </div>
+    {/if}
+
+    <!-- Section 3 — Import. Pick a JSON file, paste JSON, or
+         accept the clipboard auto-detect. Once a blob is adopted
+         we show its parsed contents inline so the user knows
+         what they're about to apply. -->
+    <button
+      class="disclosure"
+      onclick={() => (importExpanded = !importExpanded)}
+      aria-expanded={importExpanded}
+      disabled={saving}
+    >
+      <span class="disclosure-chevron">{importExpanded ? "▾" : "▸"}</span>
+      Import from JSON
+      {#if importDraft}<span class="import-pill">applied</span>{/if}
+    </button>
+    {#if importExpanded}
+      <div class="advanced">
+        {#if importDraft}
+          <div class="import-card" class:from-clipboard={importFromClipboard}>
+            {#if importFromClipboard}
+              <div class="import-card-head">
+                Detected MyOwnLLM network settings on your clipboard
+              </div>
+            {:else}
+              <div class="import-card-head">Imported network settings</div>
+            {/if}
+            <dl class="import-summary">
+              <dt>network_id</dt>
+              <dd><code>{importDraft.network_id}</code></dd>
+              <dt>signaling</dt>
+              <dd>
+                {importDraft.signaling_servers.length === 0
+                  ? "(default pool)"
+                  : importDraft.signaling_servers.join(", ")}
+              </dd>
+              <dt>STUN</dt>
+              <dd>{importDraft.stun_servers.join(", ") || "(none)"}</dd>
+              <dt>TURN</dt>
+              <dd>
+                {importDraft.turn_servers.length === 0
+                  ? "(none)"
+                  : importDraft.turn_servers.map((t) => t.url).join(", ")}
+              </dd>
+            </dl>
+            <button class="btn-small ghost" onclick={clearImport}>Discard import</button>
+          </div>
+        {:else}
+          <p class="advanced-hint">
+            Paste a JSON envelope or pick a <code>.json</code> file. The
+            envelope must carry <code>"kind": "myownllm.network-settings"</code>
+            so we don't try to import an unrelated blob by accident.
+          </p>
+          <div class="import-actions">
+            <button class="btn-small" onclick={() => fileInput?.click()}>
+              Choose file…
+            </button>
+            <input
+              bind:this={fileInput}
+              type="file"
+              accept=".json,application/json"
+              style="display:none"
+              onchange={onFilePicked}
+            />
+          </div>
+          <textarea
+            class="paste-area"
+            bind:value={pasteText}
+            placeholder={`{\n  "kind": "myownllm.network-settings",\n  "version": 1,\n  "network_id": "home-mesh",\n  ...\n}`}
+            spellcheck="false"
+            rows="4"
+          ></textarea>
+          <button class="btn-small" disabled={!pasteText.trim()} onclick={onPasteApply}>
+            Apply pasted JSON
+          </button>
+        {/if}
+      </div>
+    {/if}
 
     {#if error}
       <div class="error">{error}</div>
@@ -130,10 +481,20 @@
 
   <div class="actions">
     <button class="cancel" onclick={onClose} disabled={saving}>Cancel</button>
-    <button class="ghost" onclick={() => save("save")} disabled={saving} title="Save to your list without joining yet">
-      Save
+    <button
+      class="ghost"
+      onclick={() => save("save")}
+      disabled={saving}
+      title="Save to your list without joining yet"
+    >
+      {hasOverrides ? "Save with overrides" : "Save"}
     </button>
-    <button class="primary" onclick={() => save("activate")} disabled={saving} title="Save and start joining immediately (⌘/Ctrl + Enter)">
+    <button
+      class="primary"
+      onclick={() => save("activate")}
+      disabled={saving}
+      title="Save and start joining immediately (⌘/Ctrl + Enter)"
+    >
       Save & activate
     </button>
   </div>
@@ -151,7 +512,8 @@
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
-    width: min(480px, 92vw);
+    width: min(560px, 94vw);
+    max-height: 90vh;
     background: #161616;
     border: 1px solid #2a2a2a;
     border-radius: 10px;
@@ -177,23 +539,24 @@
   }
   .close:hover { color: #ccc; }
 
-  .body { padding: 0.3rem 1.1rem 0.85rem 1.1rem; display: flex; flex-direction: column; gap: 0.65rem; }
-  .hint {
-    font-size: 0.75rem;
-    color: #888;
-    line-height: 1.55;
-    margin: 0;
+  .body {
+    padding: 0.3rem 1.1rem 0.85rem 1.1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+    overflow-y: auto;
+    min-height: 0;
   }
   .field {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
+    gap: 0.3rem;
   }
   .field-label {
     font-size: 0.62rem;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    color: #666;
+    color: #888;
   }
   .text-input {
     background: #0d0d0d;
@@ -205,12 +568,21 @@
     border-radius: 5px;
     min-width: 0;
   }
-  .text-input.mono { font-family: monospace; }
+  .text-input.mono { font-family: monospace; font-size: 0.8rem; }
+  .text-input.narrow { flex: 0 0 11rem; font-size: 0.8rem; }
   .text-input:focus { outline: none; border-color: #3a3a55; }
   .text-input:disabled { color: #888; background: #0d0d0d; border-color: #1c1c1c; }
 
   .id-row { display: flex; align-items: center; gap: 0.4rem; }
   .id-row .text-input { flex: 1; }
+
+  .tagline {
+    font-size: 0.74rem;
+    color: #888;
+    line-height: 1.55;
+    margin: 0;
+  }
+  .tagline strong { color: #c8c8e8; font-weight: 500; }
 
   .btn-small {
     background: #1a1a2a;
@@ -221,9 +593,173 @@
     font-size: 0.76rem;
     cursor: pointer;
     flex-shrink: 0;
+    align-self: flex-start;
   }
   .btn-small:hover:not(:disabled) { background: #22223a; }
   .btn-small:disabled { opacity: 0.4; cursor: default; }
+  .btn-small.ghost {
+    background: none;
+    border: 1px solid #222;
+    color: #888;
+  }
+  .btn-small.ghost:hover { background: #1c1c1c; color: #ccc; }
+
+  .disclosure {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    background: none;
+    border: none;
+    color: #aaa;
+    font-size: 0.78rem;
+    cursor: pointer;
+    padding: 0.35rem 0.1rem;
+    align-self: flex-start;
+  }
+  .disclosure:hover { color: #ddd; }
+  .disclosure:disabled { color: #555; cursor: default; }
+  .disclosure-chevron {
+    font-size: 0.7rem;
+    width: 0.8rem;
+    display: inline-block;
+    text-align: center;
+  }
+  .import-pill {
+    margin-left: 0.4rem;
+    padding: 0.05rem 0.45rem;
+    font-size: 0.65rem;
+    background: #1a2a1a;
+    border: 1px solid #2a4a2a;
+    border-radius: 999px;
+    color: #9fdc9f;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .advanced {
+    border-left: 2px solid #2a2a3a;
+    padding: 0.2rem 0 0.4rem 0.85rem;
+    margin-left: 0.3rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.65rem;
+  }
+  .advanced-hint {
+    margin: 0;
+    color: #777;
+    font-size: 0.74rem;
+    line-height: 1.55;
+  }
+  .advanced-hint code {
+    font-family: monospace;
+    font-size: 0.72rem;
+    background: #1a1a22;
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+    color: #b9b9ee;
+  }
+
+  .adv-block {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .adv-label {
+    font-size: 0.7rem;
+    color: #aaa;
+    letter-spacing: 0.03em;
+  }
+  .adv-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .adv-row .text-input { flex: 1; }
+  .turn-row {
+    background: #0e0e12;
+    border: 1px solid #1e1e1e;
+    border-radius: 5px;
+    padding: 0.35rem 0.5rem;
+  }
+  .turn-url {
+    font-family: monospace;
+    font-size: 0.78rem;
+    color: #cfeacf;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .turn-meta {
+    font-size: 0.7rem;
+    color: #888;
+  }
+  .turn-draft {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+  }
+  .turn-draft .text-input.mono { flex: 1; min-width: 9rem; }
+
+  .import-actions {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+  }
+  .paste-area {
+    background: #0d0d0d;
+    border: 1px solid #222;
+    color: #e8e8e8;
+    font-family: monospace;
+    font-size: 0.78rem;
+    padding: 0.45rem 0.6rem;
+    border-radius: 5px;
+    resize: vertical;
+    min-height: 5rem;
+  }
+  .paste-area:focus { outline: none; border-color: #3a3a55; }
+  .import-card {
+    background: #0e0e12;
+    border: 1px solid #1e1e2a;
+    border-radius: 7px;
+    padding: 0.55rem 0.7rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+  .import-card.from-clipboard { border-color: #2a4a2a; background: #0e120e; }
+  .import-card-head {
+    font-size: 0.75rem;
+    color: #c0c0c0;
+    font-weight: 500;
+  }
+  .import-summary {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    column-gap: 0.7rem;
+    row-gap: 0.15rem;
+    margin: 0;
+    font-size: 0.74rem;
+    color: #aaa;
+  }
+  .import-summary dt {
+    color: #777;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    font-size: 0.62rem;
+    align-self: center;
+  }
+  .import-summary dd { margin: 0; color: #cfcfd9; word-break: break-all; }
+  .import-summary dd code {
+    font-family: monospace;
+    font-size: 0.74rem;
+    color: #cfeacf;
+    background: #1a1a1a;
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+  }
 
   .error {
     color: #f88;

@@ -5,10 +5,14 @@
   import type { Mode, NetworkConfig } from "../types";
   import { meshClient } from "../mesh-client.svelte";
   import {
+    exportNetworkSettings,
     loadConfig,
     removeNetwork,
     setActiveNetwork,
+    tryParseNetworkSettings,
+    type NetworkSettingsExport,
   } from "../config";
+  import AddNetworkModal from "./settings/AddNetworkModal.svelte";
   import { settingsRoute } from "./settings-route.svelte";
   import type { CatalogEntry } from "../mesh-protocol";
   import { FEATURES, peerSupportsFeature } from "../mesh-protocol";
@@ -119,14 +123,24 @@
   let activeNetworkId = $state<string | null>(null);
   let networksCollapsed = $state<Set<string>>(new Set());
   /** Network the user is about to forget. Confirmation modal mounts
-   *  at the bottom of the file. Adding networks is delegated to
-   *  Settings → Networks → Status (sidebar gear icon opens it),
-   *  so there's no Add modal in the sidebar itself. */
+   *  at the bottom of the file. */
   let forgetModal = $state<NetworkConfig | null>(null);
   /** Sidebar-internal pull-in-flight toast for network-context
    *  actions (Forget). Separate from the conversation-level toasts
    *  above so the wording can be different. */
   let networkActionError = $state<string>("");
+  /** Transient toast for export/copy actions — "Copied to clipboard",
+   *  "Exported to <filename>", etc. */
+  let networkInfoToast = $state<string>("");
+  /** Mounted when the user picks "Add network…" or "Import settings…"
+   *  from the Networks header context menu. The optional preloaded
+   *  blob arrives via `initialImport` when the user paths through
+   *  the import flow. */
+  let addModalState = $state<{ initialImport: NetworkSettingsExport | null } | null>(null);
+  /** Hidden file picker used by the Networks-header context menu's
+   *  Import option. Distinct from the per-peer file picker further
+   *  down (which ships bytes to a peer, not into the import path). */
+  let networkImportInput = $state<HTMLInputElement | null>(null);
 
   async function reloadNetworks() {
     try {
@@ -176,6 +190,88 @@
       if (wasActive) meshClient.reconcile().catch(() => {});
     } catch (e) {
       networkActionError = String(e);
+    }
+  }
+
+  function flashInfoToast(msg: string) {
+    networkInfoToast = msg;
+    // Auto-clear after a short hold — these are confirmations, not
+    // errors, so the user doesn't need to dismiss them.
+    setTimeout(() => {
+      if (networkInfoToast === msg) networkInfoToast = "";
+    }, 2400);
+  }
+
+  async function copyNetworkSettings(net: NetworkConfig) {
+    closeMenu();
+    const blob = exportNetworkSettings(net);
+    const text = JSON.stringify(blob, null, 2);
+    try {
+      await navigator.clipboard.writeText(text);
+      flashInfoToast(`Copied "${net.network_id}" settings to clipboard`);
+    } catch (e) {
+      networkActionError = `Couldn't copy: ${String(e)}`;
+    }
+  }
+
+  async function downloadNetworkSettings(net: NetworkConfig) {
+    closeMenu();
+    const blob = exportNetworkSettings(net);
+    const text = JSON.stringify(blob, null, 2);
+    try {
+      const file = new Blob([text], { type: "application/json" });
+      const url = URL.createObjectURL(file);
+      const a = document.createElement("a");
+      a.href = url;
+      // Filenames are kept simple — the user can rename on save.
+      a.download = `${net.network_id}.network.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      flashInfoToast(`Exported "${net.network_id}.network.json"`);
+    } catch (e) {
+      networkActionError = `Couldn't export: ${String(e)}`;
+    }
+  }
+
+  function openImportFromClipboard() {
+    closeMenu();
+    // Open the AddNetwork modal with no preloaded blob — the modal
+    // runs its own clipboard auto-detect on mount, which is exactly
+    // what the user wants here ("import what I just copied").
+    addModalState = { initialImport: null };
+  }
+
+  function openAddNetworkModal() {
+    closeMenu();
+    addModalState = { initialImport: null };
+  }
+
+  function openImportFromFile() {
+    closeMenu();
+    if (networkImportInput) {
+      networkImportInput.value = "";
+      networkImportInput.click();
+    }
+  }
+
+  async function onNetworkImportFileChosen(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files && input.files.length > 0 ? input.files[0] : null;
+    input.value = "";
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = tryParseNetworkSettings(text);
+      if (!parsed) {
+        networkActionError =
+          "File doesn't contain a MyOwnLLM network-settings blob.";
+        return;
+      }
+      addModalState = { initialImport: parsed };
+    } catch (err) {
+      networkActionError = `Couldn't read file: ${String(err)}`;
     }
   }
 
@@ -492,8 +588,13 @@
         status: "active" | "shelved" | "offline" | "reconnecting";
       }
     /** A saved-network row in the sidebar's Network section. Menu
-     *  exposes switch / forget / settings. */
-    | { kind: "saved-network"; network: NetworkConfig };
+     *  exposes switch / forget / settings / export. */
+    | { kind: "saved-network"; network: NetworkConfig }
+    /** The Networks-section header (the separator above the saved
+     *  network list). Right-click here pops Add / Import options
+     *  that aren't scoped to a specific network — the user wanted
+     *  these next to the section divider, not buried in Settings. */
+    | { kind: "networks-header" };
   let menu = $state<{ target: MenuTarget; x: number; y: number } | null>(null);
   let editingId = $state<string | null>(null);
   let editingFolder = $state<string | null>(null);
@@ -574,8 +675,15 @@
   function openSavedNetworkMenu(e: MouseEvent | KeyboardEvent, network: NetworkConfig) {
     e.preventDefault();
     e.stopPropagation();
-    const { x, y } = menuAnchor(e, 200, 160);
+    const { x, y } = menuAnchor(e, 220, 220);
     menu = { target: { kind: "saved-network", network }, x, y };
+  }
+
+  function openNetworksHeaderMenu(e: MouseEvent | KeyboardEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    const { x, y } = menuAnchor(e, 220, 200);
+    menu = { target: { kind: "networks-header" }, x, y };
   }
 
   /** Compute a viewport-pinned anchor for the context menu. Mouse
@@ -1162,9 +1270,27 @@
            - Inactive saved networks: collapsed, click the header
              (or right-click → Switch to this network) to switch.
          Right-click on a network header → switch / settings /
-         forget menu. -->
-    <div class="network-divider" aria-hidden="true"></div>
-    <div class="network-section-head">
+         export / forget menu.
+         Right-click on the Networks separator → Add / Import. -->
+    <div
+      class="network-divider"
+      role="separator"
+      tabindex="-1"
+      oncontextmenu={openNetworksHeaderMenu}
+      aria-label="Networks section — right-click for add / import options"
+    ></div>
+    <div
+      class="network-section-head"
+      role="button"
+      tabindex="0"
+      oncontextmenu={openNetworksHeaderMenu}
+      onkeydown={(e) => {
+        if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+          openNetworksHeaderMenu(e);
+        }
+      }}
+      title="Right-click to add a network, import settings, or paste from clipboard"
+    >
       <span class="group-label network-label">Networks</span>
       <button
         class="network-settings-btn"
@@ -1686,7 +1812,7 @@
           Forget cached view
         </button>
       {/if}
-    {:else}
+    {:else if menu.target.kind === "saved-network"}
       {@const target = menu.target}
       {@const isActive = target.network.id === activeNetworkId}
       <div class="menu-section-label">{target.network.network_id}</div>
@@ -1699,6 +1825,20 @@
         Settings
       </button>
       <div class="menu-divider"></div>
+      <div class="menu-section-label">Export settings</div>
+      <button
+        onclick={() => copyNetworkSettings(target.network)}
+        title="Copy this network's signaling / STUN / TURN config as JSON to your clipboard"
+      >
+        Copy as JSON
+      </button>
+      <button
+        onclick={() => downloadNetworkSettings(target.network)}
+        title="Save this network's settings to a .json file you can hand to another device"
+      >
+        Save .json file…
+      </button>
+      <div class="menu-divider"></div>
       <button
         class="danger"
         onclick={() => {
@@ -1708,6 +1848,32 @@
         title="Remove from saved list and delete this network's roster"
       >
         Forget
+      </button>
+    {:else}
+      <!-- networks-header: the actions that aren't scoped to a
+           specific saved network (Add / Import). Surfaced on
+           right-click of the Networks separator or section
+           header. -->
+      <div class="menu-section-label">Networks</div>
+      <button
+        onclick={openAddNetworkModal}
+        title="Open the Add network modal (with optional advanced + import)"
+      >
+        Add network…
+      </button>
+      <div class="menu-divider"></div>
+      <div class="menu-section-label">Import settings</div>
+      <button
+        onclick={openImportFromFile}
+        title="Pick a .json file exported from another device"
+      >
+        From .json file…
+      </button>
+      <button
+        onclick={openImportFromClipboard}
+        title="Open the Add network modal — it auto-detects network settings on your clipboard"
+      >
+        From clipboard
       </button>
     {/if}
   </div>
@@ -1756,6 +1922,40 @@
   style="display:none"
   onchange={onFileChosen}
 />
+
+<!-- Separate hidden picker for network-settings JSON imports
+     opened from the Networks-section context menu. Distinct from
+     the peer file-send input above so the change handlers don't
+     race or share state. -->
+<input
+  bind:this={networkImportInput}
+  type="file"
+  accept=".json,application/json"
+  style="display:none"
+  onchange={onNetworkImportFileChosen}
+/>
+
+{#if addModalState}
+  <AddNetworkModal
+    initialImport={addModalState.initialImport}
+    onClose={async () => {
+      addModalState = null;
+      await reloadNetworks();
+    }}
+  />
+{/if}
+
+{#if networkInfoToast}
+  <div class="move-toast info" role="status" aria-live="polite">
+    {networkInfoToast}
+  </div>
+{/if}
+{#if networkActionError}
+  <div class="move-toast error" role="alert">
+    {networkActionError}
+    <button onclick={() => (networkActionError = "")} class="dismiss">✕</button>
+  </div>
+{/if}
 
 {#if fileSendError}
   <div class="move-toast error" role="alert">
@@ -2002,6 +2202,22 @@
     margin: .55rem .45rem .15rem .45rem;
     height: 1px;
     background: #181818;
+    /* The divider is also the right-click hit target for the
+       Networks-section context menu (Add / Import). Pad the
+       hit-box vertically so it's easy to land without making
+       the visual line any thicker. */
+    position: relative;
+  }
+  .network-divider::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: -4px;
+    bottom: -4px;
+  }
+  .network-section-head[role="button"] {
+    cursor: context-menu;
   }
   /* Network-section header: label on the left, "+ Add" button on
      the right. Always visible — even with zero saved networks the
@@ -2472,6 +2688,11 @@
     background: #2a1a1a;
     border-color: #5a2a2a;
     color: #f88;
+  }
+  .move-toast.info {
+    background: #1a2a1a;
+    border-color: #2a4a2a;
+    color: #aeeaae;
   }
   .move-toast .dismiss {
     background: none;

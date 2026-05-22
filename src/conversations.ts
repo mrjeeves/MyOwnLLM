@@ -53,6 +53,12 @@ export interface StoredMessage {
    *  long the model is taking. Optional — absent on legacy messages
    *  and on non-assistant rows. */
   duration_ms?: number;
+  /** Base64-encoded image attachments uploaded by the user via the
+   *  chat input's + button. Wired through Ollama's `images: [...]` field
+   *  on user messages so vision-capable models see them inline. Stored
+   *  verbatim so reloading a conversation paints the same attachments
+   *  back in the user bubble. Absent on text-only messages. */
+  images?: string[];
 }
 
 /** One unit of transcribed speech. Mirrors `transcribe::EmittedSegment`
