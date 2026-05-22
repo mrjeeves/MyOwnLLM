@@ -1,7 +1,16 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { activeNetwork, loadConfig, updateNetwork } from "../../config";
+  import {
+    activeNetwork,
+    exportNetworkSettings,
+    importNetworkSettings,
+    loadConfig,
+    tryParseNetworkSettings,
+    updateNetwork,
+    type NetworkSettingsExport,
+  } from "../../config";
   import { meshClient } from "../../mesh-client.svelte";
+  import { normalizeNetworkId } from "../../mesh";
   import type { NetworkConfig, TurnServer } from "../../types";
 
   /** All saved networks + which one is currently active. The
@@ -155,6 +164,109 @@
       editingId !== null &&
       editingId === activeNetworkId,
   );
+
+  /** Transient confirmation banner after Copy / Save .json / Import.
+   *  Auto-clears so the user doesn't have to dismiss. */
+  let infoToast = $state<string>("");
+  let importInput = $state<HTMLInputElement | null>(null);
+
+  function flashInfo(msg: string) {
+    infoToast = msg;
+    setTimeout(() => {
+      if (infoToast === msg) infoToast = "";
+    }, 2400);
+  }
+
+  async function copyEditingSettings() {
+    if (!editing) return;
+    const blob = exportNetworkSettings(editing);
+    const text = JSON.stringify(blob, null, 2);
+    try {
+      await navigator.clipboard.writeText(text);
+      flashInfo(`Copied "${editing.network_id}" settings to clipboard`);
+    } catch (e) {
+      error = `Couldn't copy: ${String(e)}`;
+    }
+  }
+
+  function downloadEditingSettings() {
+    if (!editing) return;
+    const blob = exportNetworkSettings(editing);
+    const text = JSON.stringify(blob, null, 2);
+    const file = new Blob([text], { type: "application/json" });
+    const url = URL.createObjectURL(file);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${editing.network_id}.network.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    flashInfo(`Exported "${editing.network_id}.network.json"`);
+  }
+
+  function openImportPicker() {
+    if (importInput) {
+      importInput.value = "";
+      importInput.click();
+    }
+  }
+
+  async function pasteImport() {
+    error = "";
+    if (!navigator.clipboard?.readText) {
+      error = "Clipboard read not supported in this browser.";
+      return;
+    }
+    try {
+      const raw = await navigator.clipboard.readText();
+      const parsed = tryParseNetworkSettings(raw);
+      if (!parsed) {
+        error =
+          "Clipboard doesn't contain a MyOwnLLM network-settings blob. Copy a network's settings first, or use 'From .json file…' to pick a file.";
+        return;
+      }
+      await applyImport(parsed);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function onImportFileChosen(e: Event) {
+    const inp = e.currentTarget as HTMLInputElement;
+    const file = inp.files && inp.files.length > 0 ? inp.files[0] : null;
+    inp.value = "";
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = tryParseNetworkSettings(text);
+      if (!parsed) {
+        error =
+          "File doesn't contain a MyOwnLLM network-settings blob (missing 'kind' marker).";
+        return;
+      }
+      await applyImport(parsed);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function applyImport(blob: NetworkSettingsExport) {
+    // Re-normalize the network_id so a hand-edited blob gets coerced
+    // into the canonical form before lookup / save.
+    const normalized = await normalizeNetworkId(blob.network_id);
+    const result = await importNetworkSettings({ ...blob, network_id: normalized });
+    if (result.network.id === activeNetworkId) {
+      meshClient.reconcile().catch(() => {});
+    }
+    await reload();
+    selectEditing(result.network.id);
+    flashInfo(
+      result.created
+        ? `Imported new network "${result.network.network_id}"`
+        : `Updated settings on "${result.network.network_id}"`,
+    );
+  }
 </script>
 
 <div class="root">
@@ -167,29 +279,106 @@
       Status tab first; its address config lives here.
     </div>
   {:else}
-    <!-- Picker so the user can edit a non-active network's
-         transport without first having to switch to it. Hidden
-         when there's only one network because there's nothing to
-         pick between. -->
-    {#if networks.length > 1}
-      <section class="block">
-        <h3>Editing</h3>
-        <div class="picker-row">
-          <select
-            class="picker"
-            value={editingId}
-            onchange={(e) => selectEditing((e.target as HTMLSelectElement).value)}
-          >
-            {#each networks as net (net.id)}
-              <option value={net.id}>{net.network_id}</option>
-            {/each}
-          </select>
+    <!-- Editing banner. Always rendered (even with one saved
+         network) so the user is never in doubt about which
+         network's transport they're touching. With multiple
+         networks the name turns into a picker so the user can
+         switch the edit target without first switching the live
+         mesh; with a single network we still show the name as a
+         prominent label rather than letting the page header
+         carry that load implicitly. -->
+    {#if editing}
+      <section class="editing-banner" class:is-active={editing.id === activeNetworkId}>
+        <div class="editing-banner-prefix">
+          <span class="editing-banner-eyebrow">Editing network</span>
+          <span class="editing-banner-sub">
+            signaling, STUN, and TURN settings for this network only —
+            other saved networks are untouched.
+          </span>
+        </div>
+        <div class="editing-banner-name-wrap">
+          {#if networks.length > 1}
+            <select
+              class="editing-banner-picker"
+              value={editingId}
+              onchange={(e) => selectEditing((e.target as HTMLSelectElement).value)}
+              aria-label="Pick which network's settings to edit"
+              title="Pick which saved network to edit. Switching here changes the edit target only — the live mesh stays on its current network."
+            >
+              {#each networks as net (net.id)}
+                <option value={net.id}>
+                  {net.network_id}{net.id === activeNetworkId ? " (active)" : ""}
+                </option>
+              {/each}
+            </select>
+          {:else}
+            <span class="editing-banner-name" title={editing.network_id}>
+              {editing.network_id}
+            </span>
+          {/if}
+          {#if editing.id === activeNetworkId}
+            <span class="editing-banner-pill" title="Mesh client is joined to this network. Changes here take effect on the next reconcile.">
+              active
+            </span>
+          {/if}
         </div>
       </section>
     {/if}
 
+    <!-- Portable settings: Copy / Save .json / Import. The whole
+         signaling+STUN+TURN block exports as a single JSON envelope,
+         so onboarding a new device is paste-and-go instead of typing
+         every URL twice. The envelope INCLUDES the network_id — that's
+         what lets two devices land in the same room after import, so
+         we call it out in the hint here. -->
     <section class="block">
-      <h3>Signaling relays</h3>
+      <h3>
+        Portable settings
+        {#if editing}<span class="scope-tag" title="Export/import operate on '{editing.network_id}'. Pick a different network in the banner above to operate on it instead.">for {editing.network_id}</span>{/if}
+      </h3>
+      <div class="block-hint">
+        Export the active edit target's <code>network_id</code> +
+        signaling / STUN / TURN config as a JSON envelope to share to
+        another device, or import an envelope to adopt someone else's
+        setup. The envelope carries the network name itself
+        (<code>network_id</code>) — that's the rendezvous handle two
+        devices use to find each other, so importing the same envelope
+        on a second device lands you in the same mesh without retyping.
+        A <code>"kind": "myownllm.network-settings"</code> marker keeps
+        unrelated JSON pastes from accidentally clobbering your config.
+      </div>
+      <div class="export-row">
+        <button class="btn-small" onclick={copyEditingSettings} disabled={!editing}>
+          Copy as JSON
+        </button>
+        <button class="btn-small" onclick={downloadEditingSettings} disabled={!editing}>
+          Save .json file…
+        </button>
+        <span class="export-spacer"></span>
+        <button class="btn-small ghost" onclick={openImportPicker}>
+          Import from file…
+        </button>
+        <button class="btn-small ghost" onclick={pasteImport}>
+          Paste from clipboard
+        </button>
+        <input
+          bind:this={importInput}
+          type="file"
+          accept=".json,application/json"
+          style="display:none"
+          onchange={onImportFileChosen}
+        />
+      </div>
+      {#if infoToast}
+        <div class="info-toast" role="status" aria-live="polite">{infoToast}</div>
+      {/if}
+    </section>
+
+    <section class="block">
+      <h3>
+        Signaling relays
+        {#if editing}<span class="scope-tag" title="These signaling relays apply to '{editing.network_id}' only.">for {editing.network_id}</span>{/if}
+      </h3>
       <div class="block-hint">
         Networks use <a href="https://trystero.dev" target="_blank" rel="noopener">Trystero</a>
         for peer discovery — currently over Nostr relays. By default
@@ -282,7 +471,10 @@
     </section>
 
     <section class="block">
-      <h3>STUN servers</h3>
+      <h3>
+        STUN servers
+        {#if editing}<span class="scope-tag" title="These STUN servers apply to '{editing.network_id}' only.">for {editing.network_id}</span>{/if}
+      </h3>
       <div class="block-hint">
         Public NAT-traversal helpers. Defaults to Google's public STUN
         pool, which works for the majority of home networks.
@@ -308,7 +500,10 @@
     </section>
 
     <section class="block">
-      <h3>TURN servers</h3>
+      <h3>
+        TURN servers
+        {#if editing}<span class="scope-tag" title="These TURN servers apply to '{editing.network_id}' only.">for {editing.network_id}</span>{/if}
+      </h3>
       <div class="block-hint">
         Relay servers used when direct peer connections can't be
         established. Required for peers behind symmetric NAT (phone
@@ -422,21 +617,95 @@
     line-height: 1.55;
     max-width: 36rem;
   }
-  .picker-row {
+  /* Editing banner. Two-row layout: small uppercase eyebrow + sub
+     hint on the left, big network name on the right. Designed to
+     read at a glance from the top of the page — the user should
+     never have to scan the page chrome to remember which network
+     they're touching. Accent border switches when the edit target
+     is also the live one. */
+  .editing-banner {
     display: flex;
     align-items: center;
-    gap: 0.55rem;
+    gap: 1rem;
+    flex-wrap: wrap;
+    background: linear-gradient(180deg, #161620 0%, #131318 100%);
+    border: 1px solid #2a2a3a;
+    border-left: 3px solid #3a3a55;
+    border-radius: 8px;
+    padding: 0.7rem 0.85rem;
   }
-  .picker {
-    background: #131313;
-    color: #e8e8e8;
-    border: 1px solid #2a2a2a;
-    border-radius: 5px;
-    font-size: 0.8rem;
-    padding: 0.3rem 0.5rem;
+  .editing-banner.is-active {
+    border-left-color: #4a7a4a;
+    background: linear-gradient(180deg, #161e16 0%, #131813 100%);
+  }
+  .editing-banner-prefix {
+    display: flex;
+    flex-direction: column;
+    gap: 0.18rem;
+    min-width: 0;
+    flex: 1;
+  }
+  .editing-banner-eyebrow {
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: #888;
+    font-weight: 600;
+  }
+  .editing-banner.is-active .editing-banner-eyebrow { color: #9fbf9f; }
+  .editing-banner-sub {
+    font-size: 0.72rem;
+    color: #777;
+    line-height: 1.45;
+    max-width: 26rem;
+  }
+  .editing-banner-name-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-shrink: 0;
+  }
+  .editing-banner-name {
+    font-family: monospace;
+    font-size: 1.05rem;
+    color: #ecf0ff;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    max-width: 18rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .editing-banner.is-active .editing-banner-name { color: #cfeacf; }
+  .editing-banner-picker {
+    background: #0d0d12;
+    color: #ecf0ff;
+    border: 1px solid #2a2a3a;
+    border-radius: 6px;
+    font-family: monospace;
+    font-size: 0.95rem;
+    padding: 0.4rem 0.6rem;
     cursor: pointer;
+    max-width: 20rem;
+    /* Wider than the old .picker so the network name reads as the
+       hero, not as a hidden field in a small dropdown. */
   }
-  .picker:focus { outline: none; border-color: #3a3a55; }
+  .editing-banner-picker:focus { outline: none; border-color: #4a5a8a; }
+  .editing-banner.is-active .editing-banner-picker {
+    color: #cfeacf;
+    border-color: #2a4a2a;
+  }
+  .editing-banner-pill {
+    padding: 0.1rem 0.5rem;
+    font-size: 0.62rem;
+    background: #1a2a1a;
+    border: 1px solid #2a4a2a;
+    border-radius: 999px;
+    color: #9fdc9f;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-weight: 600;
+  }
 
   .block { display: flex; flex-direction: column; gap: 0.55rem; }
   .block h3 {
@@ -446,11 +715,59 @@
     letter-spacing: 0.06em;
     color: #888;
     margin: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  /* "for <network_id>" pill on each section heading. Repeats the
+     editing context next to each control group so the user can
+     confirm scope without scrolling back to the banner. Lower
+     contrast than the heading itself so it reads as metadata. */
+  .scope-tag {
+    font-family: monospace;
+    font-size: 0.65rem;
+    color: #777;
+    background: #16161e;
+    border: 1px solid #1e1e2a;
+    padding: 0.05rem 0.4rem;
+    border-radius: 4px;
+    letter-spacing: 0;
+    text-transform: none;
+    font-weight: 400;
+    max-width: 14rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .block-hint {
     font-size: 0.73rem;
     color: #666;
     line-height: 1.5;
+    max-width: 36rem;
+  }
+  .block-hint code {
+    font-family: monospace;
+    font-size: 0.72rem;
+    background: #1a1a22;
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+    color: #b9b9ee;
+  }
+  .export-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+  .export-spacer { flex: 1; min-width: 0.5rem; }
+  .info-toast {
+    color: #aeeaae;
+    font-size: 0.72rem;
+    background: #1a2a1a;
+    border: 1px solid #2a4a2a;
+    border-radius: 5px;
+    padding: 0.3rem 0.55rem;
     max-width: 36rem;
   }
 

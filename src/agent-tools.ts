@@ -17,15 +17,21 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
   addNetwork,
+  exportNetworkSettings,
+  importNetworkSettings,
+  isNetworkSettingsExport,
   loadConfig,
   removeNetwork,
   setActiveNetwork,
+  tryParseNetworkSettings,
   updateNetwork,
   activeNetwork,
+  type NetworkSettingsExport,
 } from "./config";
 import { generateNetworkId, getMeshIdentity, normalizeNetworkId } from "./mesh";
 import { meshClient } from "./mesh-client.svelte";
 import { agentPermissions } from "./agent-permissions.svelte";
+import type { TurnServer } from "./types";
 
 /** Mirror of `agent_io::AgentHostInfo` in the Rust side. Fetched
  *  once per chat send so the system prompt + the shell tool's
@@ -99,7 +105,12 @@ type NetworksAction =
   | "reconnect_peer"
   | "force_rediscovery"
   | "set_accepting"
-  | "recent_activity";
+  | "recent_activity"
+  | "export_settings"
+  | "import_settings"
+  | "set_signaling_servers"
+  | "set_stun_servers"
+  | "set_turn_servers";
 
 const NETWORKS_ACTIONS: NetworksAction[] = [
   "status",
@@ -116,6 +127,11 @@ const NETWORKS_ACTIONS: NetworksAction[] = [
   "force_rediscovery",
   "set_accepting",
   "recent_activity",
+  "export_settings",
+  "import_settings",
+  "set_signaling_servers",
+  "set_stun_servers",
+  "set_turn_servers",
 ];
 
 function asString(args: Record<string, unknown>, key: string): string {
@@ -141,6 +157,95 @@ function asBool(args: Record<string, unknown>, key: string, dflt: boolean): bool
     if (v === "false") return false;
   }
   return dflt;
+}
+
+/** Read a string[] argument, accepting either a JSON-array string or a
+ *  native array. Tolerant of stray empty entries — those are stripped
+ *  before returning. Throws on the wrong shape so the model surfaces
+ *  the error rather than silently dropping its input. */
+function asStringArray(args: Record<string, unknown>, key: string): string[] {
+  const v = args[key];
+  if (Array.isArray(v)) {
+    return v.filter((s): s is string => typeof s === "string" && s.trim() !== "")
+      .map((s) => s.trim());
+  }
+  if (typeof v === "string") {
+    const trimmed = v.trim();
+    if (trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          return parsed
+            .filter((s): s is string => typeof s === "string" && s.trim() !== "")
+            .map((s) => s.trim());
+        }
+      } catch {
+        // Fall through to single-string handling.
+      }
+    }
+    if (trimmed === "") return [];
+    return [trimmed];
+  }
+  throw new Error(`expected an array of strings for '${key}'`);
+}
+
+/** Coerce a value into a TurnServer[]. Accepts arrays of objects or a
+ *  JSON-string version of the same. Each entry needs at least a `url`;
+ *  empty entries get dropped. */
+function asTurnArray(args: Record<string, unknown>, key: string): TurnServer[] {
+  let raw: unknown = args[key];
+  if (typeof raw === "string") {
+    try {
+      raw = JSON.parse(raw);
+    } catch {
+      throw new Error(`'${key}' must be a JSON array of {url, username?, credential?}`);
+    }
+  }
+  if (!Array.isArray(raw)) {
+    throw new Error(`'${key}' must be an array`);
+  }
+  return raw
+    .filter(
+      (t): t is { url: string; username?: string; credential?: string } =>
+        !!t && typeof t === "object" && typeof (t as { url?: unknown }).url === "string",
+    )
+    .map((t) => ({
+      url: t.url,
+      ...(typeof t.username === "string" && t.username ? { username: t.username } : {}),
+      ...(typeof t.credential === "string" && t.credential
+        ? { credential: t.credential }
+        : {}),
+    }));
+}
+
+/** Resolve a target network for the multi-network mutating actions.
+ *  Accepts `id` (stable internal id), `network_id` (user-facing
+ *  handle), or neither (defaults to the currently-active network).
+ *  Throws when nothing matches so the model can recover. */
+async function resolveNetwork(args: Record<string, unknown>) {
+  const cfg = await loadConfig();
+  const idArg = optionalString(args, "id");
+  const networkIdArg = optionalString(args, "network_id");
+  if (idArg) {
+    const net = cfg.cloud_mesh.networks.find((n) => n.id === idArg);
+    if (!net) throw new Error(`no saved network with id='${idArg}' — call list_networks`);
+    return net;
+  }
+  if (networkIdArg) {
+    const normalized = await normalizeNetworkId(networkIdArg);
+    const net = cfg.cloud_mesh.networks.find((n) => n.network_id === normalized);
+    if (!net) {
+      throw new Error(`no saved network with network_id='${networkIdArg}' — call list_networks`);
+    }
+    return net;
+  }
+  const active = activeNetwork(cfg);
+  if (!active) {
+    throw new Error(
+      "no target network given and no active network — pass 'id' or 'network_id' explicitly, or add+switch first",
+    );
+  }
+  return active;
 }
 
 /** Resolve a peer either by `peer_id` (Trystero session id) or by
@@ -334,6 +439,97 @@ async function runNetworksAction(
         message: e.msg,
       }));
     }
+    case "export_settings": {
+      // Return the same envelope shape the UI's Copy / Save .json
+      // actions produce — including the kind/version markers so the
+      // model can hand the blob back to import_settings on another
+      // device verbatim.
+      const net = await resolveNetwork(args);
+      return exportNetworkSettings(net);
+    }
+    case "import_settings": {
+      // Accepts either a parsed `settings` object or a `json` string
+      // (the user may have pasted raw JSON into chat for the model
+      // to apply). The model is encouraged to use the parsed form,
+      // but the string fallback keeps a "copy this blob and ask
+      // your AI to set it up" flow working without a tool-call
+      // schema round-trip.
+      let blob: NetworkSettingsExport | null = null;
+      const direct = args.settings;
+      if (direct && typeof direct === "object" && isNetworkSettingsExport(direct)) {
+        blob = direct;
+      } else if (typeof args.json === "string") {
+        blob = tryParseNetworkSettings(args.json);
+      } else if (typeof direct === "string") {
+        // Some models stringify their object args; try parsing
+        // before giving up.
+        blob = tryParseNetworkSettings(direct);
+      }
+      if (!blob) {
+        throw new Error(
+          "couldn't read network settings — pass either a parsed object as 'settings' " +
+            "or a JSON string as 'json', containing 'kind: \"myownllm.network-settings\"'",
+        );
+      }
+      // The model can request a different network_id than what's in
+      // the blob (useful when adopting someone else's blob onto a
+      // fresh handle). Override only when explicitly given.
+      const override = optionalString(args, "network_id");
+      if (override) {
+        blob = { ...blob, network_id: await normalizeNetworkId(override) };
+      } else {
+        blob = { ...blob, network_id: await normalizeNetworkId(blob.network_id) };
+      }
+      const activate = asBool(args, "activate", false);
+      const result = await importNetworkSettings(blob, { activate });
+      if (activate) await meshClient.reconcile();
+      return {
+        imported: true,
+        created: result.created,
+        activated: activate,
+        network_id: result.network.network_id,
+        id: result.network.id,
+      };
+    }
+    case "set_signaling_servers": {
+      const net = await resolveNetwork(args);
+      const list = asStringArray(args, "servers");
+      const cfg = await updateNetwork(net.id, { signaling_servers: list });
+      if (cfg.cloud_mesh.active_network_id === net.id) {
+        await meshClient.reconcile();
+      }
+      return {
+        network_id: net.network_id,
+        signaling_servers: list,
+      };
+    }
+    case "set_stun_servers": {
+      const net = await resolveNetwork(args);
+      const list = asStringArray(args, "servers");
+      const cfg = await updateNetwork(net.id, { stun_servers: list });
+      if (cfg.cloud_mesh.active_network_id === net.id) {
+        await meshClient.reconcile();
+      }
+      return {
+        network_id: net.network_id,
+        stun_servers: list,
+      };
+    }
+    case "set_turn_servers": {
+      const net = await resolveNetwork(args);
+      const list = asTurnArray(args, "servers");
+      const cfg = await updateNetwork(net.id, { turn_servers: list });
+      if (cfg.cloud_mesh.active_network_id === net.id) {
+        await meshClient.reconcile();
+      }
+      return {
+        network_id: net.network_id,
+        turn_servers: list.map((t) => ({
+          url: t.url,
+          ...(t.username ? { username: t.username } : {}),
+        })),
+      };
+    }
   }
 }
 
@@ -371,7 +567,10 @@ export const NETWORKS_TOOL: Tool = {
               "'reconnect_peer' nudges a specific peer (args: peer_id OR pubkey). " +
               "'force_rediscovery' leaves and rejoins the mesh room (heavy; use when peers should be visible but aren't). " +
               "'set_accepting' updates this device's accepting policy (args: policy='available'|'limited'|'busy'). " +
-              "'recent_activity' returns the last N diagnostic log entries (args: limit, default 25).",
+              "'recent_activity' returns the last N diagnostic log entries (args: limit, default 25). " +
+              "'export_settings' returns this network's portable JSON envelope for sharing (args: id OR network_id; defaults to active). " +
+              "'import_settings' applies a portable JSON envelope, creating or updating the matching network (args: settings=parsed object OR json=string; optional activate, network_id override). " +
+              "'set_signaling_servers' / 'set_stun_servers' / 'set_turn_servers' replace the respective list on a network (args: id OR network_id, servers=array). For TURN, each entry is {url, username?, credential?}.",
           },
           network_id: {
             type: "string",
@@ -405,6 +604,25 @@ export const NETWORKS_TOOL: Tool = {
           limit: {
             type: "integer",
             description: "For recent_activity: max entries to return (1-80). Defaults 25.",
+          },
+          settings: {
+            type: "object",
+            description:
+              "For import_settings: parsed network-settings envelope. Must carry " +
+              "'kind: \"myownllm.network-settings\"'. Alternative to passing 'json'.",
+          },
+          json: {
+            type: "string",
+            description:
+              "For import_settings: raw JSON string of the network-settings envelope " +
+              "(useful when the user pasted JSON into chat). The handler parses and validates.",
+          },
+          servers: {
+            type: "array",
+            description:
+              "For set_signaling_servers / set_stun_servers: array of URL strings. " +
+              "For set_turn_servers: array of {url, username?, credential?} objects. " +
+              "Empty array clears the list (Trystero / Google defaults will be used).",
           },
         },
         required: ["action"],
@@ -708,7 +926,8 @@ export function buildAgentSystemPrompt(host: AgentHostInfo): string {
     "\n\n" +
     "Tools available:\n" +
     "- `networks` — inspect / mutate Cloud Mesh state (status, peers, saved " +
-    "networks, accepting policy, diagnostic log).\n" +
+    "networks, accepting policy, diagnostic log, signaling/STUN/TURN servers, " +
+    "import/export of portable settings).\n" +
     "- `read_file` — read a text file (non-destructive, no prompt).\n" +
     "- `write_file` — write or append text to a file (prompts the user).\n" +
     "- `shell` — run a shell command (prompts the user).\n\n" +
@@ -734,6 +953,17 @@ export function buildAgentSystemPrompt(host: AgentHostInfo): string {
     "running a shell command), confirm with the user. They'll see a permission " +
     "prompt for shell / write_file, but a quick \"I'm about to run X — okay?\" " +
     "in chat first is better UX than a surprise modal.\n\n" +
+    "Network settings & imports:\n" +
+    "- Network settings travel as a portable JSON envelope carrying " +
+    "`kind: \"myownllm.network-settings\"`. The user can paste one into chat or " +
+    "attach a .json file — when you see this shape, offer to import it via " +
+    "`action='import_settings'` (pass the parsed object as `settings`, or the " +
+    "raw string as `json`). Confirm the network_id with the user before applying.\n" +
+    "- `action='export_settings'` returns the same envelope for the active (or " +
+    "named) network, ready to share to another device.\n" +
+    "- `action='set_signaling_servers' / 'set_stun_servers' / 'set_turn_servers'` " +
+    "replace the respective list on a network. Empty array restores defaults " +
+    "(Trystero public Nostr relays / Google STUN / no TURN).\n\n" +
     "Style:\n" +
     "- Be direct. Quote tool results back to the user in plain English; don't dump JSON.\n" +
     "- When you take an action, say what you did and what the result was.\n" +

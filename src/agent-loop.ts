@@ -216,7 +216,9 @@ export async function runAgent(args: AgentRunArgs): Promise<void> {
 /** Translate StoredMessage[] into the wire shape Ollama expects.
  *  Tool messages stay role="tool" and carry `name` + `tool_call_id`;
  *  assistant turns with tool_calls include them so the model
- *  re-grounds against its prior call when continuing. */
+ *  re-grounds against its prior call when continuing. User turns
+ *  with image attachments carry an `images: [base64...]` array,
+ *  which Ollama's chat API hands to vision models verbatim. */
 function toWireMessages(messages: StoredMessage[]): unknown[] {
   return messages.map((m) => {
     const out: Record<string, unknown> = { role: m.role, content: m.content };
@@ -228,6 +230,7 @@ function toWireMessages(messages: StoredMessage[]): unknown[] {
     }
     if (m.name) out.name = m.name;
     if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
+    if (m.images && m.images.length > 0) out.images = m.images;
     return out;
   });
 }
