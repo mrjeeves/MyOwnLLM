@@ -882,44 +882,32 @@ fn main() {
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_dialog::init());
 
-    // Linux WebRTC probe (#199): log every page-load event with a
-    // JS-side `typeof RTCPeerConnection` check so we can see whether
-    // the reload trick actually swaps in a JS context that has the
-    // binding. Output lands in the same stderr as the `[webrtc]`
-    // setup-time prints, prefixed `[webrtc-pageload]`. Strictly
-    // diagnostic. Cfg-gated via let-rebind because `#[cfg(...)]`
-    // attributes don't apply inside the middle of a method chain.
+    // Linux WebRTC bootstrap, part 2: one-shot WebView reload after
+    // the initial page-load. WebKitGTK gates `RTCPeerConnection`
+    // registration on the `enable-webrtc` setting at JS-context
+    // creation time. The setting flip happens in `setup()` (below)
+    // but Tauri's first navigation has already kicked off by then,
+    // so the first frame's JS context is born without WebRTC
+    // bindings. Reloading the frame brings up a fresh JS context
+    // against the now-true setting and gets `RTCPeerConnection`
+    // into the global, which is what Trystero looks for.
+    //
+    // Reload runs from `on_page_load(Finished)` rather than from
+    // `with_webview` (#199 take-2) because firing reload before the
+    // WebView attaches to a visible GTK window leaves the window
+    // permanently invisible. Atomic gate makes it one-shot so
+    // legitimate `location.reload()` calls (devtools, user-driven)
+    // don't re-fire ours. `cfg`-gated via let-rebind because
+    // `#[cfg(...)]` attributes don't apply mid-method-chain.
     #[cfg(target_os = "linux")]
     let builder = builder.on_page_load(|window, payload| {
         use std::sync::atomic::{AtomicBool, Ordering};
         use tauri::webview::PageLoadEvent;
-        // One-shot reload guard. The previous attempt called
-        // `wv.reload()` from inside `with_webview`, which fires
-        // before the WebView attaches to a visible GTK window —
-        // calling reload at that point left the window
-        // permanently invisible (taskbar only). Doing the reload
-        // from `on_page_load(Finished)` instead means the
-        // WebView is fully alive, and we just need to make sure
-        // we fire it exactly once so we don't infinite-loop.
         static RELOADED: AtomicBool = AtomicBool::new(false);
-        let phase = match payload.event() {
-            PageLoadEvent::Started => "started",
-            PageLoadEvent::Finished => "finished",
-        };
-        eprintln!("[webrtc-pageload] {phase}: {}", payload.url());
         if !matches!(payload.event(), PageLoadEvent::Finished) {
             return;
         }
-        // Probe + (one-shot) reload combined: log the current
-        // value of `typeof RTCPeerConnection`, and if this is
-        // the first Finished event, eval `location.reload()`
-        // so the JS context re-inits against the
-        // (already-flipped) `enable-webrtc=true` setting.
-        let _ = window.eval(
-            "console.log('[webrtc-pageload] RTCPeerConnection =', typeof RTCPeerConnection);",
-        );
         if !RELOADED.swap(true, Ordering::SeqCst) {
-            eprintln!("[webrtc] first page-load finished — triggering one-shot reload");
             let _ = window.eval("location.reload();");
         }
     });
@@ -1040,14 +1028,21 @@ fn main() {
             //
             // macOS WKWebView and Windows WebView2 expose WebRTC
             // out of the box, so this stays Linux-only.
-            // Reload-from-with_webview was poisonous (the GTK
-            // window never showed past the taskbar entry).
-            // Setting flip stays here — runs early, before the
-            // first JS context fires up — but the actual
-            // reload-to-refresh-bindings step moved into
-            // `on_page_load(Finished)` below, where the WebView
-            // is fully alive and an eval-driven
-            // `location.reload()` is safe.
+            // Linux WebRTC bootstrap, part 1: flip the WebKit
+            // settings that gate `RTCPeerConnection` and friends.
+            // The actual reload-to-refresh-JS-context lives in the
+            // `on_page_load` hook on the builder above — calling
+            // reload from inside `with_webview` blocks the GTK
+            // window from ever showing past the taskbar entry.
+            //
+            // Pairs with `scripts/install.sh` adding the GStreamer
+            // WebRTC plugin set (gstreamer1.0-plugins-bad et al.).
+            // WebKitGTK refuses to register the RTCPeerConnection
+            // binding when `webrtcbin` is missing from the
+            // GStreamer plugin path, regardless of the setting
+            // here — so on a fresh box without the install.sh
+            // run, the property flip is necessary but not
+            // sufficient.
             #[cfg(target_os = "linux")]
             {
                 use tauri::Manager;
@@ -1055,26 +1050,12 @@ fn main() {
                     let _ = window.with_webview(|webview| {
                         use webkit2gtk::{SettingsExt, WebViewExt};
                         let wv = webview.inner();
-                        let Some(settings) = WebViewExt::settings(&wv) else {
-                            eprintln!("[webrtc] WebKit settings unavailable — skipping");
-                            return;
-                        };
-                        let was_webrtc = settings.enables_webrtc();
-                        eprintln!(
-                            "[webrtc] before: enable_webrtc={} enable_media_stream={} enable_mediasource={} enable_media_capabilities={}",
-                            was_webrtc,
-                            settings.enables_media_stream(),
-                            settings.enables_mediasource(),
-                            settings.enables_media_capabilities(),
-                        );
-                        settings.set_enable_webrtc(true);
-                        settings.set_enable_media_stream(true);
-                        settings.set_enable_mediasource(true);
-                        settings.set_enable_media_capabilities(true);
-                        eprintln!(
-                            "[webrtc] after:  enable_webrtc={}",
-                            settings.enables_webrtc(),
-                        );
+                        if let Some(settings) = WebViewExt::settings(&wv) {
+                            settings.set_enable_webrtc(true);
+                            settings.set_enable_media_stream(true);
+                            settings.set_enable_mediasource(true);
+                            settings.set_enable_media_capabilities(true);
+                        }
                     });
                 }
             }

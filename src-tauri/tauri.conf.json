@@ -37,6 +37,31 @@
     ],
     "macOS": {
       "signingIdentity": "-"
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libayatana-appindicator3-1",
+          "librsvg2-2",
+          "gstreamer1.0-plugins-bad",
+          "gstreamer1.0-plugins-good",
+          "gstreamer1.0-nice",
+          "libnice10",
+          "libsrtp2-1"
+        ]
+      },
+      "rpm": {
+        "depends": [
+          "webkit2gtk4.1",
+          "libappindicator-gtk3",
+          "librsvg2",
+          "gstreamer1-plugins-bad-free",
+          "gstreamer1-plugins-good",
+          "libnice",
+          "libsrtp"
+        ]
+      }
     }
   },
   "plugins": {

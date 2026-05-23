@@ -101,9 +101,30 @@ install_linux_runtime_deps() {
   [ "$OS" = "linux" ] || return 0
   [ "$DRY_RUN" = "true" ] && { log "(dry-run) would install Linux runtime deps"; return 0; }
 
+  # WebRTC packages on top of the existing webkit2gtk runtime set.
+  # libwebkit2gtk-4.1-0 ships the WebRTC *bindings* but the actual
+  # implementation runs through GStreamer's webrtcbin element — which
+  # lives in gstreamer1.0-plugins-bad. Without it, WebKit registers
+  # the `enable-webrtc` setting (we can flip it true from Rust) but
+  # never binds `window.RTCPeerConnection` into the JS global,
+  # because it knows webrtcbin isn't available at runtime. End
+  # result: Trystero startup errors with "Can't find variable:
+  # RTCPeerConnection" and the mesh never joins.
+  #
+  # Ubuntu/Debian ship these plugins as *Recommends* rather than
+  # Depends of libwebkit2gtk-4.1, which means `--no-install-
+  # recommends` (which we use to keep installs small) strips them
+  # out. Listing them explicitly here forces the install regardless
+  # of the recommends flag.
+  #
+  #   webrtcbin      ← gstreamer1.0-plugins-bad   (the WebRTC core)
+  #   libnice / ICE  ← gstreamer1.0-nice, libnice10
+  #   DTLS-SRTP      ← libsrtp2-1
+  #   misc encoders  ← gstreamer1.0-plugins-good
   if command -v apt-get >/dev/null 2>&1; then
-    log "Installing Linux runtime libraries via apt (libwebkit2gtk-4.1, libayatana-appindicator3, librsvg2)…"
-    pkgs="libwebkit2gtk-4.1-0 libayatana-appindicator3-1 librsvg2-2"
+    log "Installing Linux runtime libraries via apt (webkit2gtk-4.1, appindicator, librsvg, gstreamer webrtc stack)…"
+    pkgs="libwebkit2gtk-4.1-0 libayatana-appindicator3-1 librsvg2-2 \
+gstreamer1.0-plugins-bad gstreamer1.0-plugins-good gstreamer1.0-nice libnice10 libsrtp2-1"
     apt_opts="-y --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
     if [ "$(id -u)" = "0" ]; then
       env DEBIAN_FRONTEND=noninteractive apt-get update -qq \
@@ -116,7 +137,8 @@ install_linux_runtime_deps() {
     fi
   elif command -v dnf >/dev/null 2>&1; then
     log "Installing Linux runtime libraries via dnf…"
-    pkgs="webkit2gtk4.1 libappindicator-gtk3 librsvg2"
+    pkgs="webkit2gtk4.1 libappindicator-gtk3 librsvg2 \
+gstreamer1-plugins-bad-free gstreamer1-plugins-good libnice libsrtp"
     if [ "$(id -u)" = "0" ]; then
       dnf install -y $pkgs || { _runtime_dep_failure "dnf" "$pkgs" "sudo dnf install -y $pkgs"; return 1; }
     else
@@ -124,7 +146,8 @@ install_linux_runtime_deps() {
     fi
   elif command -v pacman >/dev/null 2>&1; then
     log "Installing Linux runtime libraries via pacman…"
-    pkgs="webkit2gtk-4.1 libappindicator-gtk3 librsvg"
+    pkgs="webkit2gtk-4.1 libappindicator-gtk3 librsvg \
+gst-plugins-bad gst-plugins-good libnice libsrtp"
     if [ "$(id -u)" = "0" ]; then
       pacman -S --noconfirm --needed $pkgs || { _runtime_dep_failure "pacman" "$pkgs" "sudo pacman -S $pkgs"; return 1; }
     else
@@ -133,7 +156,8 @@ install_linux_runtime_deps() {
   else
     err "Unrecognized Linux distro — cannot auto-install Tauri runtime libs."
     err "Install your distro's equivalents of webkit2gtk-4.1, libayatana-appindicator3,"
-    err "and librsvg2, then re-run this installer."
+    err "librsvg2, and the GStreamer WebRTC stack (gstreamer1.0-plugins-bad,"
+    err "gstreamer1.0-nice, libnice, libsrtp2), then re-run this installer."
     return 1
   fi
 
