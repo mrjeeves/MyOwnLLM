@@ -777,6 +777,28 @@ fn quiet_alsa_diagnostics() {
     }
 }
 
+/// JS-side diagnostic for the Linux WebRTC bootstrap. The frontend
+/// invokes this from `on_page_load(Finished)` so the answer to
+/// "did the WebView actually bind RTCPeerConnection?" reaches our
+/// stderr regardless of whether dev tools is attached. Pure
+/// reporter — no state changes; safe to ship even when we drop
+/// the rest of the diag.
+#[tauri::command]
+fn webrtc_probe_report(
+    peer_connection: String,
+    data_channel: String,
+    session_description: String,
+    media_devices: String,
+    user_agent: String,
+) {
+    eprintln!(
+        "[webrtc-probe] JS reports: RTCPeerConnection={peer_connection} \
+         RTCDataChannel={data_channel} RTCSessionDescription={session_description} \
+         navigator.mediaDevices={media_devices}"
+    );
+    eprintln!("[webrtc-probe] navigator.userAgent={user_agent}");
+}
+
 fn main() {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     workaround_pi_webkit_dmabuf();
@@ -876,20 +898,26 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Linux WebRTC sandbox workaround: some WebKitGTK builds gate
-    // gstreamer plugin discovery (incl. webrtcbin) through the
-    // bubblewrap sandbox in a way that prevents the JS engine from
-    // ever registering `RTCPeerConnection`. Force-disabling the
-    // sandbox is the last runtime knob before we conclude WebKit
-    // was compiled without WebRTC support entirely. Cheap to set
-    // unconditionally — distros where the sandbox isn't gating
-    // anything just ignore it. Must run BEFORE tauri::Builder
-    // touches GTK, since WebKit reads it once at process start.
+    // Linux WebRTC sandbox workaround: WebKitGTK 2.44+ renamed the
+    // sandbox-disable env var from `WEBKIT_FORCE_SANDBOX=0` to
+    // `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1` to make the
+    // security tradeoff explicit (the user's runtime literally
+    // prints "WEBKIT_FORCE_SANDBOX no longer allows disabling the
+    // sandbox" when the old name is set). Set both for max
+    // compatibility — older WebKit honors the first, newer the
+    // second. The sandbox sometimes gates gstreamer plugin
+    // discovery (webrtcbin) in a way that suppresses
+    // `RTCPeerConnection` registration; if WebRTC works without
+    // either env var, the sandbox isn't the issue and these are
+    // no-ops on this distro.
     //
     // Honors a user-set value so anyone wanting the sandbox on can
-    // still flip it back with `WEBKIT_FORCE_SANDBOX=1 myownllm`.
+    // flip it back via env.
     #[cfg(target_os = "linux")]
     {
+        if std::env::var_os("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
+        }
         if std::env::var_os("WEBKIT_FORCE_SANDBOX").is_none() {
             std::env::set_var("WEBKIT_FORCE_SANDBOX", "0");
         }
@@ -936,8 +964,29 @@ fn main() {
             "[webrtc-probe] page-load finished (post-reload={already_reloaded}): {}",
             payload.url(),
         );
+        // Bounce the JS-side answer back through a Tauri command —
+        // previously we used `console.log`, but that only reaches
+        // stderr if dev tools is attached. The invoke() route hits
+        // our Rust handler regardless. Reports `typeof
+        // RTCPeerConnection` plus a couple of related globals so
+        // we can see if some of the WebRTC surface is bound even
+        // when the constructor isn't.
         let _ = window.eval(
-            "console.log('[webrtc-probe] typeof RTCPeerConnection =', typeof RTCPeerConnection);",
+            r#"
+            (async () => {
+                try {
+                    await window.__TAURI__.core.invoke('webrtc_probe_report', {
+                        peerConnection: typeof RTCPeerConnection,
+                        dataChannel: typeof RTCDataChannel,
+                        sessionDescription: typeof RTCSessionDescription,
+                        mediaDevices: typeof navigator.mediaDevices,
+                        userAgent: navigator.userAgent,
+                    });
+                } catch (e) {
+                    console.log('[webrtc-probe] invoke failed', String(e));
+                }
+            })();
+            "#,
         );
         if !already_reloaded {
             let _ = window.eval("location.reload();");
@@ -1019,6 +1068,7 @@ fn main() {
             agent_io::agent_read_file,
             agent_io::agent_write_file,
             agent_io::agent_host_info,
+            webrtc_probe_report,
         ])
         .setup(|app| {
             // Linux WebKitGTK: enable WebRTC, then reload to refresh
