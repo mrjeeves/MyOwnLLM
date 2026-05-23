@@ -957,65 +957,70 @@ fn main() {
             agent_io::agent_host_info,
         ])
         .setup(|app| {
-            // Linux WebKitGTK: diagnostic probe for the persistent
-            // "Can't find variable: RTCPeerConnection" error.
+            // Linux WebKitGTK: enable WebRTC, then reload to refresh
+            // the JS context.
             //
-            // #198 added `set_enable_webrtc(true)` here, on the theory
-            // that WebKitGTK 2.38+ defaults it off and wry doesn't opt
-            // in. That didn't fix the error in the field, so before
-            // throwing more "maybe this" fixes at the wall, we need
-            // ground truth on what's actually happening. This block:
+            // Diagnostic from #199 confirmed the actual sequence on
+            // a working Ubuntu box:
             //
-            //   1. Confirms the `with_webview` hook fires at all on
-            //      the user's build (silence = it didn't, which is
-            //      itself a finding).
-            //   2. Reads the current value of every WebRTC-adjacent
-            //      WebKitSetting BEFORE we touch anything. If
-            //      enable_webrtc is already true, the setter is a
-            //      no-op and the cause lives somewhere else
-            //      entirely — most likely WebKit compiled without
-            //      WebRTC support, or missing gstreamer plugins.
-            //   3. Writes the same settings (so the prior fix is
-            //      preserved), then reads them back. If the after-
-            //      value doesn't match what we wrote, the property
-            //      is read-only or absent in this build.
+            //   [webrtc-probe] with_webview callback entered
+            //   [webrtc-probe] BEFORE: enable_webrtc=false
+            //   [webrtc-probe] AFTER:  enable_webrtc=true
             //
-            // No reload, no other speculative remediation. Once the
-            // user runs this and shares the stderr output we can
-            // pick a targeted fix.
+            // The setter takes effect. The persistent
+            // "Can't find variable: RTCPeerConnection" error comes
+            // from JS-context initialisation order: WebKit binds
+            // `RTCPeerConnection` into the global scope when a
+            // frame's JavaScript context is created, and only when
+            // `enable-webrtc` is true at that moment. The
+            // `with_webview` callback fires inside `setup()`, which
+            // runs after the WebView has already been created (and
+            // its initial `load_uri` dispatched on the GTK main
+            // loop) — so by the time we flip the bit, the first
+            // frame's JS context already exists *without* the
+            // WebRTC bindings, and flipping the setting doesn't
+            // retroactively register them.
             //
-            // macOS WKWebView and Windows WebView2 expose WebRTC out
-            // of the box, so this stays Linux-only.
+            // Cheapest correct fix: reload the WebView once the
+            // setting is on. The reload tears down the existing
+            // frame and brings up a fresh one whose JS context is
+            // initialised against the (now-true) `enable-webrtc`,
+            // so `RTCPeerConnection` lands in the global as the
+            // mesh client expects. The user sees a one-frame
+            // flicker at startup; the alternative (no mesh on
+            // Linux at all) is strictly worse.
+            //
+            // Only reload when the flip actually changed something —
+            // future WebKitGTK versions that default `enable-webrtc`
+            // to true would otherwise pay the flicker tax forever.
+            //
+            // macOS WKWebView and Windows WebView2 expose WebRTC
+            // out of the box, so this stays Linux-only.
             #[cfg(target_os = "linux")]
             {
                 use tauri::Manager;
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.with_webview(|webview| {
                         use webkit2gtk::{SettingsExt, WebViewExt};
-                        eprintln!("[webrtc-probe] with_webview callback entered");
                         let wv = webview.inner();
                         let Some(settings) = WebViewExt::settings(&wv) else {
-                            eprintln!("[webrtc-probe] WebKit settings unavailable");
+                            eprintln!("[webrtc] WebKit settings unavailable — skipping");
                             return;
                         };
-                        eprintln!(
-                            "[webrtc-probe] BEFORE: enable_webrtc={} enable_media_stream={} enable_mediasource={} enable_media_capabilities={}",
-                            settings.enables_webrtc(),
-                            settings.enables_media_stream(),
-                            settings.enables_mediasource(),
-                            settings.enables_media_capabilities(),
-                        );
+                        let was_webrtc = settings.enables_webrtc();
                         settings.set_enable_webrtc(true);
                         settings.set_enable_media_stream(true);
                         settings.set_enable_mediasource(true);
                         settings.set_enable_media_capabilities(true);
-                        eprintln!(
-                            "[webrtc-probe] AFTER:  enable_webrtc={} enable_media_stream={} enable_mediasource={} enable_media_capabilities={}",
-                            settings.enables_webrtc(),
-                            settings.enables_media_stream(),
-                            settings.enables_mediasource(),
-                            settings.enables_media_capabilities(),
-                        );
+                        if !was_webrtc && settings.enables_webrtc() {
+                            // Frame's JS context was created before
+                            // our flip — without a reload, the
+                            // page's `window.RTCPeerConnection`
+                            // stays undefined for the life of this
+                            // session. Reload registers the
+                            // bindings.
+                            wv.reload();
+                        }
                     });
                 }
             }
