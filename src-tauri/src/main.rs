@@ -965,26 +965,46 @@ fn main() {
             payload.url(),
         );
         // Bounce the JS-side answer back through a Tauri command —
-        // previously we used `console.log`, but that only reaches
-        // stderr if dev tools is attached. The invoke() route hits
-        // our Rust handler regardless. Reports `typeof
-        // RTCPeerConnection` plus a couple of related globals so
-        // we can see if some of the WebRTC surface is bound even
-        // when the constructor isn't.
+        // `console.log` only reaches stderr when dev tools is
+        // attached, and we can't rely on the user having that
+        // open. Tauri 2 doesn't expose the legacy `__TAURI__`
+        // global by default — the internal-but-stable invoke
+        // lives at `window.__TAURI_INTERNALS__.invoke`. Try a few
+        // alternative paths so we're robust against version drift
+        // between Tauri's JS-side and what's in our build.
+        //
+        // Reports `typeof RTCPeerConnection` plus adjacent globals
+        // so we can see if WebRTC is *partially* exposed (e.g.
+        // RTCDataChannel present but RTCPeerConnection missing,
+        // which would be a different bug than "no WebRTC at all").
         let _ = window.eval(
             r#"
             (async () => {
-                try {
-                    await window.__TAURI__.core.invoke('webrtc_probe_report', {
-                        peerConnection: typeof RTCPeerConnection,
-                        dataChannel: typeof RTCDataChannel,
-                        sessionDescription: typeof RTCSessionDescription,
-                        mediaDevices: typeof navigator.mediaDevices,
-                        userAgent: navigator.userAgent,
-                    });
-                } catch (e) {
-                    console.log('[webrtc-probe] invoke failed', String(e));
+                const payload = {
+                    peerConnection: typeof RTCPeerConnection,
+                    dataChannel: typeof RTCDataChannel,
+                    sessionDescription: typeof RTCSessionDescription,
+                    mediaDevices: typeof navigator.mediaDevices,
+                    userAgent: navigator.userAgent,
+                };
+                const candidates = [
+                    () => window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke,
+                    () => window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke,
+                    () => window.__TAURI__ && window.__TAURI__.invoke,
+                ];
+                for (const get of candidates) {
+                    const fn = get();
+                    if (typeof fn === 'function') {
+                        try { await fn('webrtc_probe_report', payload); return; } catch (e) { /* try next */ }
+                    }
                 }
+                // Last-ditch: set the document title with the answer
+                // so a Rust-side read of `WebViewExt::title` could in
+                // principle pick it up. Mostly here so we have a
+                // visible breadcrumb in the WebView console if the
+                // user does happen to have devtools open.
+                console.log('[webrtc-probe] no invoke path found, payload =', JSON.stringify(payload));
+                document.title = '[webrtc-probe] RTCPeerConnection=' + payload.peerConnection;
             })();
             "#,
         );
