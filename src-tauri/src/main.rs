@@ -657,8 +657,8 @@ fn workaround_pi_webkit_dmabuf() {
 ///      enumeration, and our own threads can hit ALSA via the
 ///      WebKitGTK media stack linked into this process.
 ///   2. Out-of-process: WebKitGTK 2.38+ runs the WebContent /
-///      MediaProcessGStreamer subprocesses; once `set_enable_webrtc`
-///      flipped on (see #198), the WebRTC media stack in those
+///      MediaProcessGStreamer subprocesses; if WebRTC is
+///      available on the host's WebKit, the media stack in those
 ///      subprocesses enumerates audio devices via ALSA and the
 ///      same diagnostic prints come out — on the inherited stderr
 ///      that ultimately flows to our terminal.
@@ -777,28 +777,6 @@ fn quiet_alsa_diagnostics() {
     }
 }
 
-/// JS-side diagnostic for the Linux WebRTC bootstrap. The frontend
-/// invokes this from `on_page_load(Finished)` so the answer to
-/// "did the WebView actually bind RTCPeerConnection?" reaches our
-/// stderr regardless of whether dev tools is attached. Pure
-/// reporter — no state changes; safe to ship even when we drop
-/// the rest of the diag.
-#[tauri::command]
-fn webrtc_probe_report(
-    peer_connection: String,
-    data_channel: String,
-    session_description: String,
-    media_devices: String,
-    user_agent: String,
-) {
-    eprintln!(
-        "[webrtc-probe] JS reports: RTCPeerConnection={peer_connection} \
-         RTCDataChannel={data_channel} RTCSessionDescription={session_description} \
-         navigator.mediaDevices={media_devices}"
-    );
-    eprintln!("[webrtc-probe] navigator.userAgent={user_agent}");
-}
-
 fn main() {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     workaround_pi_webkit_dmabuf();
@@ -898,122 +876,11 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Linux WebRTC sandbox workaround: WebKitGTK 2.44+ renamed the
-    // sandbox-disable env var from `WEBKIT_FORCE_SANDBOX=0` to
-    // `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1` to make the
-    // security tradeoff explicit (the user's runtime literally
-    // prints "WEBKIT_FORCE_SANDBOX no longer allows disabling the
-    // sandbox" when the old name is set). Set both for max
-    // compatibility — older WebKit honors the first, newer the
-    // second. The sandbox sometimes gates gstreamer plugin
-    // discovery (webrtcbin) in a way that suppresses
-    // `RTCPeerConnection` registration; if WebRTC works without
-    // either env var, the sandbox isn't the issue and these are
-    // no-ops on this distro.
-    //
-    // Honors a user-set value so anyone wanting the sandbox on can
-    // flip it back via env.
-    #[cfg(target_os = "linux")]
-    {
-        if std::env::var_os("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").is_none() {
-            std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
-        }
-        if std::env::var_os("WEBKIT_FORCE_SANDBOX").is_none() {
-            std::env::set_var("WEBKIT_FORCE_SANDBOX", "0");
-        }
-    }
-
-    let builder = tauri::Builder::default()
+    tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_http::init())
-        .plugin(tauri_plugin_dialog::init());
-
-    // Linux WebRTC bootstrap, part 2: one-shot WebView reload after
-    // the initial page-load. WebKitGTK gates `RTCPeerConnection`
-    // registration on the `enable-webrtc` setting at JS-context
-    // creation time. The setting flip happens in `setup()` (below)
-    // but Tauri's first navigation has already kicked off by then,
-    // so the first frame's JS context is born without WebRTC
-    // bindings. Reloading the frame brings up a fresh JS context
-    // against the now-true setting and gets `RTCPeerConnection`
-    // into the global, which is what Trystero looks for.
-    //
-    // Also probes — at each page-load finish — the actual JS-side
-    // `typeof RTCPeerConnection` value, so if the binding still
-    // isn't there after our reload we can see it in stderr instead
-    // of guessing from a downstream Trystero error.
-    //
-    // Reload runs from `on_page_load(Finished)` rather than from
-    // `with_webview` (#199 take-2) because firing reload before the
-    // WebView attaches to a visible GTK window leaves the window
-    // permanently invisible. Atomic gate makes it one-shot so
-    // legitimate `location.reload()` calls (devtools, user-driven)
-    // don't re-fire ours. `cfg`-gated via let-rebind because
-    // `#[cfg(...)]` attributes don't apply mid-method-chain.
-    #[cfg(target_os = "linux")]
-    let builder = builder.on_page_load(|window, payload| {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use tauri::webview::PageLoadEvent;
-        static RELOADED: AtomicBool = AtomicBool::new(false);
-        if !matches!(payload.event(), PageLoadEvent::Finished) {
-            return;
-        }
-        let already_reloaded = RELOADED.swap(true, Ordering::SeqCst);
-        eprintln!(
-            "[webrtc-probe] page-load finished (post-reload={already_reloaded}): {}",
-            payload.url(),
-        );
-        // Bounce the JS-side answer back through a Tauri command —
-        // `console.log` only reaches stderr when dev tools is
-        // attached, and we can't rely on the user having that
-        // open. Tauri 2 doesn't expose the legacy `__TAURI__`
-        // global by default — the internal-but-stable invoke
-        // lives at `window.__TAURI_INTERNALS__.invoke`. Try a few
-        // alternative paths so we're robust against version drift
-        // between Tauri's JS-side and what's in our build.
-        //
-        // Reports `typeof RTCPeerConnection` plus adjacent globals
-        // so we can see if WebRTC is *partially* exposed (e.g.
-        // RTCDataChannel present but RTCPeerConnection missing,
-        // which would be a different bug than "no WebRTC at all").
-        let _ = window.eval(
-            r#"
-            (async () => {
-                const payload = {
-                    peerConnection: typeof RTCPeerConnection,
-                    dataChannel: typeof RTCDataChannel,
-                    sessionDescription: typeof RTCSessionDescription,
-                    mediaDevices: typeof navigator.mediaDevices,
-                    userAgent: navigator.userAgent,
-                };
-                const candidates = [
-                    () => window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke,
-                    () => window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke,
-                    () => window.__TAURI__ && window.__TAURI__.invoke,
-                ];
-                for (const get of candidates) {
-                    const fn = get();
-                    if (typeof fn === 'function') {
-                        try { await fn('webrtc_probe_report', payload); return; } catch (e) { /* try next */ }
-                    }
-                }
-                // Last-ditch: set the document title with the answer
-                // so a Rust-side read of `WebViewExt::title` could in
-                // principle pick it up. Mostly here so we have a
-                // visible breadcrumb in the WebView console if the
-                // user does happen to have devtools open.
-                console.log('[webrtc-probe] no invoke path found, payload =', JSON.stringify(payload));
-                document.title = '[webrtc-probe] RTCPeerConnection=' + payload.peerConnection;
-            })();
-            "#,
-        );
-        if !already_reloaded {
-            let _ = window.eval("location.reload();");
-        }
-    });
-
-    builder
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             detect_hardware,
             ollama_pull,
@@ -1088,101 +955,8 @@ fn main() {
             agent_io::agent_read_file,
             agent_io::agent_write_file,
             agent_io::agent_host_info,
-            webrtc_probe_report,
         ])
         .setup(|app| {
-            // Linux WebKitGTK: enable WebRTC, then reload to refresh
-            // the JS context.
-            //
-            // Diagnostic from #199 confirmed the actual sequence on
-            // a working Ubuntu box:
-            //
-            //   [webrtc-probe] with_webview callback entered
-            //   [webrtc-probe] BEFORE: enable_webrtc=false
-            //   [webrtc-probe] AFTER:  enable_webrtc=true
-            //
-            // The setter takes effect. The persistent
-            // "Can't find variable: RTCPeerConnection" error comes
-            // from JS-context initialisation order: WebKit binds
-            // `RTCPeerConnection` into the global scope when a
-            // frame's JavaScript context is created, and only when
-            // `enable-webrtc` is true at that moment. The
-            // `with_webview` callback fires inside `setup()`, which
-            // runs after the WebView has already been created (and
-            // its initial `load_uri` dispatched on the GTK main
-            // loop) — so by the time we flip the bit, the first
-            // frame's JS context already exists *without* the
-            // WebRTC bindings, and flipping the setting doesn't
-            // retroactively register them.
-            //
-            // Cheapest correct fix: reload the WebView once the
-            // setting is on. The reload tears down the existing
-            // frame and brings up a fresh one whose JS context is
-            // initialised against the (now-true) `enable-webrtc`,
-            // so `RTCPeerConnection` lands in the global as the
-            // mesh client expects. The user sees a one-frame
-            // flicker at startup; the alternative (no mesh on
-            // Linux at all) is strictly worse.
-            //
-            // Only reload when the flip actually changed something —
-            // future WebKitGTK versions that default `enable-webrtc`
-            // to true would otherwise pay the flicker tax forever.
-            //
-            // macOS WKWebView and Windows WebView2 expose WebRTC
-            // out of the box, so this stays Linux-only.
-            // Linux WebRTC bootstrap, part 1: flip the WebKit
-            // settings that gate `RTCPeerConnection` and friends.
-            // The actual reload-to-refresh-JS-context lives in the
-            // `on_page_load` hook on the builder above — calling
-            // reload from inside `with_webview` blocks the GTK
-            // window from ever showing past the taskbar entry.
-            //
-            // Pairs with `scripts/install.sh` adding the GStreamer
-            // WebRTC plugin set (gstreamer1.0-plugins-bad et al.).
-            // WebKitGTK refuses to register the RTCPeerConnection
-            // binding when `webrtcbin` is missing from the
-            // GStreamer plugin path, regardless of the setting
-            // here — so on a fresh box without the install.sh
-            // run, the property flip is necessary but not
-            // sufficient.
-            #[cfg(target_os = "linux")]
-            {
-                use tauri::Manager;
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.with_webview(|webview| {
-                        use webkit2gtk::{SettingsExt, WebViewExt};
-                        let wv = webview.inner();
-                        // Runtime version of the underlying
-                        // WebKitGTK library — different from the
-                        // webkit2gtk-rs crate's build version. The
-                        // bound `webkit_get_*_version()` C
-                        // functions are exported as free fns in
-                        // webkit2gtk-rs, but the GIR-generated
-                        // bindings put them under different
-                        // namespaces depending on version; the
-                        // safe fallback is reading them via the
-                        // WebKitWebContext if needed. For now,
-                        // skip the version print here and rely on
-                        // the user's `apt list --installed`
-                        // showing the package version.
-                        if let Some(settings) = WebViewExt::settings(&wv) {
-                            let before = settings.enables_webrtc();
-                            settings.set_enable_webrtc(true);
-                            settings.set_enable_media_stream(true);
-                            settings.set_enable_mediasource(true);
-                            settings.set_enable_media_capabilities(true);
-                            let after = settings.enables_webrtc();
-                            eprintln!(
-                                "[webrtc-probe] enable_webrtc: {before} -> {after} (WEBKIT_FORCE_SANDBOX={})",
-                                std::env::var("WEBKIT_FORCE_SANDBOX").unwrap_or_else(|_| "<unset>".into()),
-                            );
-                        } else {
-                            eprintln!("[webrtc-probe] WebKit settings unavailable");
-                        }
-                    });
-                }
-            }
-
             // If the configured 800x600 window can't fit on this monitor —
             // e.g. the official 7" Pi DSI screen at 800x480 — start
             // maximized so the user doesn't lose the bottom of the UI off

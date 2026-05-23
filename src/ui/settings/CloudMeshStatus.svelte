@@ -37,7 +37,7 @@
   } from "../../config";
   import type { NetworkConfig } from "../../types";
   import { meshUi } from "../../mesh-state.svelte";
-  import { meshClient } from "../../mesh-client.svelte";
+  import { meshClient, webrtcAvailable } from "../../mesh-client.svelte";
   import { scrollAffordance } from "../scroll-affordance";
   import { setMeshIdentityLabel } from "../../mesh";
   import AddNetworkModal from "./AddNetworkModal.svelte";
@@ -259,6 +259,33 @@ import { APP_VERSION } from "../../mesh-capabilities";
 
 <div class="scroll-affordance-wrap">
 <div class="root scroll-fade" use:scrollAffordance>
+  {#if !webrtcAvailable}
+    <!-- The WebView this app is running in doesn't expose
+         `window.RTCPeerConnection`. Trystero (our peer-discovery
+         + data-channel layer) needs it; mesh can't run without
+         it. The most common cause is Linux distros that ship
+         `libwebkit2gtk-4.1-0` compiled with ENABLE_WEB_RTC=OFF
+         (Ubuntu does this; Chrome on the same machine works fine
+         because Chrome bundles its own WebRTC stack rather than
+         using the system one). No code-only workaround exists —
+         the binding has to be compiled into the WebView. -->
+    <div class="webrtc-banner">
+      <strong>Mesh networking is unavailable on this system.</strong>
+      <p>
+        This WebView doesn't expose <code>RTCPeerConnection</code>, so
+        peer-to-peer connections can't be made. Chrome, Firefox, and
+        Safari all bundle their own WebRTC implementations and work
+        fine — this app uses the system's WebKit, which on some Linux
+        distros (notably Ubuntu's <code>libwebkit2gtk-4.1</code>) ships
+        without WebRTC compiled in.
+      </p>
+      <p>
+        Everything else in MyOwnLLM works normally. The proper fix —
+        moving WebRTC into the Rust side so the WebView no longer
+        gates it — is on the roadmap.
+      </p>
+    </div>
+  {/if}
   {#if loading || meshUi.loading}
     <div class="loading">Loading…</div>
   {:else if meshUi.error}
@@ -587,6 +614,34 @@ import { APP_VERSION } from "../../mesh-capabilities";
     font-size: 0.85rem;
   }
   .error { color: #d66; }
+
+  /* WebRTC unavailable banner. Top of the status tab when this
+     WebView doesn't expose RTCPeerConnection — Linux WebKitGTK
+     compiled without WebRTC is the most common cause. Designed
+     to be calmly explanatory rather than alarming red, since it's
+     a permanent property of the install, not a transient
+     failure. */
+  .webrtc-banner {
+    margin: 0.6rem 0.6rem 0.2rem 0.6rem;
+    padding: 0.75rem 0.95rem;
+    background: #1a1a22;
+    border: 1px solid #3a3a55;
+    border-left: 3px solid #d6b25a;
+    border-radius: 6px;
+    color: #ccc;
+    font-size: 0.78rem;
+    line-height: 1.55;
+  }
+  .webrtc-banner strong { color: #f0d090; font-weight: 600; display: block; margin-bottom: 0.3rem; }
+  .webrtc-banner p { margin: 0.35rem 0 0 0; color: #aaa; }
+  .webrtc-banner code {
+    background: #0d0d12;
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+    color: #cdeaff;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.74rem;
+  }
 
   /* Blocks */
   .block { display: flex; flex-direction: column; gap: 0.55rem; min-width: 0; }

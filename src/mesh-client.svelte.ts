@@ -131,30 +131,39 @@ const webrtcDiagState = {
   iceStateChanges: [] as string[],
 };
 
+/** Module-level "does the WebView expose WebRTC at all" flag.
+ *  Mirrors `typeof window.RTCPeerConnection === "function"` as
+ *  observed at module load — same answer every script sees because
+ *  the binding registration happens once at JS-context init. UI
+ *  surfaces a clear banner off this so the user doesn't have to
+ *  decode a downstream Trystero error.
+ *
+ *  Common failure mode (Linux): Tauri uses the system WebKitGTK as
+ *  its WebView, and some distros (Ubuntu's `libwebkit2gtk-4.1-0`
+ *  among them) ship it compiled with `ENABLE_WEB_RTC=OFF` — the
+ *  RTCPeerConnection constructor simply isn't registered into the
+ *  global scope regardless of any runtime setting. No code-only
+ *  workaround recovers from that; users hitting it need a different
+ *  WebKit build (different distro, Flatpak runtime, etc.).
+ *
+ *  macOS WKWebView and Windows WebView2 both expose WebRTC out of
+ *  the box, so this should be `true` on those platforms. */
+export const webrtcAvailable: boolean =
+  typeof window !== "undefined" && typeof window.RTCPeerConnection === "function";
+
 function installRTCPeerConnectionDiag(): void {
   if (webrtcDiagInstalled) return;
   if (typeof window === "undefined") return;
   const Original = window.RTCPeerConnection;
   if (typeof Original !== "function") {
-    // Log loudly — this is the failure mode that surfaces downstream
-    // as "trystero init failed: ReferenceError: Can't find variable:
-    // RTCPeerConnection" with no obvious cause. Without a hint here,
-    // the user blames Trystero (or assumes our pnpm patch isn't
-    // applied — it's the easy-to-form hypothesis from the error
-    // text). The real cause is the WebView shipping without WebRTC:
-    // WebKitGTK 2.38+ gates `RTCPeerConnection` behind an
-    // `enable-webrtc` setting that defaults to off. The Rust setup
-    // in src-tauri/src/main.rs flips that on at WebView creation —
-    // if you still see this log in a bundled build, either the
-    // setup hook didn't run (rare, would also break other Tauri
-    // commands) or the host's WebKitGTK is too old (<2.38) to
-    // expose the setting at all.
+    // Log once for the diag log / devtools; the user-facing
+    // explanation now lives in the Network settings banner driven
+    // by `webrtcAvailable`. Keeping the console warn so the cause
+    // is greppable for anyone digging into a downstream Trystero
+    // ReferenceError.
     console.warn(
-      "[mesh] RTCPeerConnection is not defined on `window` — the WebView lacks WebRTC support. " +
-        "On Linux, this happens when WebKitGTK ships with WebRTC disabled. The bundled app enables it at " +
-        "startup; if you're seeing this in a dev session (`pnpm tauri dev`), the same `with_webview` hook " +
-        "runs there too, so an older WebKitGTK runtime (<2.38) is the most likely cause. " +
-        "Mesh features will refuse to start.",
+      "[mesh] window.RTCPeerConnection is undefined — this WebView build doesn't expose WebRTC. " +
+        "Mesh networking is unavailable. See the banner in Settings → Networks.",
     );
     return;
   }
