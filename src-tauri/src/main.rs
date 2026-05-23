@@ -876,37 +876,38 @@ fn main() {
         std::process::exit(1);
     }
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_http::init())
-        .plugin(tauri_plugin_dialog::init())
-        // Linux WebRTC probe (#199): log every page-load event with
-        // a JS-side `typeof RTCPeerConnection` check so we can see
-        // whether the reload trick actually swaps in a JS context
-        // that has the binding. Output lands in the same stderr as
-        // the `[webrtc]` setup-time prints, prefixed
-        // `[webrtc-pageload]`. Strictly diagnostic; ship a non-
-        // Linux no-op-ifying version after the cause is settled.
-        #[cfg(target_os = "linux")]
-        .on_page_load(|window, payload| {
-            use tauri::webview::PageLoadEvent;
-            let phase = match payload.event() {
-                PageLoadEvent::Started => "started",
-                PageLoadEvent::Finished => "finished",
-            };
-            eprintln!("[webrtc-pageload] {phase}: {}", payload.url());
-            if matches!(payload.event(), PageLoadEvent::Finished) {
-                // Bounce the JS-side check back through stderr via
-                // a Tauri command would be cleanest, but `eval` +
-                // `console.log` is enough for a one-shot probe —
-                // WebKitGTK in dev mode pipes the WebView console
-                // to the host terminal.
-                let _ = window.eval(
-                    "console.log('[webrtc-pageload] RTCPeerConnection =', typeof RTCPeerConnection);",
-                );
-            }
-        })
+        .plugin(tauri_plugin_dialog::init());
+
+    // Linux WebRTC probe (#199): log every page-load event with a
+    // JS-side `typeof RTCPeerConnection` check so we can see whether
+    // the reload trick actually swaps in a JS context that has the
+    // binding. Output lands in the same stderr as the `[webrtc]`
+    // setup-time prints, prefixed `[webrtc-pageload]`. Strictly
+    // diagnostic. Cfg-gated via let-rebind because `#[cfg(...)]`
+    // attributes don't apply inside the middle of a method chain.
+    #[cfg(target_os = "linux")]
+    let builder = builder.on_page_load(|window, payload| {
+        use tauri::webview::PageLoadEvent;
+        let phase = match payload.event() {
+            PageLoadEvent::Started => "started",
+            PageLoadEvent::Finished => "finished",
+        };
+        eprintln!("[webrtc-pageload] {phase}: {}", payload.url());
+        if matches!(payload.event(), PageLoadEvent::Finished) {
+            // `eval` + `console.log` is enough for a one-shot
+            // probe — WebKitGTK in dev mode pipes the WebView
+            // console to the host terminal.
+            let _ = window.eval(
+                "console.log('[webrtc-pageload] RTCPeerConnection =', typeof RTCPeerConnection);",
+            );
+        }
+    });
+
+    builder
         .invoke_handler(tauri::generate_handler![
             detect_hardware,
             ollama_pull,
