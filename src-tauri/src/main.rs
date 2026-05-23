@@ -1027,26 +1027,62 @@ fn main() {
             {
                 use tauri::Manager;
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.with_webview(|webview| {
+                    let window_for_reload = window.clone();
+                    let _ = window.with_webview(move |webview| {
                         use webkit2gtk::{SettingsExt, WebViewExt};
+                        eprintln!(
+                            "[webrtc] webkit2gtk-rs build: {}.{}.{}",
+                            webkit2gtk::MAJOR_VERSION,
+                            webkit2gtk::MINOR_VERSION,
+                            webkit2gtk::MICRO_VERSION,
+                        );
                         let wv = webview.inner();
                         let Some(settings) = WebViewExt::settings(&wv) else {
                             eprintln!("[webrtc] WebKit settings unavailable — skipping");
                             return;
                         };
                         let was_webrtc = settings.enables_webrtc();
+                        eprintln!(
+                            "[webrtc] before: enable_webrtc={} enable_media_stream={} enable_mediasource={} enable_media_capabilities={}",
+                            was_webrtc,
+                            settings.enables_media_stream(),
+                            settings.enables_mediasource(),
+                            settings.enables_media_capabilities(),
+                        );
                         settings.set_enable_webrtc(true);
                         settings.set_enable_media_stream(true);
                         settings.set_enable_mediasource(true);
                         settings.set_enable_media_capabilities(true);
-                        if !was_webrtc && settings.enables_webrtc() {
-                            // Frame's JS context was created before
-                            // our flip — without a reload, the
-                            // page's `window.RTCPeerConnection`
-                            // stays undefined for the life of this
-                            // session. Reload registers the
-                            // bindings.
+                        let now_webrtc = settings.enables_webrtc();
+                        eprintln!(
+                            "[webrtc] after:  enable_webrtc={}",
+                            now_webrtc,
+                        );
+                        if !was_webrtc && now_webrtc {
+                            // Try both reload paths: the native
+                            // webkit2gtk-rs reload (which we expected
+                            // to work but the previous run shows no
+                            // second page-load event from), and a
+                            // JS-side `location.reload()` via Tauri's
+                            // eval (which has clear browser semantics
+                            // and uses the WebView's own navigation
+                            // path). Whichever one actually fires a
+                            // page-load event will tell us which API
+                            // to use going forward.
+                            eprintln!("[webrtc] calling wv.reload()");
                             wv.reload();
+                            eprintln!("[webrtc] wv.reload() returned");
+                            // Also schedule a JS-side reload — fires
+                            // on the next event-loop turn so the
+                            // native reload above has a chance first.
+                            // If both work we'll see TWO extra
+                            // page-load cycles in the probe output;
+                            // if only the JS one works, exactly one
+                            // extra cycle.
+                            let _ = window_for_reload.eval(
+                                "setTimeout(() => { console.log('[webrtc] JS-side reload firing'); location.reload(); }, 50);",
+                            );
+                            eprintln!("[webrtc] queued JS-side reload");
                         }
                     });
                 }
