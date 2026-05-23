@@ -1030,12 +1030,6 @@ fn main() {
                     let window_for_reload = window.clone();
                     let _ = window.with_webview(move |webview| {
                         use webkit2gtk::{SettingsExt, WebViewExt};
-                        eprintln!(
-                            "[webrtc] webkit2gtk-rs build: {}.{}.{}",
-                            webkit2gtk::MAJOR_VERSION,
-                            webkit2gtk::MINOR_VERSION,
-                            webkit2gtk::MICRO_VERSION,
-                        );
                         let wv = webview.inner();
                         let Some(settings) = WebViewExt::settings(&wv) else {
                             eprintln!("[webrtc] WebKit settings unavailable — skipping");
