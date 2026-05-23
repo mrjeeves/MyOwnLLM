@@ -876,6 +876,25 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Linux WebRTC sandbox workaround: some WebKitGTK builds gate
+    // gstreamer plugin discovery (incl. webrtcbin) through the
+    // bubblewrap sandbox in a way that prevents the JS engine from
+    // ever registering `RTCPeerConnection`. Force-disabling the
+    // sandbox is the last runtime knob before we conclude WebKit
+    // was compiled without WebRTC support entirely. Cheap to set
+    // unconditionally — distros where the sandbox isn't gating
+    // anything just ignore it. Must run BEFORE tauri::Builder
+    // touches GTK, since WebKit reads it once at process start.
+    //
+    // Honors a user-set value so anyone wanting the sandbox on can
+    // still flip it back with `WEBKIT_FORCE_SANDBOX=1 myownllm`.
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WEBKIT_FORCE_SANDBOX").is_none() {
+            std::env::set_var("WEBKIT_FORCE_SANDBOX", "0");
+        }
+    }
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
@@ -892,6 +911,11 @@ fn main() {
     // against the now-true setting and gets `RTCPeerConnection`
     // into the global, which is what Trystero looks for.
     //
+    // Also probes — at each page-load finish — the actual JS-side
+    // `typeof RTCPeerConnection` value, so if the binding still
+    // isn't there after our reload we can see it in stderr instead
+    // of guessing from a downstream Trystero error.
+    //
     // Reload runs from `on_page_load(Finished)` rather than from
     // `with_webview` (#199 take-2) because firing reload before the
     // WebView attaches to a visible GTK window leaves the window
@@ -907,7 +931,15 @@ fn main() {
         if !matches!(payload.event(), PageLoadEvent::Finished) {
             return;
         }
-        if !RELOADED.swap(true, Ordering::SeqCst) {
+        let already_reloaded = RELOADED.swap(true, Ordering::SeqCst);
+        eprintln!(
+            "[webrtc-probe] page-load finished (post-reload={already_reloaded}): {}",
+            payload.url(),
+        );
+        let _ = window.eval(
+            "console.log('[webrtc-probe] typeof RTCPeerConnection =', typeof RTCPeerConnection);",
+        );
+        if !already_reloaded {
             let _ = window.eval("location.reload();");
         }
     });
@@ -1050,11 +1082,32 @@ fn main() {
                     let _ = window.with_webview(|webview| {
                         use webkit2gtk::{SettingsExt, WebViewExt};
                         let wv = webview.inner();
+                        // Runtime version of the underlying
+                        // WebKitGTK library — different from the
+                        // webkit2gtk-rs crate's build version. The
+                        // bound `webkit_get_*_version()` C
+                        // functions are exported as free fns in
+                        // webkit2gtk-rs, but the GIR-generated
+                        // bindings put them under different
+                        // namespaces depending on version; the
+                        // safe fallback is reading them via the
+                        // WebKitWebContext if needed. For now,
+                        // skip the version print here and rely on
+                        // the user's `apt list --installed`
+                        // showing the package version.
                         if let Some(settings) = WebViewExt::settings(&wv) {
+                            let before = settings.enables_webrtc();
                             settings.set_enable_webrtc(true);
                             settings.set_enable_media_stream(true);
                             settings.set_enable_mediasource(true);
                             settings.set_enable_media_capabilities(true);
+                            let after = settings.enables_webrtc();
+                            eprintln!(
+                                "[webrtc-probe] enable_webrtc: {before} -> {after} (WEBKIT_FORCE_SANDBOX={})",
+                                std::env::var("WEBKIT_FORCE_SANDBOX").unwrap_or_else(|_| "<unset>".into()),
+                            );
+                        } else {
+                            eprintln!("[webrtc-probe] WebKit settings unavailable");
                         }
                     });
                 }
