@@ -784,6 +784,30 @@ fn main() {
     #[cfg(target_os = "linux")]
     quiet_alsa_diagnostics();
 
+    // Point myownmesh-core at our existing data directory before any
+    // mesh module is touched. The substrate defaults to `~/.myownmesh/`,
+    // but MyOwnLLM has shipped `~/.myownllm/.secrets/identity.json` and
+    // `~/.myownllm/mesh/rosters/*.json` for many releases — moving the
+    // anchor would orphan every user's Device ID and peer approvals.
+    // `MYOWNMESH_HOME` overrides the default at the source. Set
+    // unconditionally; explicit override wins if the user set one
+    // themselves (mostly relevant for cross-app test harnesses).
+    if std::env::var_os("MYOWNMESH_HOME").is_none() {
+        if let Ok(dir) = myownllm_dir() {
+            std::env::set_var("MYOWNMESH_HOME", dir);
+        }
+    }
+    // Pre-multi-network rosters lived at `~/.myownllm/mesh/roster.json`
+    // (single file keyed by self-reported network_id). The substrate
+    // expects the per-network layout that MyOwnLLM moved to several
+    // releases ago. Run the one-shot migration here, after the env
+    // var is set, so a legacy file gets relocated before anything
+    // reads from `mesh/rosters/`. The function is a no-op when the
+    // legacy file doesn't exist (the case for nearly every user by
+    // now); failures are swallowed so a malformed file can't block
+    // launch.
+    let _ = mesh::roster::migrate_legacy_if_present();
+
     // If invoked from CLI with arguments, handle as CLI and exit before starting GUI.
     let args: Vec<String> = std::env::args().collect();
     let cli_mode = args.len() > 1;
