@@ -28,6 +28,7 @@ import type { SettingsTab } from "../update-state.svelte";
 export type CloudMeshSubTab =
   | "status"
   | "connections"
+  | "graph"
   | "governance"
   | "activity"
   | "settings"
