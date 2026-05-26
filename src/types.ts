@@ -193,6 +193,30 @@ export interface NetworkConfig {
    *  ID — and the only thing the user ever reads. Doubles as the
    *  per-network roster filename. */
   network_id: string;
+  /** Cosmetic display name. Optional — when absent the UI falls
+   *  back to `network_id`. Mirrors `myownmesh_core::config::NetworkConfig::label`
+   *  so a network record round-trips between MyOwnLLM and any
+   *  other myownmesh consumer without losing its friendly name. */
+  label?: string;
+  /** Governance kind. `"open"` (default) means every peer can
+   *  edit the roster; `"closed"` enables the proposal /
+   *  threshold-signature flow from `myownmesh_core::network_state`.
+   *  Matches the substrate's `NetworkKind` serde encoding so the
+   *  daemon-side governance state agrees on the wire. */
+  kind?: NetworkKind;
+  /** Topology selector for the runtime mesh. `"ring"` is the only
+   *  shape MyOwnLLM's JS mesh client currently implements; the
+   *  field is persisted so a future substrate-driven runtime
+   *  (Star, FullMesh) can pick it up without a schema migration.
+   *  Mirrors `myownmesh_core::config::TopologyMode`. */
+  topology?: TopologyMode;
+  /** Headless auto-roster: when true, incoming hellos are
+   *  approved without the user-facing prompt. Off by default
+   *  because MyOwnLLM is a desktop app where the user is
+   *  expected to be present; mirrors the substrate's
+   *  `auto_approve` field so a NetworkConfig blob ported from a
+   *  daemon-only setup keeps the same semantics. */
+  auto_approve?: boolean;
   /** Per-network signaling / NAT settings. Each network can point
    *  at a different relay pool — home / office / public mesh all
    *  configurable independently. Empty signaling = Trystero's
@@ -237,6 +261,32 @@ export interface NetworkConfig {
    *  for backwards compat — absent = enabled. */
   auto_gossip?: boolean;
 }
+
+/** Governance kind for a network. Mirrors
+ *  `myownmesh_core::network_state::NetworkKind`.
+ *
+ *  - `"open"` — every roster entry can add or remove peers; no
+ *    threshold required. Default. The only kind MyOwnLLM has
+ *    historically shipped.
+ *  - `"closed"` — roster edits become signed transitions through
+ *    the governance proposal flow. Requires at least one Owner
+ *    on the network to bootstrap. */
+export type NetworkKind = "open" | "closed";
+
+/** Authority tier within a closed network. Mirrors
+ *  `myownmesh_core::network_state::Role`. Cosmetic on open
+ *  networks (every peer is effectively Owner-equivalent there). */
+export type Role = "member" | "controller" | "owner";
+
+/** Topology selector. Mirrors `myownmesh_core::config::TopologyMode`
+ *  with serde `tag = "kind"`, `rename_all = "snake_case"`. The
+ *  shape on disk matches what the substrate's `serde_json` emits,
+ *  so a NetworkConfig blob written by either side parses on the
+ *  other. */
+export type TopologyMode =
+  | { kind: "ring"; n_preferred?: number | null }
+  | { kind: "star"; hub: string }
+  | { kind: "full_mesh" };
 
 /** Cloud Mesh — peer-to-peer substrate that lets multiple MyOwnLLM
  *  instances share identities, conversations, and (later) sensors /

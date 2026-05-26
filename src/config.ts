@@ -11,6 +11,7 @@ import type {
   MicConfig,
   AgentPermissionsConfig,
   ToolPermission,
+  TopologyMode,
   TurnServer,
   Prompt,
   PromptToolId,
@@ -300,6 +301,25 @@ function mergeNetwork(
     // behavior. Only an explicit `false` on disk disables gossip.
     auto_gossip: typeof raw.auto_gossip === "boolean" ? raw.auto_gossip : true,
   };
+  // Substrate-aligned optional fields. Defaults are chosen so an
+  // entry written by MyOwnLLM before this PR still loads identically:
+  //   - `label` absent → UI shows `network_id`
+  //   - `kind` absent → "open" (the only governance mode MyOwnLLM
+  //     has historically supported; no signed transitions required)
+  //   - `topology` absent → ring with default n_preferred
+  //   - `auto_approve` absent → false (desktop-app default, user
+  //     approves each peer)
+  if (typeof raw.label === "string" && raw.label.trim()) {
+    net.label = raw.label.trim();
+  }
+  if (raw.kind === "open" || raw.kind === "closed") {
+    net.kind = raw.kind;
+  }
+  const t = coerceTopology(raw.topology);
+  if (t) net.topology = t;
+  if (typeof raw.auto_approve === "boolean") {
+    net.auto_approve = raw.auto_approve;
+  }
   if (raw.agent_permissions) {
     net.agent_permissions = mergeAgentPermissions(raw.agent_permissions);
   }
@@ -309,6 +329,36 @@ function mergeNetwork(
       .filter((p): p is Prompt => p !== null);
   }
   return net;
+}
+
+/** Coerce a raw topology blob into a strict `TopologyMode`. Drops
+ *  anything we don't recognise so the substrate's serde stays the
+ *  shape authority — adding a new variant in `myownmesh-core` is
+ *  what teaches this function how to accept it. Returns `undefined`
+ *  on a degenerate input so the caller falls back to the implicit
+ *  ring default. */
+function coerceTopology(raw: unknown): TopologyMode | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const obj = raw as Record<string, unknown>;
+  switch (obj.kind) {
+    case "ring": {
+      const n = obj.n_preferred;
+      return {
+        kind: "ring",
+        ...(typeof n === "number" && Number.isFinite(n) && n > 0
+          ? { n_preferred: Math.floor(n) }
+          : {}),
+      };
+    }
+    case "star":
+      return typeof obj.hub === "string" && obj.hub
+        ? { kind: "star", hub: obj.hub }
+        : undefined;
+    case "full_mesh":
+      return { kind: "full_mesh" };
+    default:
+      return undefined;
+  }
 }
 
 /** Merge a partial cloud_mesh config from a saved file with
@@ -524,6 +574,17 @@ export interface NetworkSettingsExport {
   kind: typeof NETWORK_SETTINGS_KIND;
   version: number;
   network_id: string;
+  /** Optional cosmetic display name. Mirrors
+   *  `myownmesh_core::config::NetworkConfig::label`. */
+  label?: string;
+  /** Substrate-aligned governance kind. Absent → "open" on
+   *  import; substrate consumers stamp it explicitly. */
+  network_kind?: NetworkConfig["kind"];
+  /** Substrate-aligned topology selector. Absent → ring default.
+   *  Field name is `topology` in the substrate; we mirror it. */
+  topology?: NetworkConfig["topology"];
+  /** Headless auto-roster. */
+  auto_approve?: boolean;
   signaling_servers: string[];
   stun_servers: string[];
   turn_servers: TurnServer[];
@@ -538,6 +599,10 @@ export function exportNetworkSettings(net: NetworkConfig): NetworkSettingsExport
     kind: NETWORK_SETTINGS_KIND,
     version: NETWORK_SETTINGS_VERSION,
     network_id: net.network_id,
+    ...(net.label ? { label: net.label } : {}),
+    ...(net.kind ? { network_kind: net.kind } : {}),
+    ...(net.topology ? { topology: net.topology } : {}),
+    ...(typeof net.auto_approve === "boolean" ? { auto_approve: net.auto_approve } : {}),
     signaling_servers: [...net.signaling_servers],
     stun_servers: [...net.stun_servers],
     turn_servers: net.turn_servers.map((t) => ({
@@ -599,10 +664,19 @@ function coerceImport(raw: NetworkSettingsExport): NetworkSettingsExport {
             : {}),
         }))
     : [];
+  const network_kind =
+    raw.network_kind === "open" || raw.network_kind === "closed"
+      ? raw.network_kind
+      : undefined;
+  const topology = coerceTopology(raw.topology);
   return {
     kind: NETWORK_SETTINGS_KIND,
     version: NETWORK_SETTINGS_VERSION,
     network_id: String(raw.network_id ?? ""),
+    ...(typeof raw.label === "string" && raw.label.trim() ? { label: raw.label.trim() } : {}),
+    ...(network_kind ? { network_kind } : {}),
+    ...(topology ? { topology } : {}),
+    ...(typeof raw.auto_approve === "boolean" ? { auto_approve: raw.auto_approve } : {}),
     signaling_servers: cleanSignaling(signaling),
     stun_servers: stun,
     turn_servers: turn,
@@ -627,12 +701,25 @@ export async function importNetworkSettings(
   const existing = cfg.cloud_mesh.networks.find(
     (n) => n.network_id === blob.network_id,
   );
+  // Substrate-aligned overlays applied on both the update and create
+  // paths. Each field is only included when the envelope carries it
+  // so an old MyOwnLLM export (no `label`/`network_kind`/etc.) doesn't
+  // accidentally wipe an existing entry's local customisations.
+  const substrate_overlay: Partial<NetworkConfig> = {
+    ...(blob.label ? { label: blob.label } : {}),
+    ...(blob.network_kind ? { kind: blob.network_kind } : {}),
+    ...(blob.topology ? { topology: blob.topology } : {}),
+    ...(typeof blob.auto_approve === "boolean"
+      ? { auto_approve: blob.auto_approve }
+      : {}),
+  };
   if (existing) {
     const updated = await updateNetwork(existing.id, {
       signaling_servers: blob.signaling_servers,
       stun_servers: blob.stun_servers,
       turn_servers: blob.turn_servers,
       accepting: blob.accepting,
+      ...substrate_overlay,
     });
     if (options?.activate) {
       await setActiveNetwork(existing.id);
@@ -647,6 +734,7 @@ export async function importNetworkSettings(
     stun_servers: blob.stun_servers,
     turn_servers: blob.turn_servers,
     accepting: blob.accepting,
+    ...substrate_overlay,
   });
   const networks = [...cfg.cloud_mesh.networks, fresh];
   const active_network_id = options?.activate ? fresh.id : cfg.cloud_mesh.active_network_id;
