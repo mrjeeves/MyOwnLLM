@@ -937,6 +937,8 @@ fn main() {
             mesh::commands::mesh_identity_set_label,
             mesh::commands::mesh_network_id_generate,
             mesh::commands::mesh_network_id_normalize,
+            mesh::commands::mesh_verification_code_generate,
+            mesh::commands::mesh_verification_code_is_well_formed,
             mesh::commands::mesh_sign,
             mesh::commands::mesh_verify,
             mesh::commands::mesh_roster_get,

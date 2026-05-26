@@ -67,6 +67,7 @@ import {
   generateMeshId,
   generateNonce,
   generateVerificationCode,
+  isWellFormedVerificationCode,
   peerSupportsFeature,
   pubkeyPart,
   pubkeySuffix,
@@ -4066,7 +4067,16 @@ class MeshClient {
     conn.device_pubkey = msg.device_id;
     conn.their_nonce = msg.nonce;
     conn.label = msg.label || "";
-    conn.their_verification_code = (msg.verification_code || "").slice(0, 16);
+    // Validate via the substrate's canonical rules (alphabet +
+    // length). Mismatch → empty string so the approval tile renders
+    // "[malformed]" instead of showing degenerate input. The trim
+    // to 16 chars stays as a defense-in-depth cap; a well-formed
+    // code is always 6 chars but a peer running a future protocol
+    // version with a longer code would still log sanely here.
+    const raw_code = (msg.verification_code || "").slice(0, 16);
+    conn.their_verification_code = (await isWellFormedVerificationCode(raw_code))
+      ? raw_code
+      : "";
     // Phase 2: peer's capabilities and ring capacity. v1 peers omit
     // both; the defaults are equivalent to "no LLM/ASR/mic, hold up
     // to 3 connections" which is the same as a fresh ConnectionState.

@@ -507,6 +507,19 @@ export async function setActiveNetwork(id: string | null): Promise<Config> {
 export const NETWORK_SETTINGS_KIND = "myownllm.network-settings";
 export const NETWORK_SETTINGS_VERSION = 1;
 
+/** Envelope kinds we recognise on import. Files exported from any
+ *  myownmesh-family product (currently MyOwnLLM + MyOwnMesh) carry
+ *  one of these markers; the on-the-wire shape is identical so we
+ *  accept all of them and re-export only with our own kind. The
+ *  substrate's canonical name (`myownmesh.network-settings`) is
+ *  what bare-mesh and future products use; legacy `myownllm.*` keeps
+ *  working for users sharing files between MyOwnLLM installs that
+ *  pre-date this PR. */
+const IMPORT_KINDS: readonly string[] = [
+  NETWORK_SETTINGS_KIND,
+  "myownmesh.network-settings",
+];
+
 export interface NetworkSettingsExport {
   kind: typeof NETWORK_SETTINGS_KIND;
   version: number;
@@ -542,7 +555,11 @@ export function exportNetworkSettings(net: NetworkConfig): NetworkSettingsExport
 export function isNetworkSettingsExport(raw: unknown): raw is NetworkSettingsExport {
   if (!raw || typeof raw !== "object") return false;
   const obj = raw as Record<string, unknown>;
-  return obj.kind === NETWORK_SETTINGS_KIND && typeof obj.network_id === "string";
+  return (
+    typeof obj.kind === "string" &&
+    IMPORT_KINDS.includes(obj.kind) &&
+    typeof obj.network_id === "string"
+  );
 }
 
 /** Try to parse a JSON string as a network-settings envelope.

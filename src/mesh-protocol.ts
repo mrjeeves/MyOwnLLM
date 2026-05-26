@@ -1011,17 +1011,49 @@ export async function pubkeySuffix(pubkey: string): Promise<string> {
   return hex.slice(0, 5);
 }
 
+/** Length of a well-formed verification code. Mirrors
+ *  `myownmesh_core::verification::VERIFICATION_CODE_LEN`; the
+ *  substrate is the canonical source of the alphabet + length
+ *  rules and we keep this in sync. */
+export const VERIFICATION_CODE_LEN = 6;
+
 /** Generate a short human-readable verification code. 6 chars from
  *  `[a-z0-9]` = 36^6 ≈ 2 billion possibilities — vastly more than
  *  needed for a "did the right request just arrive?" eyeball check,
- *  and short enough to read over a phone call. */
+ *  and short enough to read over a phone call.
+ *
+ *  Kept as a synchronous JS impl (rather than a `mesh_verification_code_generate`
+ *  Tauri roundtrip) because it's called inline when seeding a
+ *  fresh `ConnectionState` and async-ifying that path would touch
+ *  half a dozen unrelated call sites. The substrate's
+ *  `myownmesh_core::verification::generate_code` is byte-for-byte
+ *  identical; a code minted here is indistinguishable from a code
+ *  minted there. The matching Tauri command is exposed for callers
+ *  that prefer routing through the substrate (e.g. tests, agent
+ *  tools) — see `mesh_verification_code_generate`. */
 export function generateVerificationCode(): string {
   const ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
-  const bytes = new Uint8Array(6);
+  const bytes = new Uint8Array(VERIFICATION_CODE_LEN);
   crypto.getRandomValues(bytes);
   let out = "";
   for (const b of bytes) out += ALPHABET[b % ALPHABET.length];
   return out;
+}
+
+/** Sanity-check a code received from a peer's `hello`. The
+ *  ed25519 mutual signature is what authenticates the peer; this
+ *  check just lets the approval UI render "[malformed]" instead of
+ *  surfacing a degenerate string (empty, oversize, wrong alphabet)
+ *  in the verification tile.
+ *
+ *  Routed through the substrate (`mesh_verification_code_is_well_formed`)
+ *  so the rules can evolve in one place — if a future protocol
+ *  bump widens the alphabet or changes the length, every consumer
+ *  picks up the new behaviour from `myownmesh_core` automatically. */
+export async function isWellFormedVerificationCode(code: string): Promise<boolean> {
+  return (await invoke<boolean>("mesh_verification_code_is_well_formed", {
+    code,
+  })) as boolean;
 }
 
 /** Generate a short opaque id used for `infer_request` /
