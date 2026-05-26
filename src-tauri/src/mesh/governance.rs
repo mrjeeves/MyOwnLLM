@@ -17,9 +17,8 @@
 //! at MyOwnLLM's data directory.
 
 use myownmesh_core::network_state::{
-    apply_transition, derive_split_network_id, load, save, transition_payload,
-    verify_quorum, verify_transition_signatures, NetworkState, Role, Transition,
-    TransitionVariant,
+    apply_transition, derive_split_network_id, load, save, transition_payload, verify_quorum,
+    verify_transition_signatures, NetworkState, Role, Transition, TransitionVariant,
 };
 use myownmesh_core::{identity, signing};
 use serde::Serialize;
@@ -131,10 +130,7 @@ pub fn mesh_governance_state_save_pending(
 /// the same new network id, so a split retried after a crash doesn't
 /// shadow-fork into a fresh id.
 #[tauri::command]
-pub fn mesh_governance_derive_split_network_id(
-    parent_id: String,
-    signers: Vec<String>,
-) -> String {
+pub fn mesh_governance_derive_split_network_id(parent_id: String, signers: Vec<String>) -> String {
     derive_split_network_id(&parent_id, &signers)
 }
 
