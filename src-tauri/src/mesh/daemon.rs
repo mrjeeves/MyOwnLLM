@@ -502,20 +502,58 @@ impl Drop for DaemonChild {
 ///      `target/{debug,release}/`) — only relevant in dev when
 ///      the sidecar wasn't bundled (offline iteration,
 ///      `MYOWNLLM_SKIP_SIDECAR=1`).
-/// Cheap "is this file an executable?" check used to filter
-/// candidates before spawn. Reads the first 4 bytes and matches
-/// against PE / ELF / Mach-O magic. A non-existent or short
-/// file resolves to false. Matches the build-time validator
-/// in `build.rs::validate_executable_magic`.
+/// Verify a candidate path is a real, usable daemon binary
+/// before we try to spawn it. Matches the build-time
+/// validator in `build.rs::validate_executable_magic`:
+///
+/// - File size ≥ 1 MiB (filters truncated downloads / stubs).
+/// - PE / ELF / Mach-O magic at offset 0.
+/// - On Windows (`.exe`): walk the DOS header's `e_lfanew` and
+///   verify the PE signature is `PE\0\0`. A 4 MB truncated PE
+///   that still starts with `MZ` would pass a magic-only check
+///   but spawn would reject it with the cryptic "not a valid
+///   Win32 application" error — this catches it.
+///
+/// Files at paths we own (the source `binaries/<triple>` slot,
+/// Tauri's dev-mode `target/<profile>/` staging) that fail the
+/// check get unlinked here as a self-heal so the next build /
+/// dev cycle rewrites with fresh content instead of perpetually
+/// staging corrupt bits. Files at paths we DON'T own (PATH
+/// lookup, env-var override) just get skipped without deletion.
 fn looks_like_executable(path: &Path) -> bool {
-    use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut head = [0u8; 4];
-    if f.read_exact(&mut head).is_err() {
-        return false;
+    match validate_path_is_executable(path) {
+        Ok(()) => true,
+        Err(reason) => {
+            // Self-heal: if this is a known-owned slot and the
+            // content is invalid, delete it. Tauri's externalBin
+            // staging will regenerate from the source on the
+            // next build; the source's own validator catches
+            // problems before propagating them.
+            if is_owned_slot(path) {
+                eprintln!(
+                    "daemon: {} failed executable check ({reason}); removing stale file",
+                    path.display()
+                );
+                let _ = std::fs::remove_file(path);
+            } else {
+                eprintln!("daemon: skipping {} ({reason})", path.display());
+            }
+            false
+        }
     }
+}
+
+fn validate_path_is_executable(path: &Path) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let meta = std::fs::metadata(path).map_err(|e| format!("stat: {e}"))?;
+    let size = meta.len();
+    if size < 1_048_576 {
+        return Err(format!("{size} bytes < 1 MiB minimum"));
+    }
+    let mut f = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+    let mut head = [0u8; 4];
+    f.read_exact(&mut head)
+        .map_err(|e| format!("read magic: {e}"))?;
     let pe = head[0..2] == *b"MZ";
     let elf = head == [0x7f, b'E', b'L', b'F'];
     let macho = matches!(
@@ -525,7 +563,51 @@ fn looks_like_executable(path: &Path) -> bool {
         u32::from_be_bytes(head),
         0xFEED_FACE | 0xFEED_FACF | 0xCAFE_BABE | 0xBEBA_FECA
     );
-    pe || elf || macho
+    if !(pe || elf || macho) {
+        return Err(format!("bad magic {:02x?}", head));
+    }
+    if pe {
+        f.seek(SeekFrom::Start(0x3C))
+            .map_err(|e| format!("seek 0x3C: {e}"))?;
+        let mut e_lfanew_bytes = [0u8; 4];
+        f.read_exact(&mut e_lfanew_bytes)
+            .map_err(|e| format!("read e_lfanew: {e}"))?;
+        let e_lfanew = u32::from_le_bytes(e_lfanew_bytes) as u64;
+        if e_lfanew < 0x40 || e_lfanew >= size {
+            return Err(format!("nonsense e_lfanew=0x{e_lfanew:x}"));
+        }
+        f.seek(SeekFrom::Start(e_lfanew))
+            .map_err(|e| format!("seek to PE sig: {e}"))?;
+        let mut pe_sig = [0u8; 4];
+        f.read_exact(&mut pe_sig)
+            .map_err(|e| format!("read PE sig: {e}"))?;
+        if pe_sig != [b'P', b'E', 0, 0] {
+            return Err(format!("no PE sig at 0x{e_lfanew:x}"));
+        }
+    }
+    Ok(())
+}
+
+/// Identify paths where the LLM owns the file and a stale /
+/// corrupt blob can be safely removed: the source `binaries/`
+/// sidecar slot, and the Tauri dev-staging `target/<profile>/`
+/// directories. Everything else (env-var overrides, PATH hits,
+/// sibling MyOwnMesh checkout) we leave alone.
+fn is_owned_slot(path: &Path) -> bool {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let owned_dirs = [
+        manifest.join("binaries"),
+        manifest.join("target").join("debug"),
+        manifest.join("target").join("release"),
+    ];
+    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    for dir in &owned_dirs {
+        let canonical_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        if canonical_path.starts_with(&canonical_dir) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn daemon_binary_candidates() -> Vec<PathBuf> {

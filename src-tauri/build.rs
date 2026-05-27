@@ -485,18 +485,34 @@ fn download_release_asset(
     Ok(bin)
 }
 
-/// Verify the first bytes of a putative binary look like an
-/// executable for the current platform. Cheap defence against a
-/// corrupt or truncated download.
+/// Verify the bytes of a putative binary look like an
+/// executable for the current platform. Stronger than just
+/// checking the 4-byte magic: a truncated PE that still starts
+/// with `MZ` would pass a magic-only check yet fail to spawn
+/// at runtime with the cryptic "not a valid Win32 application"
+/// error. We additionally:
+///
+/// - Require file size ≥ 1 MiB (the release daemon is ~7 MB;
+///   even debug builds are several MB).
+/// - On Windows (`.exe`): walk the DOS header → `e_lfanew` →
+///   verify the PE signature at that offset is `PE\0\0`.
 fn validate_executable_magic(path: &Path) -> Result<(), String> {
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
+    let meta = fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let size = meta.len();
+    if size < 1_048_576 {
+        return Err(format!(
+            "{} is only {size} bytes (< 1 MiB) — too small to be a real myownmesh build. \
+             Likely a truncated download or leftover stub. Delete it and re-run.",
+            path.display()
+        ));
+    }
     let mut f = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut head = [0u8; 4];
     f.read_exact(&mut head)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+        .map_err(|e| format!("read magic {}: {e}", path.display()))?;
     let looks_pe = head[0..2] == *b"MZ";
     let looks_elf = head == [0x7f, b'E', b'L', b'F'];
-    // macOS Mach-O magic bytes (multiple flavours: 32-bit, 64-bit, fat).
     let looks_macho = matches!(
         u32::from_le_bytes(head),
         0xFEED_FACE | 0xFEED_FACF | 0xCAFE_BABE | 0xBEBA_FECA
@@ -506,11 +522,41 @@ fn validate_executable_magic(path: &Path) -> Result<(), String> {
     );
     if !(looks_pe || looks_elf || looks_macho) {
         return Err(format!(
-            "{} doesn't look like an executable (first 4 bytes: {:02x?}) — \
-             likely a corrupt download. Delete `binaries/` and re-run the build.",
+            "{} doesn't look like an executable (first 4 bytes: {:02x?}) — corrupt download.",
             path.display(),
             head
         ));
+    }
+    if looks_pe {
+        // Walk to the PE signature via e_lfanew at offset 0x3C
+        // of the DOS header. A truncated PE that has `MZ` but
+        // no real PE header (the bug your last run hit — 4 MB
+        // file that passed the magic check but spawn rejected
+        // as "not a valid Win32 application") gets caught here.
+        f.seek(SeekFrom::Start(0x3C))
+            .map_err(|e| format!("seek 0x3C in {}: {e}", path.display()))?;
+        let mut e_lfanew_bytes = [0u8; 4];
+        f.read_exact(&mut e_lfanew_bytes)
+            .map_err(|e| format!("read e_lfanew {}: {e}", path.display()))?;
+        let e_lfanew = u32::from_le_bytes(e_lfanew_bytes) as u64;
+        if e_lfanew < 0x40 || e_lfanew >= size {
+            return Err(format!(
+                "{} has nonsense e_lfanew=0x{e_lfanew:x} (size 0x{size:x}) — truncated PE.",
+                path.display()
+            ));
+        }
+        f.seek(SeekFrom::Start(e_lfanew))
+            .map_err(|e| format!("seek to PE sig in {}: {e}", path.display()))?;
+        let mut pe_sig = [0u8; 4];
+        f.read_exact(&mut pe_sig)
+            .map_err(|e| format!("read PE sig {}: {e}", path.display()))?;
+        if pe_sig != [b'P', b'E', 0, 0] {
+            return Err(format!(
+                "{} has no PE signature at 0x{e_lfanew:x} (found {:02x?}) — truncated PE.",
+                path.display(),
+                pe_sig
+            ));
+        }
     }
     Ok(())
 }
