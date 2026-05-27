@@ -34,7 +34,7 @@
     type NetworkSettingsExport,
   } from "../../config";
   import { generateNetworkId, normalizeNetworkId } from "../../mesh";
-  import { meshClient } from "../../mesh-client.svelte";
+  import { meshClient } from "../../mesh-daemon.svelte";
   import type { TurnServer } from "../../types";
 
   let { onClose, initialImport = null } = $props<{

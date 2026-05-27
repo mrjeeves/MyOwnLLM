@@ -37,7 +37,7 @@
   } from "../../config";
   import type { NetworkConfig } from "../../types";
   import { meshUi } from "../../mesh-state.svelte";
-  import { meshClient } from "../../mesh-client.svelte";
+  import { meshClient } from "../../mesh-daemon.svelte";
   import { scrollAffordance } from "../scroll-affordance";
   import { setMeshIdentityLabel } from "../../mesh";
   import AddNetworkModal from "./AddNetworkModal.svelte";

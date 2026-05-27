@@ -27,7 +27,7 @@
    *  picked up that role. */
 
   import { onMount } from "svelte";
-  import { meshClient } from "../../mesh-client.svelte";
+  import { meshClient } from "../../mesh-daemon.svelte";
   import {
     APP_VERSION,
     capabilityBadges,

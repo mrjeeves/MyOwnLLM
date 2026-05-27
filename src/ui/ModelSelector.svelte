@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { meshClient } from "../mesh-client.svelte";
+  import { meshClient } from "../mesh-daemon.svelte";
   import { canServeInference, canServeTranscribe } from "../mesh-capabilities";
   import type { Mode } from "../types";
 

@@ -23,7 +23,7 @@
   import { transcribeUi } from "./transcribe-state.svelte";
   import { stickToBottom } from "./stick-to-bottom";
   import { renderMarkdown } from "./markdown";
-  import { meshClient } from "../mesh-client.svelte";
+  import { meshClient } from "../mesh-daemon.svelte";
   import { resolvePeerLlm } from "../mesh-capabilities";
   import { routingPins, setTextPin } from "./routing-pins.svelte";
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";

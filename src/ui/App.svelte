@@ -28,7 +28,7 @@
     type FolderMeta,
   } from "../conversations";
   import { updateUi } from "../update-state.svelte";
-  import { meshClient } from "../mesh-client.svelte";
+  import { meshClient } from "../mesh-daemon.svelte";
   import {
     transcribeUi,
     stopRecording,

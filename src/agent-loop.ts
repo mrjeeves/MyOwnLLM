@@ -25,7 +25,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ToolCall, StoredMessage } from "./conversations";
 import { TOOLS_BY_NAME, type Tool } from "./agent-tools";
-import { meshClient } from "./mesh-client.svelte";
+import { meshClient } from "./mesh-daemon.svelte";
 import type { Mode } from "./types";
 
 /** Per-frame payload the chat-stream event channel emits. Matches the

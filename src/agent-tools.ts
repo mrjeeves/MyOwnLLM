@@ -29,7 +29,7 @@ import {
   type NetworkSettingsExport,
 } from "./config";
 import { generateNetworkId, getMeshIdentity, normalizeNetworkId } from "./mesh";
-import { meshClient } from "./mesh-client.svelte";
+import { meshClient } from "./mesh-daemon.svelte";
 import { agentPermissions } from "./agent-permissions.svelte";
 import type { TurnServer } from "./types";
 

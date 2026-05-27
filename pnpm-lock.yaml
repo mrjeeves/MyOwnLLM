@@ -4,11 +4,6 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
-patchedDependencies:
-  '@trystero-p2p/core@0.24.0':
-    hash: 890515eb54da10eb3f02a930857908ab73a47a6afe688917185595ddbec59401
-    path: patches/@trystero-p2p__core@0.24.0.patch
-
 importers:
 
   .:
@@ -31,9 +26,6 @@ importers:
       marked:
         specifier: ^18.0.4
         version: 18.0.4
-      trystero:
-        specifier: ^0.24.0
-        version: 0.24.0
     devDependencies:
       '@sveltejs/vite-plugin-svelte':
         specifier: ^4
@@ -227,9 +219,6 @@ packages:
 
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
-
-  '@noble/secp256k1@3.1.0':
-    resolution: {integrity: sha512-+F7iS7tUMaNGXcc9X3PjmjvuQnXEuSjCRNzVVA2xAcKXgCaP0dHYz4SFyt4FKNHef7sOP//xihowcySSS7PK9g==}
 
   '@rollup/rollup-android-arm-eabi@4.60.3':
     resolution: {integrity: sha512-x35CNW/ANXG3hE/EZpRU8MXX1JDN86hBb2wMGAtltkz7pc6cxgjpy1OMMfDosOQ+2hWqIkag/fGok1Yady9nGw==}
@@ -480,12 +469,6 @@ packages:
   '@tauri-apps/plugin-shell@2.3.5':
     resolution: {integrity: sha512-jewtULhiQ7lI7+owCKAjc8tYLJr92U16bPOeAa472LHJdgaibLP83NcfAF2e+wkEcA53FxKQAZ7byDzs2eeizg==}
 
-  '@trystero-p2p/core@0.24.0':
-    resolution: {integrity: sha512-W5ATiflgzZLE21fN2VA3YsK2yBJEzCvhmJ/9q2Vm3QT/gcdqDpcBxsO0DYCy/wE1PBEwoB+A75eBNtGIGAPdxw==}
-
-  '@trystero-p2p/nostr@0.24.0':
-    resolution: {integrity: sha512-LmsJSicsFU/rhmOWYaP/OxFl3rwGieX+q0eh0pAWUQM7IXbMu6tLC5+aAimtHitikPv9r6sck6EUTWMin8dBAw==}
-
   '@types/estree@1.0.8':
     resolution: {integrity: sha512-dWHzHa2WqEXI/O1E9OjrocMTKJl2mSrEolh1Iomrv6U+JuNwaHXsXx9bLu5gG7BUWFIN0skIQJQ/L1rIex4X6w==}
 
@@ -632,9 +615,6 @@ packages:
   tinyglobby@0.2.16:
     resolution: {integrity: sha512-pn99VhoACYR8nFHhxqix+uvsbXineAasWm5ojXoN8xEwK5Kd3/TrhNn1wByuD52UxWRLy8pu+kRMniEi6Eq9Zg==}
     engines: {node: '>=12.0.0'}
-
-  trystero@0.24.0:
-    resolution: {integrity: sha512-IoY7kXNQg+jXQ7byjg69FNHbHaayUijnd3bNsLLumHQ7rk5p1r0Vu0JZA5JEoKYFAxGBS4shxE7MuNgsOntu+A==}
 
   typescript@5.9.3:
     resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
@@ -790,8 +770,6 @@ snapshots:
     dependencies:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
-
-  '@noble/secp256k1@3.1.0': {}
 
   '@rollup/rollup-android-arm-eabi@4.60.3':
     optional: true
@@ -958,13 +936,6 @@ snapshots:
   '@tauri-apps/plugin-shell@2.3.5':
     dependencies:
       '@tauri-apps/api': 2.11.0
-
-  '@trystero-p2p/core@0.24.0(patch_hash=890515eb54da10eb3f02a930857908ab73a47a6afe688917185595ddbec59401)': {}
-
-  '@trystero-p2p/nostr@0.24.0':
-    dependencies:
-      '@noble/secp256k1': 3.1.0
-      '@trystero-p2p/core': 0.24.0(patch_hash=890515eb54da10eb3f02a930857908ab73a47a6afe688917185595ddbec59401)
 
   '@types/estree@1.0.8': {}
 
@@ -1138,10 +1109,6 @@ snapshots:
     dependencies:
       fdir: 6.5.0(picomatch@4.0.4)
       picomatch: 4.0.4
-
-  trystero@0.24.0:
-    dependencies:
-      '@trystero-p2p/nostr': 0.24.0
 
   typescript@5.9.3: {}
 

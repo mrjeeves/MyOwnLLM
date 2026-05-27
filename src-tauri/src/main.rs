@@ -374,6 +374,60 @@ fn transcribe_upload_start(
     .map_err(|e| e.to_string())
 }
 
+/// Start an ASR session whose audio frames will arrive over the
+/// daemon's mesh IPC (see `mesh-transcribe.ts`). Mirrors the local
+/// `transcribe_start` shape minus the device picker. Audio chunks
+/// are pushed via `transcribe_feed_remote_audio`; end-of-stream is
+/// signaled by the same command's `is_final` flag.
+#[tauri::command]
+fn transcribe_start_remote_session(
+    session_id: String,
+    runtime: String,
+    model: String,
+    diarize_model: Option<String>,
+    sample_rate: u32,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    transcribe::start_remote_session(
+        session_id,
+        runtime,
+        model,
+        diarize_model,
+        sample_rate,
+        window,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Push a single PCM chunk into a running remote session. `bytes_b64`
+/// is base64-encoded i16 little-endian PCM at the session's sample
+/// rate (16 kHz mono on the LLM's wire format). Decoded + converted
+/// to the f32 shape the ingest loop expects.
+#[tauri::command]
+fn transcribe_feed_remote_audio(
+    session_id: String,
+    index: u64,
+    bytes_b64: String,
+    is_final: bool,
+) -> Result<(), String> {
+    let _ = index; // Reserved for future out-of-order detection; loop is
+                   // strictly serial today, sender always sends in
+                   // order. Accept the field so the wire shape can stay
+                   // stable when we wire reorder/retry.
+    let bytes = data_encoding::BASE64
+        .decode(bytes_b64.as_bytes())
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    if bytes.len() % 2 != 0 {
+        return Err("PCM bytes must be a multiple of 2 (i16 LE)".to_string());
+    }
+    let mut samples = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let s = i16::from_le_bytes([pair[0], pair[1]]);
+        samples.push(s as f32 / i16::MAX as f32);
+    }
+    transcribe::feed_remote_audio(&session_id, samples, is_final).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn asr_models_list() -> Vec<models::ModelInfo> {
     models::list(models::ModelKind::Asr)
@@ -961,6 +1015,8 @@ fn main() {
             transcribe_pending_streams,
             transcribe_drain_start,
             transcribe_upload_start,
+            transcribe_start_remote_session,
+            transcribe_feed_remote_audio,
             asr_models_list,
             asr_model_pull,
             asr_model_pull_cancel,
@@ -988,6 +1044,41 @@ fn main() {
             agent_io::agent_read_file,
             agent_io::agent_write_file,
             agent_io::agent_host_info,
+            // ---- daemon-backed mesh commands (PR migrating off Trystero)
+            mesh::daemon_commands::mesh_daemon_status,
+            mesh::daemon_commands::mesh_daemon_identity_show,
+            mesh::daemon_commands::mesh_daemon_identity_set_label,
+            mesh::daemon_commands::mesh_daemon_network_id_generate,
+            mesh::daemon_commands::mesh_daemon_network_id_normalize,
+            mesh::daemon_commands::mesh_daemon_config_show,
+            mesh::daemon_commands::mesh_daemon_networks_list,
+            mesh::daemon_commands::mesh_daemon_network_add,
+            mesh::daemon_commands::mesh_daemon_network_remove,
+            mesh::daemon_commands::mesh_daemon_topology_set,
+            mesh::daemon_commands::mesh_daemon_peers_list,
+            mesh::daemon_commands::mesh_daemon_roster_list,
+            mesh::daemon_commands::mesh_daemon_roster_approve,
+            mesh::daemon_commands::mesh_daemon_roster_remove,
+            mesh::daemon_commands::mesh_daemon_governance_state,
+            mesh::daemon_commands::mesh_daemon_governance_propose_kind_change,
+            mesh::daemon_commands::mesh_daemon_governance_propose_role_grant,
+            mesh::daemon_commands::mesh_daemon_governance_propose_role_revoke,
+            mesh::daemon_commands::mesh_daemon_governance_sign,
+            mesh::daemon_commands::mesh_daemon_governance_deny,
+            mesh::daemon_commands::mesh_daemon_governance_withdraw,
+            mesh::daemon_commands::mesh_daemon_governance_spawn_split,
+            mesh::daemon_commands::mesh_daemon_rpc_register,
+            mesh::daemon_commands::mesh_daemon_rpc_unregister,
+            mesh::daemon_commands::mesh_daemon_rpc_respond,
+            mesh::daemon_commands::mesh_daemon_rpc_stream_chunk,
+            mesh::daemon_commands::mesh_daemon_rpc_stream_end,
+            mesh::daemon_commands::mesh_daemon_rpc_call,
+            mesh::daemon_commands::mesh_daemon_rpc_call_stream,
+            mesh::daemon_commands::mesh_daemon_channel_subscribe,
+            mesh::daemon_commands::mesh_daemon_channel_unsubscribe,
+            mesh::daemon_commands::mesh_daemon_channel_send_to,
+            mesh::daemon_commands::mesh_daemon_channel_send_all,
+            mesh::daemon_commands::mesh_daemon_capabilities_set,
         ])
         .setup(|app| {
             // Linux WebKitGTK: flip `enable-webrtc` on at WebView creation
@@ -1202,16 +1293,82 @@ fn main() {
                     }
                 });
             }
+
+            // ---- daemon spawn + event pump --------------------------------
+            //
+            // Bring up the `myownmesh` daemon (or attach to an
+            // already-running one — see `mesh/daemon.rs` for the
+            // detect-and-share resolution order), subscribe to its
+            // event stream, and forward each frame to the frontend
+            // as `mesh://event`. The frontend listens via Tauri's
+            // event API; the same handler shape the MyOwnMesh GUI
+            // uses, intentionally — once both apps agree on the wire
+            // format, sharing peer state + roster + governance UI
+            // becomes a copy of the relevant Svelte components
+            // rather than a re-derivation of the protocol.
+            {
+                use std::sync::Arc;
+                use tauri::{Emitter, Manager};
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    match mesh::daemon::ensure_daemon_running().await {
+                        Ok((client, child)) => {
+                            // Subscribe events first — gives us the
+                            // ipc client_id needed for handler claims.
+                            let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(256);
+                            let client_id = match client.subscribe_events(tx).await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    eprintln!("daemon: event subscribe failed: {e}");
+                                    // Daemon's up but events failed — keep going
+                                    // with a placeholder id so RPC/channel ops
+                                    // produce useful errors instead of panicking.
+                                    String::from("c-unbound")
+                                }
+                            };
+                            let state =
+                                Arc::new(mesh::daemon::MeshDaemon::new(client, client_id, child));
+                            app_handle.manage(state);
+                            // Pump events into the frontend.
+                            let emit_handle = app_handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                while let Some(frame) = rx.recv().await {
+                                    let _ = emit_handle.emit("mesh://event", frame);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("daemon: ensure_daemon_running failed: {e}");
+                            // Still register an empty placeholder so commands
+                            // that take `State<Arc<MeshDaemon>>` panic with a
+                            // clear message ("state not found") rather than
+                            // silently dispatching against a half-built one.
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error building tauri application")
-        .run(|_app, event| {
+        .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async {
                     let _ = ollama::stop().await;
                 });
+                // Drop the daemon child explicitly so its `Drop`
+                // (best-effort SIGKILL) runs before process tear-
+                // down, instead of leaving the child orphaned to
+                // whatever the OS does with the parent's process
+                // group. No-op when we attached to a shared daemon
+                // (we never owned its lifetime in that path).
+                use std::sync::Arc;
+                use tauri::Manager;
+                if let Some(state) = app.try_state::<Arc<mesh::daemon::MeshDaemon>>() {
+                    let _ = state.child.lock().take();
+                }
             }
         });
 }
