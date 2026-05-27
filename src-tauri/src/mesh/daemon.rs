@@ -435,11 +435,32 @@ impl ControlClient {
 
 // ---- daemon child lifecycle ------------------------------------------
 
-/// Owned wrapper around a spawned `myownmesh serve` child. Dropping
-/// it kills the daemon (best-effort SIGKILL / TerminateProcess).
+/// Owned wrapper around a spawned `myownmesh serve` child.
+/// Dropping it kills the daemon (best-effort SIGKILL /
+/// TerminateProcess). On Windows we also attach the child to a
+/// Job Object with `KILL_ON_JOB_CLOSE`: if the LLM is killed
+/// abruptly (Ctrl-C / taskkill / crash) and Drop never runs, the
+/// OS still terminates the daemon when our process exits. That
+/// covers the orphan case the simple Drop path misses.
 pub struct DaemonChild {
     child: Option<Child>,
+    /// Windows Job Object the child is assigned to. Leaked
+    /// intentionally — the handle stays alive for the lifetime
+    /// of the LLM process so Windows reclaims it on exit (any
+    /// exit) and triggers KILL_ON_JOB_CLOSE.
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    job: Option<*mut std::ffi::c_void>,
 }
+
+// SAFETY: the Job Object handle is opaque + never dereferenced
+// directly; it's held purely so its lifetime extends across the
+// daemon child's lifetime. Sending the wrapper between threads
+// is safe.
+#[cfg(windows)]
+unsafe impl Send for DaemonChild {}
+#[cfg(windows)]
+unsafe impl Sync for DaemonChild {}
 
 impl Drop for DaemonChild {
     fn drop(&mut self) {
@@ -448,6 +469,9 @@ impl Drop for DaemonChild {
             let _ = c.wait();
             eprintln!("daemon: child terminated");
         }
+        // The Job Object handle is leaked deliberately — see the
+        // struct doc above. Windows GCs it when the LLM process
+        // exits, which is the point.
     }
 }
 
@@ -670,7 +694,21 @@ pub async fn ensure_daemon_running() -> Result<(ControlClient, Option<DaemonChil
                 continue;
             }
         };
-        let handle = DaemonChild { child: Some(child) };
+        // On Windows: assign the child to a KILL_ON_JOB_CLOSE
+        // Job Object so even an abrupt LLM exit (Ctrl-C in the
+        // parent terminal, taskkill, crash) terminates the
+        // daemon. This is what handles the orphan case the
+        // simple Drop fallback misses.
+        #[cfg(windows)]
+        let job = {
+            use std::os::windows::io::AsRawHandle;
+            crate::windows::assign_to_kill_on_close_job(child.as_raw_handle())
+        };
+        let handle = DaemonChild {
+            child: Some(child),
+            #[cfg(windows)]
+            job,
+        };
 
         // Wait for the control socket. Up to 8s is plenty even on
         // a cold-cache debug build.

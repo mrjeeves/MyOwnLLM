@@ -878,6 +878,24 @@ fn main() {
         windows::attach_parent_console();
     }
 
+    // Parent-PID watchdog. When `tauri dev` / `cargo run` /
+    // PowerShell is killed via Ctrl-C, the LLM (detached from
+    // the console as a windowed app) doesn't get the signal and
+    // keeps running — leaving the .exe file locked + the daemon
+    // it spawned orphaned. The watchdog polls the parent process
+    // and calls `std::process::exit(0)` when it dies, which
+    // fires Drop + RunEvent::Exit (and thus the daemon-child
+    // Job Object close), releasing every handle before the LLM
+    // actually terminates.
+    //
+    // CLI mode skips this: cargo run for `myownllm status` etc.
+    // already lives + dies with its console. GUI mode is the one
+    // that strands itself when the parent terminal closes.
+    #[cfg(target_os = "windows")]
+    if !cli_mode {
+        windows::install_parent_watchdog();
+    }
+
     // First thing every process does: apply any staged self-update so the new
     // binary takes over before we open ports, sockets, or the GUI window.
     self_update::apply_pending_if_any();
