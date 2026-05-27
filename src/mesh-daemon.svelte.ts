@@ -412,6 +412,13 @@ class MeshDaemonClient {
         } catch (e) {
           this.appendDiag("warn", `transcribe handler install failed: ${e}`);
         }
+        try {
+          const { installMoveHandlers } = await import("./mesh-move");
+          const release = await installMoveHandlers(this);
+          this.featureReleases.push(release);
+        } catch (e) {
+          this.appendDiag("warn", `move handlers install failed: ${e}`);
+        }
       }
     } catch (e) {
       this.error = String(e);
@@ -618,20 +625,24 @@ class MeshDaemonClient {
     );
   }
 
-  async fetchRemoteSession(_args: unknown): Promise<unknown> {
-    throw new Error("fetchRemoteSession: pending Phase C-5 migration");
+  async fetchRemoteSession(target_peer_id: string, guid: string): Promise<unknown> {
+    const { fetchRemoteSession } = await import("./mesh-move");
+    return fetchRemoteSession(this, target_peer_id, guid);
   }
 
-  async saveRemoteSession(_args: unknown): Promise<void> {
-    throw new Error("saveRemoteSession: pending Phase C-5 migration");
+  async saveRemoteSession(target_peer_id: string, conversation: unknown): Promise<void> {
+    const { saveRemoteSession } = await import("./mesh-move");
+    return saveRemoteSession(this, target_peer_id, conversation);
   }
 
-  async pullConversation(_args: unknown): Promise<void> {
-    throw new Error("pullConversation: pending Phase C-5 migration");
+  async pullConversation(guid: string, source_peer_id: string): Promise<void> {
+    const { pullConversation } = await import("./mesh-move");
+    return pullConversation(this, guid, source_peer_id);
   }
 
-  async moveConversation(_args: unknown): Promise<void> {
-    throw new Error("moveConversation: pending Phase C-5 migration");
+  async moveConversation(guid: string, target_peer_id: string): Promise<void> {
+    const { moveConversation } = await import("./mesh-move");
+    return moveConversation(this, guid, target_peer_id);
   }
 
   forgetPeerCache(_pubkey: string): void {
