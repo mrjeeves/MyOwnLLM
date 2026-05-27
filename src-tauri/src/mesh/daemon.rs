@@ -26,7 +26,7 @@
 //! propagates to the frontend as a toast.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -502,6 +502,32 @@ impl Drop for DaemonChild {
 ///      `target/{debug,release}/`) — only relevant in dev when
 ///      the sidecar wasn't bundled (offline iteration,
 ///      `MYOWNLLM_SKIP_SIDECAR=1`).
+/// Cheap "is this file an executable?" check used to filter
+/// candidates before spawn. Reads the first 4 bytes and matches
+/// against PE / ELF / Mach-O magic. A non-existent or short
+/// file resolves to false. Matches the build-time validator
+/// in `build.rs::validate_executable_magic`.
+fn looks_like_executable(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 4];
+    if f.read_exact(&mut head).is_err() {
+        return false;
+    }
+    let pe = head[0..2] == *b"MZ";
+    let elf = head == [0x7f, b'E', b'L', b'F'];
+    let macho = matches!(
+        u32::from_le_bytes(head),
+        0xFEED_FACE | 0xFEED_FACF | 0xCAFE_BABE | 0xBEBA_FECA
+    ) || matches!(
+        u32::from_be_bytes(head),
+        0xFEED_FACE | 0xFEED_FACF | 0xCAFE_BABE | 0xBEBA_FECA
+    );
+    pe || elf || macho
+}
+
 pub fn daemon_binary_candidates() -> Vec<PathBuf> {
     let exe = if cfg!(windows) {
         "myownmesh.exe"
@@ -519,13 +545,17 @@ pub fn daemon_binary_candidates() -> Vec<PathBuf> {
     };
     let mut out: Vec<PathBuf> = Vec::new();
 
-    // Helper: push a candidate iff it exists AND is non-empty
-    // (filters out the zero-byte stub `build.rs` writes when the
-    // daemon fetch was skipped).
+    // Helper: push a candidate iff it exists AND looks like a
+    // real executable (filters out the zero-byte stub
+    // `build.rs` writes when the daemon fetch was skipped, AND
+    // filters out corrupt / truncated downloads that would
+    // otherwise produce a confusing "%1 is not a valid Win32
+    // application" error when we try to spawn them).
     fn push_if_usable(out: &mut Vec<PathBuf>, p: PathBuf) {
-        if p.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-            out.push(p);
+        if !looks_like_executable(&p) {
+            return;
         }
+        out.push(p);
     }
 
     // 1. Bundled sidecar next to the running LLM executable —

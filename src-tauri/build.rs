@@ -253,19 +253,66 @@ fn bundle_myownmesh_sidecar() -> Result<(), Box<dyn std::error::Error>> {
 /// finish opening the file. After a fixed budget we give up
 /// and surface the error — letting the user see something is
 /// holding it open rather than busy-looping forever.
+/// Atomic-rename copy with retries against the Windows
+/// `ERROR_SHARING_VIOLATION` (os error 32). Writes to a temp
+/// file alongside the destination, then renames over it — that
+/// way a failed copy never leaves a partial / truncated file
+/// at `dst` (which is exactly what would cause the runtime's
+/// "%1 is not a valid Win32 application" error).
+///
+/// Also self-heals against a corrupt existing `dst`: if the
+/// file already there fails our PE / ELF / Mach-O magic check,
+/// we try to delete it first before the rename so Tauri's dev
+/// staging picks up the freshly-extracted content rather than
+/// the old garbage.
 fn write_sidecar_with_retry(src: &Path, dst: &Path) -> std::io::Result<()> {
+    // If dst exists but doesn't look like an executable, blow
+    // it away. A leftover zero-byte stub or partial download
+    // would otherwise survive — and Tauri's externalBin staging
+    // happily copies whatever's there into `target/debug/`.
+    if dst.exists() && validate_executable_magic(dst).is_err() {
+        println!(
+            "cargo:warning=[sidecar] existing {} doesn't look like an executable; replacing",
+            dst.display()
+        );
+        let _ = fs::remove_file(dst);
+    }
+
+    let tmp = dst.with_extension("tmp-incoming");
+    let _ = fs::remove_file(&tmp);
+
     let mut last_err: Option<std::io::Error> = None;
     for attempt in 0..6 {
-        match fs::copy(src, dst) {
-            Ok(_) => return Ok(()),
+        match fs::copy(src, &tmp) {
+            Ok(_) => match fs::rename(&tmp, dst) {
+                Ok(()) => {
+                    println!(
+                        "cargo:warning=[sidecar] wrote {} ({} bytes)",
+                        dst.display(),
+                        fs::metadata(dst).map(|m| m.len()).unwrap_or(0)
+                    );
+                    return Ok(());
+                }
+                Err(e) if e.raw_os_error() == Some(32) => {
+                    // dst is held open; clean up the temp and
+                    // back off. Next attempt re-copies (cheap).
+                    let _ = fs::remove_file(&tmp);
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(150 << attempt));
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            },
             Err(e) if e.raw_os_error() == Some(32) => {
-                // ERROR_SHARING_VIOLATION — back off and retry.
                 last_err = Some(e);
                 std::thread::sleep(std::time::Duration::from_millis(150 << attempt));
             }
             Err(e) => return Err(e),
         }
     }
+    let _ = fs::remove_file(&tmp);
     Err(last_err
         .unwrap_or_else(|| std::io::Error::other("retries exhausted with no recorded error")))
 }
@@ -320,27 +367,51 @@ fn download_release_asset(
         format!("https://github.com/mrjeeves/MyOwnMesh/releases/download/{tag}/{archive_name}");
     let archive_path = staging.join(&archive_name);
 
-    println!("cargo:warning=downloading {url}");
-    // `curl -fL` — `-f` fails on HTTP errors instead of writing
-    // the error page to disk; `-L` follows the redirect chain
-    // GitHub uses for release assets.
+    // Clear any stale archive / extracted binary from a prior
+    // partial run. Expand-Archive's `-Force` overwrites files
+    // but won't notice extra junk left from a previous attempt;
+    // `tar` will overwrite. Wiping the destination upfront keeps
+    // the steps deterministic.
+    let _ = fs::remove_file(&archive_path);
+    let _ = fs::remove_file(staging.join(format!("myownmesh{exe_suffix}")));
+
+    println!("cargo:warning=[download] {url}");
     let status = Command::new("curl")
         .args(["-fL", "--retry", "3", "-o"])
         .arg(&archive_path)
         .arg(&url)
         .status()
-        .map_err(|e| format!("curl spawn: {e} (install curl, then re-run the build)"))?;
+        .map_err(|e| format!("curl spawn failed: {e} (install curl, then re-run the build)"))?;
     if !status.success() {
-        return Err(format!("curl failed with status {status} fetching {url}"));
+        return Err(format!("curl exited with {status} fetching {url}"));
     }
 
-    // Extract. The release archives contain a single file
-    // (`myownmesh` or `myownmesh.exe`) at the root, so the
-    // extraction target is `staging/` directly.
+    // Sanity-check the archive: even a successful curl can land
+    // a zero-byte file on disk if the response body was empty
+    // (rare, but seen with mis-configured releases). The
+    // archives the MyOwnMesh release pipeline ships are >5 MB
+    // each; anything tiny is suspect.
+    let archive_size = fs::metadata(&archive_path)
+        .map_err(|e| format!("stat {}: {e}", archive_path.display()))?
+        .len();
+    if archive_size < 1024 {
+        return Err(format!(
+            "downloaded archive {} is only {archive_size} bytes — likely a redirect / error page rather than the daemon",
+            archive_path.display()
+        ));
+    }
+    println!(
+        "cargo:warning=[download] saved {} ({} bytes)",
+        archive_path.display(),
+        archive_size
+    );
+
+    println!("cargo:warning=[extract] {}", archive_path.display());
     if is_windows {
-        // PowerShell's Expand-Archive is available on every
-        // Windows 10+ box and handles .zip without extra deps.
-        let status = Command::new("powershell")
+        // PowerShell's Expand-Archive ships on every Windows
+        // 10+ box. Capture stderr so a malformed zip fails
+        // loud instead of silently producing nothing.
+        let output = Command::new("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -351,34 +422,97 @@ fn download_release_asset(
                     staging.display()
                 ),
             ])
-            .status()
-            .map_err(|e| format!("powershell spawn: {e}"))?;
-        if !status.success() {
-            return Err(format!("Expand-Archive failed with status {status}"));
+            .output()
+            .map_err(|e| format!("powershell spawn failed: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Expand-Archive exited with {} extracting {}\nstderr: {}",
+                output.status,
+                archive_path.display(),
+                stderr.trim()
+            ));
         }
     } else {
-        // `tar` ships by default on Linux + macOS. The release
-        // archive is gzipped; `-xzf` handles both layers.
-        let status = Command::new("tar")
+        let output = Command::new("tar")
             .arg("-xzf")
             .arg(&archive_path)
             .arg("-C")
             .arg(staging)
-            .status()
-            .map_err(|e| format!("tar spawn: {e}"))?;
-        if !status.success() {
-            return Err(format!("tar failed with status {status}"));
+            .output()
+            .map_err(|e| format!("tar spawn failed: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "tar exited with {} extracting {}\nstderr: {}",
+                output.status,
+                archive_path.display(),
+                stderr.trim()
+            ));
         }
     }
 
     let bin = staging.join(format!("myownmesh{exe_suffix}"));
     if !bin.exists() {
+        // List staging to help diagnose what came out of the
+        // archive — if it's nested in a subdirectory the
+        // release packaging changed and we need to bump the
+        // search path here.
+        let mut listing = String::new();
+        if let Ok(entries) = fs::read_dir(staging) {
+            for entry in entries.flatten() {
+                listing.push_str(&format!("  {}\n", entry.path().display()));
+            }
+        }
         return Err(format!(
-            "extracted archive but `{}` not found — release asset shape changed?",
+            "extracted archive but `{}` not found. staging contents:\n{listing}",
             bin.display()
         ));
     }
+    let bin_size = fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "cargo:warning=[extract] produced {} ({} bytes)",
+        bin.display(),
+        bin_size
+    );
+
+    // Validate the extracted binary's magic bytes. Windows PE
+    // and ELF both start with two-byte signatures that are
+    // cheap to check. Anything else is corrupt — either a
+    // botched download (HTML error page renamed to .exe by
+    // mis-configured release) or a partial extraction.
+    validate_executable_magic(&bin)?;
     Ok(bin)
+}
+
+/// Verify the first bytes of a putative binary look like an
+/// executable for the current platform. Cheap defence against a
+/// corrupt or truncated download.
+fn validate_executable_magic(path: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut f = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut head = [0u8; 4];
+    f.read_exact(&mut head)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let looks_pe = head[0..2] == *b"MZ";
+    let looks_elf = head == [0x7f, b'E', b'L', b'F'];
+    // macOS Mach-O magic bytes (multiple flavours: 32-bit, 64-bit, fat).
+    let looks_macho = matches!(
+        u32::from_le_bytes(head),
+        0xFEED_FACE | 0xFEED_FACF | 0xCAFE_BABE | 0xBEBA_FECA
+    ) || matches!(
+        u32::from_be_bytes(head),
+        0xFEED_FACE | 0xFEED_FACF | 0xCAFE_BABE | 0xBEBA_FECA
+    );
+    if !(looks_pe || looks_elf || looks_macho) {
+        return Err(format!(
+            "{} doesn't look like an executable (first 4 bytes: {:02x?}) — \
+             likely a corrupt download. Delete `binaries/` and re-run the build.",
+            path.display(),
+            head
+        ));
+    }
+    Ok(())
 }
 
 /// Build from source via `cargo install --git`. Used as the
