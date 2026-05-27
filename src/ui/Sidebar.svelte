@@ -3,7 +3,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import type { ConversationMeta, FolderMeta } from "../conversations";
   import type { Mode, NetworkConfig } from "../types";
-  import { meshClient } from "../mesh-client.svelte";
+  import { meshClient } from "../mesh-daemon.svelte";
   import {
     exportNetworkSettings,
     loadConfig,

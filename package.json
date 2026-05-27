@@ -19,8 +19,7 @@
     "@tauri-apps/plugin-fs": "^2",
     "@tauri-apps/plugin-http": "^2",
     "@tauri-apps/plugin-shell": "^2",
-    "marked": "^18.0.4",
-    "trystero": "^0.24.0"
+    "marked": "^18.0.4"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^4",
@@ -33,9 +32,6 @@
   "pnpm": {
     "onlyBuiltDependencies": [
       "esbuild"
-    ],
-    "patchedDependencies": {
-      "@trystero-p2p/core@0.24.0": "patches/@trystero-p2p__core@0.24.0.patch"
-    }
+    ]
   }
 }

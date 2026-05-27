@@ -26,7 +26,7 @@
   import { onDestroy, onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { loadConfig } from "../../config";
-  import { meshClient } from "../../mesh-client.svelte";
+  import { meshClient } from "../../mesh-daemon.svelte";
   import {
     describeTransitionVariant,
     meshGovernanceApplyTransition,

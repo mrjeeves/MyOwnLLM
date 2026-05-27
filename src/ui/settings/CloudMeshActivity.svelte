@@ -11,7 +11,7 @@
    *  so genuine problems never get hidden. Persisted globally
    *  via `cloud_mesh.diag_quiet`. */
 
-  import { meshClient } from "../../mesh-client.svelte";
+  import { meshClient } from "../../mesh-daemon.svelte";
   import { scrollAffordance } from "../scroll-affordance";
 
   function diagTime(ts: number): string {

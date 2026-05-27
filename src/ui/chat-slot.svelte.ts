@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { transcribeUi } from "./transcribe-state.svelte";
-import { meshClient } from "../mesh-client.svelte";
+import { meshClient } from "../mesh-daemon.svelte";
 import {
   loadConversation,
   saveConversation,

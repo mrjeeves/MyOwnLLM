@@ -9,7 +9,7 @@
     updateNetwork,
     type NetworkSettingsExport,
   } from "../../config";
-  import { meshClient } from "../../mesh-client.svelte";
+  import { meshClient } from "../../mesh-daemon.svelte";
   import { normalizeNetworkId } from "../../mesh";
   import type { NetworkConfig, TurnServer } from "../../types";
 
@@ -160,7 +160,7 @@
    *  network because failures on the live mesh aren't attributable
    *  to a different saved network's config. */
   let showIceBanner = $derived(
-    meshClient.recent_ice_failure_at > 0 &&
+    (meshClient.recent_ice_failure_at ?? 0) > 0 &&
       editingId !== null &&
       editingId === activeNetworkId,
   );

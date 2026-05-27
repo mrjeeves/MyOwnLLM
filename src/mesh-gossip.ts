@@ -52,17 +52,9 @@ interface CapabilitiesClient {
  *  reused from `mesh-capabilities.ts`. */
 export async function refreshCapabilities(
   client: CapabilitiesClient,
-  accepting: "yes" | "if_idle" | "no",
+  accepting: "available" | "limited" | "busy",
 ): Promise<Capabilities> {
-  // The legacy `snapshotCapabilities` takes the protocol-level
-  // `AcceptingPolicy` (`available | limited | busy`). The
-  // daemon-side simplification uses `yes | if_idle | no`; map
-  // between them. `if_idle` ⇒ `limited` (the daemon flips
-  // accepting on observed activity); `no` ⇒ `busy`; `yes` ⇒
-  // `available`.
-  const accepting_legacy: "available" | "limited" | "busy" =
-    accepting === "yes" ? "available" : accepting === "no" ? "busy" : "limited";
-  const cap = await snapshotCapabilities(accepting_legacy);
+  const cap = await snapshotCapabilities(accepting);
   await client.pushCapabilities(cap);
   return cap;
 }

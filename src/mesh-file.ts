@@ -234,6 +234,10 @@ interface HandlerClient extends FileClient {
 export interface InboundOffer {
   id: string;
   peer_id: string;
+  /** Human-readable peer name (label or short-pubkey suffix). The
+   *  legacy UI binds to this so each offer card can show "from
+   *  Alice (a1b2c…)" without re-deriving from the peer list. */
+  peer_label: string;
   filename: string;
   size_bytes: number;
   mime_type?: string;
@@ -395,6 +399,7 @@ async function handleOffer(
   const inbound: InboundOffer = {
     id: offer.id,
     peer_id: call.from,
+    peer_label: call.from.slice(0, 8),
     filename: sanitizeFilename(offer.filename),
     size_bytes: offer.size_bytes,
     mime_type: offer.mime_type,

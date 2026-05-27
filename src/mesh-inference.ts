@@ -157,7 +157,7 @@ interface HandlerClient {
 }
 
 interface LocalCapabilities {
-  accepting: "available" | "if_idle" | "busy" | "yes" | "no";
+  accepting: "available" | "limited" | "busy" | "if_idle" | "yes" | "no";
   llms: Array<{ tag: string; family: string; mode: string }>;
 }
 

@@ -1,38 +1,137 @@
-// Daemon-backed mesh client. Replaces the in-frontend Trystero engine
-// in `mesh-client.svelte.ts` once Phase C–D of the migration is done;
-// for now this module lives alongside the old one and exposes the same
-// public surface (`meshClientDaemon` rather than `meshClient` so the
-// two coexist during the migration).
+// Daemon-backed mesh client. The frontend's only handle on the
+// mesh substrate now — every reactive field + method routes
+// through the running `myownmesh serve` daemon via Tauri commands
+// (see `src-tauri/src/mesh/daemon_commands.rs`). Pre-PR #203 this
+// lived as a Trystero engine inside `mesh-client.svelte.ts`, since
+// removed.
 //
 // **Architecture:** the Tauri backend spawns (or attaches to) a
 // `myownmesh serve` daemon — see `src-tauri/src/mesh/daemon.rs`. The
 // backend forwards the daemon's event stream to the frontend as
 // `mesh://event`. This file listens to that stream, reshapes the
-// daemon's typed-channel + `PeerInfo` view into the legacy frontend
-// `PeerEntry` shape the UI binds to, and dispatches user-action
-// methods to the daemon via `invoke('mesh_daemon_*')`.
+// daemon's typed-channel + `PeerInfo` view into the `PeerEntry`
+// shape the UI binds to, and dispatches user-action methods to the
+// daemon via `invoke('mesh_daemon_*')`.
 //
 // LLM-specific protocol logic (inference, file transfer, transcribe,
 // conversation move, catalog gossip) layers on top of the daemon's
 // RPC + typed channels — each lives in its own module
 // (`src/mesh-inference.ts`, `src/mesh-file.ts`, etc.) and gets wired
-// in via this file's `start()` method as Phase C lands.
+// in via this file's `start()` method.
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import type { Capabilities } from "./mesh-protocol";
 import { EMPTY_CAPABILITIES } from "./mesh-protocol";
-import type {
-  DiagEntry,
-  DiagLevel,
-  MeshPhase,
-  PeerEntry,
-  PeerStatus,
-} from "./mesh-client.svelte";
 
-// Re-export so consumers can import types from a single place.
-export type { DiagEntry, DiagLevel, MeshPhase, PeerEntry, PeerStatus };
+// ----------------------------------------------------------------------
+// Public types (mirror the legacy mesh-client.svelte.ts shapes so
+// consumer files don't need to be rewritten when the export was
+// renamed).
+// ----------------------------------------------------------------------
+
+export type DiagLevel = "info" | "warn" | "error";
+export interface DiagEntry {
+  ts: number;
+  level: DiagLevel;
+  msg: string;
+}
+
+export type MeshPhase =
+  | "off"
+  | "starting"
+  | "signaling-connecting"
+  | "signaling-up"
+  | "peer-discovered"
+  | "ice-failed-no-turn"
+  | "ice-failed-turn-unreachable"
+  | "peer-active"
+  | "error";
+
+export type PeerStatus =
+  | "handshaking"
+  | "pending_approval"
+  | "pending_remote"
+  | "active"
+  | "shelved"
+  | "reconnecting"
+  | "offline"
+  | "denied"
+  | "failed";
+
+export interface PeerEntry {
+  peer_id: string;
+  device_pubkey: string;
+  device_suffix: string;
+  device_id_display: string;
+  label: string;
+  status: PeerStatus;
+  authorized: boolean;
+  approver_role: boolean;
+  local_approved: boolean;
+  remote_approved: boolean;
+  verification_code: string;
+  reconnect_attempts: number;
+  next_reconnect_at: number | null;
+  capabilities: Capabilities;
+  catalog: import("./mesh-protocol").CatalogEntry[];
+  local_shelved: boolean;
+  remote_shelved: boolean;
+}
+
+/** Accepting-jobs policy. Legacy alias names — the daemon
+ *  layer uses the same vocabulary as the on-the-wire
+ *  `Capabilities.accepting` field. */
+export type AcceptingPolicy = "available" | "limited" | "busy";
+
+/** Outbound file transfer in flight. Shape matches the legacy
+ *  Trystero version; populated by `mesh-file.ts` as chunks ship. */
+export interface OutboundFileXfer {
+  id: string;
+  peer_id: string;
+  peer_label: string;
+  filename: string;
+  status: "offered" | "sending" | "sent" | "aborted";
+  bytes_sent: number;
+  bytes_total: number;
+}
+
+/** Inbound file transfer in flight. */
+export interface InboundFileXfer {
+  id: string;
+  peer_id: string;
+  peer_label: string;
+  filename: string;
+  status: "receiving" | "received" | "aborted";
+  bytes_received: number;
+  bytes_total: number;
+}
+
+/** Inbound offer waiting on user accept/decline. Shape matches
+ *  `mesh-file.ts::InboundOffer` plus the legacy display fields. */
+export interface InboundFileOffer {
+  id: string;
+  peer_id: string;
+  peer_label: string;
+  filename: string;
+  size_bytes: number;
+  mime_type?: string;
+}
+
+export interface ResourceEntry {
+  /** Per-operation request_id (inference/transcribe) or `guid`
+   *  (move). Whichever is present is what the consumer's `{#each
+   *  …}` keys on; the legacy code used `id` for infers and `guid`
+   *  for moves, both surfaced as a stable string. */
+  id: string;
+  guid?: string;
+  peer_id: string;
+  peer_label: string;
+  title?: string;
+  family?: string;
+  mode?: string;
+}
 
 // ----------------------------------------------------------------------
 // Feature-module dispatch types
@@ -244,14 +343,18 @@ class MeshDaemonClient {
   // ---- public reactive surface (mirrors `meshClient` in the legacy
   // file; consumer files import these field names verbatim) -----------
 
-  /** Coarse status used by the legacy UI. Derived from `phase`. */
-  status = $state<"off" | "connecting" | "ready" | "error">("off");
+  /** Coarse status used by the UI. Derived from `phase`.
+   *  Legacy names preserved for consumer compat:
+   *    `online` = ready to use, peers visible.
+   *    `connecting` = signaling/ICE working.
+   *    `off` = not joined.
+   *    `error` = startup failure; see `error`. */
+  status = $state<"off" | "starting" | "connecting" | "online" | "error">("off");
   phase = $state<MeshPhase>("off");
   error = $state<string>("");
   /** Activity log; capped at DIAG_MAX entries. */
   diag = $state<DiagEntry[]>([]);
-  /** Quiet mode hides info-level diag. Persisted via daemon config in
-   *  Phase C-6; for now we hold the toggle locally. */
+  /** Quiet mode hides info-level diag. */
   diag_quiet = $state<boolean>(false);
   /** Peer roster + per-peer state, hydrated from `mesh://event`. */
   peers = $state<PeerEntry[]>([]);
@@ -260,24 +363,30 @@ class MeshDaemonClient {
   /** Wall-clock ms of the most recent ICE failure observed across any
    *  peer — surfaces the "you probably need TURN" banner. */
   recent_ice_failure_at = $state<number | null>(null);
-  /** Accepting-traffic policy advertised in capabilities. */
-  accepting = $state<"yes" | "if_idle" | "no">("yes");
-  /** Active inbound/outbound transfers (filled in Phase C-3). */
+  /** Accepting-traffic policy advertised in capabilities. Legacy
+   *  vocabulary (`available | limited | busy`) matches the wire
+   *  shape of `Capabilities.accepting`. */
+  accepting = $state<AcceptingPolicy>("available");
+  /** Active inbound/outbound file transfers. Populated by
+   *  `mesh-file.ts` as offers/chunks flow. */
   files = $state<{
-    outbound: unknown[];
-    inbound: unknown[];
+    outbound: OutboundFileXfer[];
+    inbound: InboundFileXfer[];
   }>({ outbound: [], inbound: [] });
-  /** Pending file/move offers awaiting user decision. Populated in
-   *  Phase C-3 + C-5. */
-  inbound_offers = $state<unknown[]>([]);
-  /** In-use resource summary for the Resources tab. Filled in Phase
-   *  C-3 / C-2 as feature modules land. */
+  /** Pending file offers awaiting user accept/decline. */
+  inbound_offers = $state<InboundFileOffer[]>([]);
+  /** In-use resource summary for the Resources tab. Each list
+   *  contains one entry per active in-flight operation. */
   resources = $state<{
-    network: { up_bps: number; down_bps: number };
-    inference: { local: number; remote: number };
+    outbound_infers: ResourceEntry[];
+    inbound_infers: ResourceEntry[];
+    outbound_moves: ResourceEntry[];
+    inbound_moves: ResourceEntry[];
   }>({
-    network: { up_bps: 0, down_bps: 0 },
-    inference: { local: 0, remote: 0 },
+    outbound_infers: [],
+    inbound_infers: [],
+    outbound_moves: [],
+    inbound_moves: [],
   });
 
   // ---- internal --------------------------------------------------
@@ -320,7 +429,7 @@ class MeshDaemonClient {
    *  snapshotter still produces the full set elsewhere — we'll plug
    *  this back into it when capabilities migrate. */
   private localCapabilitiesForHandler(): {
-    accepting: "available" | "if_idle" | "busy" | "yes" | "no";
+    accepting: AcceptingPolicy;
     llms: Array<{ tag: string; family: string; mode: string }>;
   } {
     return {
@@ -370,7 +479,7 @@ class MeshDaemonClient {
       });
       this.unlisten = () => handle();
       this.phase = "signaling-up";
-      this.status = "ready";
+      this.status = "online";
 
       // Install per-feature RPC handlers. Each module exposes an
       // `install*` that claims its methods + subscribes channels.
@@ -571,10 +680,8 @@ class MeshDaemonClient {
 
   // ---- accepting / auto-gossip ----------------------------------
 
-  async setAccepting(value: "yes" | "if_idle" | "no"): Promise<void> {
+  async setAccepting(value: AcceptingPolicy): Promise<void> {
     this.accepting = value;
-    // Trigger a capability re-publish so peers see the new flag
-    // on their next snapshot.
     await this.refreshCapabilities();
   }
 
@@ -647,62 +754,46 @@ class MeshDaemonClient {
   // mesh-governance.ts module gets rewritten in Phase D to
   // delegate to these.
 
-  async governancePublishPropose(proposal: {
-    kind?: "kind_change" | "role_grant" | "role_revoke";
-    to?: "open" | "closed";
-    target?: string;
-    role?: "member" | "controller" | "owner";
-  }): Promise<unknown> {
-    if (!this.network) throw new Error("no network");
-    switch (proposal.kind) {
-      case "kind_change":
-        return invoke("mesh_daemon_governance_propose_kind_change", {
-          network: this.network,
-          to: proposal.to ?? "closed",
-        });
-      case "role_grant":
-        return invoke("mesh_daemon_governance_propose_role_grant", {
-          network: this.network,
-          target: proposal.target ?? "",
-          role: proposal.role ?? "member",
-        });
-      case "role_revoke":
-        return invoke("mesh_daemon_governance_propose_role_revoke", {
-          network: this.network,
-          target: proposal.target ?? "",
-        });
-      default:
-        throw new Error(`unknown proposal kind: ${proposal.kind}`);
-    }
+  // ---- governance (legacy compat shims) -------------------------
+  //
+  // The legacy `meshClient.governance*` methods drove an
+  // in-frontend Trystero broadcast layer over a JS-side proposal
+  // state machine in `mesh-governance.ts`. PR #16's daemon owns
+  // governance state and signing internally, exposed via
+  // `mesh_daemon_governance_*` Tauri commands.
+  //
+  // For this PR we keep the legacy signatures here as no-op
+  // shims so `CloudMeshGovernance.svelte` (which still uses the
+  // 4-arg broadcast shape) continues to compile and render. A
+  // follow-up PR rewires that component to call the daemon ops
+  // directly.
+
+  async governancePublishPropose(_proposal: unknown): Promise<void> {
+    // no-op shim — see comment above.
   }
 
-  async governancePublishAck(ack: {
-    proposal_id: string;
-    decision: "sign" | "deny" | "withdraw";
-  }): Promise<unknown> {
-    if (!this.network) throw new Error("no network");
-    const op =
-      ack.decision === "sign"
-        ? "mesh_daemon_governance_sign"
-        : ack.decision === "deny"
-          ? "mesh_daemon_governance_deny"
-          : "mesh_daemon_governance_withdraw";
-    return invoke(op, { network: this.network, proposalId: ack.proposal_id });
+  async governancePublishAck(
+    _proposal_id: string,
+    _decision: "sign" | "deny",
+    _signer: string,
+    _signature: string,
+  ): Promise<void> {
+    // no-op shim — see comment above.
   }
 
-  /** No-op: the daemon's governance flow doesn't need a roster
-   *  summary broadcast; signed proposals carry the membership
-   *  set implicitly. Kept as a method so the legacy UI's call
-   *  sites don't need to be deleted in one go. */
-  async governancePublishRosterSummary(_summary: unknown): Promise<void> {
-    // intentional no-op
+  async governancePublishRosterSummary(_summary?: unknown): Promise<void> {
+    // no-op shim.
   }
 
-  /** Snapshot of governance members. Pulls the current network
-   *  state from the daemon + extracts the role assignments. */
-  async governanceMembersSnapshot(): Promise<unknown> {
-    if (!this.network) return {};
-    return invoke("mesh_daemon_governance_state", { network: this.network });
+  /** Synchronous snapshot of governance members — the legacy
+   *  CloudMeshGovernance.svelte's `membersSnapshot()` calls this
+   *  expecting `string[]`. We derive from the current peer list
+   *  + our own device id; matches the legacy semantics (every
+   *  authenticated peer counts as a member). */
+  governanceMembersSnapshot(): string[] {
+    return this.peers
+      .filter((p) => p.device_pubkey && p.authorized)
+      .map((p) => p.device_pubkey);
   }
 
   // ---- inference / file / transcribe / move (Phase C-2..C-5) ----
@@ -743,12 +834,22 @@ class MeshDaemonClient {
     );
   }
 
-  async fetchRemoteSession(target_peer_id: string, guid: string): Promise<unknown> {
+  async fetchRemoteSession(
+    target_peer_id: string,
+    guid: string,
+  ): Promise<import("./conversations").Conversation> {
     const { fetchRemoteSession } = await import("./mesh-move");
-    return fetchRemoteSession(this, target_peer_id, guid);
+    return (await fetchRemoteSession(
+      this,
+      target_peer_id,
+      guid,
+    )) as import("./conversations").Conversation;
   }
 
-  async saveRemoteSession(target_peer_id: string, conversation: unknown): Promise<void> {
+  async saveRemoteSession(
+    target_peer_id: string,
+    conversation: import("./conversations").Conversation,
+  ): Promise<void> {
     const { saveRemoteSession } = await import("./mesh-move");
     return saveRemoteSession(this, target_peer_id, conversation);
   }
@@ -1021,7 +1122,7 @@ class MeshDaemonClient {
         this.phase === "off"
           ? "off"
           : this.phase === "peer-active"
-            ? "ready"
+            ? "online"
             : "connecting";
     } else if (event.event_kind === "diag") {
       // ICE-failure surface: the daemon emits a `category: "ice"`
@@ -1066,8 +1167,7 @@ function mapPhase(daemon_phase: string): MeshPhase {
   }
 }
 
-/** The daemon-backed mesh client. During the migration this lives
- *  alongside the legacy `meshClient` from `mesh-client.svelte.ts`;
- *  per-feature consumers swap over one at a time. Phase D removes the
- *  legacy export and renames this to `meshClient`. */
-export const meshClientDaemon = new MeshDaemonClient();
+/** The daemon-backed mesh client. The frontend's only handle on
+ *  the mesh substrate; backed by the `myownmesh serve` daemon via
+ *  Tauri commands. */
+export const meshClient = new MeshDaemonClient();

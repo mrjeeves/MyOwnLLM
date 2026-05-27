@@ -23,7 +23,7 @@
     type EmittedSegment,
   } from "./transcribe-state.svelte";
   import { chatSlot } from "./chat-slot.svelte";
-  import { meshClient } from "../mesh-client.svelte";
+  import { meshClient } from "../mesh-daemon.svelte";
   import {
     routingPins,
     setTranscribePin,
