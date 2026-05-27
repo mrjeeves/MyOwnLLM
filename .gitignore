@@ -5,6 +5,11 @@ target/
 # Tauri regenerates per-platform capability schemas next to the tracked
 # capabilities.json on every build; they're build artifacts, not source.
 src-tauri/gen/schemas/*-schema.json
+# `build.rs` builds the `myownmesh` daemon binary and drops it into
+# `src-tauri/binaries/myownmesh-<target-triple>{.exe}` so Tauri's
+# bundler can ship it as a sidecar (see tauri.conf.json::externalBin).
+# Build artefact; the pinned source rev lives in `.myownmesh-rev`.
+src-tauri/binaries/
 .env
 .env.local
 .DS_Store

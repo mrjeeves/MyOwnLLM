@@ -444,13 +444,53 @@ impl Drop for DaemonChild {
 }
 
 /// Resolve the `myownmesh` binary in this priority order:
-///   1. `MYOWNLLM_MESH_BIN` env var (LLM-specific override)
-///   2. `MYOWNMESH_BIN` env var (shared with MyOwnMesh GUI's convention)
-///   3. `myownmesh` (or `myownmesh.exe`) on `$PATH`
-///   4. Workspace dev artefacts under `../target/{debug,release}/`
-///      relative to this crate (CARGO_MANIFEST_DIR), so `cargo run`
-///      in MyOwnMesh + `tauri dev` in MyOwnLLM coexists.
+///   1. **Sidecar next to the running LLM executable** — the
+///      production-bundle path. `build.rs` builds (or copies) the
+///      daemon binary into `src-tauri/binaries/myownmesh-<triple>`
+///      and `tauri.conf.json::bundle::externalBin` declares it as
+///      a sidecar. Tauri's bundler places it next to the main
+///      `MyOwnLLM` executable in the `.app` / `.deb` / `.msi`. End
+///      users never need to install MyOwnMesh separately.
+///   2. `MYOWNLLM_MESH_BIN` env var (LLM-specific override).
+///   3. `MYOWNMESH_BIN` env var (shared with MyOwnMesh GUI's convention).
+///   4. `myownmesh` (or `myownmesh.exe`) on `$PATH`.
+///   5. Workspace dev artefacts (sibling MyOwnMesh checkout's
+///      `target/{debug,release}/`) — only relevant in dev when the
+///      sidecar wasn't bundled (e.g. `MYOWNLLM_SKIP_SIDECAR=1`).
 pub fn find_daemon_binary() -> Result<PathBuf> {
+    let exe = if cfg!(windows) {
+        "myownmesh.exe"
+    } else {
+        "myownmesh"
+    };
+
+    // 1. Bundled sidecar. Tauri 2 places sidecar binaries next to
+    //    the main executable, renamed to drop the `-<triple>`
+    //    suffix (Tauri's `externalBin` convention). So
+    //    `<exe_dir>/myownmesh{.exe}` is the post-bundle location
+    //    on every supported platform. macOS `.app` bundles, Linux
+    //    `.deb`, and Windows `.msi` all land it in the same dir
+    //    as the main exe — one join covers all three.
+    //
+    //    Zero-byte placeholders (written by `build.rs` when the
+    //    daemon fetch was skipped) are treated as "not bundled"
+    //    and we fall through to the next path so dev iteration
+    //    still finds a working binary via PATH / workspace.
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let candidate = exe_dir.join(exe);
+            if candidate.exists() {
+                let usable = std::fs::metadata(&candidate)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false);
+                if usable {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+
+    // 2 + 3. Explicit env-var overrides.
     for var in ["MYOWNLLM_MESH_BIN", "MYOWNMESH_BIN"] {
         if let Ok(p) = std::env::var(var) {
             let p = PathBuf::from(p);
@@ -459,11 +499,8 @@ pub fn find_daemon_binary() -> Result<PathBuf> {
             }
         }
     }
-    let exe = if cfg!(windows) {
-        "myownmesh.exe"
-    } else {
-        "myownmesh"
-    };
+
+    // 4. PATH lookup.
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join(exe);
@@ -472,12 +509,10 @@ pub fn find_daemon_binary() -> Result<PathBuf> {
             }
         }
     }
-    // Dev fallback — relative to this crate's MANIFEST_DIR. The LLM
-    // workspace lives next to the MyOwnMesh workspace in the dev
-    // setup; both compile into their own `target/` dirs. We look at
-    // the LLM's own target first (developer just ran
-    // `cargo build -p myownmesh` from the LLM tree, which is rare),
-    // then peek at a sibling `../../MyOwnMesh/target/...` path.
+
+    // 5. Dev fallback — sibling MyOwnMesh checkout's `target/`.
+    //    Only relevant when the sidecar wasn't bundled (e.g.
+    //    `MYOWNLLM_SKIP_SIDECAR=1` for offline iteration).
     let mut candidates: Vec<PathBuf> = Vec::new();
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for profile in ["debug", "release"] {
@@ -501,8 +536,9 @@ pub fn find_daemon_binary() -> Result<PathBuf> {
         }
     }
     Err(anyhow!(
-        "couldn't find `{exe}` — set MYOWNLLM_MESH_BIN or MYOWNMESH_BIN, install it on PATH, \
-         or run `cargo build -p myownmesh` in the MyOwnMesh workspace first"
+        "couldn't find `{exe}` — the daemon sidecar wasn't bundled and no fallback \
+         binary is on PATH. Re-run the LLM build with network access so `build.rs` \
+         can fetch myownmesh, or set MYOWNLLM_MESH_BIN to a pre-built binary."
     ))
 }
 
