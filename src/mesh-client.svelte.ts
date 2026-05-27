@@ -67,6 +67,7 @@ import {
   generateMeshId,
   generateNonce,
   generateVerificationCode,
+  isWellFormedVerificationCode,
   peerSupportsFeature,
   pubkeyPart,
   pubkeySuffix,
@@ -86,9 +87,25 @@ import {
   type FileOfferMessage,
   type InferRequestMessage,
   type MeshMessage,
+  type NetworkStateAckMessage,
+  type NetworkStateBroadcastMessage,
+  type NetworkStateProposeMessage,
+  type NetworkStateSplitMessage,
+  type RosterEntriesMessage,
+  type RosterRequestMessage,
+  type RosterSummaryMessage,
   type TranscribeRequestMessage,
   TRANSCRIBE_SAMPLE_RATE,
 } from "./mesh-protocol";
+import {
+  meshGovernanceApplyTransition,
+  meshGovernanceStateGet,
+  meshGovernanceStateSavePending,
+  type NetworkState,
+  type Proposal,
+  type Transition,
+} from "./mesh-governance";
+import type { AckDecision } from "./mesh-protocol";
 import { snapshotCapabilities } from "./mesh-capabilities";
 
 /** Build-time selected Trystero strategy. Defined in vite.config.ts
@@ -4051,6 +4068,43 @@ class MeshClient {
         if (this.peerStatus(conn) !== "active") break;
         void this.handlePromptsSnapshot(msg.prompts);
         break;
+
+      // ---- network-state governance + roster gossip --------------------
+      //
+      // Six frames mirror `myownmesh_core::protocol::governance`. The
+      // active-rostered gate matches every other gossip RPC: only
+      // peers who've finished the bilateral approval handshake on
+      // THIS network can mutate our governance state. A stranger in
+      // the same Trystero room sending a forged Propose would be
+      // silently dropped here before reaching the Rust bridge.
+      case "network_state_broadcast":
+        if (this.peerStatus(conn) !== "active") break;
+        void this.handleNetworkStateBroadcast(conn, msg);
+        break;
+      case "network_state_propose":
+        if (this.peerStatus(conn) !== "active") break;
+        void this.handleNetworkStatePropose(msg);
+        break;
+      case "network_state_ack":
+        if (this.peerStatus(conn) !== "active") break;
+        void this.handleNetworkStateAck(msg);
+        break;
+      case "network_state_split":
+        if (this.peerStatus(conn) !== "active") break;
+        void this.handleNetworkStateSplit(msg);
+        break;
+      case "roster_summary":
+        if (this.peerStatus(conn) !== "active") break;
+        void this.handleRosterSummary(conn, msg);
+        break;
+      case "roster_request":
+        if (this.peerStatus(conn) !== "active") break;
+        void this.handleRosterRequest(conn, msg);
+        break;
+      case "roster_entries":
+        if (this.peerStatus(conn) !== "active") break;
+        void this.handleRosterEntries(msg);
+        break;
     }
   }
 
@@ -4066,7 +4120,16 @@ class MeshClient {
     conn.device_pubkey = msg.device_id;
     conn.their_nonce = msg.nonce;
     conn.label = msg.label || "";
-    conn.their_verification_code = (msg.verification_code || "").slice(0, 16);
+    // Validate via the substrate's canonical rules (alphabet +
+    // length). Mismatch → empty string so the approval tile renders
+    // "[malformed]" instead of showing degenerate input. The trim
+    // to 16 chars stays as a defense-in-depth cap; a well-formed
+    // code is always 6 chars but a peer running a future protocol
+    // version with a longer code would still log sanely here.
+    const raw_code = (msg.verification_code || "").slice(0, 16);
+    conn.their_verification_code = (await isWellFormedVerificationCode(raw_code))
+      ? raw_code
+      : "";
     // Phase 2: peer's capabilities and ring capacity. v1 peers omit
     // both; the defaults are equivalent to "no LLM/ASR/mic, hold up
     // to 3 connections" which is the same as a fresh ConnectionState.
@@ -4480,6 +4543,12 @@ class MeshClient {
       // current snapshot so the new peer picks up everything we've
       // authored on this network.
       this.sendPromptsSnapshotTo(conn);
+      // Network-state advertisement: tell the new peer what we
+      // think the governance state + roster look like so they can
+      // request entries or catch us up if they're ahead. Gated on
+      // NETWORK_STATE_V1 inside the fan-out so older peers stay
+      // quiet.
+      void this.governanceAdvertiseAll();
       this.reevaluateRing();
     }
     if (this.computePeers().every((p) => p.status !== "pending_approval")) {
@@ -6496,6 +6565,354 @@ class MeshClient {
       sha256_b32: string | null;
     }
   >();
+
+  // ---- network-state governance + roster gossip --------------------
+  //
+  // Multi-peer half of the governance flow. The Tauri bridge in
+  // `mesh-governance.ts` owns the substrate primitives (sign,
+  // verify_quorum, apply_transition, persist); these methods orchestrate
+  // the wire side over Trystero data channels.
+  //
+  // Send fan-out is gated on `NETWORK_STATE_V1` so older peers don't
+  // get frames they'd silently drop. Inbound is gated on
+  // `peerStatus(conn) === "active"` in the dispatcher so a stranger
+  // in the same Trystero room can't drive our governance state.
+  //
+  // The pending-proposal list is the single source of truth: each
+  // inbound Propose/Ack/Split mutates the on-disk pending list via
+  // the Tauri bridge, and a quorum-met sign triggers
+  // `meshGovernanceApplyTransition` which atomically verifies sigs +
+  // quorum, applies, and saves. The UI polls the on-disk state via
+  // `meshGovernanceStateGet` and re-renders.
+
+  /** Send a network-state broadcast advertising our current
+   *  governance kind + transition log length + roster Merkle root to
+   *  every peer that supports the feature. Called on ACTIVE
+   *  transition and after every local mutation that ratifies a
+   *  transition or modifies the roster. */
+  private async governanceAdvertiseAll(): Promise<void> {
+    if (!this.network_id) return;
+    let state: NetworkState;
+    try {
+      state = await meshGovernanceStateGet(this.network_id);
+    } catch {
+      return;
+    }
+    // Roster Merkle root: derived locally by sorting roster pubkeys
+    // and hashing — the substrate's own merkle_root function does the
+    // same thing on the Rust side. Computing here keeps the broadcast
+    // self-contained without a Tauri roundtrip per peer.
+    const root = await this.computeRosterRoot();
+    const frame: NetworkStateBroadcastMessage = {
+      kind: "network_state_broadcast",
+      network_kind: state.kind,
+      transitions_count: state.transitions.length,
+      roster_root: root,
+    };
+    for (const conn of this.connections.values()) {
+      if (this.peerStatus(conn) !== "active") continue;
+      if (!peerSupportsFeature(conn.capabilities, FEATURES.NETWORK_STATE_V1)) continue;
+      this.send(conn, frame);
+    }
+  }
+
+  /** Cheap-and-cheerful roster Merkle root for the broadcast frame.
+   *  Mirrors what `myownmesh_core::roster::merkle_root` produces:
+   *  base32-lowercase SHA-256 over sorted pubkeys (with the leaf
+   *  marker prefix the substrate uses). v1 only — a future
+   *  optimisation can route through a Tauri command if the leaf
+   *  hashing rules diverge from this approximation. */
+  private async computeRosterRoot(): Promise<string> {
+    const sorted = [...this.roster_pubkeys].sort();
+    if (sorted.length === 0) {
+      const hash = await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode("v1|empty"),
+      );
+      return base32Encode(new Uint8Array(hash));
+    }
+    const text = "v1|" + sorted.join("|");
+    const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+    return base32Encode(new Uint8Array(hash));
+  }
+
+  /** Fan out a Propose frame to every active peer that advertises
+   *  `NETWORK_STATE_V1`. Called by the UI's "propose" actions
+   *  immediately after the local proposer signs + persists into
+   *  pending — the wire frame is what carries it to peers for
+   *  co-signature. */
+  governancePublishPropose(proposal: Proposal): void {
+    if (proposal.signers.length === 0 || proposal.signatures.length === 0) return;
+    const frame: NetworkStateProposeMessage = {
+      kind: "network_state_propose",
+      proposal_id: proposal.id,
+      variant: proposal.variant,
+      proposer: proposal.proposer,
+      created_at: proposal.created_at,
+      // First signature is the proposer's by convention (substrate's
+      // `engine::governance::propose` always self-signs first).
+      signature: proposal.signatures[0],
+    };
+    this.governanceFanout(frame);
+  }
+
+  /** Fan out an Ack (sign / deny) for a proposal we've decided on
+   *  locally. Called by the UI's sign/deny actions after the local
+   *  signature has been computed and persisted to pending. */
+  governancePublishAck(
+    proposal_id: string,
+    decision: AckDecision,
+    signer: string,
+    signature: string,
+  ): void {
+    const frame: NetworkStateAckMessage = {
+      kind: "network_state_ack",
+      proposal_id,
+      signer,
+      decision,
+      at: Math.floor(Date.now() / 1000),
+      signature,
+    };
+    this.governanceFanout(frame);
+  }
+
+  /** Fan out a Split announcement. Carries the derived new-network
+   *  id and the member list moving over — receivers correlate
+   *  against their pending set to remove the parent proposal, and
+   *  members in the list admit the new network on their end. */
+  governancePublishSplit(split: NetworkStateSplitMessage): void {
+    this.governanceFanout(split);
+  }
+
+  /** Roster sync after a local mutation: send a summary to every
+   *  active peer. Receivers whose own root disagrees fire back a
+   *  `roster_request`, which we answer with a `roster_entries`. */
+  governancePublishRosterSummary(): void {
+    void this.governanceSendRosterSummaryToAll();
+  }
+
+  private async governanceSendRosterSummaryToAll(): Promise<void> {
+    const root = await this.computeRosterRoot();
+    const frame: RosterSummaryMessage = {
+      kind: "roster_summary",
+      root,
+      count: this.roster_pubkeys.size,
+      last_edit_ts: Math.floor(Date.now() / 1000),
+    };
+    this.governanceFanout(frame);
+  }
+
+  private governanceFanout(frame: MeshMessage): void {
+    for (const conn of this.connections.values()) {
+      if (this.peerStatus(conn) !== "active") continue;
+      if (!peerSupportsFeature(conn.capabilities, FEATURES.NETWORK_STATE_V1)) continue;
+      this.send(conn, frame);
+    }
+  }
+
+  // ---- inbound handlers --------------------------------------------
+
+  private async handleNetworkStateBroadcast(
+    conn: ConnectionState,
+    msg: NetworkStateBroadcastMessage,
+  ): Promise<void> {
+    if (!this.network_id) return;
+    // Surface drift as a diag event so the user / activity log
+    // notices when peers disagree on state. The substrate's catch-up
+    // path is a follow-up — for now we just log + request roster
+    // entries when roots disagree.
+    const local = await meshGovernanceStateGet(this.network_id).catch(() => null);
+    if (!local) return;
+    if (local.transitions.length !== msg.transitions_count) {
+      this.logDiag(
+        "info",
+        `governance: peer ${conn.peer_id.slice(0, 8)} reports ${
+          msg.transitions_count
+        } transitions, we have ${local.transitions.length}`,
+      );
+    }
+    const ourRoot = await this.computeRosterRoot();
+    if (ourRoot !== msg.roster_root) {
+      const req: RosterRequestMessage = {
+        kind: "roster_request",
+        include_all: true,
+        subtree_hashes: [],
+      };
+      this.send(conn, req);
+    }
+  }
+
+  private async handleNetworkStatePropose(
+    msg: NetworkStateProposeMessage,
+  ): Promise<void> {
+    if (!this.network_id) return;
+    try {
+      const state = await meshGovernanceStateGet(this.network_id);
+      // Drop dup ids — proposer may resend on reconnect. Keep the
+      // first one we saw so signer accumulation isn't reset.
+      if (state.pending.some((p) => p.id === msg.proposal_id)) return;
+      const proposal: Proposal = {
+        id: msg.proposal_id,
+        created_at: msg.created_at,
+        proposer: msg.proposer,
+        variant: msg.variant,
+        signers: [msg.proposer],
+        signatures: [msg.signature],
+        deniers: [],
+      };
+      await meshGovernanceStateSavePending(this.network_id, [...state.pending, proposal]);
+    } catch (e) {
+      this.logDiag("warn", `governance: ingest propose failed: ${e}`);
+    }
+  }
+
+  private async handleNetworkStateAck(msg: NetworkStateAckMessage): Promise<void> {
+    if (!this.network_id) return;
+    try {
+      const state = await meshGovernanceStateGet(this.network_id);
+      const target = state.pending.find((p) => p.id === msg.proposal_id);
+      if (!target) return;
+      if (msg.decision === "deny") {
+        // Substrate kill-switch: a single deny drops the proposal.
+        const next = state.pending.filter((p) => p.id !== msg.proposal_id);
+        await meshGovernanceStateSavePending(this.network_id, next);
+        return;
+      }
+      // Sign: accumulate if not already present.
+      if (target.signers.includes(msg.signer)) return;
+      const signed: Proposal = {
+        ...target,
+        signers: [...target.signers, msg.signer],
+        signatures: [...target.signatures, msg.signature],
+      };
+      // Try to apply now that we have another signature — if quorum is
+      // met the substrate's verify_quorum returns Ok and the transition
+      // ratifies; otherwise we just persist the updated pending list.
+      const tx: Transition = {
+        at: signed.created_at,
+        variant: signed.variant,
+        signers: signed.signers,
+        signatures: signed.signatures,
+      };
+      try {
+        await meshGovernanceApplyTransition(
+          this.network_id,
+          tx,
+          this.governanceMembersSnapshot(),
+        );
+        // Ratified — remove from pending.
+        const next = state.pending.filter((p) => p.id !== msg.proposal_id);
+        await meshGovernanceStateSavePending(this.network_id, next);
+        // Tell peers what the new state looks like.
+        void this.governanceAdvertiseAll();
+      } catch {
+        // Quorum not met yet — keep the proposal alive with the
+        // updated signer list.
+        const next = state.pending.map((p) =>
+          p.id === msg.proposal_id ? signed : p,
+        );
+        await meshGovernanceStateSavePending(this.network_id, next);
+      }
+    } catch (e) {
+      this.logDiag("warn", `governance: ingest ack failed: ${e}`);
+    }
+  }
+
+  private async handleNetworkStateSplit(
+    msg: NetworkStateSplitMessage,
+  ): Promise<void> {
+    if (!this.network_id) return;
+    try {
+      const state = await meshGovernanceStateGet(this.network_id);
+      const next = state.pending.filter((p) => p.id !== msg.parent_proposal_id);
+      await meshGovernanceStateSavePending(this.network_id, next);
+      this.logDiag(
+        "info",
+        `governance: split spawned new network ${msg.new_network_id.slice(
+          0,
+          12,
+        )}… by ${msg.proposer.slice(0, 8)}`,
+      );
+    } catch (e) {
+      this.logDiag("warn", `governance: ingest split failed: ${e}`);
+    }
+  }
+
+  private async handleRosterSummary(
+    conn: ConnectionState,
+    msg: RosterSummaryMessage,
+  ): Promise<void> {
+    const ourRoot = await this.computeRosterRoot();
+    if (ourRoot === msg.root) return;
+    // Roots disagree — ask for everything. v1 keeps the diff coarse
+    // (matches the substrate's v1 behaviour); a future tree-walk
+    // variant ships under the same kind without a wire bump.
+    const req: RosterRequestMessage = {
+      kind: "roster_request",
+      include_all: true,
+      subtree_hashes: [],
+    };
+    this.send(conn, req);
+  }
+
+  private async handleRosterRequest(
+    conn: ConnectionState,
+    _msg: RosterRequestMessage,
+  ): Promise<void> {
+    // v1: respond with everything we have. The wire shape supports a
+    // partial subtree request but neither side issues those yet.
+    const entries = Array.from(this.roster_pubkeys).map((device_id) => ({
+      device_id,
+      label: this.roster_labels.get(device_id) ?? "",
+      approved_at: 0,
+      role: "member" as const,
+      granted_by: "",
+    }));
+    const frame: RosterEntriesMessage = {
+      kind: "roster_entries",
+      entries,
+    };
+    this.send(conn, frame);
+  }
+
+  private async handleRosterEntries(msg: RosterEntriesMessage): Promise<void> {
+    if (!this.network_id) return;
+    // v1 merge: add anyone we don't have. Tombstones for removal land
+    // in a follow-up; for now removals only happen on the local user
+    // explicitly revoking. Mirrors the substrate's v1 roster-merge
+    // policy in `engine::governance::on_state_broadcast`.
+    for (const e of msg.entries) {
+      if (!e.device_id) continue;
+      if (this.roster_pubkeys.has(e.device_id)) continue;
+      try {
+        await invoke("mesh_roster_add", {
+          networkId: this.network_id,
+          deviceId: e.device_id,
+          label: e.label || "",
+        });
+        this.roster_pubkeys.add(e.device_id);
+        this.roster_labels.set(e.device_id, e.label || "");
+      } catch (err) {
+        this.logDiag("warn", `governance: roster merge failed: ${err}`);
+      }
+    }
+    this.republishPeers();
+  }
+
+  /** Members list for quorum checks. Used both by the UI and by
+   *  inbound ack handlers — every site that calls
+   *  `meshGovernanceApplyTransition` needs to pass the same membership
+   *  snapshot the substrate sees, so we centralise the assembly. */
+  governanceMembersSnapshot(): string[] {
+    const set = new Set<string>(this.roster_pubkeys);
+    for (const conn of this.connections.values()) {
+      if (conn.device_pubkey) set.add(conn.device_pubkey);
+    }
+    if (this.identity?.device_id) {
+      set.add(pubkeyPart(this.identity.device_id));
+    }
+    return Array.from(set);
+  }
 }
 
 function buildIceServers(

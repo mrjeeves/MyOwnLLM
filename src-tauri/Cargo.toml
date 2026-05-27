@@ -41,16 +41,22 @@ sha2 = "0.10"
 hex = "0.4"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
-# Cloud Mesh identity layer. Each instance generates a long-lived
-# ed25519 keypair on first use of the mesh feature, stored under
-# `~/.myownllm/.secrets/identity.json`. The public key is encoded as
-# base32-lowercase (RFC 4648) and surfaced as the Device ID; Network IDs
-# use the same encoding for 256-bit shared rendezvous handles. The
-# `rand_core/getrandom` feature pulls OS randomness for keypair and
-# Network ID generation. Wire protocol / signaling / WebRTC live in
-# follow-up PRs; this dep set covers identity + the anchor file only.
-ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+# Cloud Mesh substrate. Identity, signing, and roster live in the
+# `myownmesh-core` crate from the MyOwnMesh repo — the same code that
+# was extracted out of this app's `mesh/` directory. We pin to `main`
+# while the substrate stabilises; will switch to `tag = "v0.1.0"` once
+# the first MyOwnMesh release lands. The library is not on crates.io
+# yet (gated on a public-API freeze), so git is the supported pin.
+# `MYOWNMESH_HOME` is set to `~/.myownllm` in main.rs so the substrate
+# reads/writes our existing on-disk layout (identity.json, rosters/)
+# without surprising users with a path move.
+myownmesh-core = { git = "https://github.com/mrjeeves/MyOwnMesh", branch = "main" }
+
+# base32 is still used directly by the Tauri command layer to decode
+# `message_b32` arguments before handing the raw bytes to
+# myownmesh-core's sign/verify. ed25519-dalek and rand_core, by
+# contrast, are no longer needed here — the substrate owns key
+# material and OS randomness behind its own API.
 data-encoding = "2"
 
 # Local transcription stack. ASR + diarization run as ONNX models via

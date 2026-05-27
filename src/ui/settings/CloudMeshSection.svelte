@@ -1,6 +1,8 @@
 <script lang="ts">
   import CloudMeshStatus from "./CloudMeshStatus.svelte";
   import CloudMeshConnections from "./CloudMeshConnections.svelte";
+  import CloudMeshNodeMap from "./CloudMeshNodeMap.svelte";
+  import CloudMeshGovernance from "./CloudMeshGovernance.svelte";
   import CloudMeshActivity from "./CloudMeshActivity.svelte";
   import CloudMeshAddresses from "./CloudMeshAddresses.svelte";
   import RemoteSection from "./RemoteSection.svelte";
@@ -43,6 +45,8 @@
     <button class:active={tab === "status"} onclick={() => (tab = "status")}>Status</button>
     <button class:active={tab === "settings"} onclick={() => (tab = "settings")}>Settings</button>
     <button class:active={tab === "connections"} onclick={() => (tab = "connections")}>Connections</button>
+    <button class:active={tab === "graph"} onclick={() => (tab = "graph")}>Graph</button>
+    <button class:active={tab === "governance"} onclick={() => (tab = "governance")}>Governance</button>
     <button class:active={tab === "activity"} onclick={() => (tab = "activity")}>Activity</button>
     <button class:active={tab === "http"} onclick={() => (tab = "http")}>HTTP</button>
   </div>
@@ -52,6 +56,10 @@
       <CloudMeshStatus />
     {:else if tab === "connections"}
       <CloudMeshConnections />
+    {:else if tab === "graph"}
+      <CloudMeshNodeMap />
+    {:else if tab === "governance"}
+      <CloudMeshGovernance />
     {:else if tab === "activity"}
       <CloudMeshActivity />
     {:else if tab === "settings"}
