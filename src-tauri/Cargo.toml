@@ -29,6 +29,16 @@ tokio-util = { version = "0.7", features = ["rt"] }
 dirs = "5"
 which = "6"
 anyhow = "1"
+# Local interprocess socket transport for the daemon control protocol —
+# the LLM Tauri backend talks to `myownmesh serve` over the same
+# line-delimited JSON socket the MyOwnMesh GUI uses. Unix-domain socket
+# on Unix, namespaced pipe on Windows.
+interprocess = { version = "2", features = ["tokio"] }
+# Sync primitives for the Tauri daemon-state slot. parking_lot's Mutex
+# is what the rest of the workspace uses (myownmesh-core ships it as a
+# workspace dep); matching it here keeps the lockfile from picking up a
+# second sync-primitives crate.
+parking_lot = "0.12"
 axum = { version = "0.7", features = ["macros"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }

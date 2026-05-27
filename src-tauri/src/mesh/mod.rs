@@ -28,6 +28,8 @@
 //!   - `commands`: Tauri commands exposed to the Svelte UI.
 
 pub mod commands;
+pub mod daemon;
+pub mod daemon_commands;
 pub mod governance;
 pub mod identity;
 pub mod roster;

@@ -1268,6 +1268,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "doctest-file"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2446,6 +2452,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "interprocess"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "069323743400cb7ab06a8fe5c1ed911d36b6919ec531661d034c89083629595b"
+dependencies = [
+ "doctest-file",
+ "futures-core",
+ "libc",
+ "recvmsg",
+ "tokio",
+ "widestring",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2938,9 +2959,11 @@ dependencies = [
  "futures-util",
  "hex",
  "hyper",
+ "interprocess",
  "myownmesh-core",
  "ndarray",
  "ort",
+ "parking_lot",
  "qrcode",
  "realfft",
  "reqwest 0.12.28",
@@ -2968,8 +2991,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-core"
-version = "0.1.0"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?branch=main#700c4f21ad16bb1edb4dba5c318384c578713ef1"
+version = "0.1.1"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?branch=main#93b536280faba49b84eb938245982fe4dce75985"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2999,8 +3022,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-signaling"
-version = "0.1.0"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?branch=main#700c4f21ad16bb1edb4dba5c318384c578713ef1"
+version = "0.1.1"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?branch=main#93b536280faba49b84eb938245982fe4dce75985"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4130,6 +4153,12 @@ checksum = "f821338fddb99d089116342c46e9f1fbf3828dba077674613e734e01d6ea8677"
 dependencies = [
  "rustfft",
 ]
+
+[[package]]
+name = "recvmsg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
 name = "redox_syscall"
@@ -6878,6 +6907,12 @@ dependencies = [
  "rustix 0.38.44",
  "winsafe",
 ]
+
+[[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "winapi"
