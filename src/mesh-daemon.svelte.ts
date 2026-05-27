@@ -405,6 +405,13 @@ class MeshDaemonClient {
         } catch (e) {
           this.appendDiag("warn", `file handler install failed: ${e}`);
         }
+        try {
+          const { installTranscribeHandler } = await import("./mesh-transcribe");
+          const release = await installTranscribeHandler(this);
+          this.featureReleases.push(release);
+        } catch (e) {
+          this.appendDiag("warn", `transcribe handler install failed: ${e}`);
+        }
       }
     } catch (e) {
       this.error = String(e);
@@ -580,6 +587,17 @@ class MeshDaemonClient {
   ): Promise<{ id: string; cancel: () => void }> {
     const { sendInferRequest } = await import("./mesh-inference");
     return sendInferRequest(this, args);
+  }
+
+  async sendTranscribeRequest(
+    args: import("./mesh-transcribe").SendTranscribeRequestArgs,
+  ): Promise<{
+    id: string;
+    sendAudioChunk: (pcmBytes: Uint8Array, isFinal: boolean) => void;
+    cancel: () => void;
+  }> {
+    const { sendTranscribeRequest } = await import("./mesh-transcribe");
+    return sendTranscribeRequest(this, args);
   }
 
   async sendFile(
