@@ -139,20 +139,27 @@ fn bundle_myownmesh_sidecar() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 3. `cargo install --git`. Pin to the rev in .myownmesh-rev
-    //    when present; otherwise the same `main` branch the
-    //    Cargo.toml dep tracks.
+    // 3. Prebuilt release asset from MyOwnMesh's GitHub Releases.
+    //    `.myownmesh-rev` holds the release tag (`v0.1.2`-style);
+    //    the matching binary is at
+    //    https://github.com/mrjeeves/MyOwnMesh/releases/download/
+    //      <tag>/myownmesh-<platform>.{tar.gz,zip}
+    //
+    //    Going through the release artifact instead of cargo
+    //    install --git skips the whole webrtc-rs native-build
+    //    chain (libsrtp / cmake / openssl). CI is already
+    //    compiling those once per tag; the daemon binary is the
+    //    deliverable, downloading it here is the right primitive.
     let rev = fs::read_to_string(&rev_file)
         .map(|s| s.trim().to_string())
         .ok()
         .filter(|s| !s.is_empty());
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let staging = out_dir.join("myownmesh-staging");
+    fs::create_dir_all(&staging)?;
     let sentinel = staging.join(".rev");
-    let installed_bin = staging.join("bin").join(format!("myownmesh{exe_suffix}"));
+    let installed_bin = staging.join(format!("myownmesh{exe_suffix}"));
 
-    // Skip rebuild if the sentinel matches the requested rev and
-    // the binary is present.
     let already_built = installed_bin.exists()
         && sentinel
             .exists()
@@ -162,58 +169,39 @@ fn bundle_myownmesh_sidecar() -> Result<(), Box<dyn std::error::Error>> {
             == rev;
 
     if !already_built {
-        println!(
-            "cargo:warning=building myownmesh daemon via cargo install \
-             (rev: {})",
-            rev.as_deref().unwrap_or("main")
-        );
-        let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-        cmd.args([
-            "install",
-            "--git",
-            "https://github.com/mrjeeves/MyOwnMesh",
-            "--bin",
-            "myownmesh",
-            "--root",
-        ])
-        .arg(&staging)
-        .arg("--force");
-        // `--locked` is intentionally NOT passed: the cloned
-        // checkout's Cargo.lock may post-date the rev we're
-        // installing, and `cargo install` then refuses to start.
-        // Without the lock pin cargo resolves against crates.io's
-        // latest compatible versions, which is what we want for a
-        // build-time daemon fetch.
-        if let Some(r) = &rev {
-            cmd.args(["--rev", r]);
+        if let Some(tag) = rev.as_deref().filter(|s| s.starts_with('v')) {
+            // Tagged release — download prebuilt.
+            match download_release_asset(tag, &target_triple, &staging, exe_suffix) {
+                Ok(bin) => {
+                    fs::copy(&bin, &installed_bin)?;
+                    make_executable(&installed_bin)?;
+                    fs::write(&sentinel, tag)?;
+                }
+                Err(release_err) => {
+                    // Release download failed — fall back to
+                    // `cargo install --git` so dev iteration
+                    // still has a path forward when GH releases
+                    // are unreachable (offline, rate-limited).
+                    println!(
+                        "cargo:warning=release asset download failed: {release_err} — \
+                         falling back to cargo install --git"
+                    );
+                    cargo_install_fallback(tag, &staging, &installed_bin, exe_suffix)?;
+                    fs::write(&sentinel, tag)?;
+                }
+            }
         } else {
-            cmd.args(["--branch", "main"]);
+            // No tag pinned (raw SHA in .myownmesh-rev, or empty
+            // / missing file) — only path is cargo install --git.
+            let r = rev.as_deref().unwrap_or("main");
+            cargo_install_fallback(r, &staging, &installed_bin, exe_suffix)?;
+            fs::write(&sentinel, r)?;
         }
-        // Capture stderr so failures surface a real diagnostic
-        // rather than just "status: 101". A failing cargo install
-        // is almost always either a missing native build dep
-        // (libsrtp / cmake on Windows) or a network reach issue;
-        // both are obvious from the captured output.
-        let output = cmd.stderr(std::process::Stdio::piped()).output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Tail the last ~60 lines — cargo's full output is
-            // verbose and the actionable error usually sits at the
-            // bottom.
-            let tail: Vec<&str> = stderr.lines().rev().take(60).collect();
-            let tail_str = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-            return Err(format!(
-                "cargo install myownmesh failed (status {}). Last lines of stderr:\n{tail_str}",
-                output.status
-            )
-            .into());
-        }
-        fs::write(&sentinel, rev.as_deref().unwrap_or("main"))?;
     }
 
     if !installed_bin.exists() {
         return Err(format!(
-            "myownmesh binary not found after cargo install: {}",
+            "myownmesh binary not found after install: {}",
             installed_bin.display()
         )
         .into());
@@ -233,6 +221,169 @@ fn make_executable(path: &Path) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Map a Rust target triple to the platform-name the
+/// MyOwnMesh release pipeline uses (`linux-x86_64`, etc.). See
+/// `.github/workflows/release.yml` in MyOwnMesh for the matrix.
+fn release_platform_name(target_triple: &str) -> Result<&'static str, String> {
+    Ok(match target_triple {
+        "x86_64-unknown-linux-gnu" | "x86_64-unknown-linux-musl" => "linux-x86_64",
+        "aarch64-unknown-linux-gnu" | "aarch64-unknown-linux-musl" => "linux-aarch64",
+        "aarch64-apple-darwin" => "macos-aarch64",
+        "x86_64-apple-darwin" => "macos-x86_64",
+        "x86_64-pc-windows-msvc" => "windows-x86_64",
+        other => return Err(format!("no prebuilt myownmesh for target triple '{other}'")),
+    })
+}
+
+/// Download the matching prebuilt daemon archive for `tag` and
+/// `target_triple` from GitHub Releases, extract it under
+/// `staging/`, and return the absolute path of the extracted
+/// binary. Shells out to `curl` + `tar` / PowerShell (all three
+/// ship by default on every supported platform) to avoid adding
+/// reqwest / flate2 / zip as build-time dependencies.
+fn download_release_asset(
+    tag: &str,
+    target_triple: &str,
+    staging: &Path,
+    exe_suffix: &str,
+) -> Result<PathBuf, String> {
+    let platform = release_platform_name(target_triple)?;
+    let is_windows = exe_suffix == ".exe";
+    let archive_name = if is_windows {
+        format!("myownmesh-{platform}.zip")
+    } else {
+        format!("myownmesh-{platform}.tar.gz")
+    };
+    let url =
+        format!("https://github.com/mrjeeves/MyOwnMesh/releases/download/{tag}/{archive_name}");
+    let archive_path = staging.join(&archive_name);
+
+    println!("cargo:warning=downloading {url}");
+    // `curl -fL` — `-f` fails on HTTP errors instead of writing
+    // the error page to disk; `-L` follows the redirect chain
+    // GitHub uses for release assets.
+    let status = Command::new("curl")
+        .args(["-fL", "--retry", "3", "-o"])
+        .arg(&archive_path)
+        .arg(&url)
+        .status()
+        .map_err(|e| format!("curl spawn: {e} (install curl, then re-run the build)"))?;
+    if !status.success() {
+        return Err(format!("curl failed with status {status} fetching {url}"));
+    }
+
+    // Extract. The release archives contain a single file
+    // (`myownmesh` or `myownmesh.exe`) at the root, so the
+    // extraction target is `staging/` directly.
+    if is_windows {
+        // PowerShell's Expand-Archive is available on every
+        // Windows 10+ box and handles .zip without extra deps.
+        let status = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+                    archive_path.display(),
+                    staging.display()
+                ),
+            ])
+            .status()
+            .map_err(|e| format!("powershell spawn: {e}"))?;
+        if !status.success() {
+            return Err(format!("Expand-Archive failed with status {status}"));
+        }
+    } else {
+        // `tar` ships by default on Linux + macOS. The release
+        // archive is gzipped; `-xzf` handles both layers.
+        let status = Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive_path)
+            .arg("-C")
+            .arg(staging)
+            .status()
+            .map_err(|e| format!("tar spawn: {e}"))?;
+        if !status.success() {
+            return Err(format!("tar failed with status {status}"));
+        }
+    }
+
+    let bin = staging.join(format!("myownmesh{exe_suffix}"));
+    if !bin.exists() {
+        return Err(format!(
+            "extracted archive but `{}` not found — release asset shape changed?",
+            bin.display()
+        ));
+    }
+    Ok(bin)
+}
+
+/// Build from source via `cargo install --git`. Used as the
+/// fallback when release-asset download fails (or when the rev
+/// pin is a SHA rather than a tag — typically during dev
+/// iteration against an unreleased daemon).
+///
+/// Captures stderr so a failure surfaces the actual build error
+/// (almost always a missing native dep — libsrtp / cmake /
+/// openssl — that webrtc-rs needs).
+fn cargo_install_fallback(
+    rev_or_branch: &str,
+    staging: &Path,
+    installed_bin: &Path,
+    exe_suffix: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "cargo:warning=building myownmesh daemon via cargo install --git (rev: {rev_or_branch})"
+    );
+    let install_root = staging.join("cargo-install-root");
+    let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cmd.args([
+        "install",
+        "--git",
+        "https://github.com/mrjeeves/MyOwnMesh",
+        "--bin",
+        "myownmesh",
+        "--root",
+    ])
+    .arg(&install_root)
+    .arg("--force");
+    // Detect tag / branch / SHA heuristically: anything starting
+    // with `v` is a tag, otherwise treat as rev (cargo accepts
+    // both tag-name and SHA via --rev).
+    if rev_or_branch.starts_with('v') {
+        cmd.args(["--tag", rev_or_branch]);
+    } else if rev_or_branch == "main" {
+        cmd.args(["--branch", "main"]);
+    } else {
+        cmd.args(["--rev", rev_or_branch]);
+    }
+    let output = cmd.stderr(std::process::Stdio::piped()).output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: Vec<&str> = stderr.lines().rev().take(60).collect();
+        let tail_str = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+        return Err(format!(
+            "cargo install myownmesh failed (status {}). Last lines of stderr:\n{tail_str}",
+            output.status
+        )
+        .into());
+    }
+    let built = install_root
+        .join("bin")
+        .join(format!("myownmesh{exe_suffix}"));
+    if !built.exists() {
+        return Err(format!(
+            "cargo install completed but no binary at {}",
+            built.display()
+        )
+        .into());
+    }
+    fs::copy(&built, installed_bin)?;
+    make_executable(installed_bin)?;
     Ok(())
 }
 
