@@ -419,6 +419,55 @@ class MeshDaemonClient {
         } catch (e) {
           this.appendDiag("warn", `move handlers install failed: ${e}`);
         }
+        // Catalog / permissions / prompts gossip. Subscribe to
+        // inbound channels + register update hooks against the
+        // per-peer catalog map. The reactive store updates each
+        // matching `PeerEntry.catalog` so the Sidebar's remote
+        // conversation list re-renders without a peers re-snapshot.
+        try {
+          const {
+            subscribeCatalog,
+            subscribePermissions,
+            subscribePrompts,
+          } = await import("./mesh-gossip");
+          const catRelease = await subscribeCatalog(this, {
+            onCatalogFromPeer: (from, entries) => {
+              this.peers = this.peers.map((p) =>
+                p.device_pubkey === from ? { ...p, catalog: entries } : p,
+              );
+            },
+          });
+          this.featureReleases.push(catRelease);
+          const permRelease = await subscribePermissions(this, {
+            onPermissionsFromPeer: (from, snap) => {
+              // Surface as a diag for now — the legacy merge logic
+              // (apply peer's authorized list into our local
+              // permissions DB) lives in `mesh-permissions.ts`
+              // which is not yet ported. Phase D wires it.
+              this.appendDiag(
+                "info",
+                `permissions snapshot from ${from.slice(0, 8)}: ${snap.authorized.length} entries`,
+              );
+            },
+          });
+          this.featureReleases.push(permRelease);
+          const promptsRelease = await subscribePrompts(this, {
+            onPromptsFromPeer: (from, snap) => {
+              this.appendDiag(
+                "info",
+                `prompts snapshot from ${from.slice(0, 8)}: ${snap.prompts.length} entries`,
+              );
+            },
+          });
+          this.featureReleases.push(promptsRelease);
+        } catch (e) {
+          this.appendDiag("warn", `gossip subscribe failed: ${e}`);
+        }
+        // Initial capability + catalog publish so peers see us
+        // right away. Subsequent updates ride on
+        // `noteCapabilitiesChanged` / `noteCatalogChanged`.
+        void this.refreshCapabilities();
+        void this.refreshLocalCatalog();
       }
     } catch (e) {
       this.error = String(e);
@@ -524,19 +573,25 @@ class MeshDaemonClient {
 
   async setAccepting(value: "yes" | "if_idle" | "no"): Promise<void> {
     this.accepting = value;
-    // Capability advertisement: rebuild the local capabilities object
-    // with the new accepting flag and push to daemon. The full
-    // capability snapshot logic is in `mesh-capabilities.ts` and gets
-    // wired into this method in Phase C-6 so we also refresh on
-    // hardware / model changes.
-    // For now, just keep the local state in sync; the actual
-    // capabilities_set call lands once the snapshotter is connected.
+    // Trigger a capability re-publish so peers see the new flag
+    // on their next snapshot.
+    await this.refreshCapabilities();
   }
 
-  async setAutoGossip(_value: boolean): Promise<void> {
-    // Auto-gossip is the LLM's roster-sync feature. It runs over a
-    // typed channel (`permissions/snapshot`). Wiring lands in
-    // Phase C-6 alongside the permissions module.
+  /** Auto-gossip toggle. When true, the LLM publishes its full
+   *  roster (and prompt library) periodically + on roster
+   *  changes. Receivers merge — see `mesh-gossip.ts`. */
+  autoGossipEnabled = $state<boolean>(false);
+
+  async setAutoGossip(value: boolean): Promise<void> {
+    this.autoGossipEnabled = value;
+    if (value && this.network) {
+      // Fire an immediate publish so the toggle's effect is visible
+      // without waiting for the next tick.
+      const { publishPermissions, publishPrompts } = await import("./mesh-gossip");
+      await publishPermissions(this, this.network);
+      await publishPrompts(this);
+    }
   }
 
   async setDiagQuiet(value: boolean): Promise<void> {
@@ -548,43 +603,106 @@ class MeshDaemonClient {
 
   // ---- notifications from app code (debounced refresh hints) ----
 
-  /** Capability snapshot changed (e.g. user pulled a new model);
-   *  re-snapshot + republish via `mesh_daemon_capabilities_set`.
-   *  Wired in Phase C-6. */
+  /** Capability snapshot changed (user pulled a new model, switched
+   *  accepting policy, etc.). Re-snapshot + push to daemon. */
   noteCapabilitiesChanged(): void {
-    // no-op until Phase C-6
+    void this.refreshCapabilities();
   }
 
-  /** Catalog changed (new conversation saved). Refresh + republish
-   *  via the `catalog/announce` typed channel. Wired in Phase C-6. */
+  /** Catalog changed. Re-snapshot + republish on the
+   *  `catalog/announce` typed channel. */
   noteCatalogChanged(): void {
-    // no-op until Phase C-6
+    void this.refreshLocalCatalog();
   }
 
+  /** Snapshot + push capabilities to the daemon. */
+  async refreshCapabilities(): Promise<void> {
+    const { refreshCapabilities } = await import("./mesh-gossip");
+    try {
+      await refreshCapabilities(this, this.accepting);
+    } catch (e) {
+      this.appendDiag("warn", `capabilities refresh failed: ${e}`);
+    }
+  }
+
+  /** Snapshot the local conversation list + broadcast via
+   *  `catalog/announce`. */
   async refreshLocalCatalog(): Promise<void> {
-    // Phase C-6
+    if (!this.network) return;
+    const { publishCatalog } = await import("./mesh-gossip");
+    try {
+      await publishCatalog(this);
+    } catch (e) {
+      this.appendDiag("warn", `catalog refresh failed: ${e}`);
+    }
   }
 
-  // ---- governance (delegates to daemon) -------------------------
+  // ---- governance (delegates to daemon's signed-proposal flow) ---
+  //
+  // The legacy meshClient.governance* methods were a typed-channel
+  // broadcast layer over an in-frontend proposal state machine.
+  // PR #16's daemon owns governance state internally, so these
+  // are direct passthroughs now. The UI's existing call sites
+  // continue to use the same method names — the LLM-side
+  // mesh-governance.ts module gets rewritten in Phase D to
+  // delegate to these.
 
-  async governancePublishPropose(_proposal: unknown): Promise<void> {
-    // Direct propose-kind-change op lives at the daemon level. The
-    // legacy meshClient.governancePublishPropose was a typed-channel
-    // multicast — that's now subsumed by the daemon's signed
-    // proposal flow. Wired in Phase C-6.
+  async governancePublishPropose(proposal: {
+    kind?: "kind_change" | "role_grant" | "role_revoke";
+    to?: "open" | "closed";
+    target?: string;
+    role?: "member" | "controller" | "owner";
+  }): Promise<unknown> {
+    if (!this.network) throw new Error("no network");
+    switch (proposal.kind) {
+      case "kind_change":
+        return invoke("mesh_daemon_governance_propose_kind_change", {
+          network: this.network,
+          to: proposal.to ?? "closed",
+        });
+      case "role_grant":
+        return invoke("mesh_daemon_governance_propose_role_grant", {
+          network: this.network,
+          target: proposal.target ?? "",
+          role: proposal.role ?? "member",
+        });
+      case "role_revoke":
+        return invoke("mesh_daemon_governance_propose_role_revoke", {
+          network: this.network,
+          target: proposal.target ?? "",
+        });
+      default:
+        throw new Error(`unknown proposal kind: ${proposal.kind}`);
+    }
   }
 
-  async governancePublishAck(_ack: unknown): Promise<void> {
-    // Phase C-6
+  async governancePublishAck(ack: {
+    proposal_id: string;
+    decision: "sign" | "deny" | "withdraw";
+  }): Promise<unknown> {
+    if (!this.network) throw new Error("no network");
+    const op =
+      ack.decision === "sign"
+        ? "mesh_daemon_governance_sign"
+        : ack.decision === "deny"
+          ? "mesh_daemon_governance_deny"
+          : "mesh_daemon_governance_withdraw";
+    return invoke(op, { network: this.network, proposalId: ack.proposal_id });
   }
 
+  /** No-op: the daemon's governance flow doesn't need a roster
+   *  summary broadcast; signed proposals carry the membership
+   *  set implicitly. Kept as a method so the legacy UI's call
+   *  sites don't need to be deleted in one go. */
   async governancePublishRosterSummary(_summary: unknown): Promise<void> {
-    // Phase C-6 — also moves to a typed channel on the daemon.
+    // intentional no-op
   }
 
-  governanceMembersSnapshot(): Promise<unknown> {
-    // Phase C-6
-    return Promise.resolve({});
+  /** Snapshot of governance members. Pulls the current network
+   *  state from the daemon + extracts the role assignments. */
+  async governanceMembersSnapshot(): Promise<unknown> {
+    if (!this.network) return {};
+    return invoke("mesh_daemon_governance_state", { network: this.network });
   }
 
   // ---- inference / file / transcribe / move (Phase C-2..C-5) ----
@@ -780,6 +898,17 @@ class MeshDaemonClient {
       network: this.network,
       channel,
       payload,
+    });
+  }
+
+  /** Push the local capability snapshot to the daemon. The daemon
+   *  broadcasts a `capabilities_update` frame to peers on its next
+   *  engine tick. */
+  async pushCapabilities(capabilities: unknown): Promise<void> {
+    if (!this.network) throw new Error("no network — start() first");
+    await invoke("mesh_daemon_capabilities_set", {
+      network: this.network,
+      capabilities,
     });
   }
 
