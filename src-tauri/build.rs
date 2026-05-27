@@ -177,16 +177,36 @@ fn bundle_myownmesh_sidecar() -> Result<(), Box<dyn std::error::Error>> {
             "--root",
         ])
         .arg(&staging)
-        .arg("--locked")
         .arg("--force");
+        // `--locked` is intentionally NOT passed: the cloned
+        // checkout's Cargo.lock may post-date the rev we're
+        // installing, and `cargo install` then refuses to start.
+        // Without the lock pin cargo resolves against crates.io's
+        // latest compatible versions, which is what we want for a
+        // build-time daemon fetch.
         if let Some(r) = &rev {
             cmd.args(["--rev", r]);
         } else {
             cmd.args(["--branch", "main"]);
         }
-        let status = cmd.status()?;
-        if !status.success() {
-            return Err(format!("cargo install myownmesh failed (status {status})").into());
+        // Capture stderr so failures surface a real diagnostic
+        // rather than just "status: 101". A failing cargo install
+        // is almost always either a missing native build dep
+        // (libsrtp / cmake on Windows) or a network reach issue;
+        // both are obvious from the captured output.
+        let output = cmd.stderr(std::process::Stdio::piped()).output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Tail the last ~60 lines — cargo's full output is
+            // verbose and the actionable error usually sits at the
+            // bottom.
+            let tail: Vec<&str> = stderr.lines().rev().take(60).collect();
+            let tail_str = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+            return Err(format!(
+                "cargo install myownmesh failed (status {}). Last lines of stderr:\n{tail_str}",
+                output.status
+            )
+            .into());
         }
         fs::write(&sentinel, rev.as_deref().unwrap_or("main"))?;
     }
