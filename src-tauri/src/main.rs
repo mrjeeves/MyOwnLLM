@@ -374,6 +374,60 @@ fn transcribe_upload_start(
     .map_err(|e| e.to_string())
 }
 
+/// Start an ASR session whose audio frames will arrive over the
+/// daemon's mesh IPC (see `mesh-transcribe.ts`). Mirrors the local
+/// `transcribe_start` shape minus the device picker. Audio chunks
+/// are pushed via `transcribe_feed_remote_audio`; end-of-stream is
+/// signaled by the same command's `is_final` flag.
+#[tauri::command]
+fn transcribe_start_remote_session(
+    session_id: String,
+    runtime: String,
+    model: String,
+    diarize_model: Option<String>,
+    sample_rate: u32,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    transcribe::start_remote_session(
+        session_id,
+        runtime,
+        model,
+        diarize_model,
+        sample_rate,
+        window,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Push a single PCM chunk into a running remote session. `bytes_b64`
+/// is base64-encoded i16 little-endian PCM at the session's sample
+/// rate (16 kHz mono on the LLM's wire format). Decoded + converted
+/// to the f32 shape the ingest loop expects.
+#[tauri::command]
+fn transcribe_feed_remote_audio(
+    session_id: String,
+    index: u64,
+    bytes_b64: String,
+    is_final: bool,
+) -> Result<(), String> {
+    let _ = index; // Reserved for future out-of-order detection; loop is
+                   // strictly serial today, sender always sends in
+                   // order. Accept the field so the wire shape can stay
+                   // stable when we wire reorder/retry.
+    let bytes = data_encoding::BASE64
+        .decode(bytes_b64.as_bytes())
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    if bytes.len() % 2 != 0 {
+        return Err("PCM bytes must be a multiple of 2 (i16 LE)".to_string());
+    }
+    let mut samples = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let s = i16::from_le_bytes([pair[0], pair[1]]);
+        samples.push(s as f32 / i16::MAX as f32);
+    }
+    transcribe::feed_remote_audio(&session_id, samples, is_final).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn asr_models_list() -> Vec<models::ModelInfo> {
     models::list(models::ModelKind::Asr)
@@ -961,6 +1015,8 @@ fn main() {
             transcribe_pending_streams,
             transcribe_drain_start,
             transcribe_upload_start,
+            transcribe_start_remote_session,
+            transcribe_feed_remote_audio,
             asr_models_list,
             asr_model_pull,
             asr_model_pull_cancel,

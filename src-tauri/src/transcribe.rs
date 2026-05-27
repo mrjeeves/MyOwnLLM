@@ -734,6 +734,359 @@ pub fn start_upload(
     Ok(())
 }
 
+/// Remote-audio session inboxes. Keyed by stream id, value is the
+/// f32-PCM sender feeding the ingest loop. Populated by
+/// [`start_remote_session`], drained by [`feed_remote_audio`],
+/// removed by [`end_remote_audio`] (or cleared automatically when
+/// the run thread exits).
+///
+/// A separate map from `sessions()` because remote sessions still
+/// register a [`Session`] there for cancel/pause parity with the
+/// local path; the sender lives here so `feed_remote_audio` has an
+/// O(1) lookup that doesn't compete with the session map.
+fn remote_inboxes() -> &'static DashMap<String, crossbeam_channel::Sender<Vec<f32>>> {
+    static MAP: OnceLock<DashMap<String, crossbeam_channel::Sender<Vec<f32>>>> = OnceLock::new();
+    MAP.get_or_init(DashMap::new)
+}
+
+/// Start a transcription session whose audio frames arrive over the
+/// daemon's mesh IPC instead of the local mic. Same model-loading
+/// + diarize wiring as [`start`], minus the cpal capture. Audio is
+/// pushed by [`feed_remote_audio`]; end-of-stream is signaled by
+/// the caller (the file_chunks-like channel from `mesh-transcribe.ts`)
+/// dropping the inbox via [`end_remote_audio`] — typically when the
+/// peer's final `is_final` chunk lands.
+///
+/// Emits the same `myownllm://transcribe-segment/<stream_id>` event
+/// shape the local flow uses, so `mesh-transcribe.ts`'s handler can
+/// just subscribe to that channel and forward each frame back to
+/// the calling peer as an RPC stream chunk.
+pub fn start_remote_session(
+    stream_id: String,
+    runtime: String,
+    model_name: String,
+    diarize_model: Option<String>,
+    sample_rate: u32,
+    window: WebviewWindow,
+) -> Result<()> {
+    if sessions().contains_key(&stream_id) {
+        return Err(anyhow!("transcription {stream_id} is already running"));
+    }
+    if !models::find(&model_name, ModelKind::Asr)
+        .map(models::is_installed)
+        .unwrap_or(false)
+    {
+        return Err(anyhow!(
+            "ASR model '{model_name}' isn't installed — install it from Settings → Models."
+        ));
+    }
+    if let Some(d) = &diarize_model {
+        if !models::composite_installed(d, ModelKind::Diarize) {
+            return Err(anyhow!(
+                "diarize model '{d}' isn't installed yet — toggle off diarization or pull it first."
+            ));
+        }
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    sessions().insert(
+        stream_id.clone(),
+        Session {
+            cancel: cancel.clone(),
+            paused: paused.clone(),
+        },
+    );
+
+    // The cpal local path uses a bounded(128) channel sized for
+    // continuous mic capture. The remote feed is per-chunk
+    // network-paced; we keep the same depth for symmetry — backlog
+    // beyond that blocks `feed_remote_audio`'s push, which the
+    // caller treats as transient back-pressure.
+    let (tx, rx) = bounded::<Vec<f32>>(128);
+    remote_inboxes().insert(stream_id.clone(), tx);
+
+    let stream_id_for_thread = stream_id.clone();
+    let cancel_for_thread = cancel.clone();
+    let paused_for_thread = paused.clone();
+    let runtime_for_thread = runtime.clone();
+    let model_for_thread = model_name.clone();
+    let diarize_for_thread = diarize_model.clone();
+    let sink: Arc<dyn FrameSink> = Arc::new(window);
+    thread::spawn(move || {
+        // Distinct event channel name from the local flow so a
+        // mesh-served session running alongside a local user
+        // recording doesn't crosstalk on the frontend.
+        let event = format!("myownllm://transcribe-segment/{stream_id_for_thread}");
+        let session_start = std::time::Instant::now();
+        let res = run_remote_session(
+            &event,
+            &stream_id_for_thread,
+            &runtime_for_thread,
+            &model_for_thread,
+            diarize_for_thread.as_deref(),
+            sample_rate,
+            rx,
+            cancel_for_thread,
+            paused_for_thread,
+            &sink,
+        );
+        crate::usage::record_transcribe_seconds(session_start.elapsed().as_secs());
+        sessions().remove(&stream_id_for_thread);
+        remote_inboxes().remove(&stream_id_for_thread);
+        let final_frame = match res {
+            Ok(()) => TranscribeFrame {
+                elapsed_ms: 0,
+                segments: Vec::new(),
+                is_final: true,
+                pending_chunks: 0,
+                chunk_seconds: None,
+                status: None,
+                upload_progress: None,
+            },
+            Err(e) => TranscribeFrame {
+                elapsed_ms: 0,
+                segments: Vec::new(),
+                is_final: true,
+                pending_chunks: 0,
+                chunk_seconds: None,
+                status: Some(format!("transcription error: {e:#}")),
+                upload_progress: None,
+            },
+        };
+        sink.emit_frame(&event, final_frame);
+    });
+    Ok(())
+}
+
+/// Push a chunk of PCM samples into a running remote session. The
+/// `samples` slice is assumed to already be the f32 mono shape the
+/// ingest loop expects at the session's declared sample rate
+/// (caller resamples / downmixes — for `mesh-transcribe.ts` that's
+/// i16-LE → f32 conversion at 16 kHz mono which the LLM has been
+/// shipping for the legacy Trystero path).
+///
+/// If `is_final` is set, the inbox is removed afterward so the
+/// ingest loop sees end-of-stream and the decode loop drains. The
+/// session's cancel flag is set as a backstop in case any pending
+/// chunks fail to drain within the decode-loop's idle window.
+pub fn feed_remote_audio(stream_id: &str, samples: Vec<f32>, is_final: bool) -> Result<()> {
+    if let Some(tx) = remote_inboxes().get(stream_id) {
+        // crossbeam's `send` blocks when the channel is full; the
+        // 128-slot buffer is the same back-pressure shape the cpal
+        // path uses. A genuinely-stuck consumer surfaces as a
+        // visible delay in `feed_remote_audio` returning — the
+        // Tauri command treats that as the caller's problem, same
+        // as cpal would on a slow ASR backend.
+        tx.send(samples)
+            .map_err(|_| anyhow!("remote audio inbox closed"))?;
+    } else {
+        return Err(anyhow!("no remote transcribe session '{stream_id}'"));
+    }
+    if is_final {
+        end_remote_audio(stream_id);
+    }
+    Ok(())
+}
+
+/// Drop the inbox + flag cancel so the decode loop unblocks once
+/// the buffered chunks drain. Idempotent.
+pub fn end_remote_audio(stream_id: &str) {
+    remote_inboxes().remove(stream_id);
+    if let Some(s) = sessions().get(stream_id) {
+        // Don't yank cancel immediately — let the ingest loop see
+        // the rx close and flush any in-flight chunk to disk
+        // first. The decode loop's idle-wait then reads the flush
+        // and runs ASR over it before observing cancel. Setting
+        // cancel here just guarantees the decode loop ends if the
+        // peer disconnected before the final chunk arrived.
+        s.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Mesh-flavour run_session: same backend setup + ingest_loop +
+/// decode loop as `run_session`, with the cpal capture replaced
+/// by an externally-fed `Receiver<Vec<f32>>`. The receiver lives
+/// in `remote_inboxes()`; this function just consumes it.
+#[allow(clippy::too_many_arguments)]
+fn run_remote_session(
+    event: &str,
+    stream_id: &str,
+    runtime: &str,
+    model_name: &str,
+    diarize_composite: Option<&str>,
+    sample_rate: u32,
+    rx: Receiver<Vec<f32>>,
+    cancel: Arc<AtomicBool>,
+    _paused: Arc<AtomicBool>,
+    window: &std::sync::Arc<dyn FrameSink>,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let stage = |msg: &str| {
+        window.emit_frame(
+            event,
+            TranscribeFrame::heartbeat(0, 0, None, Some(msg.to_string())),
+        );
+    };
+    let (mut asr, mut diarize, caps) =
+        build_backends(runtime, model_name, diarize_composite, &stage, &cancel)?;
+
+    let buffer_dir = chunk_buffer_dir(stream_id)?;
+    if let Ok(entries) = std::fs::read_dir(&buffer_dir) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    write_meta(&buffer_dir, runtime, model_name, diarize_composite);
+
+    // Hand the receiver to the existing ingest_loop. It writes
+    // chunked .f32 files to `buffer_dir`; this thread reads them
+    // back in seq order and drives ASR. Same machinery as the
+    // local mic path — the audio source is the only difference.
+    let ingest_buffer_dir = buffer_dir.clone();
+    let ingest_cancel = cancel.clone();
+    let ingest_caps = caps;
+    let ingest_event = event.to_string();
+    let ingest_window: std::sync::Arc<dyn FrameSink> = std::sync::Arc::clone(window);
+    let ingest_handle = thread::spawn(move || {
+        ingest_loop(
+            rx,
+            sample_rate,
+            ingest_buffer_dir,
+            ingest_caps,
+            ingest_cancel,
+            &ingest_event,
+            &ingest_window,
+            started,
+        );
+    });
+
+    window.emit_frame(
+        event,
+        TranscribeFrame::heartbeat(
+            started.elapsed().as_millis(),
+            0,
+            Some(caps.chunk_seconds),
+            Some(format!(
+                "Receiving remote audio… first chunk in ~{:.0} s",
+                caps.chunk_seconds
+            )),
+        ),
+    );
+
+    let mut next_seq: u64 = 1;
+    let mut chunks_since_reset: u64 = 0;
+    let mut chunk_t0_ms: u64 = 0;
+    let mut consecutive_errors: u32 = 0;
+    // Track "the inbox is closed AND the buffer dir is empty" so
+    // a streaming session terminates naturally after the peer's
+    // is_final chunk drains. Without this the decode loop only
+    // exits on cancel, which would leave a remote session running
+    // forever waiting on chunks that'll never come.
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        let next_path = buffer_dir.join(format!("{next_seq:010}.f32"));
+        if !next_path.exists() {
+            // Buffer empty AND inbox closed → caller signaled end
+            // and ingest_loop drained. Exit.
+            if !remote_inboxes().contains_key(stream_id) && count_pending_chunks(&buffer_dir) == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+
+        let samples = match read_f32_chunk(&next_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("transcribe-buffer read failed for {next_path:?}: {e}");
+                let _ = std::fs::remove_file(&next_path);
+                next_seq += 1;
+                continue;
+            }
+        };
+
+        let chunk_ms = (samples.len() as u64 * 1000) / TARGET_SR as u64;
+        if chunk_rms(&samples) < SILENCE_RMS_THRESHOLD {
+            let _ = std::fs::remove_file(&next_path);
+            next_seq += 1;
+            chunk_t0_ms += chunk_ms;
+            continue;
+        }
+
+        let asr_out = match asr.process_chunk(&samples, chunk_t0_ms, &cancel) {
+            Ok(o) => {
+                consecutive_errors = 0;
+                o
+            }
+            Err(e) => {
+                if cancel.load(Ordering::SeqCst) {
+                    break;
+                }
+                consecutive_errors += 1;
+                eprintln!("ASR inference failed (consecutive={consecutive_errors}): {e}");
+                if consecutive_errors >= ASR_CONSECUTIVE_ERROR_LIMIT {
+                    return Err(anyhow!(
+                        "ASR backend failed {consecutive_errors} times in a row: {e}"
+                    ));
+                }
+                asr.reset_state();
+                let _ = std::fs::remove_file(&next_path);
+                next_seq += 1;
+                chunk_t0_ms += chunk_ms;
+                continue;
+            }
+        };
+
+        let turns: Vec<SpeakerTurn> = if let Some(d) = diarize.as_mut() {
+            match d.process_chunk(&samples, chunk_t0_ms, &cancel) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("diarize inference failed: {e}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let _ = std::fs::remove_file(&next_path);
+        next_seq += 1;
+
+        let mut segments = join_segments(&asr_out.segments, &turns, chunk_t0_ms);
+        chunk_t0_ms += chunk_ms;
+        segments.retain(|s| !s.text.trim().is_empty());
+
+        if !segments.is_empty() {
+            window.emit_frame(
+                event,
+                TranscribeFrame {
+                    elapsed_ms: started.elapsed().as_millis(),
+                    segments,
+                    is_final: false,
+                    pending_chunks: count_pending_chunks(&buffer_dir),
+                    chunk_seconds: None,
+                    status: None,
+                    upload_progress: None,
+                },
+            );
+        }
+
+        if asr_out.used_state && caps.state_reset_chunks > 0 {
+            chunks_since_reset += 1;
+            if chunks_since_reset >= caps.state_reset_chunks {
+                chunks_since_reset = 0;
+                asr.reset_state();
+            }
+        }
+    }
+
+    let _ = ingest_handle.join();
+    let _ = std::fs::remove_dir_all(&buffer_dir);
+    Ok(())
+}
+
 /// Bundle returned by `build_backends`: the warmed-up ASR backend,
 /// the optional diarize backend (None when diarization is off), and
 /// the backend's caps so the worker can read `chunk_seconds` without

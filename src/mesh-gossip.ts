@@ -34,6 +34,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+import { loadConfig, getAllPrompts } from "./config";
+import { listConversations } from "./conversations";
 import { snapshotCapabilities } from "./mesh-capabilities";
 import type { Capabilities, CatalogEntry } from "./mesh-protocol";
 
@@ -78,20 +80,17 @@ interface CatalogAnnounce {
   ts: number;
 }
 
-/** Build the local catalog snapshot. Uses the existing
- *  `list_conversations` Tauri command — same source the
- *  Sidebar binds to, so the gossip view matches the UI view. */
+/** Build the local catalog snapshot. Uses the same
+ *  `listConversations` helper the Sidebar binds to, so the
+ *  gossip view matches the UI view. */
 async function snapshotLocalCatalog(): Promise<CatalogEntry[]> {
   try {
-    const list = await invoke<{ conversations: Array<Record<string, unknown>> }>(
-      "list_conversations",
-    );
-    return list.conversations.map((c) => ({
-      guid: String(c.id ?? ""),
-      title: String(c.title ?? ""),
-      mode: String(c.mode ?? c.model_mode ?? ""),
-      updated_at: String(c.updated_at ?? ""),
-      pending_move: c.pending_move === true ? true : undefined,
+    const { conversations } = await listConversations();
+    return conversations.map((c) => ({
+      guid: c.id,
+      title: c.title,
+      mode: c.mode,
+      updated_at: c.updated_at,
     })) as CatalogEntry[];
   } catch {
     return [];
@@ -185,16 +184,18 @@ interface PromptsSnapshot {
   ts: number;
 }
 
-/** Push the local prompt library to peers. The library lives on
- *  disk under `~/.myownllm/prompts/` and is read via the existing
- *  `list_prompts` Tauri command. */
+/** Push the local prompt library to peers. The library lives in
+ *  the user config under `cloud_mesh.networks[*].prompts`. */
 export async function publishPrompts(client: CatalogClient): Promise<void> {
   try {
-    const prompts = (await invoke("list_prompts")) as
-      | Array<{ id: string; label: string; body: string }>
-      | undefined;
+    const cfg = await loadConfig();
+    const all = getAllPrompts(cfg);
     await client.channelSendAll("prompts/snapshot", {
-      prompts: prompts ?? [],
+      prompts: all.map((p) => ({
+        id: p.id,
+        label: p.name,
+        body: p.system_prompt,
+      })),
       ts: Date.now(),
     } as PromptsSnapshot);
   } catch {

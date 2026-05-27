@@ -221,35 +221,55 @@ async function handleTranscribe(
   // event stream `myownllm://transcribe-segment/<id>` mirroring the
   // local-flow event bus. We listen + forward each segment to the
   // peer as an RPC stream chunk.
+  // The Rust `start_remote_session` emits `TranscribeFrame` JSON on
+  // `myownllm://transcribe-segment/<session_id>`:
+  //   { elapsed_ms, segments: [{ text, start_ms, end_ms, speaker?,
+  //     overlap? }], final: bool, status?, ... }
+  // We unpack each segment to one peer-facing chunk, and use
+  // `final: true` (optionally with a `status` carrying the error
+  // message) as the stream-end signal.
   let unlistenSegment: (() => void) | null = null;
+  interface EmittedSegment {
+    text: string;
+    start_ms: number;
+    end_ms: number;
+    speaker?: number;
+    overlap?: boolean;
+  }
+  interface TranscribeFrameJson {
+    elapsed_ms?: number;
+    segments?: EmittedSegment[];
+    final?: boolean;
+    status?: string;
+  }
   try {
     const { listen } = await import("@tauri-apps/api/event");
-    const handle = await listen<{
-      text?: string;
-      speaker?: number;
-      overlap?: boolean;
-      start_ms?: number;
-      end_ms?: number;
-      done?: boolean;
-      cancelled?: boolean;
-      error?: string;
-    }>(`myownllm://transcribe-segment/${local_session_id}`, (e) => {
-      const f = e.payload;
-      if (f.error) {
-        void finishOnce(f.error);
-        return;
-      }
-      if (f.text !== undefined) {
-        void client.streamRpcChunk(call.request_id, {
-          text: f.text,
-          speaker: f.speaker,
-          overlap: f.overlap,
-          start_ms: f.start_ms,
-          end_ms: f.end_ms,
-        } satisfies SegmentPayload);
-      }
-      if (f.done) void finishOnce(null);
-    });
+    const handle = await listen<TranscribeFrameJson>(
+      `myownllm://transcribe-segment/${local_session_id}`,
+      (e) => {
+        const f = e.payload;
+        if (Array.isArray(f.segments)) {
+          for (const seg of f.segments) {
+            void client.streamRpcChunk(call.request_id, {
+              text: seg.text,
+              speaker: seg.speaker,
+              overlap: seg.overlap,
+              start_ms: seg.start_ms,
+              end_ms: seg.end_ms,
+            } satisfies SegmentPayload);
+          }
+        }
+        if (f.final) {
+          // The Rust side packs error info into `status` on the
+          // final frame; an Ok finish leaves status undefined.
+          void finishOnce(
+            f.status && f.status.startsWith("transcription error")
+              ? f.status
+              : null,
+          );
+        }
+      },
+    );
     unlistenSegment = () => handle();
   } catch (e) {
     await finishOnce(`listen failed: ${e}`);

@@ -29,13 +29,14 @@
 // A future chunking pass can layer typed channels in if we ever
 // see real conversation sizes that need them.
 
-import { invoke } from "@tauri-apps/api/core";
-
+import type { Conversation } from "./conversations";
+import {
+  deleteConversation,
+  listConversations,
+  loadConversation,
+  saveConversation,
+} from "./conversations";
 import type { RpcInboundCall } from "./mesh-daemon.svelte";
-
-// Conversation shape opaque to this module — we ship it verbatim
-// between peers. The Tauri side validates on read/write.
-type Conversation = unknown;
 
 // ----------------------------------------------------------------------
 // Caller side
@@ -82,9 +83,7 @@ export async function moveConversation(
   guid: string,
   target_peer_id: string,
 ): Promise<void> {
-  const conversation = await invoke<Conversation | null>("load_conversation", {
-    guid,
-  });
+  const conversation = await loadConversation(guid);
   if (!conversation) throw new Error("conversation not found locally");
   // Look up the source folder so the receiver can land the
   // conversation in the same place (creating intermediate folders
@@ -92,10 +91,8 @@ export async function moveConversation(
   // listing for any reason.
   let source_folder = "";
   try {
-    const list = await invoke<{ conversations: Array<{ id: string; path?: string }> }>(
-      "list_conversations",
-    );
-    source_folder = list.conversations.find((c) => c.id === guid)?.path ?? "";
+    const { conversations } = await listConversations();
+    source_folder = conversations.find((c) => c.id === guid)?.path ?? "";
   } catch {
     // ignore — root is the safe default
   }
@@ -107,7 +104,7 @@ export async function moveConversation(
   if (!resp?.ok || resp?.error) {
     throw new Error(resp?.error ?? "peer refused move");
   }
-  await invoke("delete_conversation", { guid });
+  await deleteConversation(guid);
 }
 
 /** Pull: fetch a conversation from `source_peer_id`, save locally,
@@ -123,7 +120,7 @@ export async function pullConversation(
   source_peer_id: string,
 ): Promise<void> {
   const conversation = await fetchRemoteSession(client, source_peer_id, guid);
-  await invoke("save_conversation", { guid, conversation });
+  await saveConversation(conversation);
   try {
     const resp = (await client.callRpc(source_peer_id, "move_drop", {
       guid,
@@ -192,9 +189,7 @@ async function handleSessionFetch(
     return;
   }
   try {
-    const conversation = await invoke<Conversation | null>("load_conversation", {
-      guid,
-    });
+    const conversation = await loadConversation(guid);
     if (!conversation) {
       await client.respondRpc(
         call.request_id,
@@ -219,8 +214,7 @@ async function handleSessionSave(
     return;
   }
   try {
-    const guid = (conversation as { id?: string } | null)?.id ?? "";
-    await invoke("save_conversation", { guid, conversation });
+    await saveConversation(conversation);
     await client.respondRpc(call.request_id, { ok: true }, null);
   } catch (e) {
     await client.respondRpc(call.request_id, { ok: false, error: String(e) }, null);
@@ -241,11 +235,7 @@ async function handleMoveTake(
     return;
   }
   try {
-    await invoke("save_conversation", {
-      guid,
-      conversation,
-      folder: source_folder ?? "",
-    });
+    await saveConversation(conversation, source_folder ?? "");
     await client.respondRpc(call.request_id, { ok: true, guid }, null);
   } catch (e) {
     await client.respondRpc(call.request_id, { ok: false, error: String(e) }, null);
@@ -262,7 +252,7 @@ async function handleMoveDrop(
     return;
   }
   try {
-    await invoke("delete_conversation", { guid });
+    await deleteConversation(guid);
     await client.respondRpc(call.request_id, { ok: true }, null);
   } catch (e) {
     await client.respondRpc(call.request_id, { ok: false, error: String(e) }, null);
