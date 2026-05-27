@@ -102,6 +102,43 @@
    *  persists for the session only. */
   let peerCollapsed = $state<Set<string>>(new Set());
 
+  /** Peers that are mid-approval in any direction — surfaces the
+   *  attention dot on the sidebar's Networks gear + active-network
+   *  row, so the user can see something needs eyes without having
+   *  to open Settings. Mirrors `updateMeshAttention()` in
+   *  mesh-client.svelte.ts: the gear-side dot is binary (any
+   *  pending peer raises it), the per-row tooltip differentiates
+   *  "action required" from "waiting on peer" so a glance tells
+   *  the user whether to click. */
+  let pendingApprovalPeers = $derived(
+    meshClient.peers.filter(
+      (p) => p.status === "pending_approval" || p.status === "pending_remote",
+    ),
+  );
+  let pendingApprovalCount = $derived(pendingApprovalPeers.length);
+  let pendingApprovalReason = $derived.by<string>(() => {
+    if (pendingApprovalPeers.length === 0) return "";
+    const actionable = pendingApprovalPeers.filter(
+      (p) => p.status === "pending_approval",
+    );
+    if (actionable.length > 0) {
+      return actionable.length === 1
+        ? `${actionable[0].label || actionable[0].device_pubkey.slice(0, 8) || "Peer"} needs your approval`
+        : `${actionable.length} peers need your approval`;
+    }
+    const waiting = pendingApprovalPeers.filter(
+      (p) => p.local_approved && !p.remote_approved,
+    );
+    if (waiting.length > 0) {
+      return waiting.length === 1
+        ? `Waiting for ${waiting[0].label || waiting[0].device_pubkey.slice(0, 8) || "peer"} to confirm`
+        : `Waiting on ${waiting.length} peers to confirm`;
+    }
+    return pendingApprovalPeers.length === 1
+      ? `Waiting for ${pendingApprovalPeers[0].label || pendingApprovalPeers[0].device_pubkey.slice(0, 8) || "peer"} to authorize you`
+      : `${pendingApprovalPeers.length} peers haven't authorized you yet`;
+  });
+
   function togglePeerCollapsed(pubkey: string) {
     peerCollapsed.has(pubkey) ? peerCollapsed.delete(pubkey) : peerCollapsed.add(pubkey);
     peerCollapsed = new Set(peerCollapsed);
@@ -1287,8 +1324,12 @@
       <button
         class="network-settings-btn"
         onclick={openMeshStatusSettings}
-        title="Open Networks settings — add, switch, or forget saved networks"
-        aria-label="Network settings"
+        title={pendingApprovalCount > 0
+          ? pendingApprovalReason
+          : "Open Networks settings — add, switch, or forget saved networks"}
+        aria-label={pendingApprovalCount > 0
+          ? `Network settings (${pendingApprovalReason})`
+          : "Network settings"}
       >
         <!-- 14×14 cog. Rendered at 11×11 to match the surrounding
              sidebar density. -->
@@ -1298,6 +1339,9 @@
             d="M19.4 13a7.7 7.7 0 0 0 0-2l2.1-1.6a.5.5 0 0 0 .1-.6l-2-3.4a.5.5 0 0 0-.6-.2l-2.4 1a7.6 7.6 0 0 0-1.7-1L14.5 2.5a.5.5 0 0 0-.5-.4h-4a.5.5 0 0 0-.5.4l-.4 2.6a7.6 7.6 0 0 0-1.7 1l-2.4-1a.5.5 0 0 0-.6.2l-2 3.4a.5.5 0 0 0 .1.6L4.6 11a7.7 7.7 0 0 0 0 2l-2.1 1.6a.5.5 0 0 0-.1.6l2 3.4a.5.5 0 0 0 .6.2l2.4-1a7.6 7.6 0 0 0 1.7 1l.4 2.6a.5.5 0 0 0 .5.4h4a.5.5 0 0 0 .5-.4l.4-2.6a7.6 7.6 0 0 0 1.7-1l2.4 1a.5.5 0 0 0 .6-.2l2-3.4a.5.5 0 0 0-.1-.6L19.4 13ZM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"
           />
         </svg>
+        {#if pendingApprovalCount > 0}
+          <span class="attention-dot" aria-hidden="true"></span>
+        {/if}
       </button>
     </div>
     {#if savedNetworks.length === 0}
@@ -1346,6 +1390,19 @@
           {#if isActive}{isCollapsed ? "▸" : "▾"}{:else}○{/if}
         </span>
         <span class="net-row-name">{net.network_id}</span>
+        {#if isActive && pendingApprovalCount > 0}
+          <!-- Active-network attention dot. Only the active network
+               can have pending approvals (mesh-client joins one at a
+               time), so this never appears on inactive rows. Clicking
+               the row toggles collapse; the dot is decorative, the
+               action is "Open settings → Networks → Status" via the
+               gear above. -->
+          <span
+            class="attention-dot net-row-dot"
+            title={pendingApprovalReason}
+            aria-label={pendingApprovalReason}
+          ></span>
+        {/if}
         {#if isActive}
           <span class="net-row-active">active</span>
         {/if}
@@ -2220,6 +2277,7 @@
     letter-spacing: .06em;
   }
   .network-settings-btn {
+    position: relative;
     background: none;
     border: none;
     color: #666;
@@ -2232,6 +2290,30 @@
     transition: background .12s, color .12s;
   }
   .network-settings-btn:hover { background: #1a1a1a; color: #ccc; }
+  /* Pending-approval indicator. Shared shape with the top-bar
+     settings button (TopBar.svelte) and the per-tab dot in
+     SettingsPanel — same #f59e0b amber so the user reads it as
+     "the same thing in three places" rather than three unrelated
+     widgets. Default presentation is the gear-button overlay (top
+     right of the button); .net-row-dot below rescopes it to the
+     active-network row's inline flex layout. */
+  .attention-dot {
+    position: absolute;
+    top: 1px;
+    right: 1px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #f59e0b;
+    box-shadow: 0 0 5px rgba(245, 158, 11, 0.7);
+  }
+  .net-row-dot {
+    position: static;
+    width: 7px;
+    height: 7px;
+    margin-left: .25rem;
+    flex-shrink: 0;
+  }
 
   .network-empty {
     padding: .35rem .65rem .35rem .65rem;

@@ -2,6 +2,7 @@
   import type { Mode } from "../types";
   import { updateUi } from "../update-state.svelte";
   import type { SettingsTab } from "../update-state.svelte";
+  import { settingsAttention } from "../settings-attention.svelte";
   import { transcribeUi, pauseRecording, resumeRecording } from "./transcribe-state.svelte";
   import {
     chatSlot,
@@ -76,6 +77,36 @@
   function openSettings() {
     onOpenSettings(updateUi.available ? "updates" : "families");
   }
+
+  /** Roll up every Settings-tab attention flag into one indicator
+   *  for the top-bar cog. Previously the dot here only watched
+   *  `updateUi.available`; widening it to every entry in
+   *  `settingsAttention.flags` picks up Networks-tab attention (peer
+   *  mid-approval, including the "waiting on the other side" state
+   *  the original code dropped on the floor) so a user outside
+   *  Settings still gets the signal.
+   *
+   *  We OR in `updateUi.available` directly because the mirror that
+   *  copies it into `settingsAttention.flags.updates` only runs while
+   *  SettingsPanel is mounted (see SettingsPanel.svelte's $effect) —
+   *  without this guard, the update dot would disappear from the
+   *  top bar whenever Settings is closed. */
+  const attentionReasons = $derived(
+    Object.values(settingsAttention.flags)
+      .filter((v): v is { reason: string } => v !== null)
+      .map((v) => v.reason),
+  );
+  const updateReason = $derived(
+    updateUi.available ? `Update ${updateUi.available.version} available` : null,
+  );
+  const attentionActive = $derived(
+    attentionReasons.length > 0 || updateReason !== null,
+  );
+  const attentionTitle = $derived(
+    (updateReason ? [updateReason] : [])
+      .concat(attentionReasons.filter((r) => r !== updateReason))
+      .join(" · "),
+  );
 </script>
 
 <div class="top-bar">
@@ -222,9 +253,7 @@
   <button
     class="settings-btn"
     onclick={openSettings}
-    title={updateUi.available
-      ? `Update ${updateUi.available.version} available`
-      : "Settings"}
+    title={attentionActive ? attentionTitle : "Settings"}
     aria-label="Settings"
   >
     <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
@@ -233,11 +262,8 @@
         d="M19.43 12.98a7.7 7.7 0 0 0 0-1.96l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.5 7.5 0 0 0-1.7-.98l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54a7.5 7.5 0 0 0-1.7.98l-2.39-.96a.5.5 0 0 0-.6.22L2.8 8.8a.5.5 0 0 0 .12.64l2.03 1.58a7.7 7.7 0 0 0 0 1.96L2.92 14.56a.5.5 0 0 0-.12.64l1.92 3.32a.5.5 0 0 0 .6.22l2.39-.96a7.5 7.5 0 0 0 1.7.98l.36 2.54a.5.5 0 0 0 .5.42h3.84a.5.5 0 0 0 .5-.42l.36-2.54a7.5 7.5 0 0 0 1.7-.98l2.39.96a.5.5 0 0 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"
       />
     </svg>
-    {#if updateUi.available}
-      <span
-        class="update-dot"
-        aria-label="Update {updateUi.available.version} available"
-      ></span>
+    {#if attentionActive}
+      <span class="update-dot" aria-label={attentionTitle}></span>
     {/if}
   </button>
 </div>

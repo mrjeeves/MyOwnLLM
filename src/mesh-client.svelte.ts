@@ -4229,17 +4229,18 @@ class MeshClient {
       const authorized = this.roster_pubkeys.has(conn.device_pubkey);
       if (authorized) {
         await this.acceptPeer(conn);
-      } else {
-        settingsAttention.set("cloud-mesh", {
-          reason: `${shortLabel(conn.label, conn.device_pubkey)} wants to connect`,
-        });
       }
+      // Otherwise the attention dot is raised by republishPeers()
+      // below via updateMeshAttention() once the peer settles into
+      // pending_approval.
     }
     // Guest side: just wait. The host either auto-allows us (in
     // which case their `approve` will arrive almost immediately
     // and the guest path in `handleApprove` runs) or prompts
     // their user. Until then we sit in `pending_remote` with
-    // "awaiting peer approval" in the UI.
+    // "awaiting peer approval" in the UI — updateMeshAttention()
+    // raises the soft "waiting to be authorized" dot for that
+    // state so the user knows a handshake is in flight.
     this.republishPeers();
   }
 
@@ -4260,11 +4261,11 @@ class MeshClient {
         const authorized = this.roster_pubkeys.has(conn.device_pubkey);
         if (authorized) {
           await this.acceptPeer(conn);
-        } else {
-          settingsAttention.set("cloud-mesh", {
-            reason: `${shortLabel(conn.label, conn.device_pubkey)} authorized you`,
-          });
         }
+        // Otherwise the attention dot is raised by republishPeers()
+        // below via updateMeshAttention() — the peer now sits in
+        // pending_approval ("confirm needed") which that helper
+        // picks up alongside the host's "wants to connect" case.
       } else {
         this.maybePromoteToActive(conn);
       }
@@ -4551,9 +4552,10 @@ class MeshClient {
       void this.governanceAdvertiseAll();
       this.reevaluateRing();
     }
-    if (this.computePeers().every((p) => p.status !== "pending_approval")) {
-      settingsAttention.set("cloud-mesh", null);
-    }
+    // Attention-dot lifecycle (clear once no peers need approval, or
+    // re-target to whoever's still pending) lives in
+    // updateMeshAttention() and runs from every republishPeers() —
+    // including the one our callers fire after invoking us.
   }
 
   private dropConnection(peer_id: string): void {
@@ -4689,9 +4691,9 @@ class MeshClient {
     this.refreshFileResources();
     this.refreshResources();
     this.republishPeers();
-    if (this.computePeers().every((p) => p.status !== "pending_approval")) {
-      settingsAttention.set("cloud-mesh", null);
-    }
+    // republishPeers() → updateMeshAttention() handles the dot —
+    // re-targets to whoever's still pending after this peer left, or
+    // clears when nothing's outstanding.
     // Phase 2: ring needs to know a peer left so it can promote a
     // shelved one back to active. No-op for a non-shelved peer
     // beyond the local set bookkeeping.
@@ -4882,6 +4884,88 @@ class MeshClient {
     // path (join, leave, drop, approve, shelve, rehandshake), so
     // hooking the phase update here covers them all in one place.
     this.updatePhase();
+    // Same idea for the Networks tab's attention dot: every peer
+    // transition that could raise OR lower the dot funnels through
+    // here, so a single helper computes the right state from the
+    // freshly-republished peer list. Previously this was scattered
+    // across handleAuthResponse/handleApproveMessage (raise) and
+    // maybePromoteToActive/dropConnection (clear), which left the
+    // "waiting-peer" state (we approved, peer hasn't) with no dot at
+    // all — the user's view went silent the moment they clicked
+    // Approve, exactly the limbo this fixes.
+    this.updateMeshAttention();
+  }
+
+  /** Single source of truth for the "cloud-mesh" attention dot.
+   *  Three buckets, in priority order:
+   *
+   *   1. **Action required** — at least one peer in
+   *      `pending_approval`. That's either the host's "wants to
+   *      connect" or the guest's "authorized you — confirm?"
+   *      prompt. The user has to click something to advance the
+   *      handshake; surface the strongest reason so it reads as
+   *      a TODO.
+   *   2. **Waiting on peer** — we sent our `approve`, peer hasn't
+   *      replied yet (`local_approved && !remote_approved`). Pre-fix
+   *      this state cleared the dot, which made the in-flight
+   *      handshake invisible from outside the Networks tab. We keep
+   *      the dot lit with a softer "waiting for X to confirm" so
+   *      the user can see something's still pending without it
+   *      reading as a TODO.
+   *   3. **Awaiting authorization** — guest in `pending_remote`
+   *      with neither side approved. The host hasn't even prompted
+   *      their user yet. Same soft framing as bucket 2; without
+   *      this the only signal a join is mid-flight is buried on the
+   *      Status tab.
+   *
+   *  Active/shelved/offline/reconnecting/denied/failed/handshaking
+   *  are deliberately invisible — they're post-approval, transient
+   *  cryptographic flux, or terminal states that don't need a
+   *  persistent attention dot. */
+  private updateMeshAttention(): void {
+    const pending = this.peers.filter(
+      (p) =>
+        p.status === "pending_approval" || p.status === "pending_remote",
+    );
+    if (pending.length === 0) {
+      settingsAttention.set("cloud-mesh", null);
+      return;
+    }
+    const actionable = pending.filter((p) => p.status === "pending_approval");
+    if (actionable.length > 0) {
+      const first = actionable[0];
+      const name = shortLabel(first.label, first.device_pubkey);
+      const reason =
+        actionable.length === 1
+          ? first.approver_role
+            ? `${name} wants to connect`
+            : `${name} authorized you — confirm to finish`
+          : `${actionable.length} peers waiting for your approval`;
+      settingsAttention.set("cloud-mesh", { reason });
+      return;
+    }
+    const waitingOnPeer = pending.filter(
+      (p) => p.local_approved && !p.remote_approved,
+    );
+    if (waitingOnPeer.length > 0) {
+      const first = waitingOnPeer[0];
+      const name = shortLabel(first.label, first.device_pubkey);
+      settingsAttention.set("cloud-mesh", {
+        reason:
+          waitingOnPeer.length === 1
+            ? `Waiting for ${name} to confirm`
+            : `Waiting on ${waitingOnPeer.length} peers to confirm`,
+      });
+      return;
+    }
+    const first = pending[0];
+    const name = shortLabel(first.label, first.device_pubkey);
+    settingsAttention.set("cloud-mesh", {
+      reason:
+        pending.length === 1
+          ? `Waiting for ${name} to authorize you`
+          : `${pending.length} peers haven't authorized you yet`,
+    });
   }
 
   /** rAF-batched variant of `refreshFileResources`. The file-receive
