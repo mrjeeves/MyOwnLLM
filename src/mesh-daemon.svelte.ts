@@ -35,6 +35,34 @@ import type {
 export type { DiagEntry, DiagLevel, MeshPhase, PeerEntry, PeerStatus };
 
 // ----------------------------------------------------------------------
+// Feature-module dispatch types
+// ----------------------------------------------------------------------
+
+/** What a feature module registered via `registerRpcHandler` sees on
+ *  each inbound peer RPC. The module owns the `request_id` lifecycle
+ *  from this point — it must call `respondRpc` (single-shot) or
+ *  `streamRpcChunk`+`streamRpcEnd` (streaming) on the daemon
+ *  client to resolve the in-flight call, or the peer hangs until
+ *  its own RPC timeout fires. */
+export interface RpcInboundCall {
+  request_id: string;
+  from: string;
+  method: string;
+  payload: unknown;
+  /** `true` when the peer requested a streaming response (matches
+   *  `streaming` on the wire). Single-shot methods registered as
+   *  streaming get a single chunk + end as the equivalent. */
+  streaming: boolean;
+}
+
+/** Callbacks an outbound `callRpcStream` caller registers to drain
+ *  chunks + end-of-stream. */
+export interface RpcCallStreamSub {
+  onChunk: (payload: unknown) => void;
+  onEnd: (error: string | null) => void;
+}
+
+// ----------------------------------------------------------------------
 // Daemon wire types
 // ----------------------------------------------------------------------
 
@@ -263,6 +291,43 @@ class MeshDaemonClient {
   private network = "";
   /** Cleanup hook for the Tauri event listener. */
   private unlisten: (() => void) | null = null;
+  /** Per-method handlers for inbound peer RPCs we've claimed via
+   *  `mesh_daemon_rpc_register`. Per-feature modules register here
+   *  in their own `init()`. Last-write-wins (matches daemon's
+   *  last-claim-wins for handlers). */
+  private rpcInboundHandlers = new Map<string, (call: RpcInboundCall) => void>();
+  /** Per-request-id subscribers for outbound RPC streams we
+   *  initiated via `mesh_daemon_rpc_call_stream`. The call site
+   *  registers a subscriber keyed by the daemon-returned
+   *  request_id; chunks + end route here. */
+  private rpcCallStreamSubs = new Map<string, RpcCallStreamSub>();
+  /** Per-channel subscribers for inbound typed-channel frames.
+   *  Keyed by `${network}/${channel}`. */
+  private channelInboundHandlers = new Map<
+    string,
+    (from: string, payload: unknown) => void
+  >();
+  /** Release callbacks for feature-module handler installs. Called
+   *  in reverse order from `stop()` to unregister each method
+   *  claim + drop channel subscriptions. */
+  private featureReleases: Array<() => Promise<void>> = [];
+
+  /** Local capability snapshot the inference handler hands back to
+   *  the LLM router. Phase C-6 wires this through `mesh-capabilities`
+   *  for real (model list + accepting policy + hardware fingerprint);
+   *  for now we return a minimal shape so the handler can at least
+   *  reach into Ollama with the first available model. The legacy
+   *  snapshotter still produces the full set elsewhere — we'll plug
+   *  this back into it when capabilities migrate. */
+  private localCapabilitiesForHandler(): {
+    accepting: "available" | "if_idle" | "busy" | "yes" | "no";
+    llms: Array<{ tag: string; family: string; mode: string }>;
+  } {
+    return {
+      accepting: this.accepting,
+      llms: [],
+    };
+  }
 
   /** Start the mesh: fetch daemon status to learn our client_id +
    *  joined network, subscribe to events, populate initial peer +
@@ -306,6 +371,24 @@ class MeshDaemonClient {
       this.unlisten = () => handle();
       this.phase = "signaling-up";
       this.status = "ready";
+
+      // Install per-feature RPC handlers. Each module exposes an
+      // `install*` that claims its methods + subscribes channels.
+      // Their release functions are tracked so `stop()` can tear
+      // them down. Errors here are non-fatal: a missing handler
+      // means peers calling that method get a "no handler" error,
+      // not a crashed app.
+      if (this.network) {
+        try {
+          const { installInferenceHandler } = await import("./mesh-inference");
+          const release = await installInferenceHandler(this, () =>
+            this.localCapabilitiesForHandler(),
+          );
+          this.featureReleases.push(release);
+        } catch (e) {
+          this.appendDiag("warn", `inference handler install failed: ${e}`);
+        }
+      }
     } catch (e) {
       this.error = String(e);
       this.phase = "error";
@@ -315,8 +398,19 @@ class MeshDaemonClient {
   }
 
   /** Stop listening. The daemon stays running (other clients may be
-   *  using it); we just tear down our event subscription. */
+   *  using it); we just tear down our event subscription + release
+   *  any per-feature handler claims so their RPC methods aren't
+   *  attributed to us after we've gone. */
   async stop(): Promise<void> {
+    // Release in reverse order; each release is best-effort.
+    while (this.featureReleases.length > 0) {
+      const r = this.featureReleases.pop();
+      try {
+        await r?.();
+      } catch (e) {
+        this.appendDiag("warn", `feature release failed: ${e}`);
+      }
+    }
     if (this.unlisten) {
       this.unlisten();
       this.unlisten = null;
@@ -464,8 +558,11 @@ class MeshDaemonClient {
 
   // ---- inference / file / transcribe / move (Phase C-2..C-5) ----
 
-  async sendInferRequest(_args: unknown): Promise<unknown> {
-    throw new Error("sendInferRequest: pending Phase C-2 migration");
+  async sendInferRequest(
+    args: import("./mesh-inference").SendInferRequestArgs,
+  ): Promise<{ id: string; cancel: () => void }> {
+    const { sendInferRequest } = await import("./mesh-inference");
+    return sendInferRequest(this, args);
   }
 
   async sendFile(_args: unknown): Promise<unknown> {
@@ -502,6 +599,142 @@ class MeshDaemonClient {
     // the frontend side. No-op.
   }
 
+  // ---- feature-module hooks -------------------------------------
+  //
+  // Per-feature modules (mesh-inference, mesh-file, mesh-transcribe,
+  // …) call these on startup to wire themselves into the event
+  // dispatch. The store doesn't know what each method or channel
+  // means — it just routes by name. This keeps the protocol layer
+  // for each feature isolated to its own module.
+
+  /** Read-only accessor for the network + ipc client_id pair the
+   *  daemon assigned us. Used by feature modules so they can pass
+   *  the right `client_id` / `network` on RPC + channel ops. */
+  get session(): { network: string; clientId: string } {
+    return { network: this.network, clientId: this.clientId };
+  }
+
+  /** Claim a method name with the daemon and route inbound RPC
+   *  calls to `handler`. Idempotent — calling twice with the same
+   *  method replaces the handler. Returns a release function the
+   *  caller can use to unregister + drop the entry. */
+  async registerRpcHandler(
+    method: string,
+    streaming: boolean,
+    handler: (call: RpcInboundCall) => void,
+  ): Promise<() => Promise<void>> {
+    if (!this.network) throw new Error("no network — start() first");
+    this.rpcInboundHandlers.set(method, handler);
+    await invoke("mesh_daemon_rpc_register", {
+      network: this.network,
+      method,
+      streaming,
+    });
+    return async () => {
+      this.rpcInboundHandlers.delete(method);
+      try {
+        await invoke("mesh_daemon_rpc_unregister", {
+          network: this.network,
+          method,
+        });
+      } catch {
+        // Network down or daemon already cleaned up — best-effort.
+      }
+    };
+  }
+
+  /** Initiate an outbound streaming RPC. Returns the
+   *  daemon-assigned `request_id` and registers `sub` to receive
+   *  `chunk` + `end` callbacks. The caller is responsible for
+   *  calling `release(request_id)` if they want to drop early; the
+   *  end frame releases automatically. */
+  async callRpcStream(
+    peer: string,
+    method: string,
+    payload: unknown,
+    sub: RpcCallStreamSub,
+  ): Promise<string> {
+    if (!this.network) throw new Error("no network — start() first");
+    const resp = (await invoke("mesh_daemon_rpc_call_stream", {
+      network: this.network,
+      peer,
+      method,
+      payload,
+    })) as { request_id?: string };
+    const request_id = resp.request_id;
+    if (!request_id) throw new Error("daemon did not return request_id");
+    this.rpcCallStreamSubs.set(request_id, sub);
+    return request_id;
+  }
+
+  /** Drop a stream subscription early (e.g. user-initiated cancel). */
+  releaseRpcCallStream(request_id: string): void {
+    this.rpcCallStreamSubs.delete(request_id);
+  }
+
+  /** Single-shot outbound RPC. The daemon awaits the peer's reply on
+   *  our behalf; we get the response synchronously here. */
+  async callRpc(peer: string, method: string, payload: unknown): Promise<unknown> {
+    if (!this.network) throw new Error("no network — start() first");
+    const resp = (await invoke("mesh_daemon_rpc_call", {
+      network: this.network,
+      peer,
+      method,
+      payload,
+    })) as { response?: unknown };
+    return resp.response;
+  }
+
+  /** Subscribe to a typed channel. Returns an unsubscribe function. */
+  async subscribeChannel(
+    channel: string,
+    handler: (from: string, payload: unknown) => void,
+  ): Promise<() => Promise<void>> {
+    if (!this.network) throw new Error("no network — start() first");
+    const key = `${this.network}/${channel}`;
+    this.channelInboundHandlers.set(key, handler);
+    await invoke("mesh_daemon_channel_subscribe", {
+      network: this.network,
+      channel,
+    });
+    return async () => {
+      this.channelInboundHandlers.delete(key);
+      try {
+        await invoke("mesh_daemon_channel_unsubscribe", {
+          network: this.network,
+          channel,
+        });
+      } catch {
+        // ignore — daemon may have already cleaned up.
+      }
+    };
+  }
+
+  /** Reply to an inbound RPC the handler is processing. Wraps the
+   *  daemon's `mesh_daemon_rpc_respond` / `_stream_chunk` /
+   *  `_stream_end` ops. */
+  async respondRpc(
+    request_id: string,
+    ok: unknown | null,
+    error: string | null,
+  ): Promise<void> {
+    await invoke("mesh_daemon_rpc_respond", { requestId: request_id, ok, error });
+  }
+
+  async streamRpcChunk(request_id: string, payload: unknown): Promise<void> {
+    await invoke("mesh_daemon_rpc_stream_chunk", {
+      requestId: request_id,
+      payload,
+    });
+  }
+
+  async streamRpcEnd(request_id: string, error: string | null): Promise<void> {
+    await invoke("mesh_daemon_rpc_stream_end", {
+      requestId: request_id,
+      error,
+    });
+  }
+
   // ---- event handling ------------------------------------------
 
   private handleEvent(frame: ServerOut): void {
@@ -517,18 +750,56 @@ class MeshDaemonClient {
         // Resync — re-snapshot peers so we don't carry stale state.
         void this.reconcile();
         break;
-      case "rpc_inbound":
-      case "rpc_call_stream_chunk":
-      case "rpc_call_stream_end":
-      case "channel_inbound":
+      case "rpc_inbound": {
+        const h = this.rpcInboundHandlers.get(frame.method);
+        if (h) {
+          h({
+            request_id: frame.request_id,
+            from: frame.from,
+            method: frame.method,
+            payload: frame.payload,
+            streaming: frame.streaming,
+          });
+        } else {
+          // No handler registered for this method — respond with an
+          // error so the peer doesn't hang. (The daemon's synthetic
+          // handler will already have returned "no IPC client holds
+          // method" if we never claimed it, but a race between
+          // register/unregister can land us here too.)
+          void this.respondRpc(
+            frame.request_id,
+            null,
+            `frontend: no handler for method '${frame.method}'`,
+          );
+        }
+        break;
+      }
+      case "rpc_call_stream_chunk": {
+        const sub = this.rpcCallStreamSubs.get(frame.request_id);
+        sub?.onChunk(frame.payload);
+        break;
+      }
+      case "rpc_call_stream_end": {
+        const sub = this.rpcCallStreamSubs.get(frame.request_id);
+        this.rpcCallStreamSubs.delete(frame.request_id);
+        sub?.onEnd(frame.error);
+        break;
+      }
+      case "channel_inbound": {
+        const key = `${frame.network}/${frame.channel}`;
+        const h = this.channelInboundHandlers.get(key);
+        h?.(frame.from, frame.payload);
+        break;
+      }
       case "handler_displaced":
-        // These are routed to per-feature modules registered via
-        // `start()`. The dispatcher lands in Phase C-2; for now we
-        // surface them as diag so unhandled events are visible
-        // during development rather than silent.
+        // Another client claimed our method. Surface as a warning so
+        // the feature module can decide whether to re-claim. For
+        // now we surface as a diag; a future PR can wire a typed
+        // signal if we ever expect two clients on the same daemon
+        // to actively contend for handlers (unlikely in practice).
         this.appendDiag(
-          "info",
-          `unhandled ipc frame: ${frame.kind}`,
+          "warn",
+          `handler displaced: ${frame.method} on ${frame.network} (by ${frame.by})`,
         );
         break;
     }
