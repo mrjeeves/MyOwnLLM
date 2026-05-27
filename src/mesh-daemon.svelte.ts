@@ -388,6 +388,23 @@ class MeshDaemonClient {
         } catch (e) {
           this.appendDiag("warn", `inference handler install failed: ${e}`);
         }
+        try {
+          const { installFileHandlers } = await import("./mesh-file");
+          const release = await installFileHandlers(this, {
+            pushInboundOffer: (offer) => {
+              this.inbound_offers = [...this.inbound_offers, offer];
+            },
+            removeInboundOffer: (id) => {
+              this.inbound_offers = this.inbound_offers.filter(
+                (o) => (o as { id: string }).id !== id,
+              );
+            },
+            diag: (level, msg) => this.appendDiag(level, msg),
+          });
+          this.featureReleases.push(release);
+        } catch (e) {
+          this.appendDiag("warn", `file handler install failed: ${e}`);
+        }
       }
     } catch (e) {
       this.error = String(e);
@@ -565,16 +582,22 @@ class MeshDaemonClient {
     return sendInferRequest(this, args);
   }
 
-  async sendFile(_args: unknown): Promise<unknown> {
-    throw new Error("sendFile: pending Phase C-3 migration");
+  async sendFile(
+    args: import("./mesh-file").SendFileArgs,
+  ): Promise<{ id: string; cancel: () => void }> {
+    const { sendFile } = await import("./mesh-file");
+    return sendFile(this, args);
   }
 
-  async acceptInboundFile(_id: string): Promise<void> {
-    throw new Error("acceptInboundFile: pending Phase C-3 migration");
+  async acceptInboundFile(id: string): Promise<void> {
+    const { acceptInboundFile } = await import("./mesh-file");
+    return acceptInboundFile(this, id);
   }
 
-  declineInboundFile(_id: string): void {
-    /* Phase C-3 */
+  declineInboundFile(id: string, reason?: string): void {
+    void import("./mesh-file").then(({ declineInboundFile }) =>
+      declineInboundFile(id, reason),
+    );
   }
 
   async fetchRemoteSession(_args: unknown): Promise<unknown> {
@@ -708,6 +731,27 @@ class MeshDaemonClient {
         // ignore — daemon may have already cleaned up.
       }
     };
+  }
+
+  /** Publish on a typed channel to a specific peer. */
+  async channelSendTo(channel: string, peer: string, payload: unknown): Promise<void> {
+    if (!this.network) throw new Error("no network — start() first");
+    await invoke("mesh_daemon_channel_send_to", {
+      network: this.network,
+      channel,
+      peer,
+      payload,
+    });
+  }
+
+  /** Broadcast on a typed channel to all active peers. */
+  async channelSendAll(channel: string, payload: unknown): Promise<void> {
+    if (!this.network) throw new Error("no network — start() first");
+    await invoke("mesh_daemon_channel_send_all", {
+      network: this.network,
+      channel,
+      payload,
+    });
   }
 
   /** Reply to an inbound RPC the handler is processing. Wraps the
