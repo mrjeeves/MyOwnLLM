@@ -40,6 +40,14 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+/// The target triple this build was compiled for. `build.rs`
+/// surfaces it via `cargo:rustc-env=DAEMON_SIDECAR_TRIPLE=...` so
+/// `daemon_binary_candidates` knows the exact name Tauri uses
+/// when staging the sidecar in dev mode
+/// (`myownmesh-<triple>{.exe}`, unchanged) vs. production
+/// (`myownmesh{.exe}`, suffix stripped).
+const DAEMON_SIDECAR_TRIPLE: &str = env!("DAEMON_SIDECAR_TRIPLE");
+
 // ---- wire protocol ----------------------------------------------------
 
 /// Mirror of `myownmesh::control::Request`. Kept in sync by hand;
@@ -476,23 +484,45 @@ pub fn daemon_binary_candidates() -> Vec<PathBuf> {
     } else {
         "myownmesh"
     };
+    // Build-time-captured target triple — surfaced by `build.rs`.
+    // `tauri dev` keeps the `-<triple>` suffix when staging
+    // sidecars next to the dev exe; `tauri build` strips it.
+    // Checking both covers dev + production from one runtime path.
+    let exe_with_triple = if cfg!(windows) {
+        format!("myownmesh-{}.exe", DAEMON_SIDECAR_TRIPLE)
+    } else {
+        format!("myownmesh-{}", DAEMON_SIDECAR_TRIPLE)
+    };
     let mut out: Vec<PathBuf> = Vec::new();
 
-    // 1. Bundled sidecar. Tauri 2 places sidecar binaries next to
-    //    the main executable in every shipped artifact.
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let candidate = exe_dir.join(exe);
-            if candidate.exists() {
-                let usable = std::fs::metadata(&candidate)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false);
-                if usable {
-                    out.push(candidate);
-                }
-            }
+    // Helper: push a candidate iff it exists AND is non-empty
+    // (filters out the zero-byte stub `build.rs` writes when the
+    // daemon fetch was skipped).
+    fn push_if_usable(out: &mut Vec<PathBuf>, p: PathBuf) {
+        if p.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            out.push(p);
         }
     }
+
+    // 1. Bundled sidecar next to the running LLM executable —
+    //    the production-bundle convention. Tauri's build step
+    //    strips the `-<triple>` suffix; the dev-mode `tauri dev`
+    //    leaves it on. Check both names so prod + dev resolve
+    //    via the same code path.
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            push_if_usable(&mut out, exe_dir.join(exe));
+            push_if_usable(&mut out, exe_dir.join(&exe_with_triple));
+        }
+    }
+
+    // 1b. Source `binaries/<triple>` directory — where `build.rs`
+    //     writes the bundled daemon before Tauri copies it
+    //     elsewhere. In `cargo run` (no Tauri staging) this is
+    //     the *only* place the binary lives. Relative to the
+    //     crate, so it works from any working directory.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    push_if_usable(&mut out, manifest.join("binaries").join(&exe_with_triple));
 
     // 2 + 3. Explicit env-var overrides.
     for var in ["MYOWNLLM_MESH_BIN", "MYOWNMESH_BIN"] {
@@ -515,26 +545,21 @@ pub fn daemon_binary_candidates() -> Vec<PathBuf> {
     }
 
     // 5. Dev fallback — sibling MyOwnMesh checkout's `target/`.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    //    `manifest` already declared above for the `binaries/`
+    //    lookup; reuse it here.
     for profile in ["debug", "release"] {
-        let local = manifest.join("target").join(profile).join(exe);
-        if local.exists() {
-            out.push(local);
-        }
+        push_if_usable(&mut out, manifest.join("target").join(profile).join(exe));
         if let Some(parent) = manifest.parent() {
-            let parent_local = parent.join("target").join(profile).join(exe);
-            if parent_local.exists() {
-                out.push(parent_local);
-            }
+            push_if_usable(&mut out, parent.join("target").join(profile).join(exe));
             if let Some(grandparent) = parent.parent() {
-                let sibling = grandparent
-                    .join("MyOwnMesh")
-                    .join("target")
-                    .join(profile)
-                    .join(exe);
-                if sibling.exists() {
-                    out.push(sibling);
-                }
+                push_if_usable(
+                    &mut out,
+                    grandparent
+                        .join("MyOwnMesh")
+                        .join("target")
+                        .join(profile)
+                        .join(exe),
+                );
             }
         }
     }
@@ -554,6 +579,7 @@ pub fn daemon_binary_candidates() -> Vec<PathBuf> {
 /// `ensure_daemon_running` now prefers
 /// [`daemon_binary_candidates`] so it can iterate, but this is
 /// still useful for the CLI's `myownllm mesh` diag.
+#[allow(dead_code)]
 pub fn find_daemon_binary() -> Result<PathBuf> {
     let candidates = daemon_binary_candidates();
     candidates.into_iter().next().ok_or_else(|| {

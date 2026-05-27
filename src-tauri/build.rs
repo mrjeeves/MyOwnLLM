@@ -85,6 +85,12 @@ fn write_sidecar_stub() -> std::io::Result<()> {
 
 fn bundle_myownmesh_sidecar() -> Result<(), Box<dyn std::error::Error>> {
     let target_triple = env::var("TARGET").unwrap_or_else(|_| "unknown".into());
+    // Expose the triple to the runtime so
+    // `mesh/daemon.rs::daemon_binary_candidates` knows to look
+    // for both `myownmesh{.exe}` (production bundle, where Tauri
+    // strips the triple) and `myownmesh-<triple>{.exe}` (dev
+    // mode, where Tauri keeps the suffix).
+    println!("cargo:rustc-env=DAEMON_SIDECAR_TRIPLE={target_triple}");
     let exe_suffix = if target_triple.contains("windows") {
         ".exe"
     } else {
@@ -100,6 +106,30 @@ fn bundle_myownmesh_sidecar() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=MYOWNLLM_MESH_BIN");
     println!("cargo:rerun-if-env-changed=MYOWNMESH_BIN");
     println!("cargo:rerun-if-env-changed=MYOWNLLM_SKIP_SIDECAR");
+
+    // Idempotency: if `binaries/.bundled-rev` already says the
+    // sidecar is the requested rev AND the file is non-empty,
+    // skip the download + copy entirely. The most common cause
+    // of os error 32 ("file in use") on Windows is a parallel
+    // `tauri dev` holding the sidecar open. The right answer is
+    // "don't rewrite the file if it's already what we'd produce."
+    let bundled_rev_sentinel = bin_dir.join(".bundled-rev");
+    let want_rev = fs::read_to_string(&rev_file)
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let Some(want) = &want_rev {
+        let bundled = fs::read_to_string(&bundled_rev_sentinel)
+            .map(|s| s.trim().to_string())
+            .ok();
+        let sidecar_present = sidecar_path
+            .metadata()
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+        if sidecar_present && bundled.as_deref() == Some(want.as_str()) {
+            return Ok(());
+        }
+    }
 
     // Escape hatch for environments that can't reach the network
     // (offline CI, sandboxed builds) — set MYOWNLLM_SKIP_SIDECAR=1
@@ -206,9 +236,38 @@ fn bundle_myownmesh_sidecar() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    fs::copy(&installed_bin, &sidecar_path)?;
+    write_sidecar_with_retry(&installed_bin, &sidecar_path)?;
     make_executable(&sidecar_path)?;
+    // Record what we just bundled so the next build can skip
+    // the whole pipeline if nothing changed.
+    if let Some(rev) = &want_rev {
+        let _ = fs::write(&bundled_rev_sentinel, rev);
+    }
     Ok(())
+}
+
+/// `fs::copy` into the sidecar slot with retries against the
+/// Windows "file in use" error. A parallel `tauri dev` holding
+/// the sidecar open hits this every time; backing off a few
+/// hundred ms is usually enough for the other process to
+/// finish opening the file. After a fixed budget we give up
+/// and surface the error — letting the user see something is
+/// holding it open rather than busy-looping forever.
+fn write_sidecar_with_retry(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..6 {
+        match fs::copy(src, dst) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.raw_os_error() == Some(32) => {
+                // ERROR_SHARING_VIOLATION — back off and retry.
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(150 << attempt));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::other("retries exhausted with no recorded error")))
 }
 
 #[cfg(unix)]
