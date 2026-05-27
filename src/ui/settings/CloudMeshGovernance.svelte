@@ -1,8 +1,8 @@
 <script lang="ts">
   /** Cloud Mesh → Governance sub-tab.
    *
-   *  Read-mostly viewer over the substrate's governance state for the
-   *  active network. Renders:
+   *  Viewer + action surface over the substrate's governance state
+   *  for the active network. Renders:
    *    1. Header: kind (open / closed) + local role
    *    2. Roles: pubkey → role table (only meaningful on closed networks)
    *    3. Pending proposals: each shows variant, signers/deniers progress,
@@ -15,14 +15,13 @@
    *  the source of truth for crypto + quorum verification; this UI is a
    *  thin viewer + action surface.
    *
-   *  Cross-peer broadcast of pending proposals over Trystero is NOT
-   *  wired in this PR — local mutations persist to the on-disk state
-   *  file but won't reach other devices until the mesh-client
-   *  governance message handlers land. Single-device operations
-   *  (founder self-election on an empty network, viewing existing
-   *  state, denying a stuck proposal locally) work today; multi-peer
-   *  ratification waits for the broadcast wiring. The UI surfaces a
-   *  banner when broadcast is required so users aren't surprised. */
+   *  Multi-peer broadcast goes through the mesh client's
+   *  `governancePublishPropose` / `governancePublishAck` / etc.
+   *  fan-outs, gated on the `NETWORK_STATE_V1` feature flag so older
+   *  peers don't get frames they'd silently drop. Inbound proposals,
+   *  acks, and splits are accumulated into the same on-disk pending
+   *  list this UI reads from, so every device's view converges once
+   *  the wire round-trips finish. */
 
   import { onDestroy, onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
@@ -127,16 +126,13 @@
   /** Members list used for quorum checks. The substrate's
    *  `verify_quorum` uses this to gate unanimous-consent transitions
    *  (open → closed founder election, closed → open owner unanimity).
-   *  Built from the live mesh client's authenticated peer list plus
-   *  the local pubkey — the same shape MyOwnMesh's daemon assembles
-   *  before calling the same Rust function. */
+   *  Delegates to the mesh client so the UI agrees with the
+   *  broadcast handlers about who's in the network — every
+   *  apply-transition call site needs to see the same membership
+   *  snapshot or quorum decisions diverge between local UI clicks and
+   *  inbound ack frames. */
   function membersSnapshot(): string[] {
-    const peers: string[] = [];
-    for (const p of meshClient.peers) {
-      if (p.device_pubkey) peers.push(p.device_pubkey);
-    }
-    if (selfPubkey) peers.push(selfPubkey);
-    return Array.from(new Set(peers));
+    return meshClient.governanceMembersSnapshot();
   }
 
   async function proposeKindChange(to: NetworkKind) {
@@ -161,10 +157,17 @@
           tx,
           membersSnapshot(),
         );
+        // Ratified on the local side (founder self-election on an
+        // empty network). Tell peers what the new state looks like
+        // so their UIs catch up without waiting on the next poll
+        // tick.
+        meshClient.governancePublishRosterSummary();
       } catch {
-        // Quorum requires co-signers — stash as pending so the JS
-        // mesh client's broadcast loop (in a follow-up PR) can ship
-        // it to peers for ack.
+        // Quorum requires co-signers — stash as pending and fan the
+        // signed proposal out to peers. Inbound ack handlers in
+        // mesh-client accumulate signatures against the same
+        // pending entry until quorum is met, at which point
+        // `apply_transition` ratifies on every device.
         const proposal: Proposal = {
           id: `prop_${tx.at}_${Math.random().toString(36).slice(2, 8)}`,
           created_at: tx.at,
@@ -178,6 +181,7 @@
           ...(view?.pending ?? []),
           proposal,
         ]);
+        meshClient.governancePublishPropose(proposal);
       }
     } catch (e) {
       error = `propose failed: ${e}`;
@@ -191,16 +195,27 @@
     busy = true;
     try {
       const me = selfPubkey;
-      const next = view.pending
-        .map((p: Proposal) =>
-          p.id === proposalId && !p.deniers.includes(me)
-            ? { ...p, deniers: [...p.deniers, me] }
-            : p,
-        )
-        // A single denial in the substrate's model is a kill switch
-        // — drop the proposal entirely once the local user has denied.
-        .filter((p: Proposal) => p.id !== proposalId || p.deniers.length === 0);
+      const target = view.pending.find((p: Proposal) => p.id === proposalId);
+      // Single denial = kill switch (substrate's model); drop the
+      // proposal locally and broadcast the deny so peers do the same.
+      const next = view.pending.filter((p: Proposal) => p.id !== proposalId);
       view = await meshGovernanceStateSavePending(activeNetworkId, next);
+      if (target) {
+        // Sign the deny statement so peers can verify the local user
+        // really denied. Substrate's verify_quorum on deny uses the
+        // signer's pubkey + the deny-statement signature shape.
+        try {
+          const sig = await meshGovernanceSignTransition(
+            activeNetworkId,
+            target.variant,
+          );
+          meshClient.governancePublishAck(proposalId, "deny", me, sig.signature);
+        } catch {
+          // If signing fails the local deny still stuck; peers will
+          // catch the proposal removal via the next broadcast cycle
+          // or eventually drop it on timeout.
+        }
+      }
     } catch (e) {
       error = `deny failed: ${e}`;
     } finally {
@@ -253,12 +268,18 @@
           tx,
           membersSnapshot(),
         );
+        // Ratified — tell peers so their pending lists drop the
+        // entry and their state files mirror ours.
+        meshClient.governancePublishRosterSummary();
       } catch {
-        // Still short of quorum — persist the updated signer list.
+        // Still short of quorum — persist the updated signer list
+        // and fan the local signature out as an ack so other peers
+        // accumulate it against their copy of the same proposal.
         view = await meshGovernanceStateSavePending(
           activeNetworkId,
           view.pending.map((p: Proposal) => (p.id === proposalId ? signed : p)),
         );
+        meshClient.governancePublishAck(proposalId, "sign", sig.signer, sig.signature);
       }
     } catch (e) {
       error = `sign failed: ${e}`;
@@ -289,12 +310,6 @@
     {#if error}
       <div class="banner err">{error}</div>
     {/if}
-
-    <div class="banner info">
-      Multi-peer ratification ships in a follow-up. Local proposals are
-      persisted but won't reach other devices until the mesh-client
-      broadcast wiring lands.
-    </div>
 
     <section class="card">
       <header>

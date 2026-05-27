@@ -149,6 +149,16 @@ export const FEATURES = {
    *  and keep their local prompts (or none, falling back to the
    *  built-in default system prompt). */
   PROMPTS_GOSSIP: "prompts_v1",
+  /** Sender participates in closed-network governance: floats and
+   *  acks signed transitions over `network_state_propose` /
+   *  `network_state_ack` / `network_state_split`, advertises ratified
+   *  roster state via `network_state_broadcast`, and answers roster
+   *  sync via `roster_summary` / `roster_request` / `roster_entries`.
+   *  Mirrors the substrate's `network_state_v1` feature flag from
+   *  `myownmesh_core::protocol::features` — peers on either side of
+   *  the family advertise the same id so a MyOwnMesh peer and a
+   *  MyOwnLLM peer can co-govern the same closed network. */
+  NETWORK_STATE_V1: "network_state_v1",
 } as const;
 
 /** The full set of feature ids this build advertises. Sent inside
@@ -170,6 +180,7 @@ export const ADVERTISED_FEATURES: string[] = [
   FEATURES.INFER_TOOLS,
   FEATURES.AGENT_PERMISSIONS_GOSSIP,
   FEATURES.PROMPTS_GOSSIP,
+  FEATURES.NETWORK_STATE_V1,
 ];
 
 /** Features a Phase 2.0 peer would have implicitly supported even
@@ -290,7 +301,14 @@ export type MeshMessage =
   | SessionSaveRequestMessage
   | SessionSaveResponseMessage
   | PermissionsSnapshotMessage
-  | PromptsSnapshotMessage;
+  | PromptsSnapshotMessage
+  | NetworkStateBroadcastMessage
+  | NetworkStateProposeMessage
+  | NetworkStateAckMessage
+  | NetworkStateSplitMessage
+  | RosterSummaryMessage
+  | RosterRequestMessage
+  | RosterEntriesMessage;
 
 // ---- capabilities --------------------------------------------------------
 
@@ -1266,4 +1284,107 @@ export interface PromptsSnapshotMessage {
    *  (tombstones aren't surfaced over the wire yet; a deletion on
    *  one device just stays local until the user mirrors it). */
   prompts: PromptSnapshot[];
+}
+
+// ---- network-state governance + roster gossip ----------------------
+//
+// Wire frames mirroring `myownmesh_core::protocol::governance`. The
+// substrate is the authority for shape + crypto rules; these
+// interfaces exist so the TypeScript side can construct and route
+// frames without re-decoding through the Rust bridge. Field names
+// match the substrate's serde encoding exactly (snake_case enum
+// variants, kind-tagged outer discriminator, `network_kind` on the
+// broadcast to avoid colliding with the MeshMessage `kind` field).
+
+/** Discriminated value for `NetworkStateAckMessage.decision`. Mirrors
+ *  `myownmesh_core::protocol::governance::AckDecision` with
+ *  `serde(rename_all = "snake_case")`. */
+export type AckDecision = "sign" | "deny";
+
+/** "This is what I think the network looks like." Emitted on every
+ *  per-peer ACTIVE transition so both sides can detect drift. Mirrors
+ *  `NetworkStateBroadcast` — the substrate renames the inner `kind`
+ *  field to `network_kind` so it doesn't collide with the outer
+ *  message discriminator. */
+export interface NetworkStateBroadcastMessage {
+  kind: "network_state_broadcast";
+  network_kind: import("./mesh-governance").NetworkKind;
+  transitions_count: number;
+  roster_root: string;
+}
+
+/** "I propose this transition." Mirrors
+ *  `NetworkStateProposeMessage`. The proposer self-signs over the
+ *  canonical `transition_payload` bytes; receivers verify before
+ *  recording the proposal in `NetworkState.pending`. */
+export interface NetworkStateProposeMessage {
+  kind: "network_state_propose";
+  proposal_id: string;
+  variant: import("./mesh-governance").TransitionVariant;
+  proposer: string;
+  created_at: number;
+  signature: string;
+}
+
+/** "I sign / deny your proposal." Mirrors `NetworkStateAckMessage`.
+ *  On `sign`, the signature is over the original transition payload;
+ *  on `deny`, the substrate signs the deny statement so the denial
+ *  itself can't be forged. */
+export interface NetworkStateAckMessage {
+  kind: "network_state_ack";
+  proposal_id: string;
+  signer: string;
+  decision: AckDecision;
+  at: number;
+  signature: string;
+}
+
+/** "Stuck close — spawning a derived closed network with the signers
+ *  I have." Mirrors `NetworkStateSplitMessage`. Receivers
+ *  correlate `parent_proposal_id` with their pending set, remove the
+ *  parent, and admit the new network if they're listed in `members`. */
+export interface NetworkStateSplitMessage {
+  kind: "network_state_split";
+  parent_proposal_id: string;
+  new_network_id: string;
+  members: string[];
+  proposer: string;
+  at: number;
+  signature: string;
+}
+
+/** "My roster Merkle root is X with N entries." Mirrors
+ *  `RosterSummaryMessage`. Triggers a `roster_request` from any
+ *  receiver whose own root disagrees. */
+export interface RosterSummaryMessage {
+  kind: "roster_summary";
+  root: string;
+  count: number;
+  last_edit_ts: number;
+}
+
+/** "Send me your roster entries." Mirrors `RosterRequestMessage`.
+ *  v1 only honours `include_all = true`; `subtree_hashes` is
+ *  reserved for the future tree-walk variant. */
+export interface RosterRequestMessage {
+  kind: "roster_request";
+  include_all: boolean;
+  subtree_hashes: string[];
+}
+
+/** "Here are the entries you asked for." Mirrors
+ *  `RosterEntriesMessage`. Each entry carries the granter's pubkey
+ *  on closed networks so the receiver can verify the authority
+ *  chain without fetching the full transition log. */
+export interface RosterEntry {
+  device_id: string;
+  label: string;
+  approved_at: number;
+  role: import("./mesh-governance").Role;
+  granted_by: string;
+}
+
+export interface RosterEntriesMessage {
+  kind: "roster_entries";
+  entries: RosterEntry[];
 }
