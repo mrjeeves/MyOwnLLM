@@ -270,7 +270,10 @@ mod tests {
         // already populated, but `identity.json` itself doesn't
         // exist at the well-known dst path — so we pre-create it
         // at a different file in the destination tree.
-        write(&daemon.join("mesh").join("rosters").join("home.json"), "dst");
+        write(
+            &daemon.join("mesh").join("rosters").join("home.json"),
+            "dst",
+        );
         write(&llm.join("mesh").join("rosters").join("home.json"), "src");
 
         migrate_daemon_state_into_subdir(llm, &daemon).unwrap();
