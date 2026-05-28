@@ -678,6 +678,8 @@ Launch the GUI by running `myownllm` with no arguments, or open the application 
 
 **Distributed Intelligence.** Two (or ten) MyOwnLLM instances with the same Network ID find each other, mutually authenticate, and share work peer-to-peer over WebRTC. No MyOwnLLM-operated signaling server, no API key, no cloud round-trip. Every device becomes a window into the same mesh: phone audio in, desktop transcription out, a laptop's idle GPU answering prompts from the tablet on the kitchen counter — each device adds its powers to the whole, picked per-surface from the model selector at the bottom of each pane.
 
+The transport — discovery, authentication, WebRTC + ICE, NAT traversal, reconnect logic — lives in the standalone [`myownmesh`](https://github.com/mrjeeves/MyOwnMesh) daemon, which MyOwnLLM bundles as a Tauri sidecar (`.myownmesh-rev` pins the release tag) and either spawns or attaches to a shared instance on startup. MyOwnLLM owns only the LLM-specific protocol on top: remote inference, file transfer, conversation move, transcribe, capability + catalog + permissions + prompts gossip.
+
 Cloud Mesh ships off by default. To turn it on, open **Settings → Networks → Status** and follow the wizard — pick or generate a Network ID, click **Save & activate**, and the mesh client comes up.
 
 ### Concepts
@@ -703,29 +705,36 @@ Cloud Mesh ships off by default. To turn it on, open **Settings → Networks →
 | Feature | Where it shows up |
 |---------|-------------------|
 | **Cross-device conversation list** | The main **sidebar** has an always-visible **Network** section at the bottom with one row per saved network and a **+ Add** button. Click a saved network to switch to it; the active network is highlighted and expanded with its connected peers as nested groups. Peer conversations appear under each peer-group row, **organized into the same folder tree the peer uses on-host** — so `Work/Projects/Q4 planning` on the source shows up as nested expandable folders on every device, not as a flat list. Right-click a network → switch / settings / forget. Right-click a peer → settings. |
-| **Saved networks** | The mesh is a single-active-network model: only one Trystero room joined at a time, but the user can save several (`home-mesh`, `office-mesh`, `camping-mesh`) and switch between them with one click. Each saved network keeps its own roster file (`~/.myownllm/mesh/rosters/{network_id}.json`) so switching back skips re-authentication for previously-approved peers. Per-network settings: accepting policy, signaling relays, STUN, TURN. **The Network ID is the display name** — there's no separate label field. The ID isn't secret either: anyone using the same handle lands in the same room and can knock (you'll see their request), but joining still requires approval. Pick something unique if you don't want to field knocks from strangers; click **Generate** for a 52-char hash that won't collide with anyone. |
-| **Push a local conversation** | Right-click any local conversation in the sidebar → **Push to device → \<peer\>**. The sender's copy is deleted after the receiver acks; the receiver lands the conversation in the same folder it lived in on the source (creating intermediate folders if needed). Single-RTT today; tracked with a `moving…` pill on the catalog row across all peers while in flight. |
-| **Pull a remote conversation** | Right-click a remote conversation under any Network group → **← Pull from \<peer\>**. The remote peer drives the Move handshake with you as the destination; the conversation appears in your local sidebar in the same folder it lived in on the source. Source must be in your roster — strangers in the same Trystero room can't be pulled from. |
+| **Saved networks** | The mesh is a single-active-network model: the daemon joins one network at a time, but the user can save several (`home-mesh`, `office-mesh`, `camping-mesh`) and switch between them with one click. Each saved network keeps its own roster file (`~/.myownllm/mesh/rosters/{network_id}.json`, daemon-owned) so switching back skips re-authentication for previously-approved peers. Per-network settings: accepting policy, signaling relays, STUN, TURN, auto-gossip. **The Network ID is the display name** — there's no separate label field. The ID isn't secret either: anyone using the same handle lands in the same room and can knock (you'll see their request), but joining still requires approval. Pick something unique if you don't want to field knocks from strangers; click **Generate** for a 52-char hash that won't collide with anyone. |
+| **Push a local conversation** | Right-click any local conversation in the sidebar → **Push to device → \<peer\>**. The conversation is pushed via the `move_take` RPC; the receiver writes it locally (creating intermediate folders to mirror the source's folder tree if needed) and the sender deletes its copy on ack. |
+| **Pull a remote conversation** | Right-click a remote conversation under any Network group → **← Pull from \<peer\>**. The Pull is a `session_fetch` followed by `move_drop` — the conversation appears in your local sidebar in the same folder it lived in on the source, and the source's copy is removed. Source must be in your roster. |
+| **Click-to-open a remote conversation** | Single-click any peer-hosted conversation in the sidebar's Network section — it opens in the Chat surface in **remote-session mode** without copying anything to local disk. Inference + persistence both route through the host (`session_save` after every turn). Closing the conversation leaves it where it lives. |
 | **Per-surface model selector** | Each pane has a bar at the bottom with a model selector that doubles as a routing picker. Chat's TextBar selects the LLM and the host. Transcribe mode has two bars — one under the live transcript (ASR model + host), one under the talking points pane (chat model + host). A peer appears in the dropdown when its capabilities match the surface kind (`canServeInference` for text, `canServeTranscribe` for transcribe). Picking a peer routes the work; picking "this device" runs it locally. The selector is just a styled pill when no peer can serve the kind — no clutter until there's actually a choice to make. |
-| **Remote inference (chat + talking points)** | Chat routes via `infer_request` to the picked peer's local Ollama; tokens stream back over the data channel. Stop, cancel, and reasoning-mode all work the same as local. Talking Points uses the same path — pin a host on the TP bar and the cycle loop runs against that device's chat model instead of yours. |
-| **Remote transcribe (protocol surface)** | `transcribe_request` / `transcribe_audio_chunk` / `transcribe_segment` / `transcribe_done` / `transcribe_error` / `transcribe_cancel` are defined, advertised (`REMOTE_TRANSCRIBE` feature flag), and gate the transcribe ModelSelector. The Rust-side audio pipeline that the receiver feeds into its local ASR worker is the follow-up — picking a peer in the transcribe bar today surfaces an inline "staged, not wired — pick 'this device' to record locally" message instead of silently degrading. |
-| **Persistent pins, by device pubkey** | The model selector pin survives reloads, peer hops, and Trystero session changes — we persist the peer's stable `device_pubkey` in localStorage (`myownllm.viaPubkey.{text,transcribe,tp}`), not the per-session `peer_id`. Three pins, one per surface: chat, transcribe-side, talking-points-side. Switching between them is one click. |
+| **Remote inference (chat + talking points)** | Chat opens an `infer` streaming RPC against the picked peer; tokens stream back as chunk frames over the daemon's RPC stream. Stop, cancel, and reasoning-mode all work the same as local. Talking Points uses the same path — pin a host on the TP bar and the cycle loop runs against that device's chat model instead of yours. |
+| **Remote transcribe** | Transcribe routes via a `transcribe` streaming RPC (handler emits segment chunks back) plus a per-call `transcribe_audio/<request_id>` typed channel carrying base64 i16 LE PCM audio (16 kHz mono) from sender to handler. The handler bridges into the existing local ASR pipeline via Rust commands; segments + diarization labels stream back unchanged. |
+| **Arbitrary file transfer** | Right-click a connected peer → "Send file…", up to 500 MB. A `file_offer` single-shot RPC asks the receiver to accept (with a save-dialog picker for the destination); after accept, 48 KB base64 PCM chunks ride a per-transfer typed channel `file_chunks/<id>` and a degenerate `file_send` streaming RPC carries the end-of-stream / SHA-256 verification signal. Mismatch → partial file unlinked, sender notified. |
+| **Permissions + prompts gossip** | When **auto-gossip** is on for the active network, per-tool agent permissions (`shell` / `write_file`) and the prompt library auto-sync across peers via the `permissions/snapshot` and `prompts/snapshot` typed channels. Last-write-wins per tool / per prompt id by `updated_at`. Toggle it off in **Settings → Networks → Status** to isolate the active network — local edits don't propagate, peer pressure can't mutate your policy. |
+| **Persistent pins, by device pubkey** | The model selector pin survives reloads, peer hops, and daemon reconnects — we persist the peer's stable `device_pubkey` in localStorage (`myownllm.viaPubkey.{text,transcribe,tp}`), not the per-session peer slot. Three pins, one per surface: chat, transcribe-side, talking-points-side. Switching between them is one click. |
 | **Pause-or-error on peer offline** | A pinned host going offline doesn't downgrade you to local. Chat refuses the next send with an inline "Pinned peer is offline" banner. Talking Points pauses its loop (`chatSlot.status === "paused"`) and resumes automatically when the peer reappears. Transcribe surfaces a matching inline error before any audio capture starts. Each path leaves the choice with you: wait, pick a different host, or fall back to this device. |
-| **Cached service availability** | We remember each peer's last-known capability advertisement keyed by pubkey, so an offline pinned host still renders in the selector as `{model} · {label} (offline)` rather than vanishing into an unlabelled entry. The cache fills on every `hello` / `capabilities_update` and clears explicitly via the sidebar's right-click → Forget on an offline peer. |
+| **Cached service availability** | We unpack each peer's capability advertisement from the daemon's `CapabilityAdvert.extra` slot — so an offline pinned host still renders in the selector as `{model} · {label} (offline)` rather than vanishing into an unlabelled entry. Clears explicitly via the sidebar's right-click → Forget on an offline peer. |
 | **Resource map** | Under **Networks → Connections → Resources in use**, every in-flight inference (outbound + inbound) and Move shows as a live row: `→` = you using a peer's resources, `←` = a peer using yours. |
-| **Capability badges** | Each peer's row shows what they can do — `LLM`, `ASR`, `mic`, `diarize`, plus a one-liner hardware summary (`Pi 5 · 4 GB RAM`). Sourced from each device's broadcast `capabilities_update`. |
+| **Capability badges** | Each peer's row shows what they can do — `LLM`, `ASR`, `mic`, `diarize`, plus a one-liner hardware summary (`Pi 5 · 4 GB RAM`). Sourced from each device's broadcast capability advertisement; the LLM-specific structured fields ride in `CapabilityAdvert.extra` so they survive the daemon round-trip. |
 | **Accepting policy** | Per-network toggle on the Status tab, inline with the status pill. `available` = take any work, `limited` = only if no better peer exists, `busy` = refuse incoming inference. Each saved network has its own setting — you can be `available` at home and `busy` on an office mesh simultaneously. |
-| **Ring + indirect peers** | The **Connections** tab splits peers into two groups. The **Ring** is the set the local selector is actively routing through — it auto-heals on every join / leave by re-running the deterministic ring selector. **Indirect** is peers we know about but aren't routing through right now — shelved (data channel open as heartbeat, parked because the mesh grew past the ring capacity) or offline rostered (approved before, not in the room right now). Keeps Pi-class devices from melting under N² connection counts on a 10-device mesh. |
+| **Ring + indirect peers** | The **Connections** tab splits peers into two groups. The **Ring** is the set the local selector is actively routing through — it auto-heals on every join / leave (the daemon's engine owns the deterministic ring selector). **Indirect** is peers we know about but aren't routing through right now — shelved (data channel open as heartbeat, parked because the mesh grew past the ring capacity) or offline rostered (approved before, not in the room right now). Keeps Pi-class devices from melting under N² connection counts on a 10-device mesh. |
+| **Graph view** | **Networks → Graph** renders a force-directed view of the live mesh — peers as nodes, ICE candidate-pair classification (`host` / `srflx` / `relay`) as edge styling. Anchors "you" centrally; LAN-direct pairs sit near, TURN-relayed pairs sit far. |
+| **Governance** | **Networks → Governance** is the closed-network proposal flow — propose / ratify / deny signed roster transitions against the daemon's governance state machine. Open networks don't need it; closed networks use it to require N-of-M ratification before a new peer joins. |
 
-### Transport: Trystero over Nostr (default)
+### Transport: MyOwnMesh daemon (Nostr signaling + WebRTC data)
 
-Discovery and WebRTC connection setup go through [Trystero](https://trystero.dev), which proxies signed signaling messages through decentralized infrastructure (Nostr relays by default, with BitTorrent / MQTT / IPFS available as compile-time alternatives). **MyOwnLLM operates none of these.** The default is Trystero's built-in pool of 52 community-run public Nostr relays, deterministically shuffled by `appId` so every MyOwnLLM client lands on the same top-N relays for the same network handle — that's what makes "two devices, same Network ID" actually find each other. We bump `redundancy` to 8 (up from Trystero's default 5) so any one misbehaving relay — notably `relay.damus.io`, which sits in our top-5 and rate-limits with "you are noting too much" — only costs us 1/8 of our signaling capacity. Anyone who'd rather pin specific relays (self-hosted, private, or just to keep traffic off third-party infra) can add their own in **Settings → Networks → Settings → Signaling relays**, and those take full precedence.
+The connection engine — discovery, signaling, mutual ed25519 auth, WebRTC + ICE, NAT traversal, reconnect logic — is the standalone [`myownmesh`](https://github.com/mrjeeves/MyOwnMesh) daemon. MyOwnLLM bundles `myownmesh serve` as a Tauri sidecar (pinned to a release tag in `.myownmesh-rev`); at startup the LLM either attaches to a shared daemon at `~/.myownmesh/daemon.sock` (if the MyOwnMesh GUI is also installed and running) or spawns its own at `~/.myownllm/daemon.sock` with `MYOWNMESH_HOME=~/.myownllm` so existing users keep their identity + roster files.
 
-The relay sees only the small WebRTC offer/answer envelopes during connection setup — never the mesh's actual traffic. Once peers connect, the data channel is direct and end-to-end.
+Signaling rides public Nostr relays by default — signed Nostr events carry WebRTC offer/answer envelopes so two clients with the same Network ID can complete an ICE round-trip without ever touching a MyOwnLLM-operated server. Once peers connect, the data channel is direct and end-to-end. The set of relays the daemon uses, the redundancy fan-out, and the per-relay denylist all live in MyOwnMesh — anyone who'd rather pin specific relays (self-hosted, private, or just to keep traffic off third-party infra) can add their own in **Settings → Networks → Settings → Signaling relays** and those take precedence.
+
+The relay sees only the small signed signaling envelopes during connection setup — never the mesh's actual traffic.
 
 ### Self-hosting a relay (LAN / office / air-gapped)
 
-For an office or home network where you don't want connection setup to traverse public relays, point Trystero at your own. **Settings → Networks → Settings → Signaling relays** takes a list of WebSocket URLs; the disclosure under "Self-host a Nostr relay" gives you one-line Docker commands for `strfry` (lightweight C++, ~10 MB RAM) and `nostr-rs-relay` (Rust, persistent SQLite).
+For an office or home network where you don't want connection setup to traverse public relays, point the daemon at your own. **Settings → Networks → Settings → Signaling relays** takes a list of WebSocket URLs; the disclosure under "Self-host a Nostr relay" gives you one-line Docker commands for `strfry` (lightweight C++, ~10 MB RAM) and `nostr-rs-relay` (Rust, persistent SQLite).
 
 ```sh
 # Lightweight option
@@ -776,59 +785,55 @@ Connect → handshake → approve → re-handshake → catalog announce — ever
 
 ### Resilience (post-sleep, network blips)
 
-The mesh client watches for OS sleep / network drop via four signals (`visibilitychange`, `focus`, `online`, `pageshow`) plus a heartbeat-tick clock-gap detector. On wake it pings every peer with a tight 1.5 s probe; if any peer doesn't pong it enters a backoff schedule of re-handshakes (2 s, 5 s, 10 s, 20 s, 30 s, then capped) before escalating to a forced Trystero room rejoin. Rejoins are throttled (1.5m → 3m → 5m → 10m, capped) so a peer that's genuinely offline doesn't drag the rest of the mesh through a churn loop and the per-rejoin presence-announce doesn't starve us out of our signaling relays' anti-spam budgets.
+The reconnect ladder lives in the daemon — wake detection, ICE-restart watchdog, hello-retry backoff, signaling-relay rejoin throttle. The LLM forwards the daemon's diag events into the Activity tab so you can see what's happening, but the recovery decisions are made downstream. See [MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh) for the spec.
 
 You can force-reconnect a peer manually from its row in the Connections list.
 
 ### Wire protocol (for the curious)
 
-Every message is a JSON envelope with a discriminated `kind` field, framed over Trystero's typed `makeAction("mesh")` data channel. The kinds (all in `src/mesh-protocol.ts`):
+Two layers:
+
+**1. The daemon's wire protocol** — handshake (`hello` + `auth_response` + `approve` / `deny`), liveness (`ping` / `pong`), `capabilities_update`, ring shelving (`shelve` / `unshelve`), governance (signed proposal frames), and the generic RPC + typed-channel envelopes. Spec'd in [MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh).
+
+**2. The LLM-specific protocol** on top of the daemon's RPC + typed channels. Each surface uses one or two of the daemon's primitives:
 
 ```
-# Handshake
-hello                    pubkey + nonce + verification code + capabilities
-auth_response            signature over the other side's nonce
-approve / deny           after user approval / denial
+# Capability advertisement
+# Daemon's own `capabilities_update` broadcast.
+# LLM Capabilities ({llms, asr, hardware, inputs, outputs, accepting, features})
+# pack into CapabilityAdvert.extra so they survive the daemon round-trip.
 
-# Liveness
-ping / pong              heartbeat with timestamp echo
+# Catalog / permissions / prompts gossip — typed channels
+catalog/announce         {entries: CatalogEntry[], ts}
+permissions/snapshot     {tools: {shell, write_file}, ts}    # gossip-gated
+prompts/snapshot         {prompts: Prompt[], ts}             # gossip-gated
 
-# Capabilities + ring topology
-capabilities_update      re-broadcast on local hardware/model change
-shelve / unshelve        ring selector toggles a peer between active and standby
+# Remote inference — streaming RPC
+infer                    initial: {messages, family, mode, think?, tools?}
+                         chunks:  {delta} / {thinking_delta} / {tool_call} / {finish_reason}
+                         end:     {error: null | string}
 
-# Catalog gossip
-catalog_announce         full list of conversations hosted on the sender
+# Conversation move + remote-session view — single-shot RPCs
+session_fetch            {guid}                 -> {conversation} | {error}
+session_save             {conversation}         -> {ok} | {error}
+move_take                {guid, conversation, source_folder}
+                                                -> {ok, guid} | {error}
+move_drop                {guid}                 -> {ok} | {error}
 
-# Move (single-RTT, Phase 1)
-move_offer / move_accept / move_decline / move_payload / move_complete
+# Arbitrary file transfer — RPC + per-transfer typed channel
+file_offer  (single)     {id, filename, size_bytes, mime_type?, sha256_b32, chunk_size}
+                                                -> {accepted, reason?}
+file_send   (streaming)  {id}                   -> end-of-stream signal
+file_chunks/<id>         {index, bytes_b64, is_final}    # sender → receiver
 
-# Move (2-phase visibility, Phase 2 — broadcast to everyone)
-move_prepare / move_commit / move_abort
-
-# Pull (Phase 2 — requester asks source to push to them)
-move_request / move_request_decline
-
-# Remote inference (text + Talking Points)
-infer_request            messages + family/mode + think hint
-infer_chunk              one delta or thinking-delta per frame
-infer_done / infer_error
-infer_cancel             abort an in-flight inference
-
-# Remote transcribe (Phase 2.2 — protocol surface; receiver pipeline staged)
-transcribe_request       runtime + tier + diarize + sample_rate
-transcribe_audio_chunk   PCM int16 mono frames, base64
-transcribe_segment       text + speaker + overlap + start/end_ms
-transcribe_done / transcribe_error
-transcribe_cancel        abort an in-flight session
-
-# Arbitrary file transfer (Phase 2.1)
-file_offer / file_accept / file_decline
-file_chunk               base64 bytes + index + is_final
-file_complete / file_abort
+# Remote transcribe — RPC + per-call typed channel
+transcribe  (streaming)  initial: {runtime, model, diarize_model, sample_rate}
+                         chunks:  {text, speaker?, overlap?, start_ms?, end_ms?}
+transcribe_audio/<rid>   {index, bytes_b64, is_final}    # sender → handler
+                                                           # i16 LE PCM, 16 kHz mono
 ```
 
-The protocol version is `1` and stays there across additive Phase 2 changes — v0.2.14 Phase 1 peers and Phase 2 peers can share a mesh, with the v1 side simply not seeing the ring shelving / remote inference / catalog / file-transfer / remote-transcribe niceties. Capability advertisement (`Capabilities.features`) gates per-peer feature use so a Phase 2.0 peer that doesn't implement file transfer or remote transcribe doesn't get spammed with frames it would silently drop.
+All structured payloads are JSON, opaque to the daemon. The LLM's feature handlers register their methods on `start()` and tear them down on `stop()`; reasonable failure modes (no handler / peer offline / busy policy) surface as RPC errors back to the caller rather than wedging the stream. Cancellation rides the daemon's stream-drop — a caller dropping its subscription causes the peer's handler to see end-of-stream and clean up its own side.
 
 ### Persistence
 
@@ -836,11 +841,14 @@ The protocol version is `1` and stays there across additive Phase 2 changes — 
 ~/.myownllm/
 ├── .secrets/
 │   └── identity.json    (ed25519 keypair; 0600 on Unix)
-└── mesh/
-    └── rosters/
-        ├── home-mesh.json      (per-network approved peers; 0600 on Unix)
-        ├── acme-office.json
-        └── ...
+├── mesh/
+│   └── rosters/
+│       ├── home-mesh.json      (per-network approved peers)
+│       ├── acme-office.json
+│       └── ...
+└── daemon.sock          (myownmesh IPC socket — only present when the LLM spawned
+                          its own daemon, not when attached to a shared one at
+                          ~/.myownmesh/daemon.sock)
 ```
 
 Identity is one keypair across every network you join. Rosters are
@@ -849,6 +857,13 @@ per-network — each saved network gets its own file under
 saved networks preserves their rosters independently. A legacy
 pre-multi-network `~/.myownllm/mesh/roster.json` is migrated into its
 per-network home automatically on first roster load.
+
+Both files are owned by the `myownmesh` daemon — the LLM points the
+daemon at `MYOWNMESH_HOME=~/.myownllm` at startup so existing users
+keep their pubkey + roster across the migration. Per-network
+LLM-side state (`agent_permissions`, `prompts`, `accepting`,
+`auto_gossip`, signaling / STUN / TURN config) lives in
+`~/.myownllm/config.json` under `cloud_mesh.networks[*]`.
 
 ---
 
@@ -1275,24 +1290,35 @@ The `manifests/` cache stores one entry per URL. When a manifest reached via an 
   "cloud_mesh": {
     "enabled": false,
     "active_network_id": "net-abc123",  // id of the currently-active saved network, or null
-    "diag_quiet": false,                // suppress info events in Activity log — Phase 2
+    "diag_quiet": false,                // suppress info events in Activity log
     "networks": [                       // saved networks; one is active at a time
       {
         "id": "net-abc123",             // stable internal id, generated on save
         "network_id": "home-mesh",      // canonical Network ID — display name + roster filename
-        "locked": true,                 // true = mesh client joins when this is active
-        "signaling_servers": [],        // per-network; empty = MyOwnLLM's curated default Nostr relay pool
+        "label": "Home",                // optional cosmetic name; falls back to network_id when absent
+        "kind": "open",                 // "open" (default) or "closed" (signed-proposal roster)
+        "topology": { "kind": "ring", "n_preferred": null },
+        "auto_approve": false,          // headless auto-roster — defaults to false for desktop UX
+        "auto_gossip": true,            // sync per-network permissions + prompts to peers
+        "signaling_servers": [],        // per-network; empty = MyOwnMesh daemon defaults
         "stun_servers": [
           "stun:stun.l.google.com:19302",
           "stun:stun1.l.google.com:19302"
         ],
         "turn_servers": [],
-        "accepting": "available"        // per-network: "available" | "limited" | "busy"
+        "accepting": "available",       // per-network: "available" | "limited" | "busy"
+        "agent_permissions": {          // per-network agent-tool gates (gossiped when auto_gossip is on)
+          "shell":      { "mode": "ask", "always_accept": [], "updated_at": 0 },
+          "write_file": { "mode": "ask", "always_accept": [], "updated_at": 0 }
+        },
+        "prompts": []                   // per-network prompt library
       },
       {
         "id": "net-def456",
         "network_id": "acme-office",
-        "locked": true,
+        "label": "ACME office",
+        "kind": "closed",
+        "auto_gossip": false,           // isolated — local permissions/prompts edits stay local
         "signaling_servers": ["wss://relay.internal.acme:7777"],
         "stun_servers": ["stun:stun.l.google.com:19302"],
         "turn_servers": [],
