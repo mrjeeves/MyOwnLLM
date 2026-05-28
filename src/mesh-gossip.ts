@@ -32,12 +32,11 @@
 // commands (`load_prompts`, `merge_permissions`, etc.) — those
 // are already in place from the legacy gossip path.
 
-import { invoke } from "@tauri-apps/api/core";
-
-import { loadConfig, getAllPrompts } from "./config";
+import { loadConfig, getAllPrompts, getAgentPermissions } from "./config";
 import { listConversations } from "./conversations";
 import { snapshotCapabilities } from "./mesh-capabilities";
 import type { Capabilities, CatalogEntry } from "./mesh-protocol";
+import type { AgentPermissionsConfig, Prompt } from "./types";
 
 // ----------------------------------------------------------------------
 // Capabilities
@@ -129,35 +128,53 @@ export async function subscribeCatalog(
 }
 
 // ----------------------------------------------------------------------
-// Permissions snapshot
+// Permissions snapshot — per-tool agent gates (shell, write_file)
 // ----------------------------------------------------------------------
+//
+// Wire shape mirrors `AgentPermissionsConfig`:
+//   { tools: { shell: {mode, always_accept, updated_at},
+//              write_file: {mode, always_accept, updated_at} },
+//     ts }
+//
+// Receivers feed `tools` into `agentPermissions.mergeIncoming(tools,
+// activeNetworkId)`, which decides per-tool LWW by `updated_at`. We
+// emit on local mutation (via `agentPermissions.setBroadcaster()` —
+// see `mesh-daemon.svelte.ts::startImpl`) and once-on-active so a
+// newly-handshaked peer picks up the policy without waiting for the
+// next edit.
 
-interface PermissionsSnapshot {
-  /** Authorised peer pubkeys + their labels. Used to converge the
-   *  roster across approved members so a newly-approved peer
-   *  sees the same authorised set everyone else already has. */
-  authorized: Array<{ device_id: string; label?: string }>;
+export interface PermissionsSnapshot {
+  tools: Partial<AgentPermissionsConfig>;
   ts: number;
 }
 
-/** Snapshot + publish on `permissions/snapshot`. Caller is
- *  expected to gate this on `auto_gossip = true`. */
-export async function publishPermissions(
-  client: CatalogClient,
-  network: string,
-): Promise<void> {
+/** Publish the current local permissions to peers on
+ *  `permissions/snapshot`. Caller gates this on
+ *  `autoGossipEnabled`. */
+export async function publishPermissions(client: CatalogClient): Promise<void> {
   try {
-    const list = (await invoke("mesh_daemon_roster_list", { network })) as {
-      roster?: Array<{ device_id: string; label?: string }>;
-    };
+    const cfg = await loadConfig();
+    const perms = getAgentPermissions(cfg);
     await client.channelSendAll("permissions/snapshot", {
-      authorized: list.roster ?? [],
+      tools: { shell: perms.shell, write_file: perms.write_file },
       ts: Date.now(),
     } as PermissionsSnapshot);
   } catch {
-    // Roster fetch failed — nothing to publish. The next
-    // capability tick will retry.
+    // No active network or config read failed — nothing to publish.
   }
+}
+
+/** Same shape as `publishPermissions` but ships an already-formed
+ *  snapshot (used by the `setBroadcaster` hook so we don't re-read
+ *  config from disk on every mutation). */
+export async function publishPermissionsSnapshot(
+  client: CatalogClient,
+  snap: AgentPermissionsConfig,
+): Promise<void> {
+  await client.channelSendAll("permissions/snapshot", {
+    tools: { shell: snap.shell, write_file: snap.write_file },
+    ts: Date.now(),
+  } as PermissionsSnapshot);
 }
 
 export interface PermissionsSubscriberHooks {
@@ -170,37 +187,52 @@ export async function subscribePermissions(
 ): Promise<() => Promise<void>> {
   return client.subscribeChannel("permissions/snapshot", (from, payload) => {
     const s = payload as PermissionsSnapshot;
-    if (!s || !Array.isArray(s.authorized)) return;
+    if (!s || typeof s !== "object" || !s.tools || typeof s.tools !== "object") return;
     hooks.onPermissionsFromPeer(from, s);
   });
 }
 
 // ----------------------------------------------------------------------
-// Prompts snapshot
+// Prompts snapshot — full Prompt[] shape so `mergeIncoming` can
+// per-id LWW merge.
 // ----------------------------------------------------------------------
 
-interface PromptsSnapshot {
-  prompts: Array<{ id: string; label: string; body: string }>;
+export interface PromptsSnapshot {
+  prompts: Prompt[];
   ts: number;
 }
 
-/** Push the local prompt library to peers. The library lives in
- *  the user config under `cloud_mesh.networks[*].prompts`. */
+/** Push the local prompt library to peers. Sends the active
+ *  network's prompts only — `Prompt[]` lives per-network, and the
+ *  receiver's merge is scoped to the active network id. Caller gates
+ *  on `autoGossipEnabled`. */
 export async function publishPrompts(client: CatalogClient): Promise<void> {
   try {
     const cfg = await loadConfig();
     const all = getAllPrompts(cfg);
-    await client.channelSendAll("prompts/snapshot", {
-      prompts: all.map((p) => ({
-        id: p.id,
-        label: p.name,
-        body: p.system_prompt,
-      })),
-      ts: Date.now(),
-    } as PromptsSnapshot);
+    await publishPromptsSnapshot(client, all);
   } catch {
     // No-op on snapshot failure.
   }
+}
+
+/** Same as `publishPrompts` but ships an already-formed list (used
+ *  by the `setBroadcaster` hook). */
+export async function publishPromptsSnapshot(
+  client: CatalogClient,
+  prompts: Prompt[],
+): Promise<void> {
+  await client.channelSendAll("prompts/snapshot", {
+    prompts: prompts.map((p) => ({
+      id: p.id,
+      name: p.name,
+      system_prompt: p.system_prompt,
+      tools: [...p.tools],
+      user_prompt: p.user_prompt,
+      updated_at: p.updated_at,
+    })),
+    ts: Date.now(),
+  } as PromptsSnapshot);
 }
 
 export interface PromptsSubscriberHooks {

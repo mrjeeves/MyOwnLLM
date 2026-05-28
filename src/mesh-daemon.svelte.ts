@@ -24,7 +24,14 @@ import { listen } from "@tauri-apps/api/event";
 
 import type { Capabilities } from "./mesh-protocol";
 import { EMPTY_CAPABILITIES } from "./mesh-protocol";
-import { loadConfig, syncActiveNetworkToDaemon } from "./config";
+import {
+  activeNetwork,
+  loadConfig,
+  syncActiveNetworkToDaemon,
+  updateNetwork,
+} from "./config";
+import { agentPermissions } from "./agent-permissions.svelte";
+import { agentPrompts } from "./agent-prompts.svelte";
 
 // ----------------------------------------------------------------------
 // Public types (mirror the legacy mesh-client.svelte.ts shapes so
@@ -169,13 +176,24 @@ export interface RpcCallStreamSub {
 /** Mirror of `myownmesh_core::PeerInfo` — what `mesh_daemon_peers_list`
  *  returns and what `peer` events carry. Kept partial here because we
  *  only consume a handful of fields. */
+/** The daemon's `CapabilityAdvert` shape on the wire (see
+ *  `myownmesh_core::protocol::CapabilityAdvert`). The structured LLM
+ *  caps ride inside `extra` — see `pushCapabilities` for the pack
+ *  side and `peerCapabilitiesFromAdvert` for the unpack side. */
+interface DaemonCapabilityAdvert {
+  tags?: string[];
+  app_version?: string | null;
+  max_connections?: number | null;
+  extra?: unknown;
+}
+
 interface DaemonPeerInfo {
   device_id: string;
   status: string;
   tier?: string;
   rtt_ms?: number | null;
   label: string;
-  capabilities?: Capabilities | null;
+  capabilities?: DaemonCapabilityAdvert | null;
   local_shelved?: boolean;
   remote_shelved?: boolean;
   authenticated?: boolean;
@@ -283,7 +301,7 @@ function daemonPeerToEntry(info: DaemonPeerInfo): PeerEntry {
     verification_code,
     reconnect_attempts: 0,
     next_reconnect_at: null,
-    capabilities: info.capabilities ?? emptyCapabilities(),
+    capabilities: peerCapabilitiesFromAdvert(info.capabilities),
     catalog: [],
     local_shelved: info.local_shelved === true,
     remote_shelved: info.remote_shelved === true,
@@ -334,6 +352,56 @@ function emptyCapabilities(): Capabilities {
   // Clone EMPTY_CAPABILITIES rather than aliasing the module-level
   // constant — consumers occasionally append to .llms / .features.
   return JSON.parse(JSON.stringify(EMPTY_CAPABILITIES)) as Capabilities;
+}
+
+/** Unpack the LLM `Capabilities` blob the peer stuffed inside the
+ *  daemon's `CapabilityAdvert.extra` (see `pushCapabilities` for the
+ *  pack side). The daemon ships only `{tags, app_version,
+ *  max_connections, extra}` — the LLM's structured `llms`, `asr`,
+ *  `hardware` etc. ride opaquely in `extra` so they survive the
+ *  daemon round-trip. Falls back to empty defaults when the peer
+ *  hasn't published or is on an older build that didn't use the
+ *  extra slot. */
+function peerCapabilitiesFromAdvert(
+  advert: DaemonCapabilityAdvert | null | undefined,
+): Capabilities {
+  if (!advert) return emptyCapabilities();
+  const inner =
+    advert.extra && typeof advert.extra === "object"
+      ? (advert.extra as Partial<Capabilities>)
+      : null;
+  const out = emptyCapabilities();
+  if (inner) {
+    if (Array.isArray(inner.llms)) out.llms = inner.llms;
+    if (Array.isArray(inner.asr)) out.asr = inner.asr;
+    if (typeof inner.diarize === "boolean") out.diarize = inner.diarize;
+    if (inner.hardware && typeof inner.hardware === "object") {
+      out.hardware = { ...out.hardware, ...inner.hardware };
+    }
+    if (inner.inputs && typeof inner.inputs === "object") {
+      out.inputs = { ...out.inputs, ...inner.inputs };
+    }
+    if (inner.outputs && typeof inner.outputs === "object") {
+      out.outputs = { ...out.outputs, ...inner.outputs };
+    }
+    if (
+      inner.accepting === "available" ||
+      inner.accepting === "limited" ||
+      inner.accepting === "busy"
+    ) {
+      out.accepting = inner.accepting;
+    }
+    if (Array.isArray(inner.features)) out.features = inner.features;
+  }
+  // `app_version` lives on `CapabilityAdvert` itself (the daemon's
+  // hello frame promotes it for cosmetic display); prefer that over
+  // the inner copy.
+  if (typeof advert.app_version === "string" && advert.app_version) {
+    out.app_version = advert.app_version;
+  } else if (inner && typeof inner.app_version === "string") {
+    out.app_version = inner.app_version;
+  }
+  return out;
 }
 
 // ----------------------------------------------------------------------
@@ -397,8 +465,17 @@ class MeshDaemonClient {
   private clientId = "";
   /** Network the LLM joins on `start()`. The LLM uses a single
    *  default network for now; multi-network support comes when the
-   *  Networks tab is wired. */
+   *  Networks tab is wired. Wire-level `network_id` value — what
+   *  the daemon's IPC ops key on. */
   private network = "";
+
+  /** LLM-side config id of the active network. Distinct from
+   *  `this.network` (which is the wire-level network_id): the
+   *  `id` field is the local saved-network identifier that
+   *  `agentPermissions.mergeIncoming` / `agentPrompts.mergeIncoming`
+   *  scope merges to. Hydrated from `activeNetwork(cfg).id` in
+   *  `start()`. */
+  private activeConfigNetworkId = "";
   /** Cleanup hook for the Tauri event listener. */
   private unlisten: (() => void) | null = null;
   /** Per-method handlers for inbound peer RPCs we've claimed via
@@ -427,20 +504,42 @@ class MeshDaemonClient {
    *  handle. */
   private inflightStart: Promise<void> | null = null;
 
+  /** setInterval handle for the periodic catalog + gossip refresh.
+   *  Reset to null on `stop()`. The daemon doesn't replay
+   *  typed-channel publishes, so this tick is the late-joiner
+   *  fill-in path — peers who joined after our initial publish
+   *  see our state on the next tick. */
+  private catalogRefreshTimer: number | null = null;
+
+  /** Pubkeys we've already shipped a one-shot catch-up gossip to
+   *  on becoming-active. Prevents re-shipping on every peer-event
+   *  refresh — the daemon doesn't dedupe per-peer, and the legacy
+   *  client tracked this with the same shape. */
+  private gossipedOnceTo = new Set<string>();
+
+  /** Most-recent local capability snapshot pushed via
+   *  `pushCapabilities`. Drives `localCapabilitiesForHandler` so the
+   *  inference handler can pick a real model when a peer dispatches
+   *  to us. `null` until the first `refreshCapabilities()` call —
+   *  the handler treats that as "no local LLM available", which
+   *  matches the safe pre-snapshot default. */
+  private lastLocalCapabilities: Capabilities | null = null;
+
   /** Local capability snapshot the inference handler hands back to
-   *  the LLM router. Phase C-6 wires this through `mesh-capabilities`
-   *  for real (model list + accepting policy + hardware fingerprint);
-   *  for now we return a minimal shape so the handler can at least
-   *  reach into Ollama with the first available model. The legacy
-   *  snapshotter still produces the full set elsewhere — we'll plug
-   *  this back into it when capabilities migrate. */
+   *  the LLM router. Reads from `lastLocalCapabilities` which is
+   *  populated by `pushCapabilities()`/`refreshCapabilities()`. The
+   *  handler picks a model by (family, mode) — exact match wins,
+   *  else any tag in the right mode, else the first available. */
   private localCapabilitiesForHandler(): {
     accepting: AcceptingPolicy;
     llms: Array<{ tag: string; family: string; mode: string }>;
   } {
+    const cap = this.lastLocalCapabilities;
     return {
       accepting: this.accepting,
-      llms: [],
+      llms: cap
+        ? cap.llms.map((m) => ({ tag: m.tag, family: m.family, mode: m.mode }))
+        : [],
     };
   }
 
@@ -583,34 +682,151 @@ class MeshDaemonClient {
           this.featureReleases.push(catRelease);
           const permRelease = await subscribePermissions(this, {
             onPermissionsFromPeer: (from, snap) => {
-              // Surface as a diag for now — the legacy merge logic
-              // (apply peer's authorized list into our local
-              // permissions DB) lives in `mesh-permissions.ts`
-              // which is not yet ported. Phase D wires it.
-              this.appendDiag(
-                "info",
-                `permissions snapshot from ${from.slice(0, 8)}: ${snap.authorized.length} entries`,
-              );
+              // Apply the peer's per-tool gates via the local
+              // `agentPermissions.mergeIncoming` LWW merge. Skip
+              // entirely when auto-gossip is off — the isolation
+              // contract says peer pressure can't overwrite our
+              // local policy on an opted-out network.
+              if (!this.autoGossipEnabled) return;
+              const networkId = this.activeNetworkId;
+              if (!networkId) return;
+              void agentPermissions
+                .mergeIncoming(snap.tools, networkId)
+                .then((changed) => {
+                  if (changed) {
+                    this.appendDiag(
+                      "info",
+                      `agent permissions updated from peer ${from.slice(0, 8)}`,
+                    );
+                  }
+                })
+                .catch((e) =>
+                  this.appendDiag(
+                    "warn",
+                    `permissions merge failed: ${String(e)}`,
+                  ),
+                );
             },
           });
           this.featureReleases.push(permRelease);
           const promptsRelease = await subscribePrompts(this, {
             onPromptsFromPeer: (from, snap) => {
-              this.appendDiag(
-                "info",
-                `prompts snapshot from ${from.slice(0, 8)}: ${snap.prompts.length} entries`,
-              );
+              if (!this.autoGossipEnabled) return;
+              const networkId = this.activeNetworkId;
+              if (!networkId) return;
+              void agentPrompts
+                .mergeIncoming(snap.prompts, networkId)
+                .then((changed) => {
+                  if (changed) {
+                    this.appendDiag(
+                      "info",
+                      `prompts updated from peer ${from.slice(0, 8)}`,
+                    );
+                  }
+                })
+                .catch((e) =>
+                  this.appendDiag(
+                    "warn",
+                    `prompts merge failed: ${String(e)}`,
+                  ),
+                );
             },
           });
           this.featureReleases.push(promptsRelease);
         } catch (e) {
           this.appendDiag("warn", `gossip subscribe failed: ${e}`);
         }
+        // Wire the agent-permissions + agent-prompts stores so a
+        // local mutation gossips out to peers on the active
+        // network. Both broadcasters are gated on
+        // `autoGossipEnabled` inside the callback (cheaper than
+        // unhooking on toggle).
+        agentPermissions.setBroadcaster((snap) => {
+          if (!this.autoGossipEnabled) return;
+          void (async () => {
+            const { publishPermissionsSnapshot } = await import(
+              "./mesh-gossip"
+            );
+            try {
+              await publishPermissionsSnapshot(this, snap);
+            } catch (e) {
+              this.appendDiag(
+                "warn",
+                `permissions broadcast failed: ${String(e)}`,
+              );
+            }
+          })();
+        });
+        agentPrompts.setBroadcaster((prompts) => {
+          if (!this.autoGossipEnabled) return;
+          void (async () => {
+            const { publishPromptsSnapshot } = await import("./mesh-gossip");
+            try {
+              await publishPromptsSnapshot(this, prompts);
+            } catch (e) {
+              this.appendDiag(
+                "warn",
+                `prompts broadcast failed: ${String(e)}`,
+              );
+            }
+          })();
+        });
+        this.featureReleases.push(async () => {
+          agentPermissions.setBroadcaster(null);
+          agentPrompts.setBroadcaster(null);
+        });
+        // Hydrate `autoGossipEnabled` + `activeConfigNetworkId`
+        // from the active network's saved config. `auto_gossip`
+        // defaults to true for backwards compatibility with
+        // networks saved before the per-network toggle existed.
+        const active = activeNetwork(cfg);
+        this.activeConfigNetworkId = active?.id ?? "";
+        this.autoGossipEnabled = active?.auto_gossip ?? true;
+        // Seed `gossipedOnceTo` with peers that are already active
+        // at start — the initial broadcast below covers them, so
+        // we don't want the first reconcile to re-broadcast on top
+        // of it.
+        for (const p of this.peers) {
+          if (p.status === "active") this.gossipedOnceTo.add(p.device_pubkey);
+        }
         // Initial capability + catalog publish so peers see us
         // right away. Subsequent updates ride on
-        // `noteCapabilitiesChanged` / `noteCatalogChanged`.
+        // `noteCapabilitiesChanged` / `noteCatalogChanged`. Also
+        // ship the gossip-gated snapshots once on start so a peer
+        // approved while we were offline picks them up immediately.
         void this.refreshCapabilities();
         void this.refreshLocalCatalog();
+        if (this.autoGossipEnabled) {
+          void (async () => {
+            const { publishPermissions, publishPrompts } = await import(
+              "./mesh-gossip"
+            );
+            try {
+              await publishPermissions(this);
+              await publishPrompts(this);
+            } catch {
+              // Best-effort — the periodic tick + setBroadcaster
+              // path will retry on the next mutation.
+            }
+          })();
+        }
+        // Periodic catalog refresh. The daemon doesn't replay
+        // typed-channel publishes for late joiners, so a peer that
+        // comes online ~30s after we did would otherwise see an
+        // empty `peer.catalog` until our next local mutation.
+        // 60s matches the legacy mesh-client cadence.
+        this.catalogRefreshTimer = window.setInterval(() => {
+          void this.refreshLocalCatalog();
+          if (this.autoGossipEnabled) {
+            void (async () => {
+              const { publishPermissions, publishPrompts } = await import(
+                "./mesh-gossip"
+              );
+              await publishPermissions(this).catch(() => undefined);
+              await publishPrompts(this).catch(() => undefined);
+            })();
+          }
+        }, 60_000);
       }
     } catch (e) {
       this.error = String(e);
@@ -620,11 +836,29 @@ class MeshDaemonClient {
     }
   }
 
+  /** The LLM-side config id of the active network. Used to scope
+   *  `agentPermissions.mergeIncoming` / `agentPrompts.mergeIncoming`
+   *  so a snapshot arriving on Network A only lands in Network A's
+   *  saved policy slot. Synchronous so inbound channel handlers can
+   *  call it on every frame without a config re-read. */
+  private get activeNetworkId(): string | null {
+    return this.activeConfigNetworkId || null;
+  }
+
   /** Stop listening. The daemon stays running (other clients may be
    *  using it); we just tear down our event subscription + release
    *  any per-feature handler claims so their RPC methods aren't
    *  attributed to us after we've gone. */
   async stop(): Promise<void> {
+    if (this.catalogRefreshTimer !== null) {
+      clearInterval(this.catalogRefreshTimer);
+      this.catalogRefreshTimer = null;
+    }
+    if (this.catalogBroadcastTimer !== null) {
+      clearTimeout(this.catalogBroadcastTimer);
+      this.catalogBroadcastTimer = null;
+    }
+    this.gossipedOnceTo.clear();
     // Release in reverse order; each release is best-effort.
     while (this.featureReleases.length > 0) {
       const r = this.featureReleases.pop();
@@ -638,6 +872,8 @@ class MeshDaemonClient {
       this.unlisten();
       this.unlisten = null;
     }
+    this.activeConfigNetworkId = "";
+    this.lastLocalCapabilities = null;
     this.status = "off";
     this.phase = "off";
   }
@@ -725,6 +961,52 @@ class MeshDaemonClient {
     } catch (e) {
       this.appendDiag("warn", `reconcile peers_list failed: ${String(e)}`);
     }
+    // Catch-up gossip for peers that just became active. The
+    // daemon's typed channels don't replay past publishes, so a
+    // peer who handshakes after our initial publish would otherwise
+    // see an empty catalog / no prompts / no permissions until our
+    // next mutation. Ship a one-shot per peer the moment we see
+    // them go active. `gossipedOnceTo` dedupes so flap (active →
+    // shelved → active) doesn't re-blast on every transition.
+    void this.shipCatchUpGossipToNewlyActive();
+  }
+
+  private async shipCatchUpGossipToNewlyActive(): Promise<void> {
+    const activeNow = this.peers.filter((p) => p.status === "active");
+    const newlyActive = activeNow.filter(
+      (p) => !this.gossipedOnceTo.has(p.device_pubkey),
+    );
+    if (newlyActive.length === 0) return;
+    for (const p of newlyActive) {
+      this.gossipedOnceTo.add(p.device_pubkey);
+    }
+    // Forget pubkeys that aren't currently active so a peer that
+    // truly went away + came back gets the catch-up again. The
+    // legacy client did the same — gossipedOnceTo is a "this active
+    // session" set, not a forever-cache.
+    const activeSet = new Set(activeNow.map((p) => p.device_pubkey));
+    for (const pk of Array.from(this.gossipedOnceTo)) {
+      if (!activeSet.has(pk)) this.gossipedOnceTo.delete(pk);
+    }
+    try {
+      const { publishCatalog, publishPermissions, publishPrompts } =
+        await import("./mesh-gossip");
+      // `channelSendAll` broadcasts to every active peer — late
+      // joiners are part of that set as soon as their status flips
+      // to active, so a broadcast (rather than per-peer
+      // `channelSendTo`) catches them up. Cheap to re-broadcast;
+      // unaffected peers just see a no-op merge.
+      await publishCatalog(this).catch(() => undefined);
+      if (this.autoGossipEnabled) {
+        await publishPermissions(this).catch(() => undefined);
+        await publishPrompts(this).catch(() => undefined);
+      }
+    } catch (e) {
+      this.appendDiag(
+        "warn",
+        `catch-up gossip failed: ${String(e)}`,
+      );
+    }
   }
 
   /** Force a stop → start round trip. The daemon engine equivalent
@@ -788,19 +1070,39 @@ class MeshDaemonClient {
     await this.refreshCapabilities();
   }
 
-  /** Auto-gossip toggle. When true, the LLM publishes its full
-   *  roster (and prompt library) periodically + on roster
-   *  changes. Receivers merge — see `mesh-gossip.ts`. */
+  /** Auto-gossip toggle. When true, the LLM publishes per-tool
+   *  permissions + the prompt library to peers on the active
+   *  network — and applies their inbound snapshots. When false,
+   *  the network is isolated for settings (local edits don't
+   *  propagate; peer pressure can't mutate our policy). Hydrated
+   *  from the active network's saved `auto_gossip` flag in
+   *  `start()`; persisted via `setAutoGossip`. */
   autoGossipEnabled = $state<boolean>(false);
 
   async setAutoGossip(value: boolean): Promise<void> {
     this.autoGossipEnabled = value;
+    // Persist on the active network so the toggle survives a
+    // restart. The UI binds to `active?.auto_gossip` from config,
+    // not to this in-memory field, so without persistence the
+    // toggle visually reverts after `reloadFromConfig`.
+    try {
+      const cfg = await loadConfig();
+      const active = activeNetwork(cfg);
+      if (active) await updateNetwork(active.id, { auto_gossip: value });
+    } catch (e) {
+      this.appendDiag(
+        "warn",
+        `auto-gossip persist failed: ${String(e)}`,
+      );
+    }
     if (value && this.network) {
-      // Fire an immediate publish so the toggle's effect is visible
-      // without waiting for the next tick.
-      const { publishPermissions, publishPrompts } = await import("./mesh-gossip");
-      await publishPermissions(this, this.network);
-      await publishPrompts(this);
+      // Fire an immediate publish so peers see our state without
+      // waiting for the next periodic tick.
+      const { publishPermissions, publishPrompts } = await import(
+        "./mesh-gossip"
+      );
+      await publishPermissions(this).catch(() => undefined);
+      await publishPrompts(this).catch(() => undefined);
     }
   }
 
@@ -820,9 +1122,19 @@ class MeshDaemonClient {
   }
 
   /** Catalog changed. Re-snapshot + republish on the
-   *  `catalog/announce` typed channel. */
+   *  `catalog/announce` typed channel. Debounced so a burst of
+   *  mutations (folder move-N-files, delete-many, multi-rename)
+   *  coalesce into a single broadcast rather than firing N
+   *  publishes against the daemon. */
+  private catalogBroadcastTimer: number | null = null;
   noteCatalogChanged(): void {
-    void this.refreshLocalCatalog();
+    if (this.catalogBroadcastTimer !== null) {
+      clearTimeout(this.catalogBroadcastTimer);
+    }
+    this.catalogBroadcastTimer = window.setTimeout(() => {
+      this.catalogBroadcastTimer = null;
+      void this.refreshLocalCatalog();
+    }, 500);
   }
 
   /** Snapshot + push capabilities to the daemon. */
@@ -1107,13 +1419,32 @@ class MeshDaemonClient {
 
   /** Push the local capability snapshot to the daemon. The daemon
    *  broadcasts a `capabilities_update` frame to peers on its next
-   *  engine tick. */
-  async pushCapabilities(capabilities: unknown): Promise<void> {
+   *  engine tick.
+   *
+   *  The daemon's `CapabilityAdvert` only has `{tags, app_version,
+   *  max_connections, extra}` — it doesn't know the LLM-specific
+   *  structured fields (`llms`, `asr`, `hardware`, `inputs`, …) and
+   *  would silently drop them on deserialize. We pack the full
+   *  `Capabilities` blob into `extra` so the LLM-side shape rides
+   *  the wire opaquely; `peerCapabilitiesFromAdvert` unpacks it on
+   *  receive. */
+  async pushCapabilities(capabilities: Capabilities): Promise<void> {
     if (!this.network) throw new Error("no network — start() first");
+    const wrapped = {
+      tags: [],
+      app_version: capabilities.app_version ?? null,
+      max_connections: null,
+      extra: capabilities,
+    };
     await invoke("mesh_daemon_capabilities_set", {
       network: this.network,
-      capabilities,
+      capabilities: wrapped,
     });
+    // Cache last-pushed snapshot so the inference handler (handler
+    // side) can answer with a real model selection instead of
+    // hitting "no local LLM available". `localCapabilitiesForHandler`
+    // reads from here.
+    this.lastLocalCapabilities = capabilities;
   }
 
   /** Reply to an inbound RPC the handler is processing. Wraps the
