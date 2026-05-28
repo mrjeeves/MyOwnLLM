@@ -143,6 +143,12 @@ tar = "0.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "2"
 
+[dev-dependencies]
+# Filesystem fixtures for migration tests. `tempdir()` + scoped
+# cleanup so a failed test doesn't leak directories under the
+# user's actual home.
+tempfile = "3"
+
 [profile.release]
 panic = "abort"
 codegen-units = 1
