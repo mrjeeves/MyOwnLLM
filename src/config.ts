@@ -1,5 +1,6 @@
 import { readTextFile, writeTextFile, exists, mkdir } from "@tauri-apps/plugin-fs";
 import { homeDir } from "@tauri-apps/api/path";
+import { invoke } from "@tauri-apps/api/core";
 import type {
   Config,
   ApiConfig,
@@ -468,6 +469,125 @@ export function invalidateConfigCache(): void {
 export function activeNetwork(cfg: Config): NetworkConfig | null {
   if (!cfg.cloud_mesh.active_network_id) return null;
   return cfg.cloud_mesh.networks.find((n) => n.id === cfg.cloud_mesh.active_network_id) ?? null;
+}
+
+// ---- daemon network bridge -------------------------------------------------
+//
+// The daemon owns the live mesh (signaling, ICE, channels); the
+// frontend owns the user's saved network catalog in
+// `~/.myownllm/config.json`. The two stores were left disconnected
+// when the migration off Trystero landed — the daemon started with
+// `networks=0` regardless of what the user had configured, leaving
+// every install stuck pre-join. These helpers wire one side to the
+// other so the active frontend network is the daemon's joined
+// network.
+
+/** Translate a frontend `NetworkConfig` into the JSON shape the
+ *  daemon's `mesh_daemon_network_add` command expects. Mirrors
+ *  `myownmesh_core::config::NetworkConfig` field-for-field, lifting
+ *  the frontend's flat `signaling_servers: string[]` / `stun_servers:
+ *  string[]` into the daemon's structured `SignalingConfig` /
+ *  `StunServer { urls }` / `TurnServer { urls }` shapes. Fields the
+ *  daemon doesn't carry (accepting, agent_permissions, prompts,
+ *  auto_gossip) are LLM-side concerns and don't cross the bridge. */
+export function networkConfigToDaemonShape(net: NetworkConfig): Record<string, unknown> {
+  const stun = net.stun_servers ?? [];
+  const turn = net.turn_servers ?? [];
+  return {
+    id: net.id,
+    network_id: net.network_id,
+    label: net.label ?? "",
+    kind: net.kind ?? "open",
+    topology: net.topology ?? { kind: "ring", n_preferred: null },
+    // Partial SignalingConfig — `redundancy` + `denylist` come from
+    // the daemon's `#[serde(default)]` Default impl (5 relays,
+    // default denylist) when omitted.
+    signaling: {
+      strategy: "nostr",
+      servers: net.signaling_servers ?? [],
+    },
+    // Daemon's StunServer groups urls into one entry; mirror its
+    // own `default_stun_servers()` shape (single entry with the
+    // url list) for one-to-one parity.
+    stun_servers: stun.length > 0 ? [{ urls: stun }] : [],
+    turn_servers: turn.map((t) => {
+      const out: Record<string, unknown> = { urls: [t.url] };
+      if (t.username) out.username = t.username;
+      if (t.credential) out.credential = t.credential;
+      return out;
+    }),
+    auto_approve: net.auto_approve ?? false,
+  };
+}
+
+/** Push a network to the daemon. Idempotent: a daemon that already
+ *  has the same id / network_id (e.g. persisted from a previous
+ *  launch) returns an "already in use" error which we treat as
+ *  success. */
+export async function daemonAddNetwork(net: NetworkConfig): Promise<void> {
+  const config = networkConfigToDaemonShape(net);
+  try {
+    await invoke("mesh_daemon_network_add", { config });
+  } catch (e) {
+    const msg = String(e);
+    if (msg.includes("already in use") || msg.includes("already joined")) {
+      return;
+    }
+    throw e;
+  }
+}
+
+/** Tell the daemon to leave a network. Accepts either the config id
+ *  or the wire-level network_id — the daemon's registry indexes by
+ *  both. Idempotent: unknown ids are silently swallowed since the
+ *  daemon already reports unknown removes as success-with-warning. */
+export async function daemonRemoveNetwork(idOrNetworkId: string): Promise<void> {
+  try {
+    await invoke("mesh_daemon_network_remove", { network: idOrNetworkId });
+  } catch {
+    // Best-effort: unknown network / daemon down / racing
+    // restart — the next reconcile pass will re-converge.
+  }
+}
+
+/** Snapshot the daemon's currently-joined `network_id` strings. */
+export async function daemonJoinedNetworkIds(): Promise<string[]> {
+  try {
+    const status = (await invoke("mesh_daemon_status")) as {
+      joined_networks?: string[];
+    };
+    return status.joined_networks ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/** Reconcile the daemon's joined-network set with the frontend
+ *  config: ensure the active network (if any) is joined and every
+ *  other joined network is dropped. The LLM is a single-active-
+ *  network UI today; keeping daemon state aligned with that model
+ *  avoids the daemon staying joined to a network the user already
+ *  switched away from (and wasting signaling bandwidth on it).
+ *
+ *  Returns the active network the bridge converged on, or null when
+ *  no network is active in the frontend config. */
+export async function syncActiveNetworkToDaemon(
+  cfg: Config,
+): Promise<NetworkConfig | null> {
+  const active = activeNetwork(cfg);
+  const joined = await daemonJoinedNetworkIds();
+
+  // Drop any daemon-joined network that isn't the current active.
+  for (const nid of joined) {
+    if (!active || nid !== active.network_id) {
+      await daemonRemoveNetwork(nid);
+    }
+  }
+  // Add active if not already joined.
+  if (active && !joined.includes(active.network_id)) {
+    await daemonAddNetwork(active);
+  }
+  return active;
 }
 
 /** Append a new saved network and (optionally) set it active.

@@ -24,6 +24,7 @@ import { listen } from "@tauri-apps/api/event";
 
 import type { Capabilities } from "./mesh-protocol";
 import { EMPTY_CAPABILITIES } from "./mesh-protocol";
+import { loadConfig, syncActiveNetworkToDaemon } from "./config";
 
 // ----------------------------------------------------------------------
 // Public types (mirror the legacy mesh-client.svelte.ts shapes so
@@ -420,6 +421,11 @@ class MeshDaemonClient {
    *  in reverse order from `stop()` to unregister each method
    *  claim + drop channel subscriptions. */
   private featureReleases: Array<() => Promise<void>> = [];
+  /** In-flight `start()` Promise. Lets concurrent callers (boot
+   *  + an early settings click, say) join the same start instead
+   *  of double-bootstrapping the listener and leaking the first
+   *  handle. */
+  private inflightStart: Promise<void> | null = null;
 
   /** Local capability snapshot the inference handler hands back to
    *  the LLM router. Phase C-6 wires this through `mesh-capabilities`
@@ -445,18 +451,46 @@ class MeshDaemonClient {
    *  those here because the daemon owns the relevant config. */
   async start(): Promise<void> {
     if (this.unlisten) return; // already started
+    if (this.inflightStart) return this.inflightStart;
+    this.inflightStart = this.startImpl().finally(() => {
+      this.inflightStart = null;
+    });
+    return this.inflightStart;
+  }
+
+  private async startImpl(): Promise<void> {
     this.status = "connecting";
     this.phase = "starting";
     try {
-      const status = (await invoke("mesh_daemon_status")) as DaemonStatus;
+      // The daemon spawn happens off Tauri's setup() thread, so the
+      // state can be unregistered for a beat after the window opens.
+      // Retry briefly so the user doesn't see a hard error during
+      // that window — daemons that genuinely failed to start surface
+      // later (the retry budget bounded so it's not unbounded).
+      const status = await this.fetchDaemonStatusWithRetry();
       this.clientId = status.ipc_client_id;
-      this.network = status.joined_networks[0] ?? "";
+
+      // Bridge the frontend's saved-network catalog into the
+      // daemon. The daemon's own config is empty on first launch
+      // after the migration, so we push the user's active network
+      // here. Subsequent launches see it via
+      // `joined_networks` and skip the add. Single-active-network
+      // UX: any other daemon-joined networks get dropped so daemon
+      // state matches what the LLM is actually showing.
+      const cfg = await loadConfig();
+      let activeNet = null;
+      try {
+        activeNet = await syncActiveNetworkToDaemon(cfg);
+      } catch (e) {
+        this.appendDiag("warn", `network sync failed: ${String(e)}`);
+      }
+      // Re-fetch status so `joined_networks` reflects the post-sync
+      // reality (peers_list below needs the daemon to know the
+      // network exists).
+      const status2 = await this.fetchDaemonStatusWithRetry();
+      this.network =
+        activeNet?.network_id ?? status2.joined_networks[0] ?? "";
       if (!this.network) {
-        // No network configured — the legacy mesh-client.svelte.ts
-        // bootstraps this from the Settings UI's saved network_id.
-        // Phase C-6 will plumb that through; for now surface the
-        // gap so the user sees a clear "no network configured"
-        // diag entry rather than silent inactivity.
         this.appendDiag(
           "warn",
           "no network configured — open Settings → Cloud Mesh to create one",
@@ -608,11 +642,80 @@ class MeshDaemonClient {
     this.phase = "off";
   }
 
-  /** Reconcile config drift: peers list, capabilities, network state.
-   *  The daemon does this internally on the engine side — we just
-   *  re-snapshot peers so the UI reflects post-config-edit reality
-   *  immediately rather than waiting on the next event. */
+  /** Re-fetch daemon status with a short retry budget. The daemon
+   *  spawn runs off Tauri's setup() thread, so on first launch the
+   *  `Arc<MeshDaemon>` state can be unregistered for a beat after
+   *  `start()` runs. Retrying smooths over that race instead of
+   *  surfacing a confusing "state not managed" error. Aborts after
+   *  ~6s so a daemon that genuinely failed to start still bubbles
+   *  the error up. */
+  private async fetchDaemonStatusWithRetry(): Promise<DaemonStatus> {
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      try {
+        return (await invoke("mesh_daemon_status")) as DaemonStatus;
+      } catch (e) {
+        lastErr = e;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+    throw lastErr ?? new Error("mesh_daemon_status: timed out");
+  }
+
+  /** Reconcile config drift. Two paths:
+   *
+   *  1. **Active-network switch** — the user picked a different
+   *     network in Settings (or added one with `activate: true`).
+   *     The daemon needs to leave the old network and join the new
+   *     one; the in-memory event listener / RPC handlers need to
+   *     re-bind under the new `this.network`. Do a full stop → start
+   *     so every consumer is in sync.
+   *  2. **Same-network refresh** — settings click that doesn't move
+   *     the active pointer. Just re-snapshot peers; the daemon's own
+   *     engine drives the rest.
+   *
+   *  Mid-session settings edits to the active network's STUN / TURN /
+   *  signaling lists aren't auto-propagated (the daemon has no
+   *  network-update RPC — only add / remove). Toggle the network
+   *  off + on in Settings to apply those. */
   async reconcile(): Promise<void> {
+    // Let any in-flight start finish before we read `this.network` —
+    // otherwise an early reconcile (during boot) sees the stale
+    // pre-start value and triggers a spurious switch.
+    if (this.inflightStart) {
+      try {
+        await this.inflightStart;
+      } catch {
+        // start() already surfaced its own error to the diag log.
+      }
+    }
+    let cfg;
+    try {
+      cfg = await loadConfig();
+    } catch (e) {
+      this.appendDiag("warn", `reconcile loadConfig failed: ${String(e)}`);
+      return;
+    }
+    const active = cfg.cloud_mesh.active_network_id
+      ? cfg.cloud_mesh.networks.find(
+          (n) => n.id === cfg.cloud_mesh.active_network_id,
+        ) ?? null
+      : null;
+    const desired = active?.network_id ?? "";
+
+    if (desired !== this.network) {
+      // Network changed under us — full restart so handler claims
+      // re-bind under the new `this.network` and the daemon leaves
+      // / joins as needed. `start()` handles the daemon-side sync
+      // via `syncActiveNetworkToDaemon`.
+      if (this.unlisten) {
+        await this.stop();
+      }
+      await this.start();
+      return;
+    }
+
+    // Same active — refresh peer snapshot.
     if (!this.network) return;
     try {
       const resp = (await invoke("mesh_daemon_peers_list", {

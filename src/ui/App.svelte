@@ -225,9 +225,14 @@
       }
       // Bring up the Cloud Mesh client if the user has an active
       // network from a previous session. Fire-and-forget — the
-      // Trystero room-join runs entirely off the startup path and
-      // the user sees its status in Settings → Networks → Status.
-      meshClient.reconcile().catch(() => {});
+      // daemon join runs entirely off the startup path and the
+      // user sees its status in Settings → Networks → Status.
+      // `start()` is idempotent (re-entry returns early via the
+      // `unlisten` guard), and it owns the frontend-config →
+      // daemon bridge: pushes the saved active network into the
+      // daemon's joined set on first launch after the migration,
+      // then subscribes to `mesh://event` so peer state flows in.
+      meshClient.start().catch(() => {});
 
       if (config.auto_cleanup?.conversations !== false) {
         clearConversationOrphans().catch(() => {});
