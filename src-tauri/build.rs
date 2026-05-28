@@ -192,8 +192,8 @@ fn bundle_myownmesh_sidecar() -> Result<(), Box<dyn std::error::Error>> {
                 // Sibling exists but its version doesn't match the
                 // pin. Loud warning + fall through to the release
                 // download so the user lands on the right daemon.
-                let actual = sibling_binary_version(&p)
-                    .unwrap_or_else(|e| format!("(unreadable: {e})"));
+                let actual =
+                    sibling_binary_version(&p).unwrap_or_else(|e| format!("(unreadable: {e})"));
                 println!(
                     "cargo:warning=ignoring sibling {} — it reports version {} but \
                      .myownmesh-rev pins {}. To use the sibling for dev, rebuild it \
