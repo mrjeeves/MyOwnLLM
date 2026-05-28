@@ -200,12 +200,26 @@ fn bundle_myownmesh_sidecar() -> Result<(), Box<dyn std::error::Error>> {
 
     if !already_built {
         if let Some(tag) = rev.as_deref().filter(|s| s.starts_with('v')) {
-            // Tagged release — download prebuilt.
+            // Tagged release — download prebuilt, then go
+            // directly to the sidecar slot. The previous
+            // version had an intermediate copy via
+            // `installed_bin` in OUT_DIR which was redundant
+            // and added another point that Windows Defender's
+            // real-time scan of the freshly-extracted .exe
+            // could lock with os error 32. write_sidecar_with_
+            // retry handles that case with retry + atomic
+            // temp-rename.
             match download_release_asset(tag, &target_triple, &staging, exe_suffix) {
                 Ok(bin) => {
-                    fs::copy(&bin, &installed_bin)?;
-                    make_executable(&installed_bin)?;
-                    fs::write(&sentinel, tag)?;
+                    write_sidecar_with_retry(&bin, &sidecar_path)?;
+                    make_executable(&sidecar_path)?;
+                    fs::write(&bundled_rev_sentinel, tag)?;
+                    println!(
+                        "cargo:warning=[sidecar] {} ready ({} bytes)",
+                        sidecar_path.display(),
+                        fs::metadata(&sidecar_path).map(|m| m.len()).unwrap_or(0)
+                    );
+                    return Ok(());
                 }
                 Err(release_err) => {
                     // Release download failed — fall back to
@@ -216,32 +230,39 @@ fn bundle_myownmesh_sidecar() -> Result<(), Box<dyn std::error::Error>> {
                         "cargo:warning=release asset download failed: {release_err} — \
                          falling back to cargo install --git"
                     );
-                    cargo_install_fallback(tag, &staging, &installed_bin, exe_suffix)?;
-                    fs::write(&sentinel, tag)?;
+                    let staging_bin = staging.join(format!("myownmesh{exe_suffix}"));
+                    cargo_install_fallback(tag, &staging, &staging_bin, exe_suffix)?;
+                    write_sidecar_with_retry(&staging_bin, &sidecar_path)?;
+                    make_executable(&sidecar_path)?;
+                    fs::write(&bundled_rev_sentinel, tag)?;
+                    return Ok(());
                 }
             }
         } else {
-            // No tag pinned (raw SHA in .myownmesh-rev, or empty
-            // / missing file) — only path is cargo install --git.
+            // No tag pinned (raw SHA in .myownmesh-rev, or
+            // empty/missing file) — only path is cargo install
+            // --git. Same pattern: build directly into the
+            // sidecar slot via write_sidecar_with_retry.
             let r = rev.as_deref().unwrap_or("main");
-            cargo_install_fallback(r, &staging, &installed_bin, exe_suffix)?;
-            fs::write(&sentinel, r)?;
+            let staging_bin = staging.join(format!("myownmesh{exe_suffix}"));
+            cargo_install_fallback(r, &staging, &staging_bin, exe_suffix)?;
+            write_sidecar_with_retry(&staging_bin, &sidecar_path)?;
+            make_executable(&sidecar_path)?;
+            fs::write(&bundled_rev_sentinel, r)?;
+            return Ok(());
         }
     }
 
-    if !installed_bin.exists() {
+    // Fell through here means already_built was true — the
+    // sidecar slot is already current. Confirm it really exists
+    // (sanity check against a manual `rm`).
+    if !sidecar_path.exists() {
         return Err(format!(
-            "myownmesh binary not found after install: {}",
-            installed_bin.display()
+            "sentinel says sidecar is current but {} is missing — delete \
+             `src-tauri/binaries/.bundled-rev` and re-run",
+            sidecar_path.display()
         )
         .into());
-    }
-    write_sidecar_with_retry(&installed_bin, &sidecar_path)?;
-    make_executable(&sidecar_path)?;
-    // Record what we just bundled so the next build can skip
-    // the whole pipeline if nothing changed.
-    if let Some(rev) = &want_rev {
-        let _ = fs::write(&bundled_rev_sentinel, rev);
     }
     Ok(())
 }
@@ -253,23 +274,26 @@ fn bundle_myownmesh_sidecar() -> Result<(), Box<dyn std::error::Error>> {
 /// finish opening the file. After a fixed budget we give up
 /// and surface the error — letting the user see something is
 /// holding it open rather than busy-looping forever.
-/// Atomic-rename copy with retries against the Windows
+/// Atomic-rename copy that survives Windows
 /// `ERROR_SHARING_VIOLATION` (os error 32). Writes to a temp
-/// file alongside the destination, then renames over it — that
-/// way a failed copy never leaves a partial / truncated file
-/// at `dst` (which is exactly what would cause the runtime's
-/// "%1 is not a valid Win32 application" error).
+/// file alongside the destination, then renames over it.
+///
+/// Two distinct sources of os error 32 on Windows:
+///
+/// - **Destination locked**: another process holds `dst` open.
+///   Common for the sidecar slot when a parallel `tauri dev`
+///   has staged it. We back off + retry the rename.
+/// - **Source locked**: Windows Defender real-time scanning a
+///   freshly-extracted executable. The source file (`src`)
+///   gets opened by Defender during/after extraction, and our
+///   `fs::copy` competes with the scanner. Defender on an
+///   unsigned 7+ MB exe can take 10+ seconds. We back off +
+///   retry the copy here too.
 ///
 /// Also self-heals against a corrupt existing `dst`: if the
-/// file already there fails our PE / ELF / Mach-O magic check,
-/// we try to delete it first before the rename so Tauri's dev
-/// staging picks up the freshly-extracted content rather than
-/// the old garbage.
+/// file already there fails our magic check, delete it first
+/// (e.g. a leftover zero-byte stub from a previous failure).
 fn write_sidecar_with_retry(src: &Path, dst: &Path) -> std::io::Result<()> {
-    // If dst exists but doesn't look like an executable, blow
-    // it away. A leftover zero-byte stub or partial download
-    // would otherwise survive — and Tauri's externalBin staging
-    // happily copies whatever's there into `target/debug/`.
     if dst.exists() && validate_executable_magic(dst).is_err() {
         println!(
             "cargo:warning=[sidecar] existing {} doesn't look like an executable; replacing",
@@ -281,8 +305,12 @@ fn write_sidecar_with_retry(src: &Path, dst: &Path) -> std::io::Result<()> {
     let tmp = dst.with_extension("tmp-incoming");
     let _ = fs::remove_file(&tmp);
 
+    // Retry budget: 10 attempts, 200ms → 102s exponential backoff.
+    // The 102s tail is unused in practice — Defender almost always
+    // releases within ~10s — but the cap matters when the user is
+    // staring at a wedged build wondering whether to abort.
     let mut last_err: Option<std::io::Error> = None;
-    for attempt in 0..6 {
+    for attempt in 0..10 {
         match fs::copy(src, &tmp) {
             Ok(_) => match fs::rename(&tmp, dst) {
                 Ok(()) => {
@@ -294,11 +322,14 @@ fn write_sidecar_with_retry(src: &Path, dst: &Path) -> std::io::Result<()> {
                     return Ok(());
                 }
                 Err(e) if e.raw_os_error() == Some(32) => {
-                    // dst is held open; clean up the temp and
-                    // back off. Next attempt re-copies (cheap).
                     let _ = fs::remove_file(&tmp);
+                    println!(
+                        "cargo:warning=[sidecar] rename to {} hit sharing violation (attempt {}/10), backing off",
+                        dst.display(),
+                        attempt + 1
+                    );
                     last_err = Some(e);
-                    std::thread::sleep(std::time::Duration::from_millis(150 << attempt));
+                    std::thread::sleep(std::time::Duration::from_millis(200 << attempt));
                 }
                 Err(e) => {
                     let _ = fs::remove_file(&tmp);
@@ -306,8 +337,14 @@ fn write_sidecar_with_retry(src: &Path, dst: &Path) -> std::io::Result<()> {
                 }
             },
             Err(e) if e.raw_os_error() == Some(32) => {
+                println!(
+                    "cargo:warning=[sidecar] copy from {} hit sharing violation \
+                     (likely Defender scanning; attempt {}/10), backing off",
+                    src.display(),
+                    attempt + 1
+                );
                 last_err = Some(e);
-                std::thread::sleep(std::time::Duration::from_millis(150 << attempt));
+                std::thread::sleep(std::time::Duration::from_millis(200 << attempt));
             }
             Err(e) => return Err(e),
         }
