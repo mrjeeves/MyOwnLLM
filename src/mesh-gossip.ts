@@ -81,7 +81,14 @@ interface CatalogAnnounce {
 
 /** Build the local catalog snapshot. Uses the same
  *  `listConversations` helper the Sidebar binds to, so the
- *  gossip view matches the UI view. */
+ *  gossip view matches the UI view.
+ *
+ *  Includes `path` so receivers can reproduce this host's folder
+ *  structure in their sidebar Network section — without it every
+ *  remote conversation lands at root and `Work/Projects/Q4` shows
+ *  up as a flat list on every peer. Empty (root) is omitted from
+ *  the wire payload to save bytes; the receiver treats missing
+ *  `path` as root via `CatalogEntry.path`'s optional shape. */
 async function snapshotLocalCatalog(): Promise<CatalogEntry[]> {
   try {
     const { conversations } = await listConversations();
@@ -90,6 +97,7 @@ async function snapshotLocalCatalog(): Promise<CatalogEntry[]> {
       title: c.title,
       mode: c.mode,
       updated_at: c.updated_at,
+      ...(c.path ? { path: c.path } : {}),
     })) as CatalogEntry[];
   } catch {
     return [];
