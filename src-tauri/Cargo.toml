@@ -60,7 +60,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # `MYOWNMESH_HOME` is set to `~/.myownllm` in main.rs so the substrate
 # reads/writes our existing on-disk layout (identity.json, rosters/)
 # without surprising users with a path move.
-myownmesh-core = { git = "https://github.com/mrjeeves/MyOwnMesh", branch = "main" }
+myownmesh-core = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.1.2" }
 
 # base32 is still used directly by the Tauri command layer to decode
 # `message_b32` arguments before handing the raw bytes to

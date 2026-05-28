@@ -26,7 +26,7 @@
 //! propagates to the frontend as a toast.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -39,6 +39,14 @@ use interprocess::local_socket::GenericNamespaced;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
+
+/// The target triple this build was compiled for. `build.rs`
+/// surfaces it via `cargo:rustc-env=DAEMON_SIDECAR_TRIPLE=...` so
+/// `daemon_binary_candidates` knows the exact name Tauri uses
+/// when staging the sidecar in dev mode
+/// (`myownmesh-<triple>{.exe}`, unchanged) vs. production
+/// (`myownmesh{.exe}`, suffix stripped).
+const DAEMON_SIDECAR_TRIPLE: &str = env!("DAEMON_SIDECAR_TRIPLE");
 
 // ---- wire protocol ----------------------------------------------------
 
@@ -427,11 +435,32 @@ impl ControlClient {
 
 // ---- daemon child lifecycle ------------------------------------------
 
-/// Owned wrapper around a spawned `myownmesh serve` child. Dropping
-/// it kills the daemon (best-effort SIGKILL / TerminateProcess).
+/// Owned wrapper around a spawned `myownmesh serve` child.
+/// Dropping it kills the daemon (best-effort SIGKILL /
+/// TerminateProcess). On Windows we also attach the child to a
+/// Job Object with `KILL_ON_JOB_CLOSE`: if the LLM is killed
+/// abruptly (Ctrl-C / taskkill / crash) and Drop never runs, the
+/// OS still terminates the daemon when our process exits. That
+/// covers the orphan case the simple Drop path misses.
 pub struct DaemonChild {
     child: Option<Child>,
+    /// Windows Job Object the child is assigned to. Leaked
+    /// intentionally — the handle stays alive for the lifetime
+    /// of the LLM process so Windows reclaims it on exit (any
+    /// exit) and triggers KILL_ON_JOB_CLOSE.
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    job: Option<*mut std::ffi::c_void>,
 }
+
+// SAFETY: the Job Object handle is opaque + never dereferenced
+// directly; it's held purely so its lifetime extends across the
+// daemon child's lifetime. Sending the wrapper between threads
+// is safe.
+#[cfg(windows)]
+unsafe impl Send for DaemonChild {}
+#[cfg(windows)]
+unsafe impl Sync for DaemonChild {}
 
 impl Drop for DaemonChild {
     fn drop(&mut self) {
@@ -440,52 +469,227 @@ impl Drop for DaemonChild {
             let _ = c.wait();
             eprintln!("daemon: child terminated");
         }
+        // The Job Object handle is leaked deliberately — see the
+        // struct doc above. Windows GCs it when the LLM process
+        // exits, which is the point.
     }
 }
 
-/// Resolve the `myownmesh` binary in this priority order:
-///   1. `MYOWNLLM_MESH_BIN` env var (LLM-specific override)
-///   2. `MYOWNMESH_BIN` env var (shared with MyOwnMesh GUI's convention)
-///   3. `myownmesh` (or `myownmesh.exe`) on `$PATH`
-///   4. Workspace dev artefacts under `../target/{debug,release}/`
-///      relative to this crate (CARGO_MANIFEST_DIR), so `cargo run`
-///      in MyOwnMesh + `tauri dev` in MyOwnLLM coexists.
-pub fn find_daemon_binary() -> Result<PathBuf> {
-    for var in ["MYOWNLLM_MESH_BIN", "MYOWNMESH_BIN"] {
-        if let Ok(p) = std::env::var(var) {
-            let p = PathBuf::from(p);
-            if p.exists() {
-                return Ok(p);
+/// Collect every viable `myownmesh` binary location on this
+/// machine, in priority order. `ensure_daemon_running` iterates
+/// through them and tries to spawn each — picking the first
+/// that actually works rather than the first that merely exists.
+/// That distinction matters in dev setups where a stale, broken,
+/// or zero-byte file at one location would otherwise block the
+/// app from using a working binary at the next.
+///
+/// Priority order:
+///   1. **Sidecar next to the running LLM executable** — the
+///      production-bundle path. `build.rs` builds (or copies)
+///      the daemon binary into `src-tauri/binaries/myownmesh-
+///      <triple>` and `tauri.conf.json::bundle::externalBin`
+///      declares it as a sidecar. Tauri's bundler places it next
+///      to the main `MyOwnLLM` executable in the `.app` / `.deb`
+///      / `.msi`. End users never need to install MyOwnMesh
+///      separately. Zero-byte placeholders (written by build.rs
+///      when the daemon fetch was skipped) are filtered out so we
+///      fall through.
+///   2. `MYOWNLLM_MESH_BIN` env var (LLM-specific override).
+///   3. `MYOWNMESH_BIN` env var (shared with MyOwnMesh GUI's
+///      convention).
+///   4. `myownmesh` (or `myownmesh.exe`) on `$PATH`.
+///   5. Workspace dev artefacts (sibling MyOwnMesh checkout's
+///      `target/{debug,release}/`) — only relevant in dev when
+///      the sidecar wasn't bundled (offline iteration,
+///      `MYOWNLLM_SKIP_SIDECAR=1`).
+/// Verify a candidate path is a real, usable daemon binary
+/// before we try to spawn it. Matches the build-time
+/// validator in `build.rs::validate_executable_magic`:
+///
+/// - File size ≥ 1 MiB (filters truncated downloads / stubs).
+/// - PE / ELF / Mach-O magic at offset 0.
+/// - On Windows (`.exe`): walk the DOS header's `e_lfanew` and
+///   verify the PE signature is `PE\0\0`. A 4 MB truncated PE
+///   that still starts with `MZ` would pass a magic-only check
+///   but spawn would reject it with the cryptic "not a valid
+///   Win32 application" error — this catches it.
+///
+/// Files at paths we own (the source `binaries/<triple>` slot,
+/// Tauri's dev-mode `target/<profile>/` staging) that fail the
+/// check get unlinked here as a self-heal so the next build /
+/// dev cycle rewrites with fresh content instead of perpetually
+/// staging corrupt bits. Files at paths we DON'T own (PATH
+/// lookup, env-var override) just get skipped without deletion.
+fn looks_like_executable(path: &Path) -> bool {
+    match validate_path_is_executable(path) {
+        Ok(()) => true,
+        Err(reason) => {
+            // Self-heal: if this is a known-owned slot and the
+            // content is invalid, delete it. Tauri's externalBin
+            // staging will regenerate from the source on the
+            // next build; the source's own validator catches
+            // problems before propagating them.
+            if is_owned_slot(path) {
+                eprintln!(
+                    "daemon: {} failed executable check ({reason}); removing stale file",
+                    path.display()
+                );
+                let _ = std::fs::remove_file(path);
+            } else {
+                eprintln!("daemon: skipping {} ({reason})", path.display());
             }
+            false
         }
     }
+}
+
+fn validate_path_is_executable(path: &Path) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let meta = std::fs::metadata(path).map_err(|e| format!("stat: {e}"))?;
+    let size = meta.len();
+    if size < 1_048_576 {
+        return Err(format!("{size} bytes < 1 MiB minimum"));
+    }
+    let mut f = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+    let mut head = [0u8; 4];
+    f.read_exact(&mut head)
+        .map_err(|e| format!("read magic: {e}"))?;
+    let pe = head[0..2] == *b"MZ";
+    let elf = head == [0x7f, b'E', b'L', b'F'];
+    let macho = matches!(
+        u32::from_le_bytes(head),
+        0xFEED_FACE | 0xFEED_FACF | 0xCAFE_BABE | 0xBEBA_FECA
+    ) || matches!(
+        u32::from_be_bytes(head),
+        0xFEED_FACE | 0xFEED_FACF | 0xCAFE_BABE | 0xBEBA_FECA
+    );
+    if !(pe || elf || macho) {
+        return Err(format!("bad magic {:02x?}", head));
+    }
+    if pe {
+        f.seek(SeekFrom::Start(0x3C))
+            .map_err(|e| format!("seek 0x3C: {e}"))?;
+        let mut e_lfanew_bytes = [0u8; 4];
+        f.read_exact(&mut e_lfanew_bytes)
+            .map_err(|e| format!("read e_lfanew: {e}"))?;
+        let e_lfanew = u32::from_le_bytes(e_lfanew_bytes) as u64;
+        if e_lfanew < 0x40 || e_lfanew >= size {
+            return Err(format!("nonsense e_lfanew=0x{e_lfanew:x}"));
+        }
+        f.seek(SeekFrom::Start(e_lfanew))
+            .map_err(|e| format!("seek to PE sig: {e}"))?;
+        let mut pe_sig = [0u8; 4];
+        f.read_exact(&mut pe_sig)
+            .map_err(|e| format!("read PE sig: {e}"))?;
+        if pe_sig != [b'P', b'E', 0, 0] {
+            return Err(format!("no PE sig at 0x{e_lfanew:x}"));
+        }
+    }
+    Ok(())
+}
+
+/// Identify paths where the LLM owns the file and a stale /
+/// corrupt blob can be safely removed: the source `binaries/`
+/// sidecar slot, and the Tauri dev-staging `target/<profile>/`
+/// directories. Everything else (env-var overrides, PATH hits,
+/// sibling MyOwnMesh checkout) we leave alone.
+fn is_owned_slot(path: &Path) -> bool {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let owned_dirs = [
+        manifest.join("binaries"),
+        manifest.join("target").join("debug"),
+        manifest.join("target").join("release"),
+    ];
+    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    for dir in &owned_dirs {
+        let canonical_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        if canonical_path.starts_with(&canonical_dir) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn daemon_binary_candidates() -> Vec<PathBuf> {
     let exe = if cfg!(windows) {
         "myownmesh.exe"
     } else {
         "myownmesh"
     };
+    // Build-time-captured target triple — surfaced by `build.rs`.
+    // `tauri dev` keeps the `-<triple>` suffix when staging
+    // sidecars next to the dev exe; `tauri build` strips it.
+    // Checking both covers dev + production from one runtime path.
+    let exe_with_triple = if cfg!(windows) {
+        format!("myownmesh-{}.exe", DAEMON_SIDECAR_TRIPLE)
+    } else {
+        format!("myownmesh-{}", DAEMON_SIDECAR_TRIPLE)
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+
+    // Helper: push a candidate iff it exists AND looks like a
+    // real executable (filters out the zero-byte stub
+    // `build.rs` writes when the daemon fetch was skipped, AND
+    // filters out corrupt / truncated downloads that would
+    // otherwise produce a confusing "%1 is not a valid Win32
+    // application" error when we try to spawn them).
+    fn push_if_usable(out: &mut Vec<PathBuf>, p: PathBuf) {
+        if !looks_like_executable(&p) {
+            return;
+        }
+        out.push(p);
+    }
+
+    // 1. Bundled sidecar next to the running LLM executable —
+    //    the production-bundle convention. Tauri's build step
+    //    strips the `-<triple>` suffix; the dev-mode `tauri dev`
+    //    leaves it on. Check both names so prod + dev resolve
+    //    via the same code path.
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            push_if_usable(&mut out, exe_dir.join(exe));
+            push_if_usable(&mut out, exe_dir.join(&exe_with_triple));
+        }
+    }
+
+    // 1b. Source `binaries/<triple>` directory — where `build.rs`
+    //     writes the bundled daemon before Tauri copies it
+    //     elsewhere. In `cargo run` (no Tauri staging) this is
+    //     the *only* place the binary lives. Relative to the
+    //     crate, so it works from any working directory.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    push_if_usable(&mut out, manifest.join("binaries").join(&exe_with_triple));
+
+    // 2 + 3. Explicit env-var overrides.
+    for var in ["MYOWNLLM_MESH_BIN", "MYOWNMESH_BIN"] {
+        if let Ok(p) = std::env::var(var) {
+            let p = PathBuf::from(p);
+            if p.exists() {
+                out.push(p);
+            }
+        }
+    }
+
+    // 4. PATH lookup.
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join(exe);
             if candidate.exists() {
-                return Ok(candidate);
+                out.push(candidate);
             }
         }
     }
-    // Dev fallback — relative to this crate's MANIFEST_DIR. The LLM
-    // workspace lives next to the MyOwnMesh workspace in the dev
-    // setup; both compile into their own `target/` dirs. We look at
-    // the LLM's own target first (developer just ran
-    // `cargo build -p myownmesh` from the LLM tree, which is rare),
-    // then peek at a sibling `../../MyOwnMesh/target/...` path.
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // 5. Dev fallback — sibling MyOwnMesh checkout's `target/`.
+    //    `manifest` already declared above for the `binaries/`
+    //    lookup; reuse it here.
     for profile in ["debug", "release"] {
-        candidates.push(manifest.join("target").join(profile).join(exe));
+        push_if_usable(&mut out, manifest.join("target").join(profile).join(exe));
         if let Some(parent) = manifest.parent() {
-            candidates.push(parent.join("target").join(profile).join(exe));
+            push_if_usable(&mut out, parent.join("target").join(profile).join(exe));
             if let Some(grandparent) = parent.parent() {
-                candidates.push(
+                push_if_usable(
+                    &mut out,
                     grandparent
                         .join("MyOwnMesh")
                         .join("target")
@@ -495,15 +699,33 @@ pub fn find_daemon_binary() -> Result<PathBuf> {
             }
         }
     }
-    for c in candidates {
-        if c.exists() {
-            return Ok(c);
-        }
-    }
-    Err(anyhow!(
-        "couldn't find `{exe}` — set MYOWNLLM_MESH_BIN or MYOWNMESH_BIN, install it on PATH, \
-         or run `cargo build -p myownmesh` in the MyOwnMesh workspace first"
-    ))
+
+    // De-dupe while preserving order (sidecar and workspace paths
+    // can resolve to the same file under symlinked dev setups).
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| {
+        let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        seen.insert(canonical)
+    });
+    out
+}
+
+/// Legacy single-binary lookup. Returns the highest-priority
+/// candidate, or an error message listing what was tried.
+/// `ensure_daemon_running` now prefers
+/// [`daemon_binary_candidates`] so it can iterate, but this is
+/// still useful for the CLI's `myownllm mesh` diag.
+#[allow(dead_code)]
+pub fn find_daemon_binary() -> Result<PathBuf> {
+    let candidates = daemon_binary_candidates();
+    candidates.into_iter().next().ok_or_else(|| {
+        anyhow!(
+            "couldn't find `myownmesh` — the daemon sidecar wasn't bundled and no fallback \
+             binary is on PATH. Re-run the LLM build with network access so `build.rs` \
+             can fetch myownmesh, point MYOWNLLM_MESH_BIN at a pre-built binary, or \
+             clone MyOwnMesh alongside this repo and run `cargo build -p myownmesh`."
+        )
+    })
 }
 
 /// Probe a candidate socket. Returns `true` when something is
@@ -544,41 +766,94 @@ pub async fn ensure_daemon_running() -> Result<(ControlClient, Option<DaemonChil
         return Ok((client, None));
     }
     // 3. No daemon up — spawn our own with MYOWNMESH_HOME=~/.myownllm
-    //    so it reads/writes the LLM's existing on-disk layout.
-    let bin = find_daemon_binary().context("locate myownmesh binary")?;
-    let home = dirs::home_dir().context("no home dir")?.join(".myownllm");
-    eprintln!(
-        "daemon: spawning own-LLM daemon: bin={} home={}",
-        bin.display(),
-        home.display()
-    );
-
-    let child = Command::new(&bin)
-        .arg("serve")
-        .env("MYOWNMESH_HOME", &home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("spawn {}", bin.display()))?;
-    let handle = DaemonChild { child: Some(child) };
-
-    // Wait for the control socket. Up to 8s is plenty even on a
-    // cold-cache debug build.
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        if let Some(client) = probe(DaemonMode::OwnLlm).await {
-            eprintln!("daemon: own-LLM daemon up");
-            return Ok((client, Some(handle)));
-        }
+    //    so it reads/writes the LLM's existing on-disk layout. We
+    //    iterate every viable binary location (`daemon_binary_
+    //    candidates`); a stale or broken file at one location is
+    //    skipped in favour of a working binary at the next. The
+    //    diag log surfaces each attempt so a user with multiple
+    //    stale candidates can see which one we picked.
+    let candidates = daemon_binary_candidates();
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "couldn't find a `myownmesh` binary. Re-run the LLM build with network \
+             access so `build.rs` can fetch the daemon, set MYOWNLLM_MESH_BIN to a \
+             pre-built daemon, or clone MyOwnMesh alongside this repo and run \
+             `cargo build -p myownmesh`."
+        ));
     }
-    // Daemon may still be coming up — return the child handle so the
-    // app retry loop can wait it out.
-    eprintln!(
-        "daemon: own-LLM daemon did not respond within 8s; leaving child running and continuing"
-    );
-    Ok((ControlClient::for_mode(DaemonMode::OwnLlm)?, Some(handle)))
+    let home = dirs::home_dir().context("no home dir")?.join(".myownllm");
+
+    let mut last_err: Option<String> = None;
+    for bin in &candidates {
+        eprintln!(
+            "daemon: spawning own-LLM daemon: bin={} home={}",
+            bin.display(),
+            home.display()
+        );
+        let spawn_res = Command::new(bin)
+            .arg("serve")
+            .env("MYOWNMESH_HOME", &home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn();
+        let child = match spawn_res {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("spawn {}: {e}", bin.display());
+                eprintln!("daemon: {msg} — trying next candidate");
+                last_err = Some(msg);
+                continue;
+            }
+        };
+        // On Windows: assign the child to a KILL_ON_JOB_CLOSE
+        // Job Object so even an abrupt LLM exit (Ctrl-C in the
+        // parent terminal, taskkill, crash) terminates the
+        // daemon. This is what handles the orphan case the
+        // simple Drop fallback misses.
+        #[cfg(windows)]
+        let job = {
+            use std::os::windows::io::AsRawHandle;
+            crate::windows::assign_to_kill_on_close_job(child.as_raw_handle())
+        };
+        let handle = DaemonChild {
+            child: Some(child),
+            #[cfg(windows)]
+            job,
+        };
+
+        // Wait for the control socket. Up to 8s is plenty even on
+        // a cold-cache debug build.
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            if let Some(client) = probe(DaemonMode::OwnLlm).await {
+                eprintln!("daemon: own-LLM daemon up (from {})", bin.display());
+                return Ok((client, Some(handle)));
+            }
+        }
+        // Didn't bind within the window. The child may still be
+        // coming up slowly — but rather than gamble, drop the
+        // child (its `Drop` kills it) and try the next candidate.
+        eprintln!(
+            "daemon: {} did not bind the control socket within 8s — trying next candidate",
+            bin.display()
+        );
+        last_err = Some(format!(
+            "{} spawned but the control socket never opened",
+            bin.display()
+        ));
+        drop(handle);
+    }
+
+    // Every candidate failed. Surface a diag listing all of them
+    // so the user can see what got tried — beats "couldn't find".
+    let tried: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+    Err(anyhow!(
+        "no working `myownmesh` binary on this machine. Tried:\n  {}\nLast error: {}",
+        tried.join("\n  "),
+        last_err.unwrap_or_else(|| "(none)".into()),
+    ))
 }
 
 // ---- Tauri state ----------------------------------------------------
