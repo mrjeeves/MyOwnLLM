@@ -158,15 +158,62 @@ fn bundle_myownmesh_sidecar() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2. Sibling workspace checkout. The dev workflow often has
-    //    MyOwnMesh and MyOwnLLM open as siblings.
+    //    MyOwnMesh and MyOwnLLM open as siblings. Gated on a
+    //    `--version` check against `.myownmesh-rev`: a stale
+    //    sibling target/ (binary built before the LLM bumped its
+    //    pin) would otherwise silently downgrade users below the
+    //    daemon version the LLM was tested against. We've seen
+    //    this in the wild — two devices running mismatched daemon
+    //    revs can't peer because the wire-protocol additions in
+    //    the newer release aren't understood by the older one.
+    //    Escape hatch for users hacking on MyOwnMesh against a
+    //    different version: point `MYOWNLLM_MESH_BIN` at the
+    //    sibling directly (handled in step 1 above, bypasses the
+    //    version check).
+    let pin = fs::read_to_string(&rev_file)
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty());
     if let Some(p) = find_sibling_workspace_binary(&crate_dir, exe_suffix) {
-        println!(
-            "cargo:warning=copying daemon from sibling checkout: {}",
-            p.display()
-        );
-        fs::copy(&p, &sidecar_path)?;
-        make_executable(&sidecar_path)?;
-        return Ok(());
+        match sibling_binary_version_matches(&p, pin.as_deref()) {
+            Ok(true) => {
+                println!(
+                    "cargo:warning=copying daemon from sibling checkout: {}",
+                    p.display()
+                );
+                fs::copy(&p, &sidecar_path)?;
+                make_executable(&sidecar_path)?;
+                if let Some(want) = &pin {
+                    fs::write(&bundled_rev_sentinel, want)?;
+                }
+                return Ok(());
+            }
+            Ok(false) => {
+                // Sibling exists but its version doesn't match the
+                // pin. Loud warning + fall through to the release
+                // download so the user lands on the right daemon.
+                let actual =
+                    sibling_binary_version(&p).unwrap_or_else(|e| format!("(unreadable: {e})"));
+                println!(
+                    "cargo:warning=ignoring sibling {} — it reports version {} but \
+                     .myownmesh-rev pins {}. To use the sibling for dev, rebuild it \
+                     against the pinned tag (cd ../MyOwnMesh && git fetch && git \
+                     checkout {pin_tag} && cargo build --bin myownmesh) or set \
+                     MYOWNLLM_MESH_BIN to override the pin entirely.",
+                    p.display(),
+                    actual,
+                    pin.as_deref().unwrap_or("(none)"),
+                    pin_tag = pin.as_deref().unwrap_or("v0.0.0"),
+                );
+            }
+            Err(e) => {
+                println!(
+                    "cargo:warning=ignoring sibling {} — couldn't read its version: {}",
+                    p.display(),
+                    e
+                );
+            }
+        }
     }
 
     // 3. Prebuilt release asset from MyOwnMesh's GitHub Releases.
@@ -685,4 +732,37 @@ fn find_sibling_workspace_binary(crate_dir: &Path, exe_suffix: &str) -> Option<P
             .join(&bin_name),
     ];
     candidates.into_iter().find(|p| p.exists())
+}
+
+/// Run `<binary> --version` and return the version token (e.g.
+/// "0.1.2"). clap's default `--version` prints `myownmesh 0.1.2\n`;
+/// we take the last whitespace-separated token of the first line.
+fn sibling_binary_version(p: &Path) -> Result<String, String> {
+    let out = Command::new(p)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("exit code: {:?}", out.status.code()));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let first = raw.lines().next().unwrap_or("").trim();
+    let token = first
+        .split_whitespace()
+        .next_back()
+        .ok_or_else(|| format!("empty --version output: {first:?}"))?;
+    Ok(token.to_string())
+}
+
+/// True iff the sibling binary's reported version matches the pin
+/// in `.myownmesh-rev`. The pin format is `vMAJOR.MINOR.PATCH` (or
+/// raw, no `v`); the binary reports `MAJOR.MINOR.PATCH`. A missing
+/// pin means "no version contract" — trust the sibling.
+fn sibling_binary_version_matches(p: &Path, pin: Option<&str>) -> Result<bool, String> {
+    let actual = sibling_binary_version(p)?;
+    let Some(want) = pin else {
+        return Ok(true);
+    };
+    let want_stripped = want.strip_prefix('v').unwrap_or(want);
+    Ok(actual == want_stripped)
 }
