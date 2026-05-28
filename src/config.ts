@@ -181,6 +181,17 @@ export async function loadConfig(): Promise<Config> {
 }
 
 function mergeDefaults(raw: Record<string, unknown>): Config {
+  // One-shot recovery for users hit by the daemon-collision bug
+  // (pre-PR #208): the bundled `myownmesh` daemon used to write its
+  // own `MeshConfig`-shape `config.json` over the LLM's
+  // `~/.myownllm/config.json`, wiping every LLM key. This rebuilds
+  // what we can — the daemon kept the user's networks at a
+  // top-level `networks` field, so we lift them into
+  // `cloud_mesh.networks` (with sensible defaults for the
+  // LLM-only fields the daemon doesn't carry), and strip the
+  // daemon-shape leftover keys so subsequent saves are clean.
+  raw = salvageDaemonShapeLeakage(raw);
+
   const merged: Config = {
     ...DEFAULT_CONFIG,
     ...(raw as Partial<Config>),
@@ -248,6 +259,162 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
     merged.active_family = DEFAULT_CONFIG.active_family;
   }
   return merged;
+}
+
+/** One-shot recovery for the daemon-collision bug fixed in PR #208.
+ *
+ *  Up through that PR, the bundled `myownmesh serve` daemon was
+ *  spawned with `MYOWNMESH_HOME=~/.myownllm`, which put its own
+ *  `MeshConfig`-shape `config.json` at the same path as the LLM's
+ *  `~/.myownllm/config.json`. Any `NetworkAdd` IPC call triggered
+ *  the daemon's `persist_network_add` → `MeshConfig::load() → push
+ *  → save`, which silently dropped every LLM-only key from the
+ *  loaded config and wrote the daemon shape back over the file.
+ *
+ *  Users who hit this see, on next launch, a config.json with the
+ *  daemon's top-level `{version, identity_path, auto_update,
+ *  auto_cleanup, daemon, networks}` shape and none of the LLM's
+ *  fields. The new build's Rust-side isolation prevents recurrence,
+ *  but the file on disk needs cleanup.
+ *
+ *  This function:
+ *   1. Detects the daemon shape (top-level `networks` array with
+ *      `id` + `network_id` fields, AND `cloud_mesh.networks` empty
+ *      or absent).
+ *   2. Converts each daemon `NetworkConfig` into the LLM's flat
+ *      shape and seeds `cloud_mesh.networks` with the result.
+ *      LLM-only fields the daemon doesn't carry (`accepting`,
+ *      `agent_permissions`, `prompts`, `auto_gossip`) default to
+ *      their fresh values via `mergeNetwork`.
+ *   3. Strips the daemon-shape leftover top-level keys so the
+ *      saved-back file is clean LLM shape going forward.
+ *
+ *  No-op when nothing matches the detection signature — fresh
+ *  installs and uncorrupted configs are untouched. */
+function salvageDaemonShapeLeakage(
+  raw: Record<string, unknown>,
+): Record<string, unknown> {
+  const daemonNetworks = raw["networks"];
+  if (!Array.isArray(daemonNetworks) || daemonNetworks.length === 0) {
+    return raw;
+  }
+  // Detection: each entry has `id` and `network_id`. If even one
+  // entry looks malformed, don't touch the file — the user might
+  // have hand-edited something we don't want to clobber.
+  const allDaemonShape = daemonNetworks.every(
+    (n): n is Record<string, unknown> =>
+      !!n &&
+      typeof n === "object" &&
+      typeof (n as Record<string, unknown>).id === "string" &&
+      typeof (n as Record<string, unknown>).network_id === "string",
+  );
+  if (!allDaemonShape) return raw;
+  // Only salvage when the LLM-side cloud_mesh.networks isn't
+  // already populated — otherwise we'd risk double-adding.
+  const existingCloudMesh = raw["cloud_mesh"] as
+    | { networks?: unknown }
+    | undefined;
+  const existingLlmNetworks = Array.isArray(existingCloudMesh?.networks)
+    ? (existingCloudMesh!.networks as unknown[])
+    : [];
+  if (existingLlmNetworks.length > 0) {
+    // We have both shapes. Trust the LLM shape; just strip the
+    // daemon-shape leftovers so saves stay clean.
+    return stripDaemonLeftovers(raw);
+  }
+  // Convert daemon NetworkConfig → LLM NetworkConfig. Field
+  // mapping:
+  //   daemon.signaling.servers           → llm.signaling_servers
+  //   daemon.stun_servers[].urls flat    → llm.stun_servers
+  //   daemon.turn_servers[].urls[0]/auth → llm.turn_servers[]
+  //   everything else (label, kind, topology, auto_approve)
+  //     passes straight through.
+  const recovered: Array<Partial<NetworkConfig>> = daemonNetworks.map((n) => {
+    const d = n as Record<string, unknown>;
+    const signaling = d["signaling"] as
+      | { servers?: unknown }
+      | undefined;
+    const signaling_servers = Array.isArray(signaling?.servers)
+      ? (signaling!.servers as unknown[]).filter(
+          (s): s is string => typeof s === "string",
+        )
+      : [];
+    const stunRaw = Array.isArray(d["stun_servers"])
+      ? (d["stun_servers"] as unknown[])
+      : [];
+    const stun_servers: string[] = [];
+    for (const entry of stunRaw) {
+      if (!entry || typeof entry !== "object") continue;
+      const urls = (entry as { urls?: unknown }).urls;
+      if (Array.isArray(urls)) {
+        for (const u of urls) {
+          if (typeof u === "string") stun_servers.push(u);
+        }
+      }
+    }
+    const turnRaw = Array.isArray(d["turn_servers"])
+      ? (d["turn_servers"] as unknown[])
+      : [];
+    const turn_servers: NetworkConfig["turn_servers"] = [];
+    for (const entry of turnRaw) {
+      if (!entry || typeof entry !== "object") continue;
+      const e = entry as Record<string, unknown>;
+      const urls = Array.isArray(e["urls"]) ? (e["urls"] as unknown[]) : [];
+      const firstUrl = urls.find((u): u is string => typeof u === "string");
+      if (!firstUrl) continue;
+      turn_servers.push({
+        url: firstUrl,
+        username:
+          typeof e["username"] === "string" ? (e["username"] as string) : undefined,
+        credential:
+          typeof e["credential"] === "string"
+            ? (e["credential"] as string)
+            : undefined,
+      });
+    }
+    return {
+      id: d["id"] as string,
+      network_id: d["network_id"] as string,
+      label: typeof d["label"] === "string" ? (d["label"] as string) : undefined,
+      kind:
+        d["kind"] === "open" || d["kind"] === "closed"
+          ? (d["kind"] as NetworkConfig["kind"])
+          : undefined,
+      topology: d["topology"] as NetworkConfig["topology"] | undefined,
+      auto_approve:
+        typeof d["auto_approve"] === "boolean"
+          ? (d["auto_approve"] as boolean)
+          : undefined,
+      signaling_servers,
+      stun_servers,
+      turn_servers,
+    };
+  });
+  const stripped = stripDaemonLeftovers(raw);
+  stripped["cloud_mesh"] = {
+    ...(stripped["cloud_mesh"] as Record<string, unknown> | undefined),
+    networks: recovered,
+  };
+  return stripped;
+}
+
+/** Remove top-level keys the daemon previously wrote into our
+ *  config.json so the saved-back file stays clean LLM shape.
+ *
+ *  `auto_update` and `auto_cleanup` are shared keys (both shapes
+ *  define them with compatible fields); the LLM's `mergeDefaults`
+ *  merges them with LLM defaults so the user's values — whichever
+ *  shape they were last in — are preserved. Only the daemon-only
+ *  keys come out. */
+function stripDaemonLeftovers(
+  raw: Record<string, unknown>,
+): Record<string, unknown> {
+  const out = { ...raw };
+  delete out["version"];
+  delete out["identity_path"];
+  delete out["daemon"];
+  delete out["networks"];
+  return out;
 }
 
 /** Generate a stable internal id for a saved network. Independent

@@ -9,12 +9,14 @@
 //! 1. **Shared daemon**: `~/.myownmesh/daemon.sock`. If MyOwnMesh GUI
 //!    is running, its daemon already binds this socket. Connecting
 //!    here shares identity, roster, and networks across both apps.
-//! 2. **LLM-owned daemon**: `~/.myownllm/daemon.sock`. We spawn
-//!    `myownmesh serve` with `MYOWNMESH_HOME=~/.myownllm` so the
-//!    daemon reads/writes the LLM's existing on-disk layout
-//!    (`identity.json`, `mesh/rosters/...`) instead of the
-//!    MyOwnMesh default. This keeps existing users on their current
-//!    pubkey when no GUI is present.
+//! 2. **LLM-owned daemon**: `~/.myownllm/.myownmesh/daemon.sock`.
+//!    We spawn `myownmesh serve` with
+//!    `MYOWNMESH_HOME=~/.myownllm/.myownmesh/` so the daemon's
+//!    `config.json` + `updates/` stay isolated from the LLM's
+//!    `~/.myownllm/config.json` + `~/.myownllm/updates/`. Identity,
+//!    rosters, and signed governance states get pre-migrated into
+//!    the subdir by `mesh::migration::migrate_daemon_state_into_subdir`
+//!    so existing users keep their pubkey + peer approvals.
 //!
 //! The choice is sticky for the app lifetime — we don't dynamically
 //! switch sockets if the GUI starts mid-session. A future "merge
@@ -221,7 +223,8 @@ pub enum DaemonMode {
     /// lifetime.
     Shared,
     /// We spawned the daemon ourselves with
-    /// `MYOWNMESH_HOME=~/.myownllm`. We own the child process.
+    /// `MYOWNMESH_HOME=~/.myownllm/.myownmesh/`. We own the child
+    /// process.
     OwnLlm,
 }
 
@@ -246,13 +249,22 @@ impl fmt::Display for SocketAddr {
 /// On Windows the namespaced pipe segment is shared between modes —
 /// we still spawn our own daemon if probing the existing one fails,
 /// but the wire name is the same.
+///
+/// Per-mode Unix paths mirror the daemon's
+/// `MYOWNMESH_HOME/daemon.sock` layout:
+/// - `Shared`: `~/.myownmesh/daemon.sock` — the MyOwnMesh GUI's
+///   default location.
+/// - `OwnLlm`: `~/.myownllm/.myownmesh/daemon.sock` — the LLM
+///   spawns its own daemon with `MYOWNMESH_HOME=~/.myownllm/.myownmesh/`
+///   so the daemon's `config.json` + `updates/` don't collide with
+///   the LLM's. See `mesh/migration.rs` for the why.
 fn socket_for_mode(mode: DaemonMode) -> Result<SocketAddr> {
     #[cfg(unix)]
     {
         let home = dirs::home_dir().context("no home dir")?;
         let dir = match mode {
             DaemonMode::Shared => home.join(".myownmesh"),
-            DaemonMode::OwnLlm => home.join(".myownllm"),
+            DaemonMode::OwnLlm => home.join(".myownllm").join(".myownmesh"),
         };
         Ok(SocketAddr::Path(dir.join("daemon.sock")))
     }
@@ -757,7 +769,8 @@ pub async fn ensure_daemon_running() -> Result<(ControlClient, Option<DaemonChil
         );
         return Ok((client, None));
     }
-    // 2. Own-LLM mode: existing daemon at ~/.myownllm/daemon.sock?
+    // 2. Own-LLM mode: existing daemon at
+    //    ~/.myownllm/.myownmesh/daemon.sock?
     if let Some(client) = probe(DaemonMode::OwnLlm).await {
         eprintln!(
             "daemon: attached to existing own-LLM daemon at {}",
@@ -765,8 +778,9 @@ pub async fn ensure_daemon_running() -> Result<(ControlClient, Option<DaemonChil
         );
         return Ok((client, None));
     }
-    // 3. No daemon up — spawn our own with MYOWNMESH_HOME=~/.myownllm
-    //    so it reads/writes the LLM's existing on-disk layout. We
+    // 3. No daemon up — spawn our own with
+    //    MYOWNMESH_HOME=~/.myownllm/.myownmesh/ so the daemon's
+    //    config.json + updates/ stay isolated from the LLM's. We
     //    iterate every viable binary location (`daemon_binary_
     //    candidates`); a stale or broken file at one location is
     //    skipped in favour of a working binary at the next. The
@@ -781,7 +795,17 @@ pub async fn ensure_daemon_running() -> Result<(ControlClient, Option<DaemonChil
              `cargo build -p myownmesh`."
         ));
     }
-    let home = dirs::home_dir().context("no home dir")?.join(".myownllm");
+    // Daemon's MYOWNMESH_HOME — isolated under `~/.myownllm/.myownmesh/`
+    // so the daemon's `config.json` + `updates/` don't collide with
+    // the LLM's. The substrate reads/writes everything (identity,
+    // rosters, states, config, updates) under this dir; identity +
+    // rosters + states get pre-migrated into here by
+    // `mesh::migration::migrate_daemon_state_into_subdir` so existing
+    // users keep their pubkey + peer approvals.
+    let home = dirs::home_dir()
+        .context("no home dir")?
+        .join(".myownllm")
+        .join(".myownmesh");
 
     let mut last_err: Option<String> = None;
     for bin in &candidates {

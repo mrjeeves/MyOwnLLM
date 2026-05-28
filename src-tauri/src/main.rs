@@ -838,17 +838,36 @@ fn main() {
     #[cfg(target_os = "linux")]
     quiet_alsa_diagnostics();
 
-    // Point myownmesh-core at our existing data directory before any
-    // mesh module is touched. The substrate defaults to `~/.myownmesh/`,
-    // but MyOwnLLM has shipped `~/.myownllm/.secrets/identity.json` and
-    // `~/.myownllm/mesh/rosters/*.json` for many releases — moving the
-    // anchor would orphan every user's Device ID and peer approvals.
-    // `MYOWNMESH_HOME` overrides the default at the source. Set
-    // unconditionally; explicit override wins if the user set one
-    // themselves (mostly relevant for cross-app test harnesses).
+    // Point myownmesh-core at a dedicated subdirectory under the LLM's
+    // tree (`~/.myownllm/.myownmesh/`) before any mesh module is
+    // touched. PRs #203/#205 set `MYOWNMESH_HOME=~/.myownllm` so the
+    // daemon shared identity + rosters with the LLM under one
+    // directory, but the daemon also writes its own
+    // `{MYOWNMESH_HOME}/config.json` — colliding with the LLM's
+    // `~/.myownllm/config.json` (different schemas). Any
+    // `NetworkAdd` IPC call triggered the daemon's
+    // `persist_network_add` → `MeshConfig::load() → push → save`,
+    // which silently dropped every LLM-only key from the loaded
+    // config and wrote the daemon shape back over the file. From the
+    // user's perspective: "I saved a network, restarted, and all my
+    // settings were gone."
+    //
+    // The subdirectory keeps the daemon's config.json + updates/
+    // isolated. Identity, rosters, and governance states get moved
+    // into the subdir on first launch so existing users keep their
+    // pubkey + peer approvals — losing identity continuity would
+    // orphan every user's Device ID. Migration is idempotent and
+    // best-effort; the function logs failures to stderr and the
+    // daemon falls back to default-empty state in the worst case.
     if std::env::var_os("MYOWNMESH_HOME").is_none() {
-        if let Ok(dir) = myownllm_dir() {
-            std::env::set_var("MYOWNMESH_HOME", dir);
+        if let Ok(llm_dir) = myownllm_dir() {
+            let daemon_home = llm_dir.join(".myownmesh");
+            if let Err(e) =
+                mesh::migration::migrate_daemon_state_into_subdir(&llm_dir, &daemon_home)
+            {
+                eprintln!("mesh-migration: failed: {e:#}");
+            }
+            std::env::set_var("MYOWNMESH_HOME", &daemon_home);
         }
     }
     // Pre-multi-network rosters lived at `~/.myownllm/mesh/roster.json`
