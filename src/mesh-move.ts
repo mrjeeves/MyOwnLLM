@@ -44,6 +44,17 @@ import type { RpcInboundCall } from "./mesh-daemon.svelte";
 
 interface MoveClient {
   callRpc(peer: string, method: string, payload: unknown): Promise<unknown>;
+  /** Read-only access to the cached peer list. Used by
+   *  `pullConversation` to look up the source's folder for the
+   *  guid being pulled — the conversation JSON itself doesn't
+   *  carry path, so without the cached catalog entry the pulled
+   *  conversation would land at root regardless of where it lived
+   *  on the source. */
+  peers: ReadonlyArray<{
+    device_pubkey: string;
+    peer_id: string;
+    catalog: ReadonlyArray<{ guid: string; path?: string }>;
+  }>;
 }
 
 /** Read a conversation from a peer's local disk. Doesn't delete. */
@@ -113,14 +124,23 @@ export async function moveConversation(
  *  we've already saved locally, the source still has its copy and
  *  the user ends up with both — surface a warning rather than
  *  roll back the local save, since the local save is what they
- *  asked for. */
+ *  asked for.
+ *
+ *  Folder preservation: the conversation JSON the source returns
+ *  doesn't carry its on-disk folder (that's a filesystem fact, not
+ *  conversation content), so we look the path up in our cached
+ *  catalog of the source peer and pass it as `target_folder` to
+ *  `saveConversation`. Falls back to root when the catalog hasn't
+ *  caught up (e.g. mid-handshake pull) — matches Push's behaviour
+ *  via `move_take.source_folder`. */
 export async function pullConversation(
   client: MoveClient,
   guid: string,
   source_peer_id: string,
 ): Promise<void> {
   const conversation = await fetchRemoteSession(client, source_peer_id, guid);
-  await saveConversation(conversation);
+  const source_folder = sourceFolderFromCatalog(client, source_peer_id, guid);
+  await saveConversation(conversation, source_folder);
   try {
     const resp = (await client.callRpc(source_peer_id, "move_drop", {
       guid,
@@ -134,6 +154,22 @@ export async function pullConversation(
       `saved locally but couldn't ask source to delete: ${e}`,
     );
   }
+}
+
+/** Look up a peer's folder path for `guid` from the cached
+ *  catalog. Returns an empty string when the catalog hasn't seen
+ *  the entry yet or the path is missing (older peer or root). */
+function sourceFolderFromCatalog(
+  client: MoveClient,
+  source_peer_id: string,
+  guid: string,
+): string {
+  const peer = client.peers.find(
+    (p) => p.peer_id === source_peer_id || p.device_pubkey === source_peer_id,
+  );
+  if (!peer) return "";
+  const entry = peer.catalog.find((c) => c.guid === guid);
+  return entry?.path ?? "";
 }
 
 // ----------------------------------------------------------------------
