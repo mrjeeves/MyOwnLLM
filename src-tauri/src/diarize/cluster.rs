@@ -30,8 +30,9 @@ use std::time::Duration;
 
 /// Configuration for the online clusterer.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // `stale_after` is wired in for the cold-start re-label
-                    // pass that lands with the ort wire-up — see PROGRESS.md.
+#[allow(dead_code)] // `stale_after` is reserved for the cold-start re-label
+                    // pass; not yet read by the live pipeline but kept on
+                    // the struct so config callers can set it ahead of time.
 pub struct ClusterConfig {
     /// Loose threshold: cosine *distance* (1 - cosine similarity) at
     /// or under which an embedding joins the nearest centroid *and*
