@@ -276,6 +276,17 @@
       // run the install lazily).
       view = "chat";
       invoke("ollama_ensure_running").catch(() => {});
+
+      // Proactively warm the chat model in the background so its
+      // one-time cold load happens now — with the throttled server
+      // keeping the machine responsive — rather than freezing the user
+      // on their first message. Skipped when the model isn't on disk
+      // yet (the download overlay owns that flow) or when keep_alive is
+      // "0" (warming would just load-then-unload). Fire-and-forget.
+      if (pendingTextModel && !textModelMissing && config.ollama_keep_alive !== "0") {
+        invoke("ollama_warm", { model: pendingTextModel }).catch(() => {});
+      }
+
       kickUpdateCheck();
 
       // Seed the sidebar early so it's ready when the chat view paints.

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { onDestroy } from "svelte";
+  import { onDestroy, tick } from "svelte";
   import TopBar from "./TopBar.svelte";
   import TextBar from "./TextBar.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
@@ -185,6 +185,20 @@
   // Belt-and-suspenders: never leak the interval if the panel is torn
   // down (mode switch, conversation close) mid-load.
   onDestroy(stopStatsPoll);
+
+  /** Resolve once the browser has actually painted: a Svelte tick to
+   *  flush the DOM update, then two animation frames so the compositor
+   *  draws the frame. We await this after showing the load dialog and
+   *  before kicking off a cold model load — a heavy load can thrash a
+   *  laptop badly enough that an un-painted dialog would never appear. */
+  function nextPaint(): Promise<void> {
+    return tick().then(
+      () =>
+        new Promise<void>((resolve) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+        }),
+    );
+  }
 
   /** Format a byte count as a compact GB string for the readout. */
   function fmtGb(bytes: number | null | undefined): string {
@@ -915,13 +929,30 @@
       enabledToolSet.has(t.definition.function.name),
     );
 
-    // Arm the cold-start dialog: if no frame has come back by the
-    // delay, the model is (re)loading into memory and we tell the
-    // user so. clearModelLoadWait() below disarms it on first frame.
-    modelLoadTimer = setTimeout(() => {
+    // Cold-start dialog. A model that isn't resident yet can thrash a
+    // laptop hard enough that a reactively-delayed dialog never gets to
+    // paint — so when we can confirm (via Ollama's /api/ps) that the
+    // model isn't loaded, we show the dialog and force a paint BEFORE
+    // firing the request. For the warm case, the remote path, or an
+    // unknown ps result, we keep the lightweight 5s reactive timer.
+    let coldStart = false;
+    if (!routeViaDevicePubkey) {
+      try {
+        coldStart = !(await invoke<boolean>("ollama_model_loaded", { model: activeModel }));
+      } catch {
+        // ps unavailable — fall back to the reactive timer below.
+      }
+    }
+    if (coldStart) {
       modelLoading = true;
       startStatsPoll();
-    }, MODEL_LOAD_POPUP_DELAY_MS);
+      await nextPaint(); // get the dialog on screen before the load freeze
+    } else {
+      modelLoadTimer = setTimeout(() => {
+        modelLoading = true;
+        startStatsPoll();
+      }, MODEL_LOAD_POPUP_DELAY_MS);
+    }
 
     try {
       await runAgent({

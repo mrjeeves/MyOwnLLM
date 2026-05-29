@@ -284,10 +284,24 @@ pub async fn ensure_running() -> Result<()> {
     let child = quiet_tokio_command("ollama")
         .arg("serve")
         .env("OLLAMA_ORIGINS", "*")
+        // Cap memory pressure on the laptop-class machines that freeze
+        // hard while a model pages in: keep at most one model resident,
+        // and serve one request at a time, so Ollama never tries to
+        // hold two models (or N parallel KV caches) in RAM/VRAM at once.
+        .env("OLLAMA_MAX_LOADED_MODELS", "1")
+        .env("OLLAMA_NUM_PARALLEL", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .context("failed to spawn ollama serve")?;
+
+    // Throttle the server we just spawned so the disk thrash of loading
+    // a model doesn't lock up the whole desktop. Best-effort, and only
+    // possible because WE own this process — when Ollama is already
+    // running as a system/tray service we never reach this branch.
+    if let Some(pid) = child.id() {
+        crate::process::lower_priority(pid).await;
+    }
 
     *guard = Some(child);
 
@@ -595,14 +609,41 @@ pub async fn has_model(model: &str) -> Result<bool> {
     Ok(out.success())
 }
 
+/// True when `model` is currently loaded in Ollama's memory — i.e. the
+/// next chat won't pay a cold load. Queried via `/api/ps`. On any error
+/// (Ollama down, curl missing, unparseable body) we return `false` so
+/// callers fall back to showing the load dialog rather than wrongly
+/// skipping it. Ollama reports loaded models under either `name` or
+/// `model`, so we match on both.
+pub async fn is_model_loaded(model: &str) -> bool {
+    let Ok(body) = reqwest_get("http://127.0.0.1:11434/api/ps").await else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    v.get("models")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter().any(|e| {
+                e.get("name").and_then(|n| n.as_str()) == Some(model)
+                    || e.get("model").and_then(|n| n.as_str()) == Some(model)
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Fire a 1-token chat call so Ollama mmaps the weights and keeps the model loaded
-/// for `keep_alive`. Used by `myownllm preload --warm`.
+/// for `keep_alive`. Used by `myownllm preload --warm` and the startup warm.
+/// Honors the user's configured `keep_alive` so a proactive warm respects
+/// the same residency window as real chats (warming with "0" would just
+/// load-then-unload, so callers skip warming in that case).
 pub async fn warm(model: &str) -> Result<()> {
     let body = serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": "ok"}],
         "stream": false,
-        "keep_alive": "10m",
+        "keep_alive": chat_keep_alive(),
         "options": { "num_predict": 1 }
     })
     .to_string();
