@@ -58,6 +58,57 @@ pub struct AsrCaps {
     /// How many successful chunks between forced internal-state resets,
     /// to bound long-recording memory growth. 0 disables the recycle.
     pub state_reset_chunks: u64,
+    /// Live-path sliding-window length in seconds: the span of audio
+    /// the rolling streaming loop re-decodes each hop. In streaming
+    /// mode this is the unit of linguistic context the model sees,
+    /// taking over the role `chunk_seconds` plays for the disk-shard
+    /// (upload/drain) path.
+    pub window_seconds: f32,
+    /// Live-path hop in seconds: how far the rolling window advances
+    /// between decodes. Sets the interim-caption refresh cadence —
+    /// smaller is snappier but costs more inference per wall-second.
+    pub hop_seconds: f32,
+    /// Live-path hard cap (seconds) on the rolling window when a
+    /// speaker never pauses, bounding per-hop compute and memory.
+    pub max_context_seconds: f32,
+}
+
+/// One decoded token with the time it ends at, relative to the chunk
+/// start. Backends populate [`AsrSegment::tokens`] with these so the
+/// live streaming loop can run its LocalAgreement-2 confirmation (see
+/// [`crate::asr::streaming`]); the disk-shard (upload/drain) path
+/// leaves them empty. Word-level for Moonshine (which has no per-token
+/// timing — `t_ms` is distributed across the chunk) and word-level
+/// with real frame times for Parakeet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AsrToken {
+    pub text: String,
+    /// End time in milliseconds relative to the chunk start.
+    pub t_ms: u64,
+}
+
+impl AsrToken {
+    pub fn new(text: impl Into<String>, t_ms: u64) -> Self {
+        Self {
+            text: text.into(),
+            t_ms,
+        }
+    }
+
+    /// Split `text` into whitespace-delimited word tokens with end
+    /// times spread uniformly across `end_ms`. For backends with no
+    /// per-token timing (Moonshine; a Parakeet export lacking a
+    /// timestamps output): the streaming loop confirms by text, so
+    /// approximate times are enough to place audio on the clock.
+    pub fn words_uniform(text: &str, end_ms: u64) -> Vec<AsrToken> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let count = words.len().max(1) as u64;
+        words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| AsrToken::new(*w, end_ms * (i as u64 + 1) / count))
+            .collect()
+    }
 }
 
 /// One unit of decoded speech. Backends emit segments with timestamps
@@ -72,6 +123,12 @@ pub struct AsrSegment {
     /// Average per-token log-probability if the backend can produce
     /// one. Surfaced for diagnostics; the UI doesn't render it today.
     pub confidence: Option<f32>,
+    /// Token-level breakdown for the live streaming loop's
+    /// LocalAgreement policy. Empty on the disk-shard path (which only
+    /// needs whole-segment text). Defaults to empty so existing
+    /// construction sites and JSON consumers are unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<AsrToken>,
 }
 
 /// What a backend reports after processing one chunk. `used_state`

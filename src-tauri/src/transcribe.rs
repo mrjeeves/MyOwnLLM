@@ -2256,6 +2256,7 @@ mod tests {
             end_ms,
             text: text.into(),
             confidence: None,
+            tokens: Vec::new(),
         }
     }
 

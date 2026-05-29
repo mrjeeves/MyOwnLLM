@@ -29,28 +29,13 @@
 //! `AsrCaps` fields and `ClusterConfig::stale_after`.
 #![allow(dead_code)]
 
-/// One decoded token plus the time it ends at.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamToken {
-    /// Surface text exactly as the backend emitted it — a whole word
-    /// for Moonshine, a SentencePiece sub-word for Parakeet.
-    pub text: String,
-    /// End time of the token in milliseconds relative to the start of
-    /// the current utterance window. Backends that don't expose
-    /// per-token timing (Moonshine decodes a whole chunk to one string)
-    /// leave this `0`; agreement falls back to text-only matching,
-    /// which is why [`norm`] does the comparison rather than `==`.
-    pub t_ms: u64,
-}
-
-impl StreamToken {
-    pub fn new(text: impl Into<String>, t_ms: u64) -> Self {
-        Self {
-            text: text.into(),
-            t_ms,
-        }
-    }
-}
+// The token type is the trait-level `AsrToken` (text + chunk-relative
+// end time): backends already produce these on `AsrSegment::tokens`,
+// so the worker feeds them straight into `LocalAgreement` with no
+// conversion. Agreement compares on `norm`-alised text, which is why
+// timeless tokens (Moonshine leaves `t_ms` distributed/approximate)
+// still confirm correctly.
+use super::AsrToken;
 
 /// Normalise a token's surface text for agreement comparison. Trims
 /// surrounding whitespace (Parakeet sub-words carry a leading word
@@ -65,7 +50,7 @@ fn norm(s: &str) -> String {
 /// on [`norm`]-alised text. The heart of LocalAgreement: this many
 /// leading tokens are identical between the previous hypothesis and
 /// the current one, so they're safe to confirm.
-fn common_prefix_len(a: &[StreamToken], b: &[StreamToken]) -> usize {
+fn common_prefix_len(a: &[AsrToken], b: &[AsrToken]) -> usize {
     let mut n = 0;
     while n < a.len() && n < b.len() && norm(&a[n].text) == norm(&b[n].text) {
         n += 1;
@@ -95,10 +80,10 @@ fn common_prefix_len(a: &[StreamToken], b: &[StreamToken]) -> usize {
 pub struct LocalAgreement {
     /// Tokens confirmed so far this utterance — two consecutive
     /// hypotheses agreed on them. Never rewritten.
-    confirmed: Vec<StreamToken>,
+    confirmed: Vec<AsrToken>,
     /// The previous hop's hypothesis tail past the confirmed prefix:
     /// the candidates we're waiting to see survive a second hop.
-    pending: Vec<StreamToken>,
+    pending: Vec<AsrToken>,
 }
 
 impl LocalAgreement {
@@ -109,19 +94,19 @@ impl LocalAgreement {
     /// Ingest one hop's whole-utterance hypothesis. Returns the tokens
     /// newly promoted to confirmed (empty when nothing stabilised this
     /// hop — common while the speaker is mid-word).
-    pub fn accept(&mut self, hyp: Vec<StreamToken>) -> Vec<StreamToken> {
+    pub fn accept(&mut self, hyp: Vec<AsrToken>) -> Vec<AsrToken> {
         // Skip the prefix the model re-states for already-confirmed
         // audio. We trust `confirmed` (immutable), so advance past
         // `confirmed.len()` leading hyp tokens rather than re-checking
         // them — if the model lightly rewrote settled text we keep the
         // confirmed version, which is the whole point of confirming.
         let skip = self.confirmed.len().min(hyp.len());
-        let tail: Vec<StreamToken> = hyp.into_iter().skip(skip).collect();
+        let tail: Vec<AsrToken> = hyp.into_iter().skip(skip).collect();
 
         // LocalAgreement-2: the prefix this hop's tail shares with the
         // previous hop's tail has now been seen twice → confirm it.
         let agreed = common_prefix_len(&self.pending, &tail);
-        let newly: Vec<StreamToken> = tail[..agreed].to_vec();
+        let newly: Vec<AsrToken> = tail[..agreed].to_vec();
         self.confirmed.extend(newly.iter().cloned());
 
         // Everything past the agreed prefix is the new interim tail and
@@ -132,12 +117,12 @@ impl LocalAgreement {
 
     /// The current interim (unconfirmed) tail — render this distinctly
     /// (lower opacity / italic) and replace it in place each hop.
-    pub fn interim(&self) -> &[StreamToken] {
+    pub fn interim(&self) -> &[AsrToken] {
         &self.pending
     }
 
     /// Everything confirmed this utterance so far.
-    pub fn confirmed(&self) -> &[StreamToken] {
+    pub fn confirmed(&self) -> &[AsrToken] {
         &self.confirmed
     }
 
@@ -145,7 +130,7 @@ impl LocalAgreement {
     /// reset for the next one. Returns the tokens that were just
     /// finalised (the interim tail at the moment of the pause), which
     /// the worker emits as the closing final segment.
-    pub fn finalize(&mut self) -> Vec<StreamToken> {
+    pub fn finalize(&mut self) -> Vec<AsrToken> {
         let tail = std::mem::take(&mut self.pending);
         self.confirmed.clear();
         tail
@@ -320,15 +305,15 @@ impl SilenceEndpointer {
 mod tests {
     use super::*;
 
-    fn toks(words: &[&str]) -> Vec<StreamToken> {
+    fn toks(words: &[&str]) -> Vec<AsrToken> {
         words
             .iter()
             .enumerate()
-            .map(|(i, w)| StreamToken::new(*w, (i as u64 + 1) * 200))
+            .map(|(i, w)| AsrToken::new(*w, (i as u64 + 1) * 200))
             .collect()
     }
 
-    fn texts(t: &[StreamToken]) -> Vec<String> {
+    fn texts(t: &[AsrToken]) -> Vec<String> {
         t.iter().map(|x| x.text.clone()).collect()
     }
 
@@ -379,12 +364,12 @@ mod tests {
         // least as much audio as the first.
         let mut la = LocalAgreement::new();
         la.accept(vec![
-            StreamToken::new("Hello", 200),
-            StreamToken::new("there", 400),
+            AsrToken::new("Hello", 200),
+            AsrToken::new("there", 400),
         ]);
         let newly = la.accept(vec![
-            StreamToken::new("hello", 200),
-            StreamToken::new(" there ", 400),
+            AsrToken::new("hello", 200),
+            AsrToken::new(" there ", 400),
         ]);
         assert_eq!(
             newly.len(),
