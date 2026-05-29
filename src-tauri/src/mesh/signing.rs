@@ -8,4 +8,4 @@
 //! which reads `MYOWNMESH_HOME` — set to `~/.myownllm` in `main.rs`
 //! — so the local Device ID is unchanged.
 
-pub use myownmesh_core::signing::{pubkey_part, sign, verify};
+pub use myownmesh_core::signing::{sign, verify};

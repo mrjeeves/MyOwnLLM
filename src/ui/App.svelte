@@ -7,6 +7,7 @@
   import Chat from "./Chat.svelte";
   import TranscribeView from "./TranscribeView.svelte";
   import Sidebar from "./Sidebar.svelte";
+  import LoadingPulse from "./LoadingPulse.svelte";
   import PermissionPromptModal from "./PermissionPromptModal.svelte";
   import { loadConfig, updateConfig } from "../config";
   import { getActiveManifest } from "../providers";
@@ -83,6 +84,12 @@
   type View = "loading" | "chat";
 
   let view = $state<View>("loading");
+  /** True while the startup warm is in flight: we keep a full-screen
+   *  loading screen up (rather than dropping into a chat that feels
+   *  sluggish because it's competing with the cold load) until the model
+   *  is resident. The chat still mounts behind it, so it's fully ready
+   *  when the screen lifts. A "Continue" button is the escape hatch. */
+  let warming = $state(false);
   let appVersion = $state("");
   let hardware = $state<HardwareProfile | null>(null);
   let activeModel = $state("");
@@ -276,6 +283,31 @@
       // run the install lazily).
       view = "chat";
       invoke("ollama_ensure_running").catch(() => {});
+
+      // Warm the chat model so the first message doesn't pay the cold-load
+      // wait. On by default; the load runs under the configured throttle
+      // (Settings → Performance). Skipped when the user turned it off, when
+      // the model isn't on disk yet (the download overlay owns that), or
+      // when keep_alive is "0" (warming would just load-then-unload).
+      //
+      // We hold a full-screen loading screen (`warming`) over the chat —
+      // which keeps mounting/initializing behind it — until the warm
+      // settles, so the user lands on a chat that's actually ready instead
+      // of one that feels sluggish while it competes with the cold load.
+      if (
+        config.warm_on_startup !== false &&
+        pendingTextModel &&
+        !textModelMissing &&
+        config.ollama_keep_alive !== "0"
+      ) {
+        warming = true;
+        invoke("ollama_warm", { model: pendingTextModel })
+          .catch(() => {})
+          .finally(() => {
+            warming = false;
+          });
+      }
+
       kickUpdateCheck();
 
       // Seed the sidebar early so it's ready when the chat view paints.
@@ -1143,6 +1175,23 @@
        the same modal; the modal self-hides when the prompt queue
        drains. -->
   <PermissionPromptModal />
+
+  {#if warming}
+    <!-- Startup warm: keep a loading screen up until the model is
+         resident. The chat mounts behind this, so it's ready the moment
+         the screen lifts. Same shining word + live CPU/RAM as the in-chat
+         indicator, under the spinner. Continue is the escape hatch. -->
+    <div class="warming-overlay">
+      <div class="spinner"></div>
+      <LoadingPulse showStats={true} />
+      <button class="warming-skip" onclick={() => (warming = false)}>
+        Continue to chat →
+      </button>
+      {#if appVersion}
+        <p class="splash-version">v{appVersion}</p>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -1316,6 +1365,35 @@
     font-size: 0.7rem;
     color: #555;
     margin-top: -0.5rem;
+  }
+  /* Startup-warm loading screen. Full-screen, opaque, same look as the
+     initial splash (spinner on top, LoadingPulse just beneath). */
+  .warming-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 55;
+    background: #111;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    color: #888;
+  }
+  .warming-skip {
+    margin-top: 0.25rem;
+    background: none;
+    border: 1px solid #2a2a2a;
+    color: #888;
+    padding: 0.4rem 0.8rem;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: color 0.12s, border-color 0.12s;
+  }
+  .warming-skip:hover {
+    color: #ccc;
+    border-color: #3a3a55;
   }
   .spinner {
     width: 28px;

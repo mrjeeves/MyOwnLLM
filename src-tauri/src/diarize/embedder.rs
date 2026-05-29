@@ -234,10 +234,7 @@ impl Embedder {
         // is correct for both shapes since the leading axes are 1.
         let shape = view.shape().to_vec();
         if shape.last().copied().unwrap_or(0) == 0 {
-            return Err(anyhow!(
-                "embedder produced zero-length output ({:?})",
-                shape
-            ));
+            return Err(anyhow!("embedder produced zero-length output ({shape:?})"));
         }
         let mut out: Vec<f32> = view.iter().copied().collect();
         l2_normalize(&mut out);

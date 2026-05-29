@@ -1052,13 +1052,10 @@ async fn cmd_fetch_onnxruntime() -> Result<()> {
             let pct = (bytes as f64 / total as f64 * 100.0) as u64;
             let _ = write!(
                 std::io::stderr(),
-                "\r  {:>3}%  {:>10} / {:>10} bytes",
-                pct,
-                bytes,
-                total
+                "\r  {pct:>3}%  {bytes:>10} / {total:>10} bytes"
             );
         } else {
-            let _ = write!(std::io::stderr(), "\r  {:>10} bytes", bytes);
+            let _ = write!(std::io::stderr(), "\r  {bytes:>10} bytes");
         }
         let _ = std::io::stderr().flush();
     });

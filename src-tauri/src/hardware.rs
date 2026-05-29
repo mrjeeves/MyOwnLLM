@@ -177,6 +177,7 @@ fn read_proc_meminfo_total_gb() -> Option<f64> {
 }
 
 /// Pulled out for testability. Reads the `MemTotal: NNN kB` line.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Linux detect() + tests only
 fn parse_meminfo_total_kb(content: &str) -> Option<u64> {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
@@ -262,6 +263,7 @@ fn df_k_gb(path: &str) -> Option<f64> {
 /// rows; field 4 is `Available` in 1K blocks. Some `df` flavours wrap long
 /// device names onto a second line, so the available column may be on the
 /// row after the device name. Find the first row with a numeric column 4.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Linux detect() + tests only
 fn parse_df_avail_kb(out: &str) -> Option<u64> {
     for line in out.lines().skip(1) {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -303,6 +305,7 @@ fn detect_soc_label() -> Option<String> {
     None
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Linux detect() + tests only
 fn parse_device_tree_model(raw: &[u8]) -> Option<String> {
     // Trim trailing NUL bytes the kernel attaches to the device-tree string.
     let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
@@ -313,6 +316,7 @@ fn parse_device_tree_model(raw: &[u8]) -> Option<String> {
     Some(s.to_string())
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Linux detect() + tests only
 fn parse_cpuinfo_model(content: &str) -> Option<String> {
     // ARM kernels emit `Model : Raspberry Pi 5 Model B Rev 1.0` and/or
     // `Hardware : BCM2712`. Prefer the human-friendly Model line.

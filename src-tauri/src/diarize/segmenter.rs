@@ -227,8 +227,7 @@ impl Segmenter {
         let shape = logits.shape().to_vec();
         if shape.len() != 3 || shape[0] != 1 || shape[2] != 7 {
             return Err(anyhow!(
-                "unexpected segmenter output shape {:?} (want [1, T, 7])",
-                shape
+                "unexpected segmenter output shape {shape:?} (want [1, T, 7])"
             ));
         }
         let t_frames = shape[1];

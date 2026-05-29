@@ -2,24 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { scrollAffordance } from "../scroll-affordance";
-
-  // Mirrors the LiveSnapshot struct in src-tauri/src/usage.rs. Every
-  // field is optional on the Rust side so we can render "—" when a
-  // platform doesn't expose the underlying counter.
-  interface LiveSnapshot {
-    cpu_app_pct: number | null;
-    cpu_total_pct: number | null;
-    ram_app_bytes: number | null;
-    ram_total_bytes: number | null;
-    ram_used_bytes: number | null;
-    gpu_pct: number | null;
-    vram_app_bytes: number | null;
-    vram_used_bytes: number | null;
-    vram_total_bytes: number | null;
-    process_uptime_seconds: number;
-    cpu_brand: string | null;
-    cpu_count: number | null;
-  }
+  import type { LiveSnapshot } from "../../types";
 
   // Mirrors UsageStats in src-tauri/src/usage.rs.
   interface UsageStats {

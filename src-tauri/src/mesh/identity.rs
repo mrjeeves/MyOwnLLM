@@ -17,5 +17,5 @@
 //! `myownmesh-core` and aren't duplicated here.
 
 pub use myownmesh_core::identity::{
-    generate_network_id, load_or_create, normalize_network_id, set_label, Identity,
+    generate_network_id, load_or_create, normalize_network_id, set_label,
 };

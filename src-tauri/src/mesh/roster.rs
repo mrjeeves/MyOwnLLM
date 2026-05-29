@@ -23,8 +23,7 @@
 //! over.
 
 pub use myownmesh_core::roster::{
-    add_peer, add_peer_in, delete, empty_for, is_authorized, load, remove_peer, remove_peer_in,
-    save, AuthorizedPeer, Roster, ROSTER_VERSION,
+    add_peer, delete, load, remove_peer, save, AuthorizedPeer, Roster, ROSTER_VERSION,
 };
 
 /// One-shot migration from the pre-multi-network single roster file

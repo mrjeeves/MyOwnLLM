@@ -127,7 +127,7 @@ impl AsrBackend for ParakeetBackend {
                 .map_err(|e| anyhow!("ort threads: {e}"))?
                 .commit_from_file(&model_path_owned)
                 .map_err(|e| anyhow!("loading {}: {e}", model_path_owned.display()))
-                .with_context(|| format!("warm_up parakeet {}", model_name_owned))
+                .with_context(|| format!("warm_up parakeet {model_name_owned}"))
         })?;
 
         // Sniff I/O names. NeMo's istupakov export uses

@@ -1409,8 +1409,7 @@ fn run_session(
                         count_pending_chunks(&buffer_dir),
                         None,
                         Some(format!(
-                            "ASR inference error ({}/{}): {e:#}",
-                            consecutive_errors, ASR_CONSECUTIVE_ERROR_LIMIT
+                            "ASR inference error ({consecutive_errors}/{ASR_CONSECUTIVE_ERROR_LIMIT}): {e:#}"
                         )),
                     ),
                 );
@@ -2128,8 +2127,7 @@ fn ingest_loop(
                         count_pending_chunks(&buffer_dir),
                         None,
                         Some(format!(
-                            "Backlog full ({:.0} s); dropping oldest chunk to stay live.",
-                            MAX_BACKLOG_SECONDS
+                            "Backlog full ({MAX_BACKLOG_SECONDS:.0} s); dropping oldest chunk to stay live."
                         )),
                     ),
                 );

@@ -73,6 +73,25 @@ async fn ollama_list_models() -> Result<Vec<ollama::ModelInfo>, String> {
     ollama::list_models().await.map_err(|e| e.to_string())
 }
 
+/// True when `model` is already resident in Ollama's memory, so the
+/// next chat won't cold-load. The chat UI uses this to decide whether
+/// to paint the load dialog *before* firing the request (a cold load
+/// can thrash the machine hard enough that a delayed dialog never
+/// renders). Best-effort: returns false if Ollama can't be reached.
+#[tauri::command]
+async fn ollama_model_loaded(model: String) -> bool {
+    ollama::is_model_loaded(&model).await
+}
+
+/// Proactively load `model` into memory at the throttled server's low
+/// priority, so the one-time cold load happens at a predictable moment
+/// (e.g. just after launch) instead of freezing the user mid-chat.
+#[tauri::command]
+async fn ollama_warm(model: String) -> Result<(), String> {
+    ollama::ensure_running().await.map_err(|e| e.to_string())?;
+    ollama::warm(&model).await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn ollama_delete_model(name: String) -> Result<(), String> {
     ollama::delete_model(&name).await.map_err(|e| e.to_string())
@@ -632,7 +651,7 @@ fn mesh_file_save_at(path: String, bytes_b64: String) -> Result<(), String> {
     }
     let target = std::path::PathBuf::from(&path);
     if target.is_dir() {
-        return Err(format!("target {} is a directory", path));
+        return Err(format!("target {path} is a directory"));
     }
     // Best-effort: make sure the parent directory exists. The
     // save-dialog typically lands the user inside an existing folder,
@@ -1005,6 +1024,8 @@ fn main() {
             ollama_install,
             ollama_stop,
             ollama_list_models,
+            ollama_model_loaded,
+            ollama_warm,
             ollama_delete_model,
             preload_modes,
             ensure_tracked_models,

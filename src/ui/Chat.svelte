@@ -1,9 +1,11 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { tick } from "svelte";
   import TopBar from "./TopBar.svelte";
   import TextBar from "./TextBar.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import DownloadOverlay from "./DownloadOverlay.svelte";
+  import LoadingPulse from "./LoadingPulse.svelte";
   import {
     loadConversation,
     saveConversation,
@@ -119,6 +121,45 @@
   let messages = $state<Message[]>([]);
   let input = $state("");
   let streaming = $state(false);
+
+  /** Cold-start UX: Ollama loads a model's weights into RAM/VRAM on
+   *  the first request after it was evicted (or never loaded this
+   *  session). That gap — between firing the chat stream and the
+   *  first token coming back — is otherwise silent. When it runs long
+   *  we swap the typing dots for a `LoadingPulse` (rotating reassurance
+   *  word + live CPU/RAM) so the user knows the app isn't wedged. Once
+   *  any frame arrives (delta, tool call, or terminal event) the model
+   *  is resident and we clear it; we don't re-arm for later turns in
+   *  the same run since the model is warm by then. The indicator owns
+   *  its own word rotation + usage poll, mounting/unmounting with
+   *  `modelLoading`. */
+  const MODEL_LOAD_POPUP_DELAY_MS = 5000;
+  let modelLoading = $state(false);
+  let modelLoadTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Clear the load indicator + its arming timer. Idempotent, so it's
+   *  safe to call from every agent event and from cleanup. */
+  function clearModelLoadWait() {
+    if (modelLoadTimer !== null) {
+      clearTimeout(modelLoadTimer);
+      modelLoadTimer = null;
+    }
+    if (modelLoading) modelLoading = false;
+  }
+
+  /** Resolve once the browser has actually painted: a Svelte tick to
+   *  flush the DOM update, then two animation frames so the compositor
+   *  draws the frame. We await this after showing the indicator and
+   *  before kicking off a cold model load — a heavy load can thrash a
+   *  laptop badly enough that an un-painted indicator would never appear. */
+  function nextPaint(): Promise<void> {
+    return tick().then(
+      () =>
+        new Promise<void>((resolve) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+        }),
+    );
+  }
 
   /** One pending attachment staged for the next send. Images become
    *  Ollama-style `images: [base64]` array entries on the user
@@ -838,6 +879,29 @@
       enabledToolSet.has(t.definition.function.name),
     );
 
+    // Cold-start dialog. A model that isn't resident yet can thrash a
+    // laptop hard enough that a reactively-delayed dialog never gets to
+    // paint — so when we can confirm (via Ollama's /api/ps) that the
+    // model isn't loaded, we show the dialog and force a paint BEFORE
+    // firing the request. For the warm case, the remote path, or an
+    // unknown ps result, we keep the lightweight 5s reactive timer.
+    let coldStart = false;
+    if (!routeViaDevicePubkey) {
+      try {
+        coldStart = !(await invoke<boolean>("ollama_model_loaded", { model: activeModel }));
+      } catch {
+        // ps unavailable — fall back to the reactive timer below.
+      }
+    }
+    if (coldStart) {
+      modelLoading = true;
+      await nextPaint(); // get the indicator on screen before the load freeze
+    } else {
+      modelLoadTimer = setTimeout(() => {
+        modelLoading = true;
+      }, MODEL_LOAD_POPUP_DELAY_MS);
+    }
+
     try {
       await runAgent({
         messages: working,
@@ -849,6 +913,9 @@
         viaDevicePubkey: routeViaDevicePubkey,
         signal: controller.signal,
         onEvent: (event: AgentEvent) => {
+          // Any frame means the model is resident and producing —
+          // tear down the load-wait dialog (idempotent).
+          clearModelLoadWait();
           switch (event.kind) {
             case "assistant_delta":
             case "thinking_delta": {
@@ -916,6 +983,9 @@
       streaming = false;
       agentAbortController = null;
       inFlightToolCallIds = new Set();
+      // Belt-and-suspenders: if the run ended before any frame (error
+      // thrown, instant cancel), the timer/dialog could still be live.
+      clearModelLoadWait();
       // Drop the streaming flag on any straggler bubble so its
       // <details> can collapse cleanly once the answer is in.
       if (liveIdx !== -1 && liveIdx < messages.length) {
@@ -958,6 +1028,9 @@
     // `infer_cancel` (mesh path) on whatever turn is in flight, then
     // unwinds the loop without starting another round.
     agentAbortController?.abort();
+    // Drop the load-wait dialog right away rather than waiting for the
+    // stream to unwind through the finally block.
+    clearModelLoadWait();
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -1258,7 +1331,18 @@
     {/each}
     {#if streaming && (messages.length === 0 || messages[messages.length - 1].role !== "assistant")}
       <div class="message assistant">
-        <div class="bubble"><span class="dots"><span></span><span></span><span></span></span></div>
+        <div class="bubble">
+          {#if modelLoading}
+            <!-- Cold-start (or a long-running call): the model is loading
+                 / still working. Replace the typing dots in place (no
+                 jolting modal) with the calmer LoadingPulse — a rotating
+                 reassurance word + live CPU/RAM. Stats are hidden for the
+                 remote path (the load is on the host's machine). -->
+            <LoadingPulse showStats={!routeViaDevicePubkey} />
+          {:else}
+            <span class="dots"><span></span><span></span><span></span></span>
+          {/if}
+        </div>
       </div>
     {/if}
   </div>
@@ -1416,6 +1500,7 @@
     flex-direction: column;
     position: relative;
   }
+
   .chat-body {
     flex: 1;
     min-height: 0;

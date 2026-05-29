@@ -96,6 +96,10 @@ fn ensure_macos_default_on_path() -> bool {
     false
 }
 
+// The trailing `Ok(())` is the Linux fall-through / unsupported-platform
+// fallback; on macOS and Windows the cfg blocks above always return, so
+// it's unreachable there by design — silence the per-platform lint.
+#[allow(unreachable_code)]
 pub async fn install() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -274,31 +278,106 @@ pub async fn ensure_running() -> Result<()> {
         return Ok(());
     }
 
-    // OLLAMA_ORIGINS=* belt-and-suspenders: when WE spawn the server (e.g. Linux
-    // or a fresh standalone Windows install), this lets the GUI fetch directly
-    // from `http://127.0.0.1:11434` without Ollama's CORS allowlist rejecting
-    // the WebView's `Origin` (which on Tauri 2 / Windows is `http://tauri.localhost`,
-    // not in Ollama's defaults). When the Windows installer runs Ollama as a
-    // tray service we can't influence its env — that's why the GUI also routes
-    // chat through myownllm's API server (see Chat.svelte).
-    let child = quiet_tokio_command("ollama")
-        .arg("serve")
-        .env("OLLAMA_ORIGINS", "*")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to spawn ollama serve")?;
+    // Throttle the server at launch (Settings → Performance). Applying it
+    // as an argv prefix is the reliable lever — notably on macOS, where
+    // taskpolicy's IO policy only takes effect when launching a program,
+    // not via `-p` on a running PID (that gap left the throttle a no-op
+    // and let a load thrash the machine). "off" yields no prefix.
+    let mode = throttle_mode();
+    let prefix = crate::process::throttle_launch_prefix(&mode);
 
+    // Spawn under the wrapper when we have one. If the wrapper binary is
+    // missing the spawn itself errors — fall back to a plain spawn so a
+    // missing throttle tool can never leave the app without an LLM.
+    let child = match spawn_ollama_serve(prefix.as_deref()) {
+        Ok(c) => c,
+        Err(_) if prefix.is_some() => {
+            spawn_ollama_serve(None).context("failed to spawn ollama serve")?
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("failed to spawn ollama serve")),
+    };
     *guard = Some(child);
 
-    // Wait up to 10 seconds for API to become reachable.
+    // Windows throttles post-spawn (no reliable launch wrapper there);
+    // Unix already throttled via the argv prefix above.
+    #[cfg(target_os = "windows")]
+    if mode != "off" {
+        if let Some(pid) = guard.as_ref().and_then(|c| c.id()) {
+            crate::process::set_priority_windows(pid, &mode).await;
+        }
+    }
+
+    // Wait up to 10s for the API. Bail early if a launch-wrapper child
+    // exited without exec'ing ollama (e.g. an unsupported flag on this OS
+    // version): try_wait → Some means the wrapper failed, so we stop
+    // waiting and retry directly below rather than burning the full 10s.
+    let mut up = false;
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if api_reachable().await {
-            return Ok(());
+            up = true;
+            break;
+        }
+        if prefix.is_some() {
+            if let Some(c) = guard.as_mut() {
+                if matches!(c.try_wait(), Ok(Some(_))) {
+                    break; // wrapper died without bringing ollama up
+                }
+            }
+        }
+    }
+    if up {
+        return Ok(());
+    }
+
+    // Wrapped launch never came up — retry with a direct spawn so a
+    // broken/incompatible throttle tool can't disable the LLM entirely.
+    if prefix.is_some() {
+        if let Some(mut dead) = guard.take() {
+            let _ = dead.kill().await;
+        }
+        let direct = spawn_ollama_serve(None).context("failed to spawn ollama serve")?;
+        *guard = Some(direct);
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if api_reachable().await {
+                return Ok(());
+            }
         }
     }
     Err(anyhow!("ollama serve did not become reachable within 10s"))
+}
+
+/// Spawn `ollama serve` with our standard env, optionally under a
+/// launch-time throttle wrapper (`prefix`, e.g. `["taskpolicy", "-d",
+/// "throttle"]`). The wrapper tools exec their target, so the child PID
+/// is ollama itself — kill-on-exit (`stop`) is unaffected.
+///
+/// OLLAMA_ORIGINS=* is belt-and-suspenders: when WE spawn the server this
+/// lets the GUI fetch directly from `http://127.0.0.1:11434` without
+/// Ollama's CORS allowlist rejecting the WebView's `Origin`. The memory
+/// caps keep at most one model resident and serve one request at a time,
+/// so Ollama never tries to hold two models (or N parallel KV caches) in
+/// RAM/VRAM at once — the swap thrash behind the hardest freezes.
+fn spawn_ollama_serve(prefix: Option<&[&str]>) -> std::io::Result<tokio::process::Child> {
+    let mut cmd = match prefix {
+        Some(p) if !p.is_empty() => {
+            let mut c = quiet_tokio_command(p[0]);
+            c.args(&p[1..]).arg("ollama").arg("serve");
+            c
+        }
+        _ => {
+            let mut c = quiet_tokio_command("ollama");
+            c.arg("serve");
+            c
+        }
+    };
+    cmd.env("OLLAMA_ORIGINS", "*")
+        .env("OLLAMA_MAX_LOADED_MODELS", "1")
+        .env("OLLAMA_NUM_PARALLEL", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
 }
 
 async fn api_reachable() -> bool {
@@ -595,14 +674,41 @@ pub async fn has_model(model: &str) -> Result<bool> {
     Ok(out.success())
 }
 
+/// True when `model` is currently loaded in Ollama's memory — i.e. the
+/// next chat won't pay a cold load. Queried via `/api/ps`. On any error
+/// (Ollama down, curl missing, unparseable body) we return `false` so
+/// callers fall back to showing the load dialog rather than wrongly
+/// skipping it. Ollama reports loaded models under either `name` or
+/// `model`, so we match on both.
+pub async fn is_model_loaded(model: &str) -> bool {
+    let Ok(body) = reqwest_get("http://127.0.0.1:11434/api/ps").await else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    v.get("models")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter().any(|e| {
+                e.get("name").and_then(|n| n.as_str()) == Some(model)
+                    || e.get("model").and_then(|n| n.as_str()) == Some(model)
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Fire a 1-token chat call so Ollama mmaps the weights and keeps the model loaded
-/// for `keep_alive`. Used by `myownllm preload --warm`.
+/// for `keep_alive`. Used by `myownllm preload --warm` and the startup warm.
+/// Honors the user's configured `keep_alive` so a proactive warm respects
+/// the same residency window as real chats (warming with "0" would just
+/// load-then-unload, so callers skip warming in that case).
 pub async fn warm(model: &str) -> Result<()> {
     let body = serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": "ok"}],
         "stream": false,
-        "keep_alive": "10m",
+        "keep_alive": chat_keep_alive(),
         "options": { "num_predict": 1 }
     })
     .to_string();
@@ -730,6 +836,44 @@ pub enum ChatStreamOutcome {
     Cancelled,
 }
 
+/// Resolve the user's configured Ollama `keep_alive` for chat
+/// requests. This controls how long Ollama keeps the model resident
+/// in RAM/VRAM after a turn finishes: longer values avoid cold-start
+/// reloads between messages (the common "why is it slow again?"
+/// complaint), shorter values free memory sooner so the LLM can
+/// coexist with transcription on a memory-tight machine. Accepts
+/// Ollama's native duration format — "30m", "1h", "0" (unload
+/// immediately), "-1" (keep until evicted). Falls back to "30m" when
+/// the config is unreadable or the key is absent (older configs).
+fn chat_keep_alive() -> serde_json::Value {
+    crate::resolver::load_config_value()
+        .ok()
+        .and_then(|c| {
+            c.get("ollama_keep_alive")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .map(serde_json::Value::from)
+        .unwrap_or_else(|| serde_json::json!("30m"))
+}
+
+/// Resolve the user's configured throttle mode for the Ollama server we
+/// spawn — how hard we ease its priority so model loading doesn't starve
+/// the desktop: "off" (no throttle), "io" (disk-IO only; keeps inference
+/// full speed — the default), or "aggressive" (also demote CPU/QoS; most
+/// responsive machine but slower inference). Falls back to "io".
+fn throttle_mode() -> String {
+    crate::resolver::load_config_value()
+        .ok()
+        .and_then(|c| {
+            c.get("ollama_throttle")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .filter(|m| matches!(m.as_str(), "off" | "io" | "aggressive"))
+        .unwrap_or_else(|| "io".to_string())
+}
+
 /// Streamed chat completion. Invokes `on_content` for each visible token
 /// chunk, `on_thinking` for any reasoning/thinking deltas (thinking models
 /// emit those in `message.thinking`; non-thinking models never call it),
@@ -771,6 +915,7 @@ where
         "model": model,
         "messages": messages,
         "stream": true,
+        "keep_alive": chat_keep_alive(),
     });
     if let Some(t) = think {
         body["think"] = serde_json::json!(t);
@@ -933,6 +1078,7 @@ pub async fn chat_once(
         "model": model,
         "messages": messages,
         "stream": false,
+        "keep_alive": chat_keep_alive(),
     });
     if let Some(opts) = options {
         body["options"] = opts;
