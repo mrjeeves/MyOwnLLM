@@ -26,31 +26,41 @@
     {
       value: "off",
       label: "Off (fastest load)",
-      hint: "No throttle. Loads fastest, but a big model can briefly bog down the whole machine.",
+      hint: "No throttle. Loads fastest, but a big model can saturate the CPU and briefly freeze the machine.",
     },
     {
       value: "io",
-      label: "Balanced — disk only (recommended)",
-      hint: "Eases disk priority during the load so the machine stays responsive, while inference keeps running at full speed.",
+      label: "Balanced (recommended)",
+      hint: "Lowers the model's priority a notch so the system — display, networking — keeps enough CPU to stay responsive during a load, while inference still gets the bulk of the cores.",
     },
     {
       value: "aggressive",
       label: "Aggressive (most responsive)",
-      hint: "Also lowers CPU priority. Keeps the desktop snappiest during a load, but token generation runs slower.",
+      hint: "Deeply deprioritizes the model. Keeps the desktop snappiest during a load, but token generation runs noticeably slower.",
     },
   ];
+
+  /** Preload the chat model at startup so the first message is instant.
+   *  On by default; the load runs under the throttle above. */
+  let warmOnStartup = $state(true);
 
   onMount(async () => {
     try {
       const config = await loadConfig();
       keepAlive = config.ollama_keep_alive ?? "30m";
       throttle = (config.ollama_throttle ?? "io") as Throttle;
+      warmOnStartup = config.warm_on_startup ?? true;
     } catch (e) {
       error = String(e);
     } finally {
       loading = false;
     }
   });
+
+  async function patchWarmOnStartup(value: boolean) {
+    warmOnStartup = value;
+    await updateConfig({ warm_on_startup: value });
+  }
 
   async function patchKeepAlive(value: string) {
     keepAlive = value;
@@ -144,6 +154,23 @@
         {/if}
       </div>
 
+      <div class="card">
+        <div class="card-title">Warm at startup</div>
+        <p class="card-meta">
+          Preload the chat model in the background when the app starts, so
+          your first message doesn't wait for it to load. The load runs
+          under the throttle above, so it won't lock up the machine.
+        </p>
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={warmOnStartup}
+            onchange={(e) => patchWarmOnStartup((e.currentTarget as HTMLInputElement).checked)}
+          />
+          Warm the chat model at startup
+        </label>
+      </div>
+
       <p class="footnote">
         Throttling only applies when MyOwnLLM starts the Ollama server
         itself. If Ollama is already running as a system or tray service,
@@ -204,4 +231,14 @@
   select:focus { outline: none; border-color: #6e6ef7; }
 
   .footnote { font-size: .72rem; color: #555; line-height: 1.5; padding: .35rem .15rem 0; margin: 0; }
+
+  .toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: .45rem;
+    font-size: .82rem;
+    color: #ccc;
+    cursor: pointer;
+  }
+  .toggle input { accent-color: #6e6ef7; }
 </style>

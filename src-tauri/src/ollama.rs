@@ -278,49 +278,106 @@ pub async fn ensure_running() -> Result<()> {
         return Ok(());
     }
 
-    // OLLAMA_ORIGINS=* belt-and-suspenders: when WE spawn the server (e.g. Linux
-    // or a fresh standalone Windows install), this lets the GUI fetch directly
-    // from `http://127.0.0.1:11434` without Ollama's CORS allowlist rejecting
-    // the WebView's `Origin` (which on Tauri 2 / Windows is `http://tauri.localhost`,
-    // not in Ollama's defaults). When the Windows installer runs Ollama as a
-    // tray service we can't influence its env — that's why the GUI also routes
-    // chat through myownllm's API server (see Chat.svelte).
-    let child = quiet_tokio_command("ollama")
-        .arg("serve")
-        .env("OLLAMA_ORIGINS", "*")
-        // Cap memory pressure on the laptop-class machines that freeze
-        // hard while a model pages in: keep at most one model resident,
-        // and serve one request at a time, so Ollama never tries to
-        // hold two models (or N parallel KV caches) in RAM/VRAM at once.
+    // Throttle the server at launch (Settings → Performance). Applying it
+    // as an argv prefix is the reliable lever — notably on macOS, where
+    // taskpolicy's IO policy only takes effect when launching a program,
+    // not via `-p` on a running PID (that gap left the throttle a no-op
+    // and let a load thrash the machine). "off" yields no prefix.
+    let mode = throttle_mode();
+    let prefix = crate::process::throttle_launch_prefix(&mode);
+
+    // Spawn under the wrapper when we have one. If the wrapper binary is
+    // missing the spawn itself errors — fall back to a plain spawn so a
+    // missing throttle tool can never leave the app without an LLM.
+    let child = match spawn_ollama_serve(prefix.as_deref()) {
+        Ok(c) => c,
+        Err(_) if prefix.is_some() => {
+            spawn_ollama_serve(None).context("failed to spawn ollama serve")?
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("failed to spawn ollama serve")),
+    };
+    *guard = Some(child);
+
+    // Windows throttles post-spawn (no reliable launch wrapper there);
+    // Unix already throttled via the argv prefix above.
+    #[cfg(target_os = "windows")]
+    if mode != "off" {
+        if let Some(pid) = guard.as_ref().and_then(|c| c.id()) {
+            crate::process::set_priority_windows(pid, &mode).await;
+        }
+    }
+
+    // Wait up to 10s for the API. Bail early if a launch-wrapper child
+    // exited without exec'ing ollama (e.g. an unsupported flag on this OS
+    // version): try_wait → Some means the wrapper failed, so we stop
+    // waiting and retry directly below rather than burning the full 10s.
+    let mut up = false;
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if api_reachable().await {
+            up = true;
+            break;
+        }
+        if prefix.is_some() {
+            if let Some(c) = guard.as_mut() {
+                if matches!(c.try_wait(), Ok(Some(_))) {
+                    break; // wrapper died without bringing ollama up
+                }
+            }
+        }
+    }
+    if up {
+        return Ok(());
+    }
+
+    // Wrapped launch never came up — retry with a direct spawn so a
+    // broken/incompatible throttle tool can't disable the LLM entirely.
+    if prefix.is_some() {
+        if let Some(mut dead) = guard.take() {
+            let _ = dead.kill().await;
+        }
+        let direct = spawn_ollama_serve(None).context("failed to spawn ollama serve")?;
+        *guard = Some(direct);
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if api_reachable().await {
+                return Ok(());
+            }
+        }
+    }
+    Err(anyhow!("ollama serve did not become reachable within 10s"))
+}
+
+/// Spawn `ollama serve` with our standard env, optionally under a
+/// launch-time throttle wrapper (`prefix`, e.g. `["taskpolicy", "-d",
+/// "throttle"]`). The wrapper tools exec their target, so the child PID
+/// is ollama itself — kill-on-exit (`stop`) is unaffected.
+///
+/// OLLAMA_ORIGINS=* is belt-and-suspenders: when WE spawn the server this
+/// lets the GUI fetch directly from `http://127.0.0.1:11434` without
+/// Ollama's CORS allowlist rejecting the WebView's `Origin`. The memory
+/// caps keep at most one model resident and serve one request at a time,
+/// so Ollama never tries to hold two models (or N parallel KV caches) in
+/// RAM/VRAM at once — the swap thrash behind the hardest freezes.
+fn spawn_ollama_serve(prefix: Option<&[&str]>) -> std::io::Result<tokio::process::Child> {
+    let mut cmd = match prefix {
+        Some(p) if !p.is_empty() => {
+            let mut c = quiet_tokio_command(p[0]);
+            c.args(&p[1..]).arg("ollama").arg("serve");
+            c
+        }
+        _ => {
+            let mut c = quiet_tokio_command("ollama");
+            c.arg("serve");
+            c
+        }
+    };
+    cmd.env("OLLAMA_ORIGINS", "*")
         .env("OLLAMA_MAX_LOADED_MODELS", "1")
         .env("OLLAMA_NUM_PARALLEL", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to spawn ollama serve")?;
-
-    // Throttle the server we just spawned so the disk thrash of loading
-    // a model doesn't lock up the whole desktop. The mode is user-tunable
-    // (Settings → Performance); "off" skips it entirely. Best-effort, and
-    // only possible because WE own this process — when Ollama is already
-    // running as a system/tray service we never reach this branch.
-    let mode = throttle_mode();
-    if mode != "off" {
-        if let Some(pid) = child.id() {
-            crate::process::lower_priority(pid, &mode).await;
-        }
-    }
-
-    *guard = Some(child);
-
-    // Wait up to 10 seconds for API to become reachable.
-    for _ in 0..20 {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if api_reachable().await {
-            return Ok(());
-        }
-    }
-    Err(anyhow!("ollama serve did not become reachable within 10s"))
 }
 
 async fn api_reachable() -> bool {

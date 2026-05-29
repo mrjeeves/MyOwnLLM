@@ -277,13 +277,19 @@
       view = "chat";
       invoke("ollama_ensure_running").catch(() => {});
 
-      // Proactively warm the chat model in the background so its
-      // one-time cold load happens now — with the throttled server
-      // keeping the machine responsive — rather than freezing the user
-      // on their first message. Skipped when the model isn't on disk
-      // yet (the download overlay owns that flow) or when keep_alive is
-      // "0" (warming would just load-then-unload). Fire-and-forget.
-      if (pendingTextModel && !textModelMissing && config.ollama_keep_alive !== "0") {
+      // Warm the chat model in the background so the first message doesn't
+      // pay the cold-load wait. On by default; the load runs under the
+      // configured throttle (Settings → Performance) so it doesn't lock up
+      // the machine. Skipped when the user turned it off, when the model
+      // isn't on disk yet (the download overlay owns that), or when
+      // keep_alive is "0" (warming would just load-then-unload).
+      // Fire-and-forget.
+      if (
+        config.warm_on_startup !== false &&
+        pendingTextModel &&
+        !textModelMissing &&
+        config.ollama_keep_alive !== "0"
+      ) {
         invoke("ollama_warm", { model: pendingTextModel }).catch(() => {});
       }
 

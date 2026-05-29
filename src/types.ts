@@ -504,6 +504,11 @@ export interface Config {
    *  desktop, slower inference). Only applies when MyOwnLLM spawns Ollama
    *  itself — not when it's a system/tray service. */
   ollama_throttle: "off" | "io" | "aggressive";
+  /** Warm (preload) the active chat model in the background at startup so
+   *  the first message doesn't pay the cold-load wait. On by default; the
+   *  load runs under the configured throttle so it doesn't lock up the
+   *  machine. Can be turned off in Settings → Performance. */
+  warm_on_startup: boolean;
   /** Family names for which the user has dismissed the
    *  "switching with auto-cleanup on" confirmation in the family
    *  detail view's per-tier picker. Per-family rather than per-tier

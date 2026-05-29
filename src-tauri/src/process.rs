@@ -48,77 +48,86 @@ fn apply_quiet_flags_tokio(cmd: &mut tokio::process::Command) {
 #[cfg(not(target_os = "windows"))]
 fn apply_quiet_flags_tokio(_cmd: &mut tokio::process::Command) {}
 
-/// Best-effort: ease a child process's priority so the heavy reads when
-/// an LLM server pages multi-GB weights in on first use don't starve the
-/// desktop. `mode` controls how hard:
+/// Launch-time throttle wrapper for the LLM server, per the user's `mode`
+/// ("io" | "aggressive"; "off" → `None`). Returned as an argv prefix to
+/// prepend before `ollama serve` rather than something we apply to the
+/// PID after spawn — that distinction matters on macOS, where
+/// `taskpolicy`'s disk-IO policy only takes effect when *launching* a
+/// program, not via `-p` on a running one. Applying it post-spawn was a
+/// silent no-op, which left the server unthrottled and let a model load
+/// thrash the whole machine. The wrapper tools (`ionice`/`nice`/
+/// `taskpolicy`) exec their target, so the resulting child PID is still
+/// ollama and our kill-on-exit handling is unaffected.
 ///
-/// - `"io"` (default): lower **disk IO** priority only. Model loading is
-///   disk-bound and inference is compute-bound, so this keeps the machine
-///   responsive during a load without kneecapping token generation.
-/// - `"aggressive"`: also demote CPU/QoS. Most responsive desktop during
-///   a load, but inference itself runs slower.
+/// - `"io"` (default, "balanced"): a moderate `nice` (CPU) — plus a low
+///   disk-IO class on Linux. `nice` only makes the server yield when
+///   something else (the display server, networking, the WebView) wants
+///   the CPU, so the machine stays responsive during a heavy load while
+///   inference still gets the bulk of the cores when nothing competes.
+///   Crucially it does NOT leave the CPU wide open to the server — which
+///   is what starved the desktop and froze the machine — nor force it
+///   onto efficiency cores like background QoS, so inference isn't
+///   crippled.
+/// - `"aggressive"`: deep `nice` / background QoS — most responsive
+///   desktop during a load, but noticeably slower inference.
 ///
-/// (`"off"` is handled by the caller, which simply doesn't call this.)
-/// Every call is fire-and-forget: a missing tool or permission error just
-/// means no throttle, never a hard failure.
-#[allow(unused_variables)] // `pid`/`mode` are unused on platforms without a branch
-pub async fn lower_priority(pid: u32, mode: &str) {
-    let pid = pid.to_string();
+/// `None` on Windows (it throttles post-spawn via [`set_priority_windows`]
+/// instead) and for `"off"`.
+pub fn throttle_launch_prefix(mode: &str) -> Option<Vec<&'static str>> {
+    if mode == "off" {
+        return None;
+    }
     let aggressive = mode == "aggressive";
     #[cfg(target_os = "linux")]
     {
-        if aggressive {
-            // Idle IO class (only runs when nothing else wants the disk)
-            // plus a CPU nice — maximum desktop responsiveness, slower
-            // load and inference.
-            let _ = quiet_tokio_command("ionice")
-                .args(["-c", "3", "-p", &pid])
-                .status()
-                .await;
-            let _ = quiet_tokio_command("renice")
-                .args(["-n", "5", "-p", &pid])
-                .status()
-                .await;
+        Some(if aggressive {
+            // Max nice + idle IO class — server only runs when nothing
+            // else wants CPU or disk. Snappiest desktop, slowest model.
+            vec!["nice", "-n", "19", "ionice", "-c", "3"]
         } else {
-            // Best-effort IO class, lowest priority (7): still gets disk
-            // time but yields under contention. IO-only — no renice, so
-            // inference keeps full CPU once loaded.
-            let _ = quiet_tokio_command("ionice")
-                .args(["-c", "2", "-n", "7", "-p", &pid])
-                .status()
-                .await;
-        }
+            // Moderate nice so the system keeps headroom, plus low
+            // best-effort IO so disk reads yield under contention. The
+            // server still gets most of the CPU when it's the only thing
+            // running, so inference stays fast.
+            vec!["nice", "-n", "10", "ionice", "-c", "2", "-n", "7"]
+        })
     }
     #[cfg(target_os = "macos")]
     {
-        if aggressive {
-            // Background QoS: demotes to efficiency cores and throttles
-            // both compute and IO. Frees the machine most, but slows
-            // inference noticeably.
-            let _ = quiet_tokio_command("taskpolicy")
-                .args(["-b", "-p", &pid])
-                .status()
-                .await;
+        Some(if aggressive {
+            // Background QoS: efficiency cores + throttled compute & IO.
+            // Frees the machine most, but slows inference.
+            vec!["taskpolicy", "-b"]
         } else {
-            // Disk IO policy "throttle" (IOPOL_THROTTLE) only — leaves CPU
-            // scheduling and QoS untouched, so inference runs on the
-            // performance cores at full speed.
-            let _ = quiet_tokio_command("taskpolicy")
-                .args(["-d", "throttle", "-p", &pid])
-                .status()
-                .await;
-        }
+            // Moderate nice only — reserves CPU headroom for the system
+            // (display, networking) while leaving the server on the
+            // performance cores, so inference isn't kneecapped. `nice` is
+            // POSIX and always present, so this can't fail the launch.
+            vec!["nice", "-n", "10"]
+        })
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        // Windows doesn't expose per-process IO priority to other
-        // processes without FFI; we nudge the priority class instead —
-        // BelowNormal for the IO tier, Idle (lowest) when aggressive.
-        let class = if aggressive { "Idle" } else { "BelowNormal" };
-        let script = format!("(Get-Process -Id {pid}).PriorityClass='{class}'");
-        let _ = quiet_tokio_command("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .status()
-            .await;
+        let _ = aggressive; // consumed on platforms without a launch wrapper
+        None
     }
+}
+
+/// Windows-only: ease the spawned server's priority class after spawn.
+/// Windows has no launch-time IO-throttle wrapper we can rely on and no
+/// external per-process IO priority without FFI, so we nudge the priority
+/// class instead — `BelowNormal` for the default, `Idle` when aggressive.
+/// Best-effort; failure just means no throttle.
+#[cfg(target_os = "windows")]
+pub async fn set_priority_windows(pid: u32, mode: &str) {
+    let class = if mode == "aggressive" {
+        "Idle"
+    } else {
+        "BelowNormal"
+    };
+    let script = format!("(Get-Process -Id {pid}).PriorityClass='{class}'");
+    let _ = quiet_tokio_command("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+        .await;
 }

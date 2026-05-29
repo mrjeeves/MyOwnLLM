@@ -113,6 +113,7 @@ const DEFAULT_CONFIG: Config = {
   model_cleanup_days: 1,
   ollama_keep_alive: "30m",
   ollama_throttle: "io",
+  warm_on_startup: true,
   cleanup_warning_suppressed_families: [],
   kept_models: [],
   mode_overrides: {},

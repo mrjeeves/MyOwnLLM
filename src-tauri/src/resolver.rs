@@ -785,6 +785,7 @@ pub fn default_config_value() -> Value {
         "model_cleanup_days": 1,
         "ollama_keep_alive": "30m",
         "ollama_throttle": "io",
+        "warm_on_startup": true,
         "kept_models": [],
         "mode_overrides": {},
         "tracked_modes": ["text"],
