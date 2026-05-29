@@ -112,6 +112,7 @@ const DEFAULT_CONFIG: Config = {
   active_mode: "transcribe",
   model_cleanup_days: 1,
   ollama_keep_alive: "30m",
+  ollama_throttle: "io",
   cleanup_warning_suppressed_families: [],
   kept_models: [],
   mode_overrides: {},

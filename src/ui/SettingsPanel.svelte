@@ -3,6 +3,7 @@
   import ModelsSection from "./settings/ModelsSection.svelte";
   import StorageSection from "./settings/StorageSection.svelte";
   import HardwareSection from "./settings/HardwareSection.svelte";
+  import PerformanceSection from "./settings/PerformanceSection.svelte";
   import UsageSection from "./settings/UsageSection.svelte";
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import CloudMeshSection from "./settings/CloudMeshSection.svelte";
@@ -18,6 +19,7 @@
     | "prompts"
     | "permissions"
     | "hardware"
+    | "performance"
     | "storage"
     | "usage"
     | "cloud-mesh"
@@ -81,6 +83,7 @@
     { id: "prompts", label: "Prompts" },
     { id: "permissions", label: "Permissions" },
     { id: "hardware", label: "Hardware" },
+    { id: "performance", label: "Performance" },
     { id: "storage", label: "Storage" },
     { id: "usage", label: "Usage" },
     { id: "updates", label: "Updates" },
@@ -151,6 +154,8 @@
         <StorageSection setActive={(t) => (active = t)} />
       {:else if active === "hardware"}
         <HardwareSection setActive={(t) => (active = t)} />
+      {:else if active === "performance"}
+        <PerformanceSection />
       {:else if active === "usage"}
         <UsageSection />
       {:else if active === "cloud-mesh"}

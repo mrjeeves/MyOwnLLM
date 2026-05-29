@@ -300,11 +300,15 @@ pub async fn ensure_running() -> Result<()> {
         .context("failed to spawn ollama serve")?;
 
     // Throttle the server we just spawned so the disk thrash of loading
-    // a model doesn't lock up the whole desktop. Best-effort, and only
-    // possible because WE own this process — when Ollama is already
+    // a model doesn't lock up the whole desktop. The mode is user-tunable
+    // (Settings → Performance); "off" skips it entirely. Best-effort, and
+    // only possible because WE own this process — when Ollama is already
     // running as a system/tray service we never reach this branch.
-    if let Some(pid) = child.id() {
-        crate::process::lower_priority(pid).await;
+    let mode = throttle_mode();
+    if mode != "off" {
+        if let Some(pid) = child.id() {
+            crate::process::lower_priority(pid, &mode).await;
+        }
     }
 
     *guard = Some(child);
@@ -794,6 +798,23 @@ fn chat_keep_alive() -> serde_json::Value {
         })
         .map(serde_json::Value::from)
         .unwrap_or_else(|| serde_json::json!("30m"))
+}
+
+/// Resolve the user's configured throttle mode for the Ollama server we
+/// spawn — how hard we ease its priority so model loading doesn't starve
+/// the desktop: "off" (no throttle), "io" (disk-IO only; keeps inference
+/// full speed — the default), or "aggressive" (also demote CPU/QoS; most
+/// responsive machine but slower inference). Falls back to "io".
+fn throttle_mode() -> String {
+    crate::resolver::load_config_value()
+        .ok()
+        .and_then(|c| {
+            c.get("ollama_throttle")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .filter(|m| matches!(m.as_str(), "off" | "io" | "aggressive"))
+        .unwrap_or_else(|| "io".to_string())
 }
 
 /// Streamed chat completion. Invokes `on_content` for each visible token

@@ -497,6 +497,13 @@ export interface Config {
    *  Longer values avoid cold-start reloads between messages; shorter
    *  values suit memory-tight machines. Default "30m". */
   ollama_keep_alive: string;
+  /** How hard to throttle the Ollama server we spawn while it loads a
+   *  model, so the disk thrash doesn't freeze the machine. "off" = no
+   *  throttle; "io" = disk-IO priority only (keeps inference full speed,
+   *  the default); "aggressive" = also demote CPU/QoS (most responsive
+   *  desktop, slower inference). Only applies when MyOwnLLM spawns Ollama
+   *  itself — not when it's a system/tray service. */
+  ollama_throttle: "off" | "io" | "aggressive";
   /** Family names for which the user has dismissed the
    *  "switching with auto-cleanup on" confirmation in the family
    *  detail view's per-tier picker. Per-family rather than per-tier
