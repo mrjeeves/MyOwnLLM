@@ -1,10 +1,11 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { onDestroy, tick } from "svelte";
+  import { tick } from "svelte";
   import TopBar from "./TopBar.svelte";
   import TextBar from "./TextBar.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import DownloadOverlay from "./DownloadOverlay.svelte";
+  import LoadingPulse from "./LoadingPulse.svelte";
   import {
     loadConversation,
     saveConversation,
@@ -15,7 +16,7 @@
     type ToolCall,
   } from "../conversations";
   import type { SettingsTab } from "../update-state.svelte";
-  import type { HardwareProfile, Mode, LiveSnapshot } from "../types";
+  import type { HardwareProfile, Mode } from "../types";
   import {
     chatSlot,
     claimChat,
@@ -124,99 +125,33 @@
   /** Cold-start UX: Ollama loads a model's weights into RAM/VRAM on
    *  the first request after it was evicted (or never loaded this
    *  session). That gap — between firing the chat stream and the
-   *  first token coming back — is silent today. If it runs long we
-   *  surface a small "loading the model" dialog so the user knows the
-   *  app isn't wedged. Once any frame arrives (delta, tool call, or
-   *  terminal event) the model is resident and we tear the dialog
-   *  down; we don't re-arm it for later turns in the same run since
-   *  the model is warm by then. */
+   *  first token coming back — is otherwise silent. When it runs long
+   *  we swap the typing dots for a `LoadingPulse` (rotating reassurance
+   *  word + live CPU/RAM) so the user knows the app isn't wedged. Once
+   *  any frame arrives (delta, tool call, or terminal event) the model
+   *  is resident and we clear it; we don't re-arm for later turns in
+   *  the same run since the model is warm by then. The indicator owns
+   *  its own word rotation + usage poll, mounting/unmounting with
+   *  `modelLoading`. */
   const MODEL_LOAD_POPUP_DELAY_MS = 5000;
   let modelLoading = $state(false);
   let modelLoadTimer: ReturnType<typeof setTimeout> | null = null;
 
-  /** Reassurance words for the cold-start indicator — cycled every few
-   *  seconds (with a shine) so the user can see something is alive while
-   *  the model loads. Short and low-key; the rotation itself is the
-   *  "still working, not frozen" signal. */
-  const LOADING_WORDS = [
-    "Working on it…",
-    "Loading the model…",
-    "Warming up…",
-    "Reading the weights…",
-    "Getting set up…",
-    "Hang tight…",
-    "Almost there…",
-  ];
-  const LOADING_WORD_MS = 3000;
-  let loadingWordIdx = $state(0);
-  // Rotate the reassurance word while a load is in progress. The $effect's
-  // cleanup clears the interval the moment `modelLoading` goes false.
-  $effect(() => {
-    if (!modelLoading) return;
-    loadingWordIdx = 0;
-    const id = setInterval(() => {
-      loadingWordIdx = (loadingWordIdx + 1) % LOADING_WORDS.length;
-    }, LOADING_WORD_MS);
-    return () => clearInterval(id);
-  });
-
-  /** Live CPU/RAM/GPU snapshot shown inside the load-wait dialog so
-   *  the user can see *why* it's slow (e.g. RAM near full → the model
-   *  is paging in from disk). Reuses the same `usage_live_snapshot`
-   *  command + cadence the Usage settings tab uses, so there's a
-   *  single source of truth for system lookups. Polled only while the
-   *  dialog is up; null when idle. */
-  let liveStats = $state<LiveSnapshot | null>(null);
-  let statsPollHandle: ReturnType<typeof setInterval> | null = null;
-  /** Poll cadence for the load-wait readout. Faster than the Usage
-   *  tab's 2s so a short load still gets a real CPU% reading (the
-   *  first sample only primes the delta cache). */
-  const STATS_POLL_MS = 1200;
-
-  async function refreshLiveStats() {
-    try {
-      liveStats = await invoke<LiveSnapshot>("usage_live_snapshot");
-    } catch {
-      // Non-fatal: the dialog still shows the spinner + copy without
-      // the resource readout if the snapshot command is unavailable.
-    }
-  }
-
-  function startStatsPoll() {
-    if (statsPollHandle !== null) return;
-    void refreshLiveStats(); // prime the CPU delta cache immediately
-    statsPollHandle = setInterval(() => void refreshLiveStats(), STATS_POLL_MS);
-  }
-
-  function stopStatsPoll() {
-    if (statsPollHandle !== null) {
-      clearInterval(statsPollHandle);
-      statsPollHandle = null;
-    }
-    liveStats = null;
-  }
-
-  /** Clear the load-wait dialog + its arming timer and stop the
-   *  resource poll. Idempotent, so it's safe to call from every agent
-   *  event and from cleanup. */
+  /** Clear the load indicator + its arming timer. Idempotent, so it's
+   *  safe to call from every agent event and from cleanup. */
   function clearModelLoadWait() {
     if (modelLoadTimer !== null) {
       clearTimeout(modelLoadTimer);
       modelLoadTimer = null;
     }
     if (modelLoading) modelLoading = false;
-    stopStatsPoll();
   }
-
-  // Belt-and-suspenders: never leak the interval if the panel is torn
-  // down (mode switch, conversation close) mid-load.
-  onDestroy(stopStatsPoll);
 
   /** Resolve once the browser has actually painted: a Svelte tick to
    *  flush the DOM update, then two animation frames so the compositor
-   *  draws the frame. We await this after showing the load dialog and
+   *  draws the frame. We await this after showing the indicator and
    *  before kicking off a cold model load — a heavy load can thrash a
-   *  laptop badly enough that an un-painted dialog would never appear. */
+   *  laptop badly enough that an un-painted indicator would never appear. */
   function nextPaint(): Promise<void> {
     return tick().then(
       () =>
@@ -224,12 +159,6 @@
           requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
         }),
     );
-  }
-
-  /** Format a byte count as a compact GB string for the readout. */
-  function fmtGb(bytes: number | null | undefined): string {
-    if (bytes == null) return "—";
-    return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
   }
 
   /** One pending attachment staged for the next send. Images become
@@ -966,12 +895,10 @@
     }
     if (coldStart) {
       modelLoading = true;
-      startStatsPoll();
-      await nextPaint(); // get the dialog on screen before the load freeze
+      await nextPaint(); // get the indicator on screen before the load freeze
     } else {
       modelLoadTimer = setTimeout(() => {
         modelLoading = true;
-        startStatsPoll();
       }, MODEL_LOAD_POPUP_DELAY_MS);
     }
 
@@ -1406,24 +1333,12 @@
       <div class="message assistant">
         <div class="bubble">
           {#if modelLoading}
-            <!-- Cold-start: the model is (re)loading into memory. Replace
-                 the typing dots in place (no jolting modal) with a calmer
-                 reassurance — a word that rotates every few seconds with a
-                 shine, plus a quiet live CPU/RAM line as proof the machine
-                 is still working, not frozen. -->
-            <div class="loading-inline" aria-live="polite">
-              {#key loadingWordIdx}
-                <span class="loading-word">{LOADING_WORDS[loadingWordIdx]}</span>
-              {/key}
-              {#if !routeViaDevicePubkey && liveStats}
-                <span class="loading-meta">
-                  {#if liveStats.cpu_total_pct != null}CPU {Math.round(liveStats.cpu_total_pct)}%{/if}
-                  {#if liveStats.ram_used_bytes != null && liveStats.ram_total_bytes != null}
-                    · RAM {fmtGb(liveStats.ram_used_bytes)}/{fmtGb(liveStats.ram_total_bytes)}
-                  {/if}
-                </span>
-              {/if}
-            </div>
+            <!-- Cold-start (or a long-running call): the model is loading
+                 / still working. Replace the typing dots in place (no
+                 jolting modal) with the calmer LoadingPulse — a rotating
+                 reassurance word + live CPU/RAM. Stats are hidden for the
+                 remote path (the load is on the host's machine). -->
+            <LoadingPulse showStats={!routeViaDevicePubkey} />
           {:else}
             <span class="dots"><span></span><span></span><span></span></span>
           {/if}
@@ -1586,49 +1501,6 @@
     position: relative;
   }
 
-  /* Cold-start inline indicator — sits in the assistant bubble in place
-     of the typing dots while the model loads. A reassurance word with a
-     moving shine, recreated on each rotation so it fades in, plus a quiet
-     live CPU/RAM line. */
-  .loading-inline {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-  }
-  .loading-word {
-    display: inline-block;
-    font-size: 0.9rem;
-    font-weight: 500;
-    background: linear-gradient(
-      90deg,
-      #8a8a8a 0%,
-      #8a8a8a 38%,
-      #eaeaff 50%,
-      #8a8a8a 62%,
-      #8a8a8a 100%
-    );
-    background-size: 220% 100%;
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    color: transparent;
-    animation:
-      loading-word-in 0.4s ease-out,
-      loading-shine 2.4s linear infinite;
-  }
-  @keyframes loading-shine {
-    0% { background-position: 160% 0; }
-    100% { background-position: -160% 0; }
-  }
-  @keyframes loading-word-in {
-    from { opacity: 0; transform: translateY(2px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  .loading-meta {
-    font-size: 0.72rem;
-    color: #6a6a6a;
-    font-variant-numeric: tabular-nums;
-  }
   .chat-body {
     flex: 1;
     min-height: 0;
