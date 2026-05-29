@@ -41,53 +41,53 @@ fn apply_quiet_flags(_cmd: &mut std::process::Command) {}
 
 #[cfg(target_os = "windows")]
 fn apply_quiet_flags_tokio(cmd: &mut tokio::process::Command) {
-    use std::os::windows::process::CommandExt;
+    // tokio's Command exposes `creation_flags` inherently — no CommandExt
+    // trait import needed (unlike the std::process variant above).
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 #[cfg(not(target_os = "windows"))]
 fn apply_quiet_flags_tokio(_cmd: &mut tokio::process::Command) {}
 
-/// Best-effort: drop a child process's scheduling priority so heavy,
-/// bursty work — notably an LLM server paging multi-GB weights in from
-/// disk on first use — doesn't starve the desktop and freeze the whole
-/// machine. We lower **IO** priority where the platform exposes it,
-/// since model loading is disk-bound and that's the real lever, plus a
-/// gentle CPU nice. Every call is fire-and-forget: a missing tool or a
-/// permission error just means no throttle, never a hard failure.
+/// Best-effort: ease a child process's **disk IO** priority so the heavy
+/// reads when an LLM server pages multi-GB weights in on first use don't
+/// starve the desktop — without throttling the CPU/GPU work, so token
+/// generation stays full speed once the model is resident. Model loading
+/// is disk-bound and inference is compute-bound, so targeting IO alone is
+/// the right lever: the machine stays responsive during the load but the
+/// model isn't kneecapped. Every call is fire-and-forget: a missing tool
+/// or permission error just means no throttle, never a hard failure.
 #[allow(unused_variables)] // `pid` is unused on platforms without a branch
 pub async fn lower_priority(pid: u32) {
     let pid = pid.to_string();
     #[cfg(target_os = "linux")]
     {
-        // ionice class 3 = "idle": the process only gets disk time when
-        // nothing else wants it. This is what keeps the UI painting
-        // (and our load dialog visible) while the model streams in.
+        // Best-effort IO class, lowest priority (7): the process still
+        // gets disk time but yields to everything else under contention.
+        // IO-only — we deliberately don't renice, so inference keeps full
+        // CPU once loaded. (Idle class 3 would make loads crawl under any
+        // disk activity; this is the gentler in-between.)
         let _ = quiet_tokio_command("ionice")
-            .args(["-c", "3", "-p", &pid])
-            .status()
-            .await;
-        // A small CPU nudge — not a full demotion — so inference still
-        // feels snappy once the model is resident.
-        let _ = quiet_tokio_command("renice")
-            .args(["-n", "5", "-p", &pid])
+            .args(["-c", "2", "-n", "7", "-p", &pid])
             .status()
             .await;
     }
     #[cfg(target_os = "macos")]
     {
-        // taskpolicy -b moves the process into the background QoS tier,
-        // throttling both CPU and disk IO — macOS's closest equivalent
-        // to Linux's ionice idle class.
+        // Set ONLY the disk IO policy to "throttle" (IOPOL_THROTTLE) —
+        // leaves CPU scheduling and QoS untouched so inference runs on
+        // the performance cores at full speed. The earlier `-b`
+        // (background QoS) demoted the whole process to efficiency cores
+        // and throttled compute, which crippled token generation.
         let _ = quiet_tokio_command("taskpolicy")
-            .args(["-b", "-p", &pid])
+            .args(["-d", "throttle", "-p", &pid])
             .status()
             .await;
     }
     #[cfg(target_os = "windows")]
     {
         // Windows doesn't expose per-process IO priority to other
-        // processes without FFI; dropping the priority class to
-        // BelowNormal still de-prioritizes the load against the UI.
+        // processes without FFI; BelowNormal is a mild priority-class
+        // nudge against the UI, not a compute throttle.
         let script = format!("(Get-Process -Id {pid}).PriorityClass='BelowNormal'");
         let _ = quiet_tokio_command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])

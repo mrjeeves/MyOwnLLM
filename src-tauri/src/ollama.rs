@@ -96,6 +96,10 @@ fn ensure_macos_default_on_path() -> bool {
     false
 }
 
+// The trailing `Ok(())` is the Linux fall-through / unsupported-platform
+// fallback; on macOS and Windows the cfg blocks above always return, so
+// it's unreachable there by design — silence the per-platform lint.
+#[allow(unreachable_code)]
 pub async fn install() -> Result<()> {
     #[cfg(target_os = "linux")]
     {

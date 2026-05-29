@@ -613,7 +613,6 @@ fn win_process_cpu_seconds() -> Option<f64> {
 #[cfg(target_os = "windows")]
 fn win_total_cpu_times() -> Option<(u64, u64)> {
     // (idle ticks, total ticks). Returns 100ns ticks summed across cores.
-    use std::ffi::c_void;
     type Bool = i32;
     #[repr(C)]
     struct Filetime {

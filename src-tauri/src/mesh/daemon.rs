@@ -532,25 +532,28 @@ impl Drop for DaemonChild {
 /// dev cycle rewrites with fresh content instead of perpetually
 /// staging corrupt bits. Files at paths we DON'T own (PATH
 /// lookup, env-var override) just get skipped without deletion.
-fn looks_like_executable(path: &Path) -> bool {
+/// Validate a candidate daemon binary. `Ok(())` when usable, else
+/// `Err(reason)` describing why it was rejected. Performs the self-heal
+/// removal of a stale *owned* slot, but does NOT log — callers collect
+/// the reasons and surface them only when the whole search fails, so a
+/// successful daemon launch stays quiet (see `ensure_daemon_running`).
+fn check_executable(path: &Path) -> Result<(), String> {
     match validate_path_is_executable(path) {
-        Ok(()) => true,
+        Ok(()) => Ok(()),
         Err(reason) => {
-            // Self-heal: if this is a known-owned slot and the
-            // content is invalid, delete it. Tauri's externalBin
-            // staging will regenerate from the source on the
-            // next build; the source's own validator catches
-            // problems before propagating them.
+            // Self-heal: if this is a known-owned slot and the content is
+            // invalid, delete it. Tauri's externalBin staging regenerates
+            // it from the source on the next build; the source's own
+            // validator catches problems before propagating them.
             if is_owned_slot(path) {
-                eprintln!(
-                    "daemon: {} failed executable check ({reason}); removing stale file",
-                    path.display()
-                );
                 let _ = std::fs::remove_file(path);
+                Err(format!(
+                    "{} failed executable check ({reason}); removed stale file",
+                    path.display()
+                ))
             } else {
-                eprintln!("daemon: skipping {} ({reason})", path.display());
+                Err(format!("skipping {} ({reason})", path.display()))
             }
-            false
         }
     }
 }
@@ -623,6 +626,14 @@ fn is_owned_slot(path: &Path) -> bool {
 }
 
 pub fn daemon_binary_candidates() -> Vec<PathBuf> {
+    daemon_binary_candidates_diag().0
+}
+
+/// Like [`daemon_binary_candidates`] but also returns the human-readable
+/// reason each rejected path was skipped. `ensure_daemon_running` holds
+/// these and only prints them if the whole search fails, so a successful
+/// launch doesn't spam the log with every probed-and-skipped location.
+fn daemon_binary_candidates_diag() -> (Vec<PathBuf>, Vec<String>) {
     let exe = if cfg!(windows) {
         "myownmesh.exe"
     } else {
@@ -638,18 +649,20 @@ pub fn daemon_binary_candidates() -> Vec<PathBuf> {
         format!("myownmesh-{DAEMON_SIDECAR_TRIPLE}")
     };
     let mut out: Vec<PathBuf> = Vec::new();
+    let mut diags: Vec<String> = Vec::new();
 
     // Helper: push a candidate iff it exists AND looks like a
     // real executable (filters out the zero-byte stub
     // `build.rs` writes when the daemon fetch was skipped, AND
     // filters out corrupt / truncated downloads that would
     // otherwise produce a confusing "%1 is not a valid Win32
-    // application" error when we try to spawn them).
-    fn push_if_usable(out: &mut Vec<PathBuf>, p: PathBuf) {
-        if !looks_like_executable(&p) {
-            return;
+    // application" error when we try to spawn them). Rejection
+    // reasons are collected into `diags` rather than logged here.
+    fn push_if_usable(out: &mut Vec<PathBuf>, diags: &mut Vec<String>, p: PathBuf) {
+        match check_executable(&p) {
+            Ok(()) => out.push(p),
+            Err(reason) => diags.push(reason),
         }
-        out.push(p);
     }
 
     // 1. Bundled sidecar next to the running LLM executable —
@@ -659,8 +672,8 @@ pub fn daemon_binary_candidates() -> Vec<PathBuf> {
     //    via the same code path.
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
-            push_if_usable(&mut out, exe_dir.join(exe));
-            push_if_usable(&mut out, exe_dir.join(&exe_with_triple));
+            push_if_usable(&mut out, &mut diags, exe_dir.join(exe));
+            push_if_usable(&mut out, &mut diags, exe_dir.join(&exe_with_triple));
         }
     }
 
@@ -670,7 +683,11 @@ pub fn daemon_binary_candidates() -> Vec<PathBuf> {
     //     the *only* place the binary lives. Relative to the
     //     crate, so it works from any working directory.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    push_if_usable(&mut out, manifest.join("binaries").join(&exe_with_triple));
+    push_if_usable(
+        &mut out,
+        &mut diags,
+        manifest.join("binaries").join(&exe_with_triple),
+    );
 
     // 2 + 3. Explicit env-var overrides.
     for var in ["MYOWNLLM_MESH_BIN", "MYOWNMESH_BIN"] {
@@ -696,12 +713,21 @@ pub fn daemon_binary_candidates() -> Vec<PathBuf> {
     //    `manifest` already declared above for the `binaries/`
     //    lookup; reuse it here.
     for profile in ["debug", "release"] {
-        push_if_usable(&mut out, manifest.join("target").join(profile).join(exe));
+        push_if_usable(
+            &mut out,
+            &mut diags,
+            manifest.join("target").join(profile).join(exe),
+        );
         if let Some(parent) = manifest.parent() {
-            push_if_usable(&mut out, parent.join("target").join(profile).join(exe));
+            push_if_usable(
+                &mut out,
+                &mut diags,
+                parent.join("target").join(profile).join(exe),
+            );
             if let Some(grandparent) = parent.parent() {
                 push_if_usable(
                     &mut out,
+                    &mut diags,
                     grandparent
                         .join("MyOwnMesh")
                         .join("target")
@@ -719,7 +745,7 @@ pub fn daemon_binary_candidates() -> Vec<PathBuf> {
         let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
         seen.insert(canonical)
     });
-    out
+    (out, diags)
 }
 
 /// Legacy single-binary lookup. Returns the highest-priority
@@ -786,8 +812,15 @@ pub async fn ensure_daemon_running() -> Result<(ControlClient, Option<DaemonChil
     //    skipped in favour of a working binary at the next. The
     //    diag log surfaces each attempt so a user with multiple
     //    stale candidates can see which one we picked.
-    let candidates = daemon_binary_candidates();
+    // `skip_diags` records every probed-but-rejected location. We stay
+    // quiet about them on the happy path and only surface them if the
+    // search ultimately fails, so a normal launch doesn't log a wall of
+    // "skipping ..." lines for paths that simply don't apply here.
+    let (candidates, skip_diags) = daemon_binary_candidates_diag();
     if candidates.is_empty() {
+        for d in &skip_diags {
+            eprintln!("daemon: {d}");
+        }
         return Err(anyhow!(
             "couldn't find a `myownmesh` binary. Re-run the LLM build with network \
              access so `build.rs` can fetch the daemon, set MYOWNLLM_MESH_BIN to a \
@@ -870,8 +903,14 @@ pub async fn ensure_daemon_running() -> Result<(ControlClient, Option<DaemonChil
         drop(handle);
     }
 
-    // Every candidate failed. Surface a diag listing all of them
-    // so the user can see what got tried — beats "couldn't find".
+    // Every candidate failed. Now that the search has definitively
+    // failed, surface the locations we skipped during enumeration too —
+    // they're part of the picture the user needs to debug it.
+    for d in &skip_diags {
+        eprintln!("daemon: {d}");
+    }
+    // Surface a diag listing everything tried so the user can see what
+    // got attempted — beats a bare "couldn't find".
     let tried: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
     Err(anyhow!(
         "no working `myownmesh` binary on this machine. Tried:\n  {}\nLast error: {}",
