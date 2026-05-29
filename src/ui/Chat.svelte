@@ -134,6 +134,32 @@
   let modelLoading = $state(false);
   let modelLoadTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** Reassurance words for the cold-start indicator — cycled every few
+   *  seconds (with a shine) so the user can see something is alive while
+   *  the model loads. Short and low-key; the rotation itself is the
+   *  "still working, not frozen" signal. */
+  const LOADING_WORDS = [
+    "Working on it…",
+    "Loading the model…",
+    "Warming up…",
+    "Reading the weights…",
+    "Getting set up…",
+    "Hang tight…",
+    "Almost there…",
+  ];
+  const LOADING_WORD_MS = 3000;
+  let loadingWordIdx = $state(0);
+  // Rotate the reassurance word while a load is in progress. The $effect's
+  // cleanup clears the interval the moment `modelLoading` goes false.
+  $effect(() => {
+    if (!modelLoading) return;
+    loadingWordIdx = 0;
+    const id = setInterval(() => {
+      loadingWordIdx = (loadingWordIdx + 1) % LOADING_WORDS.length;
+    }, LOADING_WORD_MS);
+    return () => clearInterval(id);
+  });
+
   /** Live CPU/RAM/GPU snapshot shown inside the load-wait dialog so
    *  the user can see *why* it's slow (e.g. RAM near full → the model
    *  is paging in from disk). Reuses the same `usage_live_snapshot`
@@ -204,11 +230,6 @@
   function fmtGb(bytes: number | null | undefined): string {
     if (bytes == null) return "—";
     return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
-  }
-  /** RAM-in-use percentage for the mini bar, or null when unknown. */
-  function ramUsedPct(): number | null {
-    if (!liveStats?.ram_used_bytes || !liveStats?.ram_total_bytes) return null;
-    return (liveStats.ram_used_bytes / liveStats.ram_total_bytes) * 100;
   }
 
   /** One pending attachment staged for the next send. Images become
@@ -1383,7 +1404,30 @@
     {/each}
     {#if streaming && (messages.length === 0 || messages[messages.length - 1].role !== "assistant")}
       <div class="message assistant">
-        <div class="bubble"><span class="dots"><span></span><span></span><span></span></span></div>
+        <div class="bubble">
+          {#if modelLoading}
+            <!-- Cold-start: the model is (re)loading into memory. Replace
+                 the typing dots in place (no jolting modal) with a calmer
+                 reassurance — a word that rotates every few seconds with a
+                 shine, plus a quiet live CPU/RAM line as proof the machine
+                 is still working, not frozen. -->
+            <div class="loading-inline" aria-live="polite">
+              {#key loadingWordIdx}
+                <span class="loading-word">{LOADING_WORDS[loadingWordIdx]}</span>
+              {/key}
+              {#if !routeViaDevicePubkey && liveStats}
+                <span class="loading-meta">
+                  {#if liveStats.cpu_total_pct != null}CPU {Math.round(liveStats.cpu_total_pct)}%{/if}
+                  {#if liveStats.ram_used_bytes != null && liveStats.ram_total_bytes != null}
+                    · RAM {fmtGb(liveStats.ram_used_bytes)}/{fmtGb(liveStats.ram_total_bytes)}
+                  {/if}
+                </span>
+              {/if}
+            </div>
+          {:else}
+            <span class="dots"><span></span><span></span><span></span></span>
+          {/if}
+        </div>
       </div>
     {/if}
   </div>
@@ -1517,74 +1561,6 @@
   {/if}
   </div>
 
-  {#if modelLoading}
-    <!-- Cold-start dialog. Shown only when the first token hasn't
-         arrived within MODEL_LOAD_POPUP_DELAY_MS — i.e. the model is
-         (re)loading into memory. Non-blocking: the user can keep
-         reading the transcript behind it, and Cancel aborts the run. -->
-    <div class="model-loading-backdrop" role="dialog" aria-modal="false" aria-live="polite">
-      <div class="model-loading-card">
-        <div class="model-loading-head">
-          <div class="spinner" aria-hidden="true"></div>
-          <div class="model-loading-text">
-            {#if routeViaDevicePubkey}
-              <p class="model-loading-title">Waiting for {routedPeer?.label ?? "the host"}…</p>
-              <p class="model-loading-sub">The host is loading its model. This can take a few seconds.</p>
-            {:else}
-              <p class="model-loading-title">Loading {activeModel}…</p>
-              <p class="model-loading-sub">First use reads the model into memory. This is usually a one-time wait — later replies start instantly.</p>
-            {/if}
-          </div>
-          <button class="model-loading-cancel" onclick={stop}>Cancel</button>
-        </div>
-
-        <!-- Live resource readout — only meaningful for local loads
-             (a remote model loads on the host's machine, not this
-             one). Bars + figures come from usage_live_snapshot, the
-             same lookup the Usage settings tab uses. -->
-        {#if !routeViaDevicePubkey}
-          <div class="model-loading-stats">
-            <div class="stat">
-              <div class="stat-row">
-                <span class="stat-label">CPU</span>
-                <span class="stat-val">{liveStats?.cpu_total_pct != null ? `${Math.round(liveStats.cpu_total_pct)}%` : "—"}</span>
-              </div>
-              <div class="meter"><div class="meter-fill" style="width: {Math.min(100, Math.max(0, liveStats?.cpu_total_pct ?? 0))}%"></div></div>
-            </div>
-            <div class="stat">
-              <div class="stat-row">
-                <span class="stat-label">RAM</span>
-                <span class="stat-val">
-                  {#if liveStats?.ram_used_bytes != null && liveStats?.ram_total_bytes != null}
-                    {fmtGb(liveStats.ram_used_bytes)} / {fmtGb(liveStats.ram_total_bytes)}
-                  {:else}—{/if}
-                </span>
-              </div>
-              <div class="meter"><div class="meter-fill" class:hot={(ramUsedPct() ?? 0) >= 90} style="width: {Math.min(100, Math.max(0, ramUsedPct() ?? 0))}%"></div></div>
-            </div>
-            {#if liveStats?.gpu_pct != null || liveStats?.vram_total_bytes != null}
-              <div class="stat">
-                <div class="stat-row">
-                  <span class="stat-label">GPU</span>
-                  <span class="stat-val">
-                    {liveStats?.gpu_pct != null ? `${Math.round(liveStats.gpu_pct)}%` : "—"}
-                    {#if liveStats?.vram_used_bytes != null && liveStats?.vram_total_bytes != null}
-                      <span class="stat-sub">· VRAM {fmtGb(liveStats.vram_used_bytes)} / {fmtGb(liveStats.vram_total_bytes)}</span>
-                    {/if}
-                  </span>
-                </div>
-                <div class="meter"><div class="meter-fill" style="width: {Math.min(100, Math.max(0, liveStats?.gpu_pct ?? 0))}%"></div></div>
-              </div>
-            {/if}
-            {#if hardware?.disk_free_gb != null}
-              <p class="stat-disk">Disk free: {hardware.disk_free_gb.toFixed(1)} GB</p>
-            {/if}
-          </div>
-        {/if}
-      </div>
-    </div>
-  {/if}
-
   {#if settingsTab}
     <SettingsPanel
       initialTab={settingsTab}
@@ -1610,136 +1586,48 @@
     position: relative;
   }
 
-  /* Cold-start model-loading dialog. Floats over the chat surface
-     without blocking it (pointer-events scoped to the card). */
-  .model-loading-backdrop {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: rgba(0, 0, 0, 0.45);
-    z-index: 40;
-    pointer-events: none;
-    animation: model-loading-fade 0.18s ease-out;
-  }
-  @keyframes model-loading-fade {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-  .model-loading-card {
-    pointer-events: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 0.85rem;
-    width: 25rem;
-    max-width: calc(100% - 2rem);
-    padding: 1.1rem 1.25rem;
-    background: #181818;
-    border: 1px solid #2a2a2a;
-    border-radius: 12px;
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
-  }
-  .model-loading-head {
-    display: flex;
-    align-items: center;
-    gap: 0.9rem;
-  }
-  .model-loading-card .spinner {
-    flex: none;
-    width: 24px;
-    height: 24px;
-    border: 3px solid #333;
-    border-top-color: #6e6ef7;
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-  }
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-  .model-loading-text {
-    flex: 1;
-    min-width: 0;
-  }
-  .model-loading-title {
-    margin: 0;
-    color: #e8e8e8;
-    font-size: 0.95rem;
-    font-weight: 600;
-  }
-  .model-loading-sub {
-    margin: 0.25rem 0 0;
-    color: #999;
-    font-size: 0.8rem;
-    line-height: 1.35;
-  }
-  .model-loading-cancel {
-    flex: none;
-    align-self: flex-start;
-    background: none;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
-    color: #bbb;
-    padding: 0.3rem 0.6rem;
-    font-size: 0.8rem;
-    cursor: pointer;
-  }
-  .model-loading-cancel:hover {
-    border-color: #3a3a55;
-    color: #ddd;
-  }
-  .model-loading-stats {
-    display: flex;
-    flex-direction: column;
-    gap: 0.55rem;
-    padding-top: 0.85rem;
-    border-top: 1px solid #242424;
-  }
-  .model-loading-stats .stat {
+  /* Cold-start inline indicator — sits in the assistant bubble in place
+     of the typing dots while the model loads. A reassurance word with a
+     moving shine, recreated on each rotation so it fades in, plus a quiet
+     live CPU/RAM line. */
+  .loading-inline {
     display: flex;
     flex-direction: column;
     gap: 0.25rem;
   }
-  .model-loading-stats .stat-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    gap: 0.5rem;
-    font-size: 0.76rem;
+  .loading-word {
+    display: inline-block;
+    font-size: 0.9rem;
+    font-weight: 500;
+    background: linear-gradient(
+      90deg,
+      #8a8a8a 0%,
+      #8a8a8a 38%,
+      #eaeaff 50%,
+      #8a8a8a 62%,
+      #8a8a8a 100%
+    );
+    background-size: 220% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+    animation:
+      loading-word-in 0.4s ease-out,
+      loading-shine 2.4s linear infinite;
   }
-  .model-loading-stats .stat-label {
-    color: #888;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    font-size: 0.68rem;
+  @keyframes loading-shine {
+    0% { background-position: 160% 0; }
+    100% { background-position: -160% 0; }
   }
-  .model-loading-stats .stat-val {
-    color: #ccc;
+  @keyframes loading-word-in {
+    from { opacity: 0; transform: translateY(2px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .loading-meta {
+    font-size: 0.72rem;
+    color: #6a6a6a;
     font-variant-numeric: tabular-nums;
-  }
-  .model-loading-stats .stat-sub {
-    color: #777;
-    font-size: 0.72rem;
-  }
-  .model-loading-stats .meter {
-    height: 5px;
-    background: #242424;
-    border-radius: 3px;
-    overflow: hidden;
-  }
-  .model-loading-stats .meter-fill {
-    height: 100%;
-    background: #6e6ef7;
-    border-radius: 3px;
-    transition: width 0.4s ease;
-  }
-  .model-loading-stats .meter-fill.hot {
-    background: #e35a5a;
-  }
-  .model-loading-stats .stat-disk {
-    margin: 0.1rem 0 0;
-    font-size: 0.72rem;
-    color: #777;
   }
   .chat-body {
     flex: 1;
