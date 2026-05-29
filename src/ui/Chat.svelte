@@ -120,6 +120,28 @@
   let input = $state("");
   let streaming = $state(false);
 
+  /** Cold-start UX: Ollama loads a model's weights into RAM/VRAM on
+   *  the first request after it was evicted (or never loaded this
+   *  session). That gap — between firing the chat stream and the
+   *  first token coming back — is silent today. If it runs long we
+   *  surface a small "loading the model" dialog so the user knows the
+   *  app isn't wedged. Once any frame arrives (delta, tool call, or
+   *  terminal event) the model is resident and we tear the dialog
+   *  down; we don't re-arm it for later turns in the same run since
+   *  the model is warm by then. */
+  const MODEL_LOAD_POPUP_DELAY_MS = 5000;
+  let modelLoading = $state(false);
+  let modelLoadTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Clear the load-wait dialog + its arming timer. Idempotent, so
+   *  it's safe to call from every agent event and from cleanup. */
+  function clearModelLoadWait() {
+    if (modelLoadTimer !== null) {
+      clearTimeout(modelLoadTimer);
+      modelLoadTimer = null;
+    }
+    if (modelLoading) modelLoading = false;
+  }
+
   /** One pending attachment staged for the next send. Images become
    *  Ollama-style `images: [base64]` array entries on the user
    *  message; text-like files (JSON, configs, source, plain text)
@@ -838,6 +860,13 @@
       enabledToolSet.has(t.definition.function.name),
     );
 
+    // Arm the cold-start dialog: if no frame has come back by the
+    // delay, the model is (re)loading into memory and we tell the
+    // user so. clearModelLoadWait() below disarms it on first frame.
+    modelLoadTimer = setTimeout(() => {
+      modelLoading = true;
+    }, MODEL_LOAD_POPUP_DELAY_MS);
+
     try {
       await runAgent({
         messages: working,
@@ -849,6 +878,9 @@
         viaDevicePubkey: routeViaDevicePubkey,
         signal: controller.signal,
         onEvent: (event: AgentEvent) => {
+          // Any frame means the model is resident and producing —
+          // tear down the load-wait dialog (idempotent).
+          clearModelLoadWait();
           switch (event.kind) {
             case "assistant_delta":
             case "thinking_delta": {
@@ -916,6 +948,9 @@
       streaming = false;
       agentAbortController = null;
       inFlightToolCallIds = new Set();
+      // Belt-and-suspenders: if the run ended before any frame (error
+      // thrown, instant cancel), the timer/dialog could still be live.
+      clearModelLoadWait();
       // Drop the streaming flag on any straggler bubble so its
       // <details> can collapse cleanly once the answer is in.
       if (liveIdx !== -1 && liveIdx < messages.length) {
@@ -958,6 +993,9 @@
     // `infer_cancel` (mesh path) on whatever turn is in flight, then
     // unwinds the loop without starting another round.
     agentAbortController?.abort();
+    // Drop the load-wait dialog right away rather than waiting for the
+    // stream to unwind through the finally block.
+    clearModelLoadWait();
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -1392,6 +1430,28 @@
   {/if}
   </div>
 
+  {#if modelLoading}
+    <!-- Cold-start dialog. Shown only when the first token hasn't
+         arrived within MODEL_LOAD_POPUP_DELAY_MS — i.e. the model is
+         (re)loading into memory. Non-blocking: the user can keep
+         reading the transcript behind it, and Cancel aborts the run. -->
+    <div class="model-loading-backdrop" role="dialog" aria-modal="false" aria-live="polite">
+      <div class="model-loading-card">
+        <div class="spinner" aria-hidden="true"></div>
+        <div class="model-loading-text">
+          {#if routeViaDevicePubkey}
+            <p class="model-loading-title">Waiting for {routedPeer?.label ?? "the host"}…</p>
+            <p class="model-loading-sub">The host is loading its model. This can take a few seconds.</p>
+          {:else}
+            <p class="model-loading-title">Loading {activeModel}…</p>
+            <p class="model-loading-sub">First use reads the model into memory. This is usually a one-time wait — later replies start instantly.</p>
+          {/if}
+        </div>
+        <button class="model-loading-cancel" onclick={stop}>Cancel</button>
+      </div>
+    </div>
+  {/if}
+
   {#if settingsTab}
     <SettingsPanel
       initialTab={settingsTab}
@@ -1415,6 +1475,78 @@
     display: flex;
     flex-direction: column;
     position: relative;
+  }
+
+  /* Cold-start model-loading dialog. Floats over the chat surface
+     without blocking it (pointer-events scoped to the card). */
+  .model-loading-backdrop {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.45);
+    z-index: 40;
+    pointer-events: none;
+    animation: model-loading-fade 0.18s ease-out;
+  }
+  @keyframes model-loading-fade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  .model-loading-card {
+    pointer-events: auto;
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    max-width: 24rem;
+    padding: 1.1rem 1.25rem;
+    background: #181818;
+    border: 1px solid #2a2a2a;
+    border-radius: 12px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  }
+  .model-loading-card .spinner {
+    flex: none;
+    width: 24px;
+    height: 24px;
+    border: 3px solid #333;
+    border-top-color: #6e6ef7;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+  .model-loading-text {
+    min-width: 0;
+  }
+  .model-loading-title {
+    margin: 0;
+    color: #e8e8e8;
+    font-size: 0.95rem;
+    font-weight: 600;
+  }
+  .model-loading-sub {
+    margin: 0.25rem 0 0;
+    color: #999;
+    font-size: 0.8rem;
+    line-height: 1.35;
+  }
+  .model-loading-cancel {
+    flex: none;
+    align-self: flex-start;
+    background: none;
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    color: #bbb;
+    padding: 0.3rem 0.6rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .model-loading-cancel:hover {
+    border-color: #3a3a55;
+    color: #ddd;
   }
   .chat-body {
     flex: 1;
