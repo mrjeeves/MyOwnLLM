@@ -235,6 +235,9 @@ async function handleTranscribe(
     end_ms: number;
     speaker?: number;
     overlap?: boolean;
+    /** Streaming live path: a still-refining interim caption. We don't
+     *  forward these to the requesting peer (confirmed text only). */
+    partial?: boolean;
   }
   interface TranscribeFrameJson {
     elapsed_ms?: number;
@@ -250,6 +253,10 @@ async function handleTranscribe(
         const f = e.payload;
         if (Array.isArray(f.segments)) {
           for (const seg of f.segments) {
+            // Forward confirmed text only: interim (partial) captions
+            // are a local live-UI affordance, so remote transcripts
+            // don't churn. Interim-over-mesh can come later.
+            if (seg.partial) continue;
             void client.streamRpcChunk(call.request_id, {
               text: seg.text,
               speaker: seg.speaker,

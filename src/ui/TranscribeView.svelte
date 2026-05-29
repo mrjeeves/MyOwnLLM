@@ -830,6 +830,14 @@
     transcribeUi.active && transcribeUi.conversationId === conversationId,
   );
 
+  // The live, still-refining caption for the active streaming session.
+  // Rendered tentatively beneath the confirmed transcript and never
+  // persisted. Empty unless this view owns the active recording and a
+  // partial segment is currently in flight.
+  let interimText = $derived(
+    isMyRecording ? (transcribeUi.interimSegment?.text ?? "") : "",
+  );
+
   /** This view's conversation is the one being fed by an upload. The
    *  progress-bar / "consume the Upload button" UI keys off this. */
   let isMyUploading = $derived(
@@ -1039,7 +1047,7 @@
         </label>
       </header>
       <div class="pane-body" use:stickToBottom={transcript}>
-        {#if renderedTurns.length > 0}
+        {#if renderedTurns.length > 0 || interimText}
           <div class="transcript">
             {#each renderedTurns as turn, i (i)}
               <div class="turn" class:overlap={turn.overlap}>
@@ -1084,6 +1092,13 @@
                 {/if}
               </div>
             {/each}
+            {#if interimText}
+              <div class="turn interim">
+                <p class="turn-text flat interim" aria-live="polite">
+                  {interimText}
+                </p>
+              </div>
+            {/if}
           </div>
         {:else}
           <div class="placeholder">
@@ -1621,6 +1636,12 @@
   }
   .turn-text.flat { color: #e8e8e8; }
   .turn.overlap .turn-text { color: #d4d4d4; font-style: italic; }
+  /* Live, still-refining streaming caption: dimmed + italic so it reads
+     as tentative until it finalizes into a normal turn. */
+  .turn-text.interim {
+    color: #9a9a9a;
+    font-style: italic;
+  }
   .bullets {
     list-style: disc;
     padding-left: 1.25rem;
