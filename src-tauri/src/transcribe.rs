@@ -40,7 +40,8 @@ use std::thread;
 use std::time::Duration;
 use tauri::WebviewWindow;
 
-use crate::asr::{self, AsrBackend, AsrCaps, AsrSegment};
+use crate::asr::streaming::{LocalAgreement, SilenceEndpointer, StreamWindow};
+use crate::asr::{self, AsrBackend, AsrCaps, AsrSegment, AsrToken};
 use crate::diarize::{self, DiarizeBackend, SpeakerTurn};
 use crate::frame_sink::FrameSink;
 use crate::models::{self, ModelKind};
@@ -74,6 +75,13 @@ const MAX_BACKLOG_SECONDS: f32 = 300.0;
 /// retrying so a recoverable failure doesn't poison every subsequent
 /// chunk.
 const ASR_CONSECUTIVE_ERROR_LIMIT: u32 = 3;
+
+/// Trailing low-RMS duration that ends an utterance and finalizes its
+/// caption in the streaming loop. Long enough that a brief mid-sentence
+/// breath doesn't chop a sentence, short enough that a real reply feels
+/// prompt. Per-tier tuning can move this onto `AsrCaps` later; Silero
+/// VAD will replace the RMS notion with a real speech probability.
+const ENDPOINT_SILENCE_MS: u64 = 600;
 
 /// Build a cpal `err_fn` closure that latches the first error into the
 /// shared slot. Used per-branch in the sample-format match so each cpal
@@ -173,10 +181,26 @@ pub struct EmittedSegment {
     /// with stable IDs.
     #[serde(default, skip_serializing_if = "is_false")]
     pub provisional: bool,
+    /// Stable per-session identity so the UI can replace a segment in
+    /// place as it refines. The streaming live path assigns one id per
+    /// utterance and re-emits it (interim → final); the disk-shard path
+    /// has no interim concept and leaves it 0.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub seg_id: u64,
+    /// `true` while this segment's text is still being refined by the
+    /// streaming loop (the live "typing" caption); `false` once
+    /// finalized on a speech pause. The disk-shard path always emits
+    /// final text.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub partial: bool,
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 impl TranscribeFrame {
@@ -2041,6 +2065,9 @@ fn join_segments(
             speaker,
             overlap,
             provisional: false,
+            // Disk-shard path: no interim concept, segments are final.
+            seg_id: 0,
+            partial: false,
         });
     }
     out
@@ -2152,6 +2179,266 @@ fn ingest_loop(
     }
 }
 
+/// In-memory streaming decode loop for the **live** ASR path — the
+/// streaming counterpart to `ingest_loop` + the disk-shard poll loop in
+/// `run_session`.
+///
+/// Instead of accumulating fixed chunks to disk and decoding each once,
+/// it keeps a rolling [`StreamWindow`] in RAM, re-decodes the current
+/// utterance every `caps.hop_seconds`, and runs [`LocalAgreement`] over
+/// the hypotheses so the caption appears as an interim ("typing") line
+/// (`partial = true`) that refines hop-to-hop, then finalizes
+/// (`partial = false`) on a speech pause detected by
+/// [`SilenceEndpointer`]. One `seg_id` per utterance lets the UI replace
+/// the live line in place.
+///
+/// Decoupled from cpal on purpose: it drains the same
+/// `Receiver<Vec<f32>>` the capture callback feeds and writes through a
+/// [`FrameSink`], so tests drive it with a scripted fake backend + a
+/// `CaptureSink` (no audio device, no ONNX). `run_session` wires the
+/// real cpal stream to it in a follow-up.
+///
+/// Speaker attribution isn't wired here yet — live segments emit
+/// `speaker = None`; diarization over the streaming path lands with the
+/// online speaker-registry work.
+///
+/// `dead_code` until `run_session` is switched off the disk-shard loop
+/// onto this one (the behavioural cut, validated against a real mic);
+/// exercised today by the unit tests below.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn run_streaming_loop(
+    rx: Receiver<Vec<f32>>,
+    device_sr: u32,
+    asr: &mut dyn AsrBackend,
+    caps: AsrCaps,
+    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    sink: &Arc<dyn FrameSink>,
+    event: &str,
+    started: std::time::Instant,
+) -> Result<()> {
+    let mut window = StreamWindow::new(TARGET_SR, caps.max_context_seconds);
+    let mut agree = LocalAgreement::new();
+    let mut endpointer = SilenceEndpointer::new(SILENCE_RMS_THRESHOLD, ENDPOINT_SILENCE_MS);
+
+    let hop_samples = (TARGET_SR as f32 * caps.hop_seconds).max(1.0) as usize;
+    let hop_ms = (caps.hop_seconds * 1000.0) as u64;
+    let max_ctx_ms = (caps.max_context_seconds * 1000.0) as u64;
+
+    let mut next_seg_id: u64 = 1;
+    let mut cur_seg_id: u64 = 0; // 0 = no active utterance
+    let mut utt_start_ms: u64 = 0;
+    let mut new_samples: usize = 0;
+    let mut consecutive_errors: u32 = 0;
+
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(samples) => {
+                if paused.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let pcm = resample_linear(&samples, device_sr, TARGET_SR);
+                new_samples += pcm.len();
+                window.push(&pcm);
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        // Run a hop once a hop's worth of fresh audio has arrived.
+        if new_samples < hop_samples {
+            continue;
+        }
+        new_samples = 0;
+
+        // RMS of the most recent hop drives endpointing and the
+        // silent-idle skip.
+        let win = window.samples();
+        let tail = hop_samples.min(win.len());
+        let hop_rms = if tail > 0 {
+            chunk_rms(&win[win.len() - tail..])
+        } else {
+            0.0
+        };
+        let speechy = hop_rms >= SILENCE_RMS_THRESHOLD;
+        let endpoint = endpointer.observe(hop_rms, hop_ms);
+
+        // Decode voiced hops only: silence yields empty/hallucinated
+        // tokens and would clobber the interim tail. A quiet hop just
+        // advances the endpoint clock, preserving the pending tail.
+        if speechy {
+            match asr.process_chunk(window.samples(), window.base_ms(), &cancel) {
+                Ok(out) => {
+                    consecutive_errors = 0;
+                    let hyp: Vec<AsrToken> = out
+                        .segments
+                        .iter()
+                        .flat_map(|s| s.tokens.iter().cloned())
+                        .collect();
+                    if !hyp.is_empty() {
+                        if cur_seg_id == 0 {
+                            cur_seg_id = next_seg_id;
+                            next_seg_id += 1;
+                            utt_start_ms = window.base_ms();
+                        }
+                        agree.accept(hyp);
+                        let live: Vec<AsrToken> = agree
+                            .confirmed()
+                            .iter()
+                            .chain(agree.interim().iter())
+                            .cloned()
+                            .collect();
+                        emit_stream_segment(
+                            sink,
+                            event,
+                            started,
+                            cur_seg_id,
+                            &live,
+                            window.base_ms(),
+                            utt_start_ms,
+                            true,
+                        );
+                    }
+                }
+                Err(e) => {
+                    if cancel.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    consecutive_errors += 1;
+                    eprintln!(
+                        "streaming ASR inference failed (consecutive={consecutive_errors}): {e}"
+                    );
+                    if consecutive_errors >= ASR_CONSECUTIVE_ERROR_LIMIT {
+                        return Err(anyhow!(
+                            "ASR backend failed {consecutive_errors} times in a row: {e}"
+                        ));
+                    }
+                    asr.reset_state();
+                }
+            }
+        }
+
+        let forced = cur_seg_id != 0 && window.duration_ms() >= max_ctx_ms;
+        if cur_seg_id != 0 && (endpoint || forced) {
+            // Finalize: promote confirmed + interim to a final segment
+            // under the same seg_id, then reset for the next utterance.
+            let final_tokens: Vec<AsrToken> = agree
+                .confirmed()
+                .iter()
+                .chain(agree.interim().iter())
+                .cloned()
+                .collect();
+            agree.finalize();
+            emit_stream_segment(
+                sink,
+                event,
+                started,
+                cur_seg_id,
+                &final_tokens,
+                window.base_ms(),
+                utt_start_ms,
+                false,
+            );
+            cur_seg_id = 0;
+            endpointer.reset();
+            window.reset_to(window.base_ms() + window.duration_ms());
+        } else if cur_seg_id == 0 && !speechy {
+            // Idle silence: drop it so the window doesn't grow between
+            // utterances.
+            window.reset_to(window.base_ms() + window.duration_ms());
+        }
+    }
+
+    // Stop / mic disconnect with an utterance still in flight: finalize
+    // it so its text isn't lost.
+    if cur_seg_id != 0 {
+        let final_tokens: Vec<AsrToken> = agree
+            .confirmed()
+            .iter()
+            .chain(agree.interim().iter())
+            .cloned()
+            .collect();
+        if !final_tokens.is_empty() {
+            emit_stream_segment(
+                sink,
+                event,
+                started,
+                cur_seg_id,
+                &final_tokens,
+                window.base_ms(),
+                utt_start_ms,
+                false,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Build and emit a one-segment `TranscribeFrame` for the streaming
+/// loop. Skips empty text (a hop that's confirmed nothing yet).
+#[allow(clippy::too_many_arguments)]
+fn emit_stream_segment(
+    sink: &Arc<dyn FrameSink>,
+    event: &str,
+    started: std::time::Instant,
+    seg_id: u64,
+    tokens: &[AsrToken],
+    window_base_ms: u64,
+    utt_start_ms: u64,
+    partial: bool,
+) {
+    let text = join_tokens(tokens);
+    if text.is_empty() {
+        return;
+    }
+    let end_ms = tokens
+        .last()
+        .map(|t| window_base_ms + t.t_ms)
+        .unwrap_or(utt_start_ms)
+        .max(utt_start_ms);
+    let seg = EmittedSegment {
+        start_ms: utt_start_ms,
+        end_ms,
+        text,
+        speaker: None,
+        overlap: false,
+        provisional: false,
+        seg_id,
+        partial,
+    };
+    sink.emit_frame(
+        event,
+        TranscribeFrame {
+            elapsed_ms: started.elapsed().as_millis(),
+            segments: vec![seg],
+            is_final: false,
+            pending_chunks: 0,
+            chunk_seconds: None,
+            status: None,
+            upload_progress: None,
+        },
+    );
+}
+
+/// Join word tokens into caption text with single spaces.
+fn join_tokens(tokens: &[AsrToken]) -> String {
+    let mut out = String::new();
+    for t in tokens {
+        let w = t.text.trim();
+        if w.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(w);
+    }
+    out
+}
+
 fn write_f32_chunk(path: &Path, samples: &[f32]) -> std::io::Result<()> {
     let tmp = path.with_extension("f32.tmp");
     let mut bytes = Vec::with_capacity(samples.len() * 4);
@@ -2249,6 +2536,8 @@ pub fn list_input_devices() -> Result<Vec<AudioInputDevice>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame_sink::CaptureSink;
+    use std::collections::VecDeque;
 
     fn seg(start_ms: u64, end_ms: u64, text: &str) -> AsrSegment {
         AsrSegment {
@@ -2268,6 +2557,179 @@ mod tests {
             overlap,
             confidence: None,
         }
+    }
+
+    /// Fake ASR backend for streaming-loop tests: ignores audio and
+    /// returns the next scripted hypothesis per `process_chunk`, so a
+    /// test drives LocalAgreement deterministically.
+    struct ScriptedAsr {
+        hyps: std::sync::Mutex<VecDeque<Vec<AsrToken>>>,
+    }
+
+    impl ScriptedAsr {
+        fn new(hyps: Vec<Vec<&str>>) -> Self {
+            let q = hyps
+                .into_iter()
+                .map(|words| {
+                    words
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, w)| AsrToken::new(w, (i as u64 + 1) * 100))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            Self {
+                hyps: std::sync::Mutex::new(q),
+            }
+        }
+    }
+
+    impl AsrBackend for ScriptedAsr {
+        fn caps(&self) -> AsrCaps {
+            AsrCaps {
+                label: "scripted",
+                chunk_seconds: 1.0,
+                min_tail_seconds: 0.1,
+                multilingual: false,
+                streaming: false,
+                state_reset_chunks: 0,
+                window_seconds: 2.0,
+                hop_seconds: 0.5,
+                max_context_seconds: 8.0,
+            }
+        }
+        fn warm_up(&mut self, _on_stage: &dyn Fn(&str), _cancel: &AtomicBool) -> Result<()> {
+            Ok(())
+        }
+        fn process_chunk(
+            &mut self,
+            _pcm: &[f32],
+            _t0: u64,
+            _cancel: &AtomicBool,
+        ) -> Result<asr::AsrChunkOut> {
+            let next = self.hyps.lock().unwrap().pop_front().unwrap_or_default();
+            let segments = if next.is_empty() {
+                Vec::new()
+            } else {
+                vec![AsrSegment {
+                    start_ms: 0,
+                    end_ms: next.last().map(|t| t.t_ms).unwrap_or(0),
+                    text: join_tokens(&next),
+                    confidence: None,
+                    tokens: next,
+                }]
+            };
+            Ok(asr::AsrChunkOut {
+                segments,
+                used_state: false,
+            })
+        }
+        fn reset_state(&mut self) {}
+    }
+
+    /// Drive the loop end to end: three voiced hops that grow the
+    /// hypothesis, then a pause. The caption should refine as interim
+    /// then finalize exactly once, under one stable seg_id, and every
+    /// interim must be a prefix of the final (LocalAgreement never
+    /// rewrites confirmed text).
+    #[test]
+    fn streaming_loop_emits_refining_interim_then_one_final() {
+        let mut asr = ScriptedAsr::new(vec![
+            vec!["the"],
+            vec!["the", "quick"],
+            vec!["the", "quick", "brown"],
+        ]);
+        let caps = asr.caps();
+        let cap = Arc::new(CaptureSink::new());
+        let sink: Arc<dyn FrameSink> = cap.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+
+        // 0.5 s hop @ 16 kHz = 8000 samples. Three voiced hops, then two
+        // quiet hops (1 s > the 600 ms endpoint), then disconnect.
+        let (tx, rx) = bounded::<Vec<f32>>(128);
+        let sender = thread::spawn(move || {
+            for _ in 0..3 {
+                tx.send(vec![0.1f32; 8000]).unwrap();
+            }
+            for _ in 0..2 {
+                tx.send(vec![0.0f32; 8000]).unwrap();
+            }
+        });
+
+        run_streaming_loop(
+            rx,
+            16_000,
+            &mut asr,
+            caps,
+            cancel,
+            paused,
+            &sink,
+            "evt",
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        sender.join().unwrap();
+
+        let frames = cap.drain();
+        let segs: Vec<&EmittedSegment> =
+            frames.iter().flat_map(|(_, f)| f.segments.iter()).collect();
+        assert!(!segs.is_empty(), "expected emitted segments");
+        assert!(
+            segs.iter().all(|s| s.seg_id == 1),
+            "all segments share the utterance's seg_id"
+        );
+        assert!(segs.iter().any(|s| s.partial), "expected interim frames");
+
+        let final_count = segs.iter().filter(|s| !s.partial).count();
+        assert_eq!(final_count, 1, "exactly one final segment");
+        let final_seg = segs.iter().find(|s| !s.partial).unwrap();
+        assert_eq!(final_seg.text, "the quick brown");
+        assert!(
+            final_seg.speaker.is_none(),
+            "no speaker on the streaming path yet"
+        );
+
+        for s in segs.iter().filter(|s| s.partial) {
+            assert!(
+                "the quick brown".starts_with(s.text.as_str()),
+                "interim '{}' should be a prefix of the final",
+                s.text
+            );
+        }
+    }
+
+    /// A run that is silent end to end never opens an utterance.
+    #[test]
+    fn streaming_loop_silence_emits_nothing() {
+        let mut asr = ScriptedAsr::new(vec![]);
+        let caps = asr.caps();
+        let cap = Arc::new(CaptureSink::new());
+        let sink: Arc<dyn FrameSink> = cap.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+
+        let (tx, rx) = bounded::<Vec<f32>>(128);
+        let sender = thread::spawn(move || {
+            for _ in 0..4 {
+                tx.send(vec![0.0f32; 8000]).unwrap();
+            }
+        });
+        run_streaming_loop(
+            rx,
+            16_000,
+            &mut asr,
+            caps,
+            cancel,
+            paused,
+            &sink,
+            "evt",
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        sender.join().unwrap();
+
+        assert!(cap.drain().is_empty(), "silence must not emit captions");
     }
 
     #[test]
