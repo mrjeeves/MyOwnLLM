@@ -63,6 +63,11 @@ const SILENCE_RMS_THRESHOLD: f32 = 0.005;
 /// transcript stays close to live rather than playing minutes-old
 /// audio. Chosen larger than any plausible per-chunk inference time
 /// even on a Pi 5.
+///
+/// Dead since the live paths moved to the in-memory streaming loop —
+/// retained with the disk-ingest writer below pending a decision on
+/// dropping crashed-session disk recovery entirely.
+#[allow(dead_code)]
 const MAX_BACKLOG_SECONDS: f32 = 300.0;
 
 /// Give up after this many `AsrBackend::process_chunk` failures in a
@@ -941,7 +946,7 @@ fn run_remote_session(
     sample_rate: u32,
     rx: Receiver<Vec<f32>>,
     cancel: Arc<AtomicBool>,
-    _paused: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     window: &std::sync::Arc<dyn FrameSink>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
@@ -962,153 +967,35 @@ fn run_remote_session(
     }
     write_meta(&buffer_dir, runtime, model_name, diarize_composite);
 
-    // Hand the receiver to the existing ingest_loop. It writes
-    // chunked .f32 files to `buffer_dir`; this thread reads them
-    // back in seq order and drives ASR. Same machinery as the
-    // local mic path — the audio source is the only difference.
-    let ingest_buffer_dir = buffer_dir.clone();
-    let ingest_cancel = cancel.clone();
-    let ingest_caps = caps;
-    let ingest_event = event.to_string();
-    let ingest_window: std::sync::Arc<dyn FrameSink> = std::sync::Arc::clone(window);
-    let ingest_handle = thread::spawn(move || {
-        ingest_loop(
-            rx,
-            sample_rate,
-            ingest_buffer_dir,
-            ingest_caps,
-            ingest_cancel,
-            &ingest_event,
-            &ingest_window,
-            started,
-        );
-    });
-
     window.emit_frame(
         event,
         TranscribeFrame::heartbeat(
             started.elapsed().as_millis(),
             0,
             Some(caps.chunk_seconds),
-            Some(format!(
-                "Receiving remote audio… first chunk in ~{:.0} s",
-                caps.chunk_seconds
-            )),
+            Some("Receiving remote audio…".to_string()),
         ),
     );
 
-    let mut next_seq: u64 = 1;
-    let mut chunks_since_reset: u64 = 0;
-    let mut chunk_t0_ms: u64 = 0;
-    let mut consecutive_errors: u32 = 0;
-    // Track "the inbox is closed AND the buffer dir is empty" so
-    // a streaming session terminates naturally after the peer's
-    // is_final chunk drains. Without this the decode loop only
-    // exits on cancel, which would leave a remote session running
-    // forever waiting on chunks that'll never come.
-    loop {
-        if cancel.load(Ordering::SeqCst) {
-            break;
-        }
-        let next_path = buffer_dir.join(format!("{next_seq:010}.f32"));
-        if !next_path.exists() {
-            // Buffer empty AND inbox closed → caller signaled end
-            // and ingest_loop drained. Exit.
-            if !remote_inboxes().contains_key(stream_id) && count_pending_chunks(&buffer_dir) == 0 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-            continue;
-        }
+    // Same streaming path as the local mic — only the audio source
+    // differs (the peer's PCM, fed via `feed_remote_audio` into `rx`).
+    // The loop ends when the inbox tx is dropped (`end_remote_audio`)
+    // and `rx` disconnects.
+    let result = run_streaming_loop(
+        rx,
+        sample_rate,
+        &mut *asr,
+        diarize.as_deref_mut(),
+        caps,
+        cancel.clone(),
+        paused.clone(),
+        window,
+        event,
+        started,
+    );
 
-        let samples = match read_f32_chunk(&next_path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("transcribe-buffer read failed for {next_path:?}: {e}");
-                let _ = std::fs::remove_file(&next_path);
-                next_seq += 1;
-                continue;
-            }
-        };
-
-        let chunk_ms = (samples.len() as u64 * 1000) / TARGET_SR as u64;
-        if chunk_rms(&samples) < SILENCE_RMS_THRESHOLD {
-            let _ = std::fs::remove_file(&next_path);
-            next_seq += 1;
-            chunk_t0_ms += chunk_ms;
-            continue;
-        }
-
-        let asr_out = match asr.process_chunk(&samples, chunk_t0_ms, &cancel) {
-            Ok(o) => {
-                consecutive_errors = 0;
-                o
-            }
-            Err(e) => {
-                if cancel.load(Ordering::SeqCst) {
-                    break;
-                }
-                consecutive_errors += 1;
-                eprintln!("ASR inference failed (consecutive={consecutive_errors}): {e}");
-                if consecutive_errors >= ASR_CONSECUTIVE_ERROR_LIMIT {
-                    return Err(anyhow!(
-                        "ASR backend failed {consecutive_errors} times in a row: {e}"
-                    ));
-                }
-                asr.reset_state();
-                let _ = std::fs::remove_file(&next_path);
-                next_seq += 1;
-                chunk_t0_ms += chunk_ms;
-                continue;
-            }
-        };
-
-        let turns: Vec<SpeakerTurn> = if let Some(d) = diarize.as_mut() {
-            match d.process_chunk(&samples, chunk_t0_ms, &cancel) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("diarize inference failed: {e}");
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
-
-        let _ = std::fs::remove_file(&next_path);
-        next_seq += 1;
-
-        let mut segments = join_segments(&asr_out.segments, &turns, chunk_t0_ms);
-        chunk_t0_ms += chunk_ms;
-        segments.retain(|s| !s.text.trim().is_empty());
-
-        if !segments.is_empty() {
-            window.emit_frame(
-                event,
-                TranscribeFrame {
-                    elapsed_ms: started.elapsed().as_millis(),
-                    segments,
-                    is_final: false,
-                    pending_chunks: count_pending_chunks(&buffer_dir),
-                    chunk_seconds: None,
-                    status: None,
-                    upload_progress: None,
-                },
-            );
-        }
-
-        if asr_out.used_state && caps.state_reset_chunks > 0 {
-            chunks_since_reset += 1;
-            if chunks_since_reset >= caps.state_reset_chunks {
-                chunks_since_reset = 0;
-                asr.reset_state();
-            }
-        }
-    }
-
-    let _ = ingest_handle.join();
     let _ = std::fs::remove_dir_all(&buffer_dir);
-    Ok(())
+    result
 }
 
 /// Bundle returned by `build_backends`: the warmed-up ASR backend,
@@ -1943,7 +1830,11 @@ fn lowest_pending_seq(dir: &Path) -> Option<u64> {
 /// long. Enforces the backlog cap: if more than `MAX_BACKLOG_SECONDS`
 /// of chunks accumulate, delete the oldest before writing the new
 /// one and warn via a status frame.
-#[allow(clippy::too_many_arguments)]
+///
+/// Dead since both live paths (`run_session`, `run_remote_session`)
+/// moved to the in-memory `run_streaming_loop`; kept for now as the
+/// reference disk-shard writer (`run_drain` still *reads* the format).
+#[allow(dead_code, clippy::too_many_arguments)]
 fn ingest_loop(
     rx: Receiver<Vec<f32>>,
     device_sr: u32,
@@ -2355,6 +2246,9 @@ fn diarize_speaker(
     }
 }
 
+// Dead since the streaming-loop flip (only `ingest_loop` wrote shards);
+// kept beside the writer it belongs to.
+#[allow(dead_code)]
 fn write_f32_chunk(path: &Path, samples: &[f32]) -> std::io::Result<()> {
     let tmp = path.with_extension("f32.tmp");
     let mut bytes = Vec::with_capacity(samples.len() * 4);
