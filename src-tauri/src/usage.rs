@@ -281,6 +281,67 @@ fn cpu_count() -> Option<u32> {
         .map(|n| n.get() as u32)
 }
 
+/// Sum a `ps -A -o %cpu=` dump (one float per process, each already a
+/// share of a single core) and normalise by `cpus` into a 0..100 share
+/// of total system CPU. `None` when nothing parses. Pure so it can be
+/// unit-tested on any host even though its only caller is macOS.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_total_cpu_pct(ps_output: &str, cpus: f64) -> Option<f64> {
+    let cpus = if cpus <= 0.0 { 1.0 } else { cpus };
+    let mut sum = 0.0;
+    let mut any = false;
+    for tok in ps_output.split_whitespace() {
+        if let Ok(v) = tok.parse::<f64>() {
+            sum += v;
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    Some((sum / cpus).clamp(0.0, 100.0))
+}
+
+/// Pull a page count out of a `vm_stat` line like
+/// `Pages active:    123456.` — digits only, trailing '.' dropped.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_vm_stat_pages(vm_stat: &str, key: &str) -> Option<u64> {
+    for line in vm_stat.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix(key) {
+            let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                return digits.parse::<u64>().ok();
+            }
+        }
+    }
+    None
+}
+
+/// Read the page size from a `vm_stat` header line, e.g.
+/// "Mach Virtual Memory Statistics: (page size of 16384 bytes)". Using
+/// the dump's own page size keeps the byte math consistent with its
+/// page counts (Apple Silicon is 16 KiB, Intel 4 KiB, and `hw.pagesize`
+/// doesn't always agree with the VM page size).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_vm_stat_page_size(vm_stat: &str) -> Option<u64> {
+    let line = vm_stat.lines().next()?;
+    let after = line.split("page size of").nth(1)?;
+    let tok = after.split_whitespace().next()?;
+    let digits: String = tok.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u64>().ok().filter(|&n| n > 0)
+}
+
+/// macOS system "used" memory ≈ (active + wired + compressed) pages ×
+/// page size — the same components Activity Monitor reports as "Memory
+/// Used". `None` if any component line is absent.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_vm_stat_used_bytes(vm_stat: &str, page_bytes: u64) -> Option<u64> {
+    let active = parse_vm_stat_pages(vm_stat, "Pages active:")?;
+    let wired = parse_vm_stat_pages(vm_stat, "Pages wired down:")?;
+    let compressed = parse_vm_stat_pages(vm_stat, "Pages occupied by compressor:")?;
+    Some((active + wired + compressed).saturating_mul(page_bytes))
+}
+
 #[cfg(target_os = "linux")]
 fn cpu_brand() -> Option<String> {
     let content = std::fs::read_to_string("/proc/cpuinfo").ok()?;
@@ -450,9 +511,20 @@ fn sample_cpu() -> (Option<f64>, Option<f64>) {
         .and_then(|b| String::from_utf8(b).ok())
         .and_then(|s| s.trim().parse::<f64>().ok())
         .map(|v| (v / cpus).clamp(0.0, 100.0));
-    // Total system CPU% on macOS would need host_statistics — skip and
-    // leave as None. The UI handles the missing value cleanly.
-    (app_pct, None)
+    // System CPU%: sum every process's ps %cpu (each a share of one
+    // core) and normalise by core count. ps reports a decaying average
+    // rather than a true instant, but it's a single fast call — no
+    // host_statistics FFI and no `top -l 2` second-sample stall that
+    // would block the poll — and tracks "is the machine busy" well
+    // enough for the load readout.
+    let total_pct = quiet_command("ps")
+        .args(["-A", "-o", "%cpu="])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| parse_total_cpu_pct(&s, cpus));
+    (app_pct, total_pct)
 }
 
 #[cfg(target_os = "windows")]
@@ -635,9 +707,30 @@ fn sample_ram() -> (Option<u64>, Option<u64>, Option<u64>) {
         })
         .and_then(|b| String::from_utf8(b).ok())
         .and_then(|s| s.trim().parse::<u64>().ok());
-    // System "used" via `vm_stat` page-counting is fiddly — leave as None;
-    // the UI handles missing values.
-    (app, total, None)
+    // System "used" ≈ (active + wired + compressed) pages × page size,
+    // the components Activity Monitor sums as "Memory Used". Page size
+    // differs by arch (16 KiB on Apple Silicon, 4 KiB on Intel), so
+    // read it rather than assume.
+    let page = quiet_command("sysctl")
+        .args(["-n", "hw.pagesize"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(4096);
+    let used = quiet_command("vm_stat")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            // Prefer vm_stat's own header page size; fall back to the
+            // sysctl value, then a 4 KiB default.
+            let page = parse_vm_stat_page_size(&s).unwrap_or(page);
+            parse_vm_stat_used_bytes(&s, page)
+        });
+    (app, total, used)
 }
 
 #[cfg(target_os = "windows")]
@@ -828,4 +921,57 @@ fn nvidia_app_vram_bytes() -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_cpu_pct_sums_and_normalises() {
+        // Four processes at 50% of one core each, on a 4-core box → 50%.
+        let out = "50.0\n50.0\n50.0\n50.0\n";
+        let pct = parse_total_cpu_pct(out, 4.0).unwrap();
+        assert!((pct - 50.0).abs() < 1e-6, "got {pct}");
+    }
+
+    #[test]
+    fn total_cpu_pct_handles_blanks_and_clamps() {
+        assert_eq!(parse_total_cpu_pct("", 4.0), None);
+        assert_eq!(parse_total_cpu_pct("   \n  \n", 4.0), None);
+        // Over-100% sum (transient ps quirk) clamps to 100.
+        assert_eq!(parse_total_cpu_pct("800.0\n", 4.0).unwrap(), 100.0);
+        // Zero/garbage cpu count is treated as 1, not a divide-by-zero.
+        assert_eq!(parse_total_cpu_pct("10.0\n", 0.0).unwrap(), 10.0);
+    }
+
+    #[test]
+    fn vm_stat_used_sums_active_wired_compressed() {
+        let vm = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+Pages free:                          100000.\n\
+Pages active:                        200000.\n\
+Pages inactive:                      150000.\n\
+Pages speculative:                     5000.\n\
+Pages wired down:                    100000.\n\
+Pages occupied by compressor:         50000.\n";
+        // (200000 + 100000 + 50000) pages × 16384 bytes.
+        let used = parse_vm_stat_used_bytes(vm, 16384).unwrap();
+        assert_eq!(used, 350_000u64 * 16384);
+    }
+
+    #[test]
+    fn vm_stat_page_size_parsed_from_header() {
+        let vm = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+Pages active: 1.\n";
+        assert_eq!(parse_vm_stat_page_size(vm), Some(16384));
+        assert_eq!(parse_vm_stat_page_size("no header here"), None);
+    }
+
+    #[test]
+    fn vm_stat_used_none_when_a_component_missing() {
+        // Has active + wired but no compressor line → None.
+        let vm = "Pages active: 10.\nPages wired down: 20.\n";
+        assert_eq!(parse_vm_stat_used_bytes(vm, 4096), None);
+        assert_eq!(parse_vm_stat_used_bytes("garbage", 4096), None);
+    }
 }
