@@ -10,13 +10,17 @@
 
   let { showStats = true }: { showStats?: boolean } = $props();
 
+  // Deliberately ambiguous about *what's* happening: this same indicator
+  // covers both a cold model load and a slow in-progress turn, so phrases
+  // like "Loading the model…" would wrongly suggest a reload mid-chat.
+  // These just reassure that work is underway, whatever the cause.
   const WORDS = [
     "Working on it…",
-    "Loading the model…",
-    "Warming up…",
-    "Reading the weights…",
-    "Getting set up…",
+    "Thinking it through…",
+    "Crunching…",
     "Hang tight…",
+    "Still working…",
+    "Just a moment…",
     "Almost there…",
   ];
   const WORD_MS = 3000;
