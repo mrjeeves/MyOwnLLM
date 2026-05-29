@@ -783,6 +783,7 @@ pub fn default_config_value() -> Value {
         "active_family": "gemma4",
         "active_mode": "text",
         "model_cleanup_days": 1,
+        "ollama_keep_alive": "30m",
         "kept_models": [],
         "mode_overrides": {},
         "tracked_modes": ["text"],

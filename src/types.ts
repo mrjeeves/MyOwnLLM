@@ -11,6 +11,27 @@ export interface HardwareProfile {
   soc?: string | null;
 }
 
+/** Live resource snapshot — mirrors the `LiveSnapshot` struct in
+ *  src-tauri/src/usage.rs, returned by the `usage_live_snapshot`
+ *  Tauri command. Every counter is optional on the Rust side so the
+ *  UI renders "—" when a platform doesn't expose it. Shared between
+ *  the Usage settings tab and the chat model-loading dialog so both
+ *  read the same system lookups. */
+export interface LiveSnapshot {
+  cpu_app_pct: number | null;
+  cpu_total_pct: number | null;
+  ram_app_bytes: number | null;
+  ram_total_bytes: number | null;
+  ram_used_bytes: number | null;
+  gpu_pct: number | null;
+  vram_app_bytes: number | null;
+  vram_used_bytes: number | null;
+  vram_total_bytes: number | null;
+  process_uptime_seconds: number;
+  cpu_brand: string | null;
+  cpu_count: number | null;
+}
+
 export type Mode = "text" | "vision" | "code" | "transcribe" | "diarize";
 
 /** Runtimes the resolver knows how to dispatch to.
@@ -469,6 +490,13 @@ export interface Config {
   active_family: string;
   active_mode: Mode;
   model_cleanup_days: number;
+  /** Ollama `keep_alive` for chat requests — how long the model stays
+   *  resident in RAM/VRAM after a turn before Ollama unloads it.
+   *  Native Ollama duration format: "30m", "1h", "0" (unload right
+   *  away, frees memory for transcription), "-1" (keep until evicted).
+   *  Longer values avoid cold-start reloads between messages; shorter
+   *  values suit memory-tight machines. Default "30m". */
+  ollama_keep_alive: string;
   /** Family names for which the user has dismissed the
    *  "switching with auto-cleanup on" confirmation in the family
    *  detail view's per-tier picker. Per-family rather than per-tier

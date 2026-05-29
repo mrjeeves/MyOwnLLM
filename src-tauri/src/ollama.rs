@@ -730,6 +730,27 @@ pub enum ChatStreamOutcome {
     Cancelled,
 }
 
+/// Resolve the user's configured Ollama `keep_alive` for chat
+/// requests. This controls how long Ollama keeps the model resident
+/// in RAM/VRAM after a turn finishes: longer values avoid cold-start
+/// reloads between messages (the common "why is it slow again?"
+/// complaint), shorter values free memory sooner so the LLM can
+/// coexist with transcription on a memory-tight machine. Accepts
+/// Ollama's native duration format — "30m", "1h", "0" (unload
+/// immediately), "-1" (keep until evicted). Falls back to "30m" when
+/// the config is unreadable or the key is absent (older configs).
+fn chat_keep_alive() -> serde_json::Value {
+    crate::resolver::load_config_value()
+        .ok()
+        .and_then(|c| {
+            c.get("ollama_keep_alive")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .map(serde_json::Value::from)
+        .unwrap_or_else(|| serde_json::json!("30m"))
+}
+
 /// Streamed chat completion. Invokes `on_content` for each visible token
 /// chunk, `on_thinking` for any reasoning/thinking deltas (thinking models
 /// emit those in `message.thinking`; non-thinking models never call it),
@@ -771,6 +792,7 @@ where
         "model": model,
         "messages": messages,
         "stream": true,
+        "keep_alive": chat_keep_alive(),
     });
     if let Some(t) = think {
         body["think"] = serde_json::json!(t);
@@ -933,6 +955,7 @@ pub async fn chat_once(
         "model": model,
         "messages": messages,
         "stream": false,
+        "keep_alive": chat_keep_alive(),
     });
     if let Some(opts) = options {
         body["options"] = opts;

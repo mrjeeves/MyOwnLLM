@@ -15,6 +15,23 @@
   let conversationDir = $state("");
   let loading = $state(true);
   let error = $state("");
+  /** Ollama `keep_alive` for chat — how long the model stays resident
+   *  in memory after a turn. Longer avoids cold-start reloads between
+   *  messages; shorter frees RAM/VRAM for transcription on tight
+   *  machines. Stored in Ollama's native duration format. */
+  let keepAlive = $state("30m");
+  const KEEP_ALIVE_OPTIONS: { value: string; label: string }[] = [
+    { value: "0", label: "Unload immediately (lowest memory)" },
+    { value: "5m", label: "5 minutes (Ollama default)" },
+    { value: "30m", label: "30 minutes (recommended)" },
+    { value: "1h", label: "1 hour" },
+    { value: "-1", label: "Until the app quits (keep resident)" },
+  ];
+
+  async function patchKeepAlive(value: string) {
+    keepAlive = value;
+    await updateConfig({ ollama_keep_alive: value });
+  }
   /** Tag the resolver picks for transcribe against the active family +
    *  hardware. Resolved here (not just described) so users can confirm
    *  the active whisper model from this tab without bouncing to Models. */
@@ -58,6 +75,7 @@
       ]);
       hardware = hw;
       conversationDir = config.conversation_dir ?? "";
+      keepAlive = config.ollama_keep_alive ?? "30m";
       mic = { ...config.mic };
       micDevices = devices;
       if (manifest) {
@@ -246,6 +264,36 @@
               <dd>{hardware.soc}</dd>
             </div>
           {/if}
+        </dl>
+      </div>
+
+      <div class="group-label">Performance</div>
+
+      <div class="card">
+        <div class="card-title">Model memory</div>
+        <p class="card-meta">
+          How long the chat model stays loaded in memory after a reply.
+          Longer keeps later messages instant; shorter frees RAM/VRAM
+          sooner — handy when transcription needs to run alongside on a
+          memory-tight machine.
+        </p>
+        <dl class="info">
+          <div class="full">
+            <dt>Keep model loaded for</dt>
+            <dd>
+              <select
+                value={keepAlive}
+                onchange={(e) => patchKeepAlive((e.currentTarget as HTMLSelectElement).value)}
+              >
+                {#if !KEEP_ALIVE_OPTIONS.some((o) => o.value === keepAlive)}
+                  <option value={keepAlive}>Custom: {keepAlive}</option>
+                {/if}
+                {#each KEEP_ALIVE_OPTIONS as opt (opt.value)}
+                  <option value={opt.value}>{opt.label}</option>
+                {/each}
+              </select>
+            </dd>
+          </div>
         </dl>
       </div>
 

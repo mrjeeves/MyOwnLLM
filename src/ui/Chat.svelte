@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { onDestroy } from "svelte";
   import TopBar from "./TopBar.svelte";
   import TextBar from "./TextBar.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
@@ -14,7 +15,7 @@
     type ToolCall,
   } from "../conversations";
   import type { SettingsTab } from "../update-state.svelte";
-  import type { HardwareProfile, Mode } from "../types";
+  import type { HardwareProfile, Mode, LiveSnapshot } from "../types";
   import {
     chatSlot,
     claimChat,
@@ -132,14 +133,68 @@
   const MODEL_LOAD_POPUP_DELAY_MS = 5000;
   let modelLoading = $state(false);
   let modelLoadTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Clear the load-wait dialog + its arming timer. Idempotent, so
-   *  it's safe to call from every agent event and from cleanup. */
+
+  /** Live CPU/RAM/GPU snapshot shown inside the load-wait dialog so
+   *  the user can see *why* it's slow (e.g. RAM near full → the model
+   *  is paging in from disk). Reuses the same `usage_live_snapshot`
+   *  command + cadence the Usage settings tab uses, so there's a
+   *  single source of truth for system lookups. Polled only while the
+   *  dialog is up; null when idle. */
+  let liveStats = $state<LiveSnapshot | null>(null);
+  let statsPollHandle: ReturnType<typeof setInterval> | null = null;
+  /** Poll cadence for the load-wait readout. Faster than the Usage
+   *  tab's 2s so a short load still gets a real CPU% reading (the
+   *  first sample only primes the delta cache). */
+  const STATS_POLL_MS = 1200;
+
+  async function refreshLiveStats() {
+    try {
+      liveStats = await invoke<LiveSnapshot>("usage_live_snapshot");
+    } catch {
+      // Non-fatal: the dialog still shows the spinner + copy without
+      // the resource readout if the snapshot command is unavailable.
+    }
+  }
+
+  function startStatsPoll() {
+    if (statsPollHandle !== null) return;
+    void refreshLiveStats(); // prime the CPU delta cache immediately
+    statsPollHandle = setInterval(() => void refreshLiveStats(), STATS_POLL_MS);
+  }
+
+  function stopStatsPoll() {
+    if (statsPollHandle !== null) {
+      clearInterval(statsPollHandle);
+      statsPollHandle = null;
+    }
+    liveStats = null;
+  }
+
+  /** Clear the load-wait dialog + its arming timer and stop the
+   *  resource poll. Idempotent, so it's safe to call from every agent
+   *  event and from cleanup. */
   function clearModelLoadWait() {
     if (modelLoadTimer !== null) {
       clearTimeout(modelLoadTimer);
       modelLoadTimer = null;
     }
     if (modelLoading) modelLoading = false;
+    stopStatsPoll();
+  }
+
+  // Belt-and-suspenders: never leak the interval if the panel is torn
+  // down (mode switch, conversation close) mid-load.
+  onDestroy(stopStatsPoll);
+
+  /** Format a byte count as a compact GB string for the readout. */
+  function fmtGb(bytes: number | null | undefined): string {
+    if (bytes == null) return "—";
+    return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  }
+  /** RAM-in-use percentage for the mini bar, or null when unknown. */
+  function ramUsedPct(): number | null {
+    if (!liveStats?.ram_used_bytes || !liveStats?.ram_total_bytes) return null;
+    return (liveStats.ram_used_bytes / liveStats.ram_total_bytes) * 100;
   }
 
   /** One pending attachment staged for the next send. Images become
@@ -865,6 +920,7 @@
     // user so. clearModelLoadWait() below disarms it on first frame.
     modelLoadTimer = setTimeout(() => {
       modelLoading = true;
+      startStatsPoll();
     }, MODEL_LOAD_POPUP_DELAY_MS);
 
     try {
@@ -1437,17 +1493,63 @@
          reading the transcript behind it, and Cancel aborts the run. -->
     <div class="model-loading-backdrop" role="dialog" aria-modal="false" aria-live="polite">
       <div class="model-loading-card">
-        <div class="spinner" aria-hidden="true"></div>
-        <div class="model-loading-text">
-          {#if routeViaDevicePubkey}
-            <p class="model-loading-title">Waiting for {routedPeer?.label ?? "the host"}…</p>
-            <p class="model-loading-sub">The host is loading its model. This can take a few seconds.</p>
-          {:else}
-            <p class="model-loading-title">Loading {activeModel}…</p>
-            <p class="model-loading-sub">First use reads the model into memory. This is usually a one-time wait — later replies start instantly.</p>
-          {/if}
+        <div class="model-loading-head">
+          <div class="spinner" aria-hidden="true"></div>
+          <div class="model-loading-text">
+            {#if routeViaDevicePubkey}
+              <p class="model-loading-title">Waiting for {routedPeer?.label ?? "the host"}…</p>
+              <p class="model-loading-sub">The host is loading its model. This can take a few seconds.</p>
+            {:else}
+              <p class="model-loading-title">Loading {activeModel}…</p>
+              <p class="model-loading-sub">First use reads the model into memory. This is usually a one-time wait — later replies start instantly.</p>
+            {/if}
+          </div>
+          <button class="model-loading-cancel" onclick={stop}>Cancel</button>
         </div>
-        <button class="model-loading-cancel" onclick={stop}>Cancel</button>
+
+        <!-- Live resource readout — only meaningful for local loads
+             (a remote model loads on the host's machine, not this
+             one). Bars + figures come from usage_live_snapshot, the
+             same lookup the Usage settings tab uses. -->
+        {#if !routeViaDevicePubkey}
+          <div class="model-loading-stats">
+            <div class="stat">
+              <div class="stat-row">
+                <span class="stat-label">CPU</span>
+                <span class="stat-val">{liveStats?.cpu_total_pct != null ? `${Math.round(liveStats.cpu_total_pct)}%` : "—"}</span>
+              </div>
+              <div class="meter"><div class="meter-fill" style="width: {Math.min(100, Math.max(0, liveStats?.cpu_total_pct ?? 0))}%"></div></div>
+            </div>
+            <div class="stat">
+              <div class="stat-row">
+                <span class="stat-label">RAM</span>
+                <span class="stat-val">
+                  {#if liveStats?.ram_used_bytes != null && liveStats?.ram_total_bytes != null}
+                    {fmtGb(liveStats.ram_used_bytes)} / {fmtGb(liveStats.ram_total_bytes)}
+                  {:else}—{/if}
+                </span>
+              </div>
+              <div class="meter"><div class="meter-fill" class:hot={(ramUsedPct() ?? 0) >= 90} style="width: {Math.min(100, Math.max(0, ramUsedPct() ?? 0))}%"></div></div>
+            </div>
+            {#if liveStats?.gpu_pct != null || liveStats?.vram_total_bytes != null}
+              <div class="stat">
+                <div class="stat-row">
+                  <span class="stat-label">GPU</span>
+                  <span class="stat-val">
+                    {liveStats?.gpu_pct != null ? `${Math.round(liveStats.gpu_pct)}%` : "—"}
+                    {#if liveStats?.vram_used_bytes != null && liveStats?.vram_total_bytes != null}
+                      <span class="stat-sub">· VRAM {fmtGb(liveStats.vram_used_bytes)} / {fmtGb(liveStats.vram_total_bytes)}</span>
+                    {/if}
+                  </span>
+                </div>
+                <div class="meter"><div class="meter-fill" style="width: {Math.min(100, Math.max(0, liveStats?.gpu_pct ?? 0))}%"></div></div>
+              </div>
+            {/if}
+            {#if hardware?.disk_free_gb != null}
+              <p class="stat-disk">Disk free: {hardware.disk_free_gb.toFixed(1)} GB</p>
+            {/if}
+          </div>
+        {/if}
       </div>
     </div>
   {/if}
@@ -1497,14 +1599,20 @@
   .model-loading-card {
     pointer-events: auto;
     display: flex;
-    align-items: center;
-    gap: 0.9rem;
-    max-width: 24rem;
+    flex-direction: column;
+    gap: 0.85rem;
+    width: 25rem;
+    max-width: calc(100% - 2rem);
     padding: 1.1rem 1.25rem;
     background: #181818;
     border: 1px solid #2a2a2a;
     border-radius: 12px;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  }
+  .model-loading-head {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
   }
   .model-loading-card .spinner {
     flex: none;
@@ -1519,6 +1627,7 @@
     to { transform: rotate(360deg); }
   }
   .model-loading-text {
+    flex: 1;
     min-width: 0;
   }
   .model-loading-title {
@@ -1547,6 +1656,59 @@
   .model-loading-cancel:hover {
     border-color: #3a3a55;
     color: #ddd;
+  }
+  .model-loading-stats {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    padding-top: 0.85rem;
+    border-top: 1px solid #242424;
+  }
+  .model-loading-stats .stat {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .model-loading-stats .stat-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.5rem;
+    font-size: 0.76rem;
+  }
+  .model-loading-stats .stat-label {
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.68rem;
+  }
+  .model-loading-stats .stat-val {
+    color: #ccc;
+    font-variant-numeric: tabular-nums;
+  }
+  .model-loading-stats .stat-sub {
+    color: #777;
+    font-size: 0.72rem;
+  }
+  .model-loading-stats .meter {
+    height: 5px;
+    background: #242424;
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .model-loading-stats .meter-fill {
+    height: 100%;
+    background: #6e6ef7;
+    border-radius: 3px;
+    transition: width 0.4s ease;
+  }
+  .model-loading-stats .meter-fill.hot {
+    background: #e35a5a;
+  }
+  .model-loading-stats .stat-disk {
+    margin: 0.1rem 0 0;
+    font-size: 0.72rem;
+    color: #777;
   }
   .chat-body {
     flex: 1;
