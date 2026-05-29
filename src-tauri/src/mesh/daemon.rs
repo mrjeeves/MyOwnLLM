@@ -576,7 +576,7 @@ fn validate_path_is_executable(path: &Path) -> Result<(), String> {
         0xFEED_FACE | 0xFEED_FACF | 0xCAFE_BABE | 0xBEBA_FECA
     );
     if !(pe || elf || macho) {
-        return Err(format!("bad magic {:02x?}", head));
+        return Err(format!("bad magic {head:02x?}"));
     }
     if pe {
         f.seek(SeekFrom::Start(0x3C))
@@ -633,9 +633,9 @@ pub fn daemon_binary_candidates() -> Vec<PathBuf> {
     // sidecars next to the dev exe; `tauri build` strips it.
     // Checking both covers dev + production from one runtime path.
     let exe_with_triple = if cfg!(windows) {
-        format!("myownmesh-{}.exe", DAEMON_SIDECAR_TRIPLE)
+        format!("myownmesh-{DAEMON_SIDECAR_TRIPLE}.exe")
     } else {
-        format!("myownmesh-{}", DAEMON_SIDECAR_TRIPLE)
+        format!("myownmesh-{DAEMON_SIDECAR_TRIPLE}")
     };
     let mut out: Vec<PathBuf> = Vec::new();
 

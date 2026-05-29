@@ -23,7 +23,7 @@
 //! over.
 
 pub use myownmesh_core::roster::{
-    add_peer, add_peer_in, delete, empty_for, is_authorized, load, remove_peer, remove_peer_in,
+    add_peer, delete, load, remove_peer,
     save, AuthorizedPeer, Roster, ROSTER_VERSION,
 };
 

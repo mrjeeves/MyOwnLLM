@@ -235,8 +235,7 @@ impl Embedder {
         let shape = view.shape().to_vec();
         if shape.last().copied().unwrap_or(0) == 0 {
             return Err(anyhow!(
-                "embedder produced zero-length output ({:?})",
-                shape
+                "embedder produced zero-length output ({shape:?})"
             ));
         }
         let mut out: Vec<f32> = view.iter().copied().collect();

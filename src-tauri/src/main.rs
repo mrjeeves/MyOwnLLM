@@ -651,7 +651,7 @@ fn mesh_file_save_at(path: String, bytes_b64: String) -> Result<(), String> {
     }
     let target = std::path::PathBuf::from(&path);
     if target.is_dir() {
-        return Err(format!("target {} is a directory", path));
+        return Err(format!("target {path} is a directory"));
     }
     // Best-effort: make sure the parent directory exists. The
     // save-dialog typically lands the user inside an existing folder,

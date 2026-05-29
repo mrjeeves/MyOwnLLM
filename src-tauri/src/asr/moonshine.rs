@@ -673,7 +673,7 @@ impl MoonshineBackend {
             let arr = if use_cache {
                 kv.values[idx]
                     .as_ref()
-                    .ok_or_else(|| anyhow!("KV cache slot {} unpopulated under use_cache", idx))?
+                    .ok_or_else(|| anyhow!("KV cache slot {idx} unpopulated under use_cache"))?
                     .clone()
             } else {
                 let resolved_shape: Vec<usize> = past
@@ -736,7 +736,7 @@ impl MoonshineBackend {
             .map_err(|e| anyhow!("ort extract logits: {e}"))?;
         let shape = logits_view.shape().to_vec();
         if shape.len() != 3 || shape[0] != 1 {
-            return Err(anyhow!("unexpected decoder logits shape {:?}", shape));
+            return Err(anyhow!("unexpected decoder logits shape {shape:?}"));
         }
         let last = shape[1] - 1;
         let vocab = shape[2];
