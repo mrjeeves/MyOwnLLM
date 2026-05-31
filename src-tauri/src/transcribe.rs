@@ -2033,18 +2033,28 @@ impl HopGate {
     /// trailing-silence clock.
     fn observe(&mut self, hop_audio: &[f32], hop_ms: u64, cancel: &AtomicBool) -> (bool, bool) {
         match self {
-            HopGate::Silero(s) => match s.vad.speech_prob(hop_audio, cancel) {
-                Ok(prob) => s.gate.observe(prob, hop_ms),
-                Err(e) => {
-                    // One-off inference failure: fall back to RMS for
-                    // this hop (and keep the RMS clock in sync) instead
-                    // of dropping the endpoint decision.
-                    eprintln!("[transcribe] silero VAD inference failed, RMS this hop: {e:#}");
+            HopGate::Silero(s) => {
+                // Already latched to RMS by a prior failure — don't retry
+                // Silero (and don't re-log) for the rest of the session.
+                if s.degraded {
                     let r = chunk_rms(hop_audio);
-                    let speechy = r >= SILENCE_RMS_THRESHOLD;
-                    (speechy, s.rms.observe(r, hop_ms))
+                    return (r >= SILENCE_RMS_THRESHOLD, s.rms.observe(r, hop_ms));
                 }
-            },
+                match s.vad.speech_prob(hop_audio, cancel) {
+                    Ok(prob) => s.gate.observe(prob, hop_ms),
+                    Err(e) => {
+                        // First mid-session inference failure: log once,
+                        // latch to RMS for the rest of the session so a
+                        // recurring failure can't flood the console.
+                        eprintln!(
+                            "[transcribe] silero VAD failed mid-session, latching to RMS: {e:#}"
+                        );
+                        s.degraded = true;
+                        let r = chunk_rms(hop_audio);
+                        (r >= SILENCE_RMS_THRESHOLD, s.rms.observe(r, hop_ms))
+                    }
+                }
+            }
             HopGate::Rms(ep) => {
                 let r = chunk_rms(hop_audio);
                 let speechy = r >= SILENCE_RMS_THRESHOLD;
