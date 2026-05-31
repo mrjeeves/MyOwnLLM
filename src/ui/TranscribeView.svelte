@@ -131,6 +131,11 @@
   let activeConversation = $state<Conversation | null>(null);
   let transcript = $state<TranscriptSegment[]>([]);
   let speakerLabels = $state<Record<number, string>>({});
+  /** Names from the persistent cross-session registry, used as a
+   *  fallback when this conversation has no local override for a speaker
+   *  id — so a name set in an earlier session shows on a returning
+   *  speaker. Loaded once; conversation-local `speakerLabels` win. */
+  let registryLabels = $state<Record<number, string>>({});
   let diarizeEnabled = $state(true);
   /** Routing pins for the two transcribe-mode bars. Stored as stable
    *  `device_pubkey`s in localStorage (see `routing-pins.svelte.ts`)
@@ -748,8 +753,26 @@
     return `hsl(${hue}, 60%, 50%)`;
   }
 
+  /** Load persisted speaker names once so returning speakers show their
+   *  registry name when this conversation hasn't renamed them locally. */
+  async function loadRegistryLabels() {
+    try {
+      const entries = await invoke<
+        Array<{ id: number; label: string | null }>
+      >("speaker_registry_list");
+      const map: Record<number, string> = {};
+      for (const e of entries) {
+        if (e.label) map[e.id] = e.label;
+      }
+      registryLabels = map;
+    } catch (e) {
+      console.warn("load speaker registry failed:", e);
+    }
+  }
+  loadRegistryLabels();
+
   function speakerLabel(id: number): string {
-    return speakerLabels[id] ?? `Speaker ${id + 1}`;
+    return speakerLabels[id] ?? registryLabels[id] ?? `Speaker ${id + 1}`;
   }
 
   function startRename(id: number) {
@@ -770,6 +793,13 @@
       speakerLabels = { ...speakerLabels, [id]: trimmed };
     }
     persist().catch((e) => console.warn("save speaker label failed:", e));
+    // Write through to the persistent cross-session registry so this
+    // name follows the speaker into future conversations, not just this
+    // one. Best-effort — the conversation-local label above is the
+    // source of truth for the current transcript regardless.
+    invoke("speaker_registry_rename", { id, label: trimmed || null }).catch(
+      (e) => console.warn("persist speaker name failed:", e),
+    );
   }
 
   function onRenameKey(e: KeyboardEvent) {
