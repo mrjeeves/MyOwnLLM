@@ -646,6 +646,27 @@ pub fn stop(stream_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Force-cancel one session: end its decode loop now, dropping whatever
+/// backlog is still queued — "cut it off where it left off". The loop's
+/// teardown still runs (the recorder WAV is finalized with a valid header
+/// and any captured review clips are stashed), so this is a clean cut, not
+/// a crash. This is the "Force stop" control offered while a graceful Stop
+/// is draining. Idempotent.
+pub fn abort(stream_id: &str) -> Result<()> {
+    if let Some(s) = sessions().get(stream_id) {
+        eprintln!(
+            "[transcribe] abort() called for stream {stream_id} — cutting off, dropping backlog"
+        );
+        // Set draining too so the cpal callbacks stop feeding immediately
+        // even if abort races a session that hadn't started draining yet.
+        s.draining.store(true, Ordering::SeqCst);
+        s.cancel.store(true, Ordering::SeqCst);
+    } else {
+        eprintln!("[transcribe] abort() called for unknown stream {stream_id} (already finished?)");
+    }
+    Ok(())
+}
+
 /// Hard-abort every live session: end each decode loop now, dropping any
 /// buffered backlog. Called on app exit so a draining meeting can't hang
 /// teardown. The normal Stop button uses `stop` (graceful drain) instead.

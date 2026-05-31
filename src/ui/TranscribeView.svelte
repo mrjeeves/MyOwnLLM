@@ -17,6 +17,7 @@
     startRecording,
     startUpload,
     stopRecording,
+    abortRecording,
     pauseRecording,
     resumeRecording,
     takeLiveSegments,
@@ -579,6 +580,17 @@
     flushLiveSegments();
     clearAfterPersist();
     persist().catch((e) => console.warn("save after stop failed:", e));
+  }
+
+  /** Force-cancel a draining session: cut it off now, discard the
+   *  not-yet-transcribed backlog. Whatever was already transcribed (and the
+   *  full-audio recording + captured speaker clips) is still saved. Same
+   *  persist flow as a graceful stop, just reached via transcribe_abort. */
+  async function forceStop() {
+    await abortRecording();
+    flushLiveSegments();
+    clearAfterPersist();
+    persist().catch((e) => console.warn("save after force-stop failed:", e));
   }
 
   /** Extensions Symphonia's built-in features handle (audio +
@@ -1198,6 +1210,22 @@
           <p class="transcribe-backlog" title="Audio is queued for transcription — it will all be processed; the captions are just catching up.">
             {backlogSeconds.toFixed(backlogSeconds >= 10 ? 0 : 1)}s behind — catching up
           </p>
+        {/if}
+        {#if isMyRecording && transcribeUi.draining}
+          <div class="drain-banner">
+            <span class="drain-msg">
+              Finishing transcription{backlogSeconds >= 1.5
+                ? ` — ${backlogSeconds.toFixed(backlogSeconds >= 10 ? 0 : 1)}s of audio left`
+                : "…"}
+            </span>
+            <button
+              class="force-stop"
+              onclick={forceStop}
+              title="Stop immediately and discard the audio that hasn't been transcribed yet. The recording and any speaker clips captured so far are still saved."
+            >
+              Force stop &amp; discard backlog
+            </button>
+          </div>
         {/if}
       </div>
       {#if transcribeUi.review}
@@ -1875,6 +1903,37 @@
     border-radius: 6px;
     line-height: 1.3;
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+
+  .drain-banner {
+    margin-top: 0.4rem;
+    padding: 0.4rem 0.55rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    background: #1a1622;
+    border: 1px solid #3a3050;
+    border-radius: 6px;
+  }
+  .drain-msg {
+    font-size: 0.76rem;
+    color: #b9a8d8;
+  }
+  .force-stop {
+    flex-shrink: 0;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.74rem;
+    color: #f0d0d0;
+    background: #3a1f1f;
+    border: 1px solid #6a3535;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .force-stop:hover {
+    background: #4d2727;
+    border-color: #8a4040;
   }
 
   .mic-error {

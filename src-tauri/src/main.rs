@@ -410,6 +410,14 @@ fn transcribe_stop(stream_id: String) -> Result<(), String> {
     transcribe::stop(&stream_id).map_err(|e| e.to_string())
 }
 
+/// Force-cancel a session that's currently draining its backlog: cut it off
+/// where it is, dropping the unprocessed tail, but still finalize the
+/// recording + review clips cleanly.
+#[tauri::command]
+fn transcribe_abort(stream_id: String) -> Result<(), String> {
+    transcribe::abort(&stream_id).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn transcribe_pause(stream_id: String) -> Result<(), String> {
     transcribe::pause(&stream_id).map_err(|e| e.to_string())
@@ -1298,6 +1306,7 @@ fn main() {
             transcribe_session_audio,
             transcribe_start,
             transcribe_stop,
+            transcribe_abort,
             transcribe_pause,
             transcribe_resume,
             transcribe_buffer_size_bytes,
