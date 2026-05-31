@@ -15,6 +15,7 @@ export type SettingsTab =
   | "permissions"
   | "prompts"
   | "transcription"
+  | "speakers"
   | "updates"
   // Legacy deep-link target. The Providers tab was retired and now
   // lives as a sub-page inside Updates; `SettingsPanel` maps this to
