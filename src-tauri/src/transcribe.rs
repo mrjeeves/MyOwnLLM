@@ -1027,22 +1027,27 @@ fn build_backends(
     // surfacing the actual problem — pre-checking the resolved
     // `ort_setup` status lets us tell the user immediately that
     // onnxruntime is missing / incompatible and what to do about it.
+    // onnxruntime is fetched + loaded up front at app startup (via
+    // `ort_setup::ensure_ready` behind the setup screen) — not lazily on
+    // the first record, which would put a multi-second download in the
+    // user's way at the worst time. By the time a record can start it's
+    // ready; guard anyway and fail fast with the recovery paths if setup
+    // hasn't finished or failed, rather than hanging in the 90 s
+    // `commit_from_file` watchdog.
     let ort_status = crate::ort_setup::status();
     if !ort_status.initialized {
-        // The first-run fetcher (`ort_install`) usually drops a dylib
-        // into `~/.myownllm/runtime/` automatically on launch; if
-        // we're still here the auto-fetch is either in flight (user
-        // clicked record before the download finished) or has failed
-        // (offline, AV interference, unsupported arch). Surface every
-        // one of the recovery paths so a non-Rust user can fix it
-        // without filing an issue.
+        // We just tried to fetch + load and still couldn't: offline, the
+        // download was blocked (firewall / AV quarantine), an arch we
+        // have no prebuilt for, or a version/arch mismatch on an existing
+        // dylib. Surface every manual recovery path so a non-Rust user
+        // can fix it without filing an issue.
         let runtime_dir = crate::ort_install::runtime_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "~/.myownllm/runtime/".to_string());
         return Err(anyhow!(
             "onnxruntime isn't loaded — {}. \
-             Recovery options, in order: \
-             (1) wait — MyOwnLLM downloads onnxruntime automatically on first launch (see the toast); \
+             Recovery options: \
+             (1) check your network and relaunch — MyOwnLLM re-attempts the download each launch; \
              (2) run `myownllm fetch-onnxruntime` from a terminal and restart; \
              (3) drop a libonnxruntime.{{dll,dylib,so.1}} \u{2265}1.20 into {runtime_dir} and restart; \
              (4) set ORT_DYLIB_PATH to the absolute path of the dylib and restart.",

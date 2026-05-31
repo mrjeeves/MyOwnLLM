@@ -23,6 +23,7 @@
     type EmittedSegment,
   } from "./transcribe-state.svelte";
   import { chatSlot } from "./chat-slot.svelte";
+  import { ortSetup } from "./ort-setup.svelte";
   import { meshClient } from "../mesh-daemon.svelte";
   import {
     routingPins,
@@ -1307,6 +1308,15 @@
     <div class="mic-status">{asrPullStatus}</div>
   {/if}
 
+  {#if ortSetup.checked && !ortSetup.ready}
+    {#if ortSetup.error}
+      <div class="mic-error">Speech engine unavailable — {ortSetup.error}</div>
+    {:else}
+      <div class="mic-status">
+        {ortSetup.message ?? "Setting up the speech engine (onnxruntime)…"}
+      </div>
+    {/if}
+  {/if}
   {#if transcribeError}
     <div class="mic-error">{transcribeError}</div>
   {/if}
@@ -1381,12 +1391,16 @@
       <button
         class="record-btn"
         onclick={startRec}
-        disabled={asrModelMissing}
+        disabled={asrModelMissing || !ortSetup.ready}
         title={asrModelMissing
           ? "Download the transcription model first"
-          : transcribeUi.active
-            ? "Another recording is in progress — confirm to stop it first"
-            : "Start recording"}
+          : !ortSetup.ready
+            ? ortSetup.error
+              ? `Speech engine unavailable: ${ortSetup.error}`
+              : "Setting up the speech engine — one moment…"
+            : transcribeUi.active
+              ? "Another recording is in progress — confirm to stop it first"
+              : "Start recording"}
       >
         <span class="rec-circle" aria-hidden="true"></span>
         Record

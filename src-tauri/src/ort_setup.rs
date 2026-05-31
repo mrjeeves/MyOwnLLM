@@ -39,6 +39,7 @@
 
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -93,6 +94,14 @@ impl OrtStatus {
 // before letting a record click through.
 static STATUS: Mutex<Option<OrtStatus>> = Mutex::new(None);
 
+// Serializes the find → download → load sequence. Both the startup hook
+// and a (possibly too-early) record click call `ensure_ready`; without
+// this they could double-download the runtime into the same temp file
+// or both stall in `LoadLibrary` on the same dll. Distinct from the
+// STATUS mutex, which is only held for the brief read/write of the
+// snapshot — this one is held across the whole (slow) fetch + init.
+static SETUP_LOCK: Mutex<()> = Mutex::new(());
+
 /// Process-global status. Returns a sentinel "not yet initialized"
 /// status if [`initialize`] hasn't been called — keeps callers from
 /// having to `Option::unwrap_or_else` on the path.
@@ -129,6 +138,66 @@ pub fn initialize() {
     if let Ok(mut g) = STATUS.lock() {
         *g = Some(status);
     }
+}
+
+/// Make onnxruntime ready to use, driving the one-time runtime download
+/// + load *here* rather than assuming the startup hook already finished.
+///
+/// Safe to call from any thread, any number of times: the whole
+/// find/download/load sequence is serialized on `SETUP_LOCK`, so the
+/// startup worker and a record-click worker coalesce onto a single
+/// download/init and then both observe the same status. The common
+/// steady-state case (already loaded) takes the lock-free fast path.
+///
+/// `on_stage` receives coarse progress text ("Downloading…", "Loading…")
+/// for a status frame; `cancel` lets a caller bail before the blocking
+/// download starts. Returns the final [`OrtStatus`] — callers check
+/// `.initialized`.
+pub fn ensure_ready(on_stage: &dyn Fn(&str), cancel: &AtomicBool) -> OrtStatus {
+    // Fast path: already loaded — the common case once setup has run.
+    let s = status();
+    if s.initialized {
+        return s;
+    }
+    let _guard = SETUP_LOCK.lock().expect("ort_setup SETUP_LOCK poisoned");
+    // Another caller may have finished while we waited on the lock.
+    let s = status();
+    if s.initialized {
+        return s;
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return s;
+    }
+
+    // `initialize` only searches + loads; the network fetch lives in
+    // `ort_install`. Download the pinned runtime if it isn't on disk.
+    let need_fetch = crate::ort_install::target_dylib_path()
+        .map(|p| !p.exists())
+        .unwrap_or(true);
+    if need_fetch {
+        on_stage(
+            "Downloading the speech engine (onnxruntime) — one-time setup, may take a minute…",
+        );
+        let noop: Box<crate::ort_install::ProgressFn> = Box::new(|_, _| {});
+        if let Err(e) = crate::ort_install::ensure_runtime_dylib(noop) {
+            let err = format!("onnxruntime download failed: {e:#}");
+            eprintln!("[ort_setup] {err}");
+            let st = OrtStatus {
+                initialized: false,
+                dylib_path: None,
+                searched: Vec::new(),
+                error: Some(err),
+            };
+            if let Ok(mut g) = STATUS.lock() {
+                *g = Some(st.clone());
+            }
+            return st;
+        }
+    }
+
+    on_stage("Loading the speech engine…");
+    initialize();
+    status()
 }
 
 fn run_init() -> (OrtStatus, String) {

@@ -323,6 +323,25 @@ async fn remote_ui_kick(disable: bool) -> Result<RemoteUiStatus, String> {
 // `~/.myownllm/models/diarize/` and are downloaded on demand.
 // ---------------------------------------------------------------------------
 
+/// Current onnxruntime setup state, for the load screen + record gate.
+/// Lets the frontend learn readiness even when it mounts after the
+/// startup `myownllm://ort-install-progress` event already fired — the
+/// common case once the runtime is installed.
+#[derive(serde::Serialize)]
+struct OrtSetupStatus {
+    initialized: bool,
+    error: Option<String>,
+}
+
+#[tauri::command]
+fn ort_setup_status() -> OrtSetupStatus {
+    let s = ort_setup::status();
+    OrtSetupStatus {
+        initialized: s.initialized,
+        error: s.error,
+    }
+}
+
 #[tauri::command]
 fn transcribe_start(
     stream_id: String,
@@ -1065,6 +1084,7 @@ fn main() {
             mesh::governance::mesh_governance_derive_split_network_id,
             mesh::governance::mesh_governance_role_can_grant,
             mesh_file_save_at,
+            ort_setup_status,
             transcribe_start,
             transcribe_stop,
             transcribe_pause,
@@ -1213,51 +1233,27 @@ fn main() {
                 let ah = app_handle.clone();
                 tauri::async_runtime::spawn_blocking(move || {
                     use tauri::Emitter;
-                    ort_setup::initialize();
-                    if ort_setup::status().initialized {
-                        return;
-                    }
-                    let emit_progress =
-                        |stage: &str, bytes: u64, total: u64, error: Option<&str>| {
-                            let _ = ah.emit(
-                                "myownllm://ort-install-progress",
-                                serde_json::json!({
-                                    "stage": stage,
-                                    "bytes": bytes,
-                                    "total": total,
-                                    "error": error,
-                                }),
-                            );
-                        };
-                    emit_progress("downloading", 0, 0, None);
-                    let ah_for_cb = ah.clone();
-                    let progress_cb: Box<ort_install::ProgressFn> =
-                        Box::new(move |bytes, total| {
-                            use tauri::Emitter;
-                            let _ = ah_for_cb.emit(
-                                "myownllm://ort-install-progress",
-                                serde_json::json!({
-                                    "stage": "downloading",
-                                    "bytes": bytes,
-                                    "total": total,
-                                    "error": null,
-                                }),
-                            );
-                        });
-                    match ort_install::ensure_runtime_dylib(progress_cb) {
-                        Ok(path) => {
-                            eprintln!(
-                                "[ort_install] dylib ready at {}; re-initializing ort_setup",
-                                path.display()
-                            );
-                            ort_setup::initialize();
-                            emit_progress("ready", 0, 0, None);
-                        }
-                        Err(e) => {
-                            let msg = format!("{e:#}");
-                            eprintln!("[ort_install] failed: {msg}");
-                            emit_progress("error", 0, 0, Some(&msg));
-                        }
+                    let emit = |stage: &str, error: Option<&str>| {
+                        let _ = ah.emit(
+                            "myownllm://ort-install-progress",
+                            serde_json::json!({
+                                "stage": stage,
+                                "bytes": 0,
+                                "total": 0,
+                                "error": error,
+                            }),
+                        );
+                    };
+                    // Single serialized entry point — the first record
+                    // click calls the same `ensure_ready`, so the two
+                    // can't double-fetch the runtime. Drives the one-time
+                    // download + load and flips the shared status.
+                    let never = std::sync::atomic::AtomicBool::new(false);
+                    let status = ort_setup::ensure_ready(&|stage| emit(stage, None), &never);
+                    if status.initialized {
+                        emit("ready", None);
+                    } else {
+                        emit("error", status.error.as_deref());
                     }
                 });
 
