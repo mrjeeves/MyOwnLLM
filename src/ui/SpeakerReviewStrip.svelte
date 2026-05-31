@@ -18,6 +18,7 @@
     streamId,
     items,
     labelFor,
+    compact = false,
     onResolved,
     onDismiss,
   }: {
@@ -25,6 +26,9 @@
     items: SpeakerReviewItem[];
     /** Render the live speaker label ("Speaker 2" / a session rename). */
     labelFor: (speaker: number) => string;
+    /** Compact = mid-recording inline chips (subtle, one-tap confirm of a
+     *  confident guess). Full = end-of-session review panel. */
+    compact?: boolean;
     /** Called when a speaker is attributed, with the profile name to
      *  reflect into the transcript's speaker labels. */
     onResolved: (speaker: number, profileId: number, name: string) => void;
@@ -92,9 +96,45 @@
     invoke("speaker_review_dismiss", { streamId }).catch(() => {});
     onDismiss();
   }
+
+  // Compact (in-session) dismiss of a single chip: mark it resolved
+  // locally so it stops showing, without attaching. It'll reappear in the
+  // end-of-session strip if still unconfirmed there.
+  function dismissOne(speaker: number) {
+    resolved = { ...resolved, [speaker]: "" };
+  }
 </script>
 
-{#if pending.length > 0}
+{#if pending.length > 0 && compact}
+  <!-- In-session: subtle inline chips, only for confident recognitions.
+       One-tap confirm of the guess, or ✕ to defer to the end strip. -->
+  <div class="chips" transition:fly={{ y: 10, duration: 150 }}>
+    {#each pending.filter((it) => it.auto_matched != null && it.suggestions[0]) as it (it.speaker)}
+      {@const top = it.suggestions[0]}
+      <div class="chip">
+        <span
+          class="dot"
+          style="background: {speakerColor(it.speaker)}"
+          aria-hidden="true"
+        ></span>
+        <span class="chip-q">{labelFor(it.speaker)} — is this</span>
+        <button class="play mini" onclick={() => play(it.speaker)} title="Play clip">
+          ▶
+        </button>
+        <button
+          class="confirm mini"
+          disabled={busy}
+          onclick={() => attach(it.speaker, top.profile_id, top.name)}
+        >
+          ✓ {top.name}
+        </button>
+        <button class="ghost mini" onclick={() => dismissOne(it.speaker)} title="Not now">
+          ✕
+        </button>
+      </div>
+    {/each}
+  </div>
+{:else if pending.length > 0}
   <div class="strip" transition:fly={{ y: 16, duration: 180 }}>
     <div class="strip-head">
       <span class="title">Who was speaking?</span>
@@ -184,6 +224,36 @@
 {/if}
 
 <style>
+  /* In-session compact chips. */
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    padding: 0.4rem 0.7rem;
+    border-top: 1px solid #20202c;
+    background: #101016;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    background: #16161f;
+    border: 1px solid #2a2a3a;
+    border-radius: 999px;
+    padding: 0.15rem 0.3rem 0.15rem 0.5rem;
+    font-size: 0.76rem;
+  }
+  .chip-q {
+    color: #999;
+  }
+  .mini {
+    padding: 0.1rem 0.4rem;
+    font-size: 0.72rem;
+  }
+  .play.mini {
+    padding: 0.1rem 0.35rem;
+  }
+
   .strip {
     border-top: 1px solid #2a2a3a;
     background: #12121a;

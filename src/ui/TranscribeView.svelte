@@ -1178,6 +1178,7 @@
           streamId={transcribeUi.review.streamId}
           items={transcribeUi.review.items}
           labelFor={speakerLabel}
+          compact={isMyRecording}
           onResolved={onSpeakerResolved}
           onDismiss={() => (transcribeUi.review = null)}
         />

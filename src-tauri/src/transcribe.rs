@@ -2230,15 +2230,18 @@ fn run_streaming_loop(
                 end_ms,
                 &cancel,
             );
-            // Opportunistically keep the best voice clip for this speaker.
+            // Opportunistically keep the best voice clip for this speaker;
+            // on a first capture, stash it live + emit an in-session chip.
             if let Some(spk) = dia.speaker {
-                clips.consider(
+                if let Some(cand) = clips.consider(
                     spk,
                     utterance_audio(&window, utt_start_ms, end_ms),
                     dia.embedding.as_deref(),
                     dia.confidence,
                     dia.overlap,
-                );
+                ) {
+                    emit_live_speaker_chip(sink, event, started, review_key, cand);
+                }
             }
             let (speaker, overlap) = (dia.speaker, dia.overlap);
             agree.finalize();
@@ -2462,46 +2465,46 @@ fn stash_review_candidates(
     if candidates.is_empty() {
         return None;
     }
-    let mut items = Vec::new();
-    let mut pending = Vec::new();
-    for cand in candidates {
-        let dim = cand.embedding.len();
-        // Rank existing profiles for the suggestion list.
-        let ranked =
-            crate::diarize::registry::with(|reg| reg.rank_candidates(dim, &cand.embedding))
-                .unwrap_or_default();
-        let suggestions: Vec<SpeakerSuggestion> = ranked
-            .iter()
-            .take(3)
-            .map(|(id, name, sim)| SpeakerSuggestion {
-                profile_id: *id,
-                name: name.clone(),
-                similarity: *sim,
-            })
-            .collect();
-        // Auto-match: the top suggestion if it's confidently this person.
-        let auto_matched = ranked
-            .first()
-            .filter(|(_, _, sim)| *sim >= REVIEW_AUTOMATCH_SIM)
-            .map(|(id, _, _)| *id);
-        items.push(SpeakerReviewItem {
-            speaker: cand.speaker,
-            duration_ms: cand.duration_ms,
-            suggestions,
-            auto_matched,
-        });
-        pending.push(cand);
+    // Skip speakers already attributed mid-session (via a live chip), so
+    // the end strip doesn't re-ask about someone already confirmed.
+    let resolved = resolved_speakers(review_key);
+    let unresolved: Vec<_> = candidates
+        .into_iter()
+        .filter(|c| !resolved.contains(&c.speaker))
+        .collect();
+    if unresolved.is_empty() {
+        review_store().remove(review_key);
+        return None;
     }
-    // Stash the audio+embeddings so the review commands can play clips
-    // and attach them on confirm.
+
+    let items: Vec<SpeakerReviewItem> = unresolved.iter().map(rank_review_item).collect();
+    // Replace the store entry with the full unresolved set so every clip
+    // is playable/attachable from the strip.
     review_store().insert(
         review_key.to_string(),
-        pending
-            .into_iter()
-            .map(|c| (c.speaker, c))
-            .collect::<Vec<_>>(),
+        unresolved.into_iter().map(|c| (c.speaker, c)).collect(),
     );
     Some(items)
+}
+
+/// Speakers attributed during a session (via a live chip confirm), so the
+/// end-of-session strip can skip them. Keyed by review key.
+type ResolvedStore = DashMap<String, std::collections::HashSet<u32>>;
+fn resolved_store() -> &'static ResolvedStore {
+    static M: OnceLock<ResolvedStore> = OnceLock::new();
+    M.get_or_init(DashMap::new)
+}
+fn mark_resolved(review_key: &str, speaker: u32) {
+    resolved_store()
+        .entry(review_key.to_string())
+        .or_default()
+        .insert(speaker);
+}
+fn resolved_speakers(review_key: &str) -> std::collections::HashSet<u32> {
+    resolved_store()
+        .get(review_key)
+        .map(|s| s.clone())
+        .unwrap_or_default()
 }
 
 /// Cosine similarity above which a captured clip is treated as auto-
@@ -2519,6 +2522,70 @@ type ReviewStash = DashMap<String, Vec<(u32, crate::diarize::capture::ClipCandid
 fn review_store() -> &'static ReviewStash {
     static M: OnceLock<ReviewStash> = OnceLock::new();
     M.get_or_init(DashMap::new)
+}
+
+/// Rank a candidate against existing profiles into a `SpeakerReviewItem`
+/// (shared by the live chip and the end-of-session strip).
+fn rank_review_item(cand: &crate::diarize::capture::ClipCandidate) -> SpeakerReviewItem {
+    let dim = cand.embedding.len();
+    let ranked = crate::diarize::registry::with(|reg| reg.rank_candidates(dim, &cand.embedding))
+        .unwrap_or_default();
+    let suggestions = ranked
+        .iter()
+        .take(3)
+        .map(|(id, name, sim)| SpeakerSuggestion {
+            profile_id: *id,
+            name: name.clone(),
+            similarity: *sim,
+        })
+        .collect();
+    let auto_matched = ranked
+        .first()
+        .filter(|(_, _, sim)| *sim >= REVIEW_AUTOMATCH_SIM)
+        .map(|(id, _, _)| *id);
+    SpeakerReviewItem {
+        speaker: cand.speaker,
+        duration_ms: cand.duration_ms,
+        suggestions,
+        auto_matched,
+    }
+}
+
+/// On a *first* capture of a speaker mid-session: stash the candidate live
+/// (so the chip's play/attach commands work immediately) and emit a
+/// one-item `speaker_review` frame the UI renders as a non-blocking inline
+/// chip. Only fires for a confident match (`auto_matched`) — an unknown
+/// voice shouldn't nag mid-conversation; it lands in the end strip.
+fn emit_live_speaker_chip(
+    sink: &Arc<dyn FrameSink>,
+    event: &str,
+    started: std::time::Instant,
+    review_key: &str,
+    cand: crate::diarize::capture::ClipCandidate,
+) {
+    let item = rank_review_item(&cand);
+    // Stash so speaker_review_clip_wav / _attach can find it right away.
+    review_store()
+        .entry(review_key.to_string())
+        .or_default()
+        .push((cand.speaker, cand));
+    // Only chip a confident recognition; unknowns wait for the end strip.
+    if item.auto_matched.is_none() {
+        return;
+    }
+    sink.emit_frame(
+        event,
+        TranscribeFrame {
+            elapsed_ms: started.elapsed().as_millis(),
+            segments: Vec::new(),
+            is_final: false,
+            pending_chunks: 0,
+            chunk_seconds: None,
+            status: None,
+            upload_progress: None,
+            speaker_review: Some(vec![item]),
+        },
+    );
 }
 
 /// WAV bytes of a captured (not-yet-attached) review clip, so the review
@@ -2586,17 +2653,21 @@ pub fn review_attach(
     crate::diarize::registry::save()?;
 
     // Remove this speaker from the pending set; drop the whole entry when
-    // empty so the store doesn't accrete finished sessions.
+    // empty so the store doesn't accrete finished sessions. Mark it
+    // resolved so an end-of-session strip (after a live-chip attach during
+    // recording) doesn't ask about this speaker again.
     if let Some(mut entry) = review_store().get_mut(review_key) {
         entry.retain(|(s, _)| *s != speaker);
     }
     review_store().remove_if(review_key, |_, v| v.is_empty());
+    mark_resolved(review_key, speaker);
     Ok(profile_id)
 }
 
 /// Drop a session's pending review without attaching anything.
 pub fn review_dismiss(review_key: &str) {
     review_store().remove(review_key);
+    resolved_store().remove(review_key);
 }
 
 /// Cheap unique-ish id for a clip filename (timestamp-ns + a counter).

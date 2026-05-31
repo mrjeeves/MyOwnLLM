@@ -92,6 +92,11 @@ impl ClipCollector {
     /// clip when the turn is confident, non-overlap, long enough, and
     /// beats any clip already held for them. `embedding` is the diarizer
     /// embedding of the dominant turn (the verified anchor); `None` skips.
+    ///
+    /// Returns the `ClipCandidate` *only the first time* a speaker is
+    /// captured — so the live loop can surface a one-shot in-session
+    /// suggestion chip without re-firing on every later utterance from the
+    /// same person. Later upgrades to a held clip return `None`.
     pub fn consider(
         &mut self,
         speaker: u32,
@@ -99,19 +104,20 @@ impl ClipCollector {
         embedding: Option<&[f32]>,
         confidence: f32,
         overlap: bool,
-    ) {
+    ) -> Option<ClipCandidate> {
         let dur_ms = (audio.len() as u64 * 1000) / SR;
         if overlap || confidence < CLIP_MIN_CONFIDENCE || dur_ms < CLIP_MIN_MS {
-            return;
+            return None;
         }
-        let Some(emb) = embedding else { return };
+        let emb = embedding?;
         if emb.is_empty() {
-            return;
+            return None;
         }
+        let already = self.best.iter().any(|c| c.speaker == speaker);
         // Only replace a held clip with a more confident one.
         if let Some(existing) = self.best.iter().find(|c| c.speaker == speaker) {
             if existing.confidence >= confidence {
-                return;
+                return None;
             }
         }
         let clip = best_window(audio).to_vec();
@@ -123,10 +129,14 @@ impl ClipCollector {
             confidence,
             duration_ms,
         };
-        if let Some(slot) = self.best.iter_mut().find(|c| c.speaker == speaker) {
-            *slot = cand;
+        if already {
+            if let Some(slot) = self.best.iter_mut().find(|c| c.speaker == speaker) {
+                *slot = cand;
+            }
+            None
         } else {
-            self.best.push(cand);
+            self.best.push(cand.clone());
+            Some(cand)
         }
     }
 
@@ -224,5 +234,26 @@ mod tests {
         let got = c.take();
         // Trimmed down to the 3 s target.
         assert_eq!(got[0].duration_ms, CLIP_TARGET_MS);
+    }
+
+    #[test]
+    fn consider_returns_candidate_only_on_first_capture() {
+        let mut c = ClipCollector::new();
+        let audio = vec![0.4; ms_to_samples(3000)];
+        // First capture for speaker 0 → Some (drives the live chip).
+        let first = c.consider(0, &audio, Some(&[1.0, 0.0]), 0.6, false);
+        assert!(first.is_some(), "first capture signals a new speaker");
+        assert_eq!(first.unwrap().speaker, 0);
+        // A stronger upgrade for the same speaker → None (no re-chip).
+        let upgrade = c.consider(0, &audio, Some(&[0.0, 1.0]), 0.9, false);
+        assert!(upgrade.is_none(), "upgrade must not re-fire the chip");
+        // A skipped offer (low conf) → None.
+        assert!(c
+            .consider(0, &audio, Some(&[1.0, 0.0]), 0.1, false)
+            .is_none());
+        // A different speaker → Some.
+        assert!(c
+            .consider(1, &audio, Some(&[1.0, 0.0]), 0.7, false)
+            .is_some());
     }
 }
