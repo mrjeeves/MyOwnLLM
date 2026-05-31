@@ -1619,6 +1619,9 @@ fn main() {
         .expect("error building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // Hard-abort any live transcription so a draining meeting
+                // can't hang process teardown waiting for its backlog.
+                transcribe::abort_all();
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async {
                     let _ = ollama::stop().await;

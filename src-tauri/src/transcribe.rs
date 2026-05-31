@@ -271,6 +271,12 @@ struct Session {
     /// running session. Resume just flips this back. Inference-only
     /// ("drain") sessions never read it.
     paused: Arc<AtomicBool>,
+    /// A *graceful* stop: stop capturing new mic audio but keep decoding
+    /// until the buffered backlog is fully transcribed, then finalize the
+    /// last utterance and end. This is what the Stop button sets — a
+    /// meeting's tail must never be dropped. `cancel` stays the hard-abort
+    /// (app exit, fatal error, mic loss) that ends the loop immediately.
+    draining: Arc<AtomicBool>,
 }
 
 fn sessions() -> &'static DashMap<String, Session> {
@@ -560,17 +566,20 @@ pub fn start(
     }
     let cancel = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
+    let draining = Arc::new(AtomicBool::new(false));
     sessions().insert(
         stream_id.clone(),
         Session {
             cancel: cancel.clone(),
             paused: paused.clone(),
+            draining: draining.clone(),
         },
     );
 
     let stream_id_for_thread = stream_id.clone();
     let cancel_for_thread = cancel.clone();
     let paused_for_thread = paused.clone();
+    let draining_for_thread = draining.clone();
     let runtime_for_thread = runtime.clone();
     let model_for_thread = model_name.clone();
     let diarize_for_thread = diarize_model.clone();
@@ -591,6 +600,7 @@ pub fn start(
             keep_audio,
             cancel_for_thread,
             paused_for_thread,
+            draining_for_thread,
             &sink,
         );
         crate::usage::record_transcribe_seconds(session_start.elapsed().as_secs());
@@ -624,16 +634,26 @@ pub fn start(
 
 pub fn stop(stream_id: &str) -> Result<()> {
     if let Some(s) = sessions().get(stream_id) {
-        // Diagnostic line so a spurious cancel (e.g. fired during the
-        // first warm-up because the frontend double-fired stopRecording)
-        // is visible in the backend logs. The legitimate user-Stop case
-        // is no quieter, but the volume is one line per session end.
-        eprintln!("[transcribe] stop() called for stream {stream_id}");
-        s.cancel.store(true, Ordering::SeqCst);
+        // Graceful stop: stop capturing, but let the decode loop finish the
+        // buffered backlog and finalize the in-flight utterance before it
+        // ends — so a meeting's last sentences aren't lost. `cancel` is left
+        // alone; that's reserved for the hard-abort path (`abort`).
+        eprintln!("[transcribe] stop() called for stream {stream_id} — draining backlog");
+        s.draining.store(true, Ordering::SeqCst);
     } else {
         eprintln!("[transcribe] stop() called for unknown stream {stream_id} (already finished?)");
     }
     Ok(())
+}
+
+/// Hard-abort every live session: end each decode loop now, dropping any
+/// buffered backlog. Called on app exit so a draining meeting can't hang
+/// teardown. The normal Stop button uses `stop` (graceful drain) instead.
+pub fn abort_all() {
+    for s in sessions().iter() {
+        s.cancel.store(true, Ordering::SeqCst);
+        s.draining.store(true, Ordering::SeqCst);
+    }
 }
 
 pub fn pause(stream_id: &str) -> Result<()> {
@@ -675,11 +695,13 @@ pub fn start_drain(
         ));
     }
     let cancel = Arc::new(AtomicBool::new(false));
+    let draining = Arc::new(AtomicBool::new(false));
     sessions().insert(
         stream_id.clone(),
         Session {
             cancel: cancel.clone(),
             paused: Arc::new(AtomicBool::new(false)),
+            draining: draining.clone(),
         },
     );
 
@@ -759,6 +781,8 @@ pub fn start_upload(
         Session {
             cancel: cancel.clone(),
             paused: paused.clone(),
+            // File upload is a finite decode; Stop cancels it. No drain.
+            draining: Arc::new(AtomicBool::new(false)),
         },
     );
 
@@ -866,6 +890,9 @@ pub fn start_remote_session(
         Session {
             cancel: cancel.clone(),
             paused: paused.clone(),
+            // Remote sessions end when the peer closes the inbox; Stop
+            // hard-cancels. No separate drain phase.
+            draining: Arc::new(AtomicBool::new(false)),
         },
     );
 
@@ -1034,6 +1061,8 @@ fn run_remote_session(
         caps,
         cancel.clone(),
         paused.clone(),
+        // Remote sessions end on inbox close, not a drain phase.
+        Arc::new(AtomicBool::new(false)),
         window,
         event,
         started,
@@ -1138,6 +1167,7 @@ fn run_session(
     keep_audio: bool,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
     window: &std::sync::Arc<dyn FrameSink>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
@@ -1180,16 +1210,23 @@ fn run_session(
 
     let stream_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let cancel_audio = cancel.clone();
+    // Stop forwarding mic audio once draining starts, so the buffered
+    // backlog can decode down to empty without new samples piling on.
+    let draining_audio = draining.clone();
     let stream = match format {
         cpal::SampleFormat::F32 => {
             let tx = tx.clone();
             let cancel = cancel_audio.clone();
+            let draining = draining_audio.clone();
             device.build_input_stream(
                 &stream_cfg,
                 {
                     let paused = paused.clone();
                     move |data: &[f32], _| {
-                        if cancel.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                        if cancel.load(Ordering::Relaxed)
+                            || paused.load(Ordering::Relaxed)
+                            || draining.load(Ordering::Relaxed)
+                        {
                             return;
                         }
                         let _ = tx.try_send(downmix_f32(data, channels));
@@ -1202,12 +1239,16 @@ fn run_session(
         cpal::SampleFormat::I16 => {
             let tx = tx.clone();
             let cancel = cancel_audio.clone();
+            let draining = draining_audio.clone();
             device.build_input_stream(
                 &stream_cfg,
                 {
                     let paused = paused.clone();
                     move |data: &[i16], _| {
-                        if cancel.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                        if cancel.load(Ordering::Relaxed)
+                            || paused.load(Ordering::Relaxed)
+                            || draining.load(Ordering::Relaxed)
+                        {
                             return;
                         }
                         let f: Vec<f32> =
@@ -1222,12 +1263,16 @@ fn run_session(
         cpal::SampleFormat::U16 => {
             let tx = tx.clone();
             let cancel = cancel_audio.clone();
+            let draining = draining_audio.clone();
             device.build_input_stream(
                 &stream_cfg,
                 {
                     let paused = paused.clone();
                     move |data: &[u16], _| {
-                        if cancel.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                        if cancel.load(Ordering::Relaxed)
+                            || paused.load(Ordering::Relaxed)
+                            || draining.load(Ordering::Relaxed)
+                        {
                             return;
                         }
                         let f: Vec<f32> = data
@@ -1271,6 +1316,7 @@ fn run_session(
         caps,
         cancel.clone(),
         paused.clone(),
+        draining.clone(),
         window,
         event,
         started,
@@ -2107,6 +2153,7 @@ fn run_streaming_loop(
     caps: AsrCaps,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
     sink: &Arc<dyn FrameSink>,
     event: &str,
     started: std::time::Instant,
@@ -2161,10 +2208,40 @@ fn run_streaming_loop(
     // session emits nothing).
     let mut capture_chunk_seconds: Option<f32> = None;
     let mut chunk_seconds_sent = false;
+    // Announce the drain phase once, so the UI can show "finishing
+    // transcription…" instead of looking frozen after Stop.
+    let mut drain_announced = false;
 
     loop {
+        // Hard abort (app exit / fatal error): end now, dropping backlog.
         if cancel.load(Ordering::SeqCst) {
             break;
+        }
+        // Graceful stop: mic capture has stopped, so once the channel has
+        // drained empty there's no more audio coming — finalize and end.
+        // Until then, keep decoding the buffered backlog so a meeting's
+        // tail is fully transcribed rather than dropped on Stop.
+        if draining.load(Ordering::SeqCst) {
+            if rx.is_empty() {
+                break;
+            }
+            if !drain_announced {
+                drain_announced = true;
+                let backlog = rx.len() as u32;
+                sink.emit_frame(
+                    event,
+                    TranscribeFrame {
+                        elapsed_ms: started.elapsed().as_millis(),
+                        segments: Vec::new(),
+                        is_final: false,
+                        pending_chunks: backlog,
+                        chunk_seconds: capture_chunk_seconds,
+                        status: Some("Finishing transcription…".to_string()),
+                        upload_progress: None,
+                        speaker_review: None,
+                    },
+                );
+            }
         }
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(samples) => {
@@ -3165,6 +3242,7 @@ mod tests {
             caps,
             cancel,
             paused,
+            Arc::new(AtomicBool::new(false)),
             &sink,
             "evt",
             std::time::Instant::now(),
@@ -3237,6 +3315,7 @@ mod tests {
             caps,
             cancel,
             paused,
+            Arc::new(AtomicBool::new(false)),
             &sink,
             "evt",
             std::time::Instant::now(),
@@ -3247,6 +3326,68 @@ mod tests {
         sender.join().unwrap();
 
         assert!(cap.drain().is_empty(), "silence must not emit captions");
+    }
+
+    /// Graceful stop must drain the buffered backlog, not abandon it: with
+    /// `draining` set and a full channel of voiced audio, every queued hop
+    /// is still decoded and the utterance finalizes — the meeting's tail is
+    /// transcribed rather than dropped when the user hits Stop.
+    #[test]
+    fn streaming_loop_draining_finishes_buffered_backlog() {
+        let mut asr = ScriptedAsr::new(vec![
+            vec!["the"],
+            vec!["the", "quick"],
+            vec!["the", "quick", "brown"],
+        ]);
+        let caps = asr.caps();
+        let cap = Arc::new(CaptureSink::new());
+        let sink: Arc<dyn FrameSink> = cap.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        // Drain is already requested before the loop runs, and all the
+        // audio is already in the channel — the worst case for "stop drops
+        // the tail". The loop must still consume every buffered hop.
+        let draining = Arc::new(AtomicBool::new(true));
+
+        let (tx, rx) = bounded::<Vec<f32>>(128);
+        // Three voiced hops then two quiet (1 s > 600 ms endpoint) so the
+        // utterance finalizes from buffered audio alone, then disconnect.
+        for _ in 0..3 {
+            tx.send(vec![0.1f32; 8000]).unwrap();
+        }
+        for _ in 0..2 {
+            tx.send(vec![0.0f32; 8000]).unwrap();
+        }
+        drop(tx);
+
+        run_streaming_loop(
+            rx,
+            16_000,
+            &mut asr,
+            None,
+            caps,
+            cancel,
+            paused,
+            draining,
+            &sink,
+            "evt",
+            std::time::Instant::now(),
+            "test",
+            false,
+        )
+        .unwrap();
+
+        let frames = cap.drain();
+        let finals: Vec<&EmittedSegment> = frames
+            .iter()
+            .flat_map(|(_, f)| f.segments.iter())
+            .filter(|s| !s.partial)
+            .collect();
+        assert_eq!(finals.len(), 1, "buffered utterance finalized once");
+        assert_eq!(
+            finals[0].text, "the quick brown",
+            "the whole buffered backlog was transcribed, not dropped"
+        );
     }
 
     #[test]
