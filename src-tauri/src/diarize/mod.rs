@@ -206,12 +206,15 @@ impl DiarizeBackend for PyannoteOrtBackend {
         if let Some(dim) = self.embed_dim() {
             match registry::with(|reg| reg.seed_for(dim)) {
                 Ok(seed) => {
-                    if !seed.centroids.is_empty() {
-                        eprintln!(
-                            "[diarize] seeded {} persisted speaker profile(s) (dim={dim})",
-                            seed.centroids.len()
-                        );
-                    }
+                    // Always log the seed count + active embedder dim: a
+                    // returning voice only matches a profile stored at the
+                    // *same* dim, so "seeded 0 (dim=256)" while you have a
+                    // 192-d profile is the tell for an embedder mismatch.
+                    eprintln!(
+                        "[diarize] seeded {} persisted speaker profile(s) (embedder={}, dim={dim})",
+                        seed.centroids.len(),
+                        self.embedder_name,
+                    );
                     self.clusterer = OnlineClusterer::seeded(
                         ClusterConfig::for_embedder(&self.embedder_name),
                         seed.centroids,

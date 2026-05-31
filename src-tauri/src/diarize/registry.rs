@@ -516,9 +516,35 @@ fn load_doc() -> RegistryDoc {
     };
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(_) => return RegistryDoc::default(),
+        // No file yet is the normal first-run case — stay quiet.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RegistryDoc::default(),
+        Err(e) => {
+            eprintln!(
+                "[diarize] speaker registry unreadable at {}: {e} — starting empty",
+                path.display()
+            );
+            return RegistryDoc::default();
+        }
     };
-    serde_json::from_str(&text).unwrap_or_default()
+    match serde_json::from_str::<RegistryDoc>(&text) {
+        Ok(doc) => {
+            eprintln!(
+                "[diarize] loaded speaker registry: {} profile(s) from {}",
+                doc.speakers.len(),
+                path.display()
+            );
+            doc
+        }
+        // A parse failure is the silent-corruption trap: warn loudly rather
+        // than treating every returning voice as brand new.
+        Err(e) => {
+            eprintln!(
+                "[diarize] speaker registry at {} failed to parse: {e} — starting empty (existing profiles will NOT match until this is resolved)",
+                path.display()
+            );
+            RegistryDoc::default()
+        }
+    }
 }
 
 fn save_doc(doc: &RegistryDoc) -> Result<()> {
