@@ -93,7 +93,7 @@ function Try-Release {
     }
 }
 
-# MyOwnLLM transcription needs onnxruntime ≥1.22. It's not bundled in
+# MyOwnLLM transcription needs onnxruntime ≥1.24. It's not bundled in
 # the release zip — keeps the artifact lean and lets us ship one
 # binary per platform — so we fetch Microsoft's prebuilt and drop the
 # DLL next to myownllm.exe at install time. The app has an in-process
@@ -110,7 +110,7 @@ function Install-OnnxRuntime {
         if (Test-Path ".ort-version") { $ortVersion = (Get-Content ".ort-version" -Raw).Trim() }
     }
     if (-not $ortVersion) {
-        $ortVersion = "1.22.0"
+        $ortVersion = "1.24.2"
         Warn "couldn't read .ort-version; falling back to $ortVersion"
     }
 

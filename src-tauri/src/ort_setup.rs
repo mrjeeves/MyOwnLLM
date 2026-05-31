@@ -13,7 +13,7 @@
 //!   loader paths) the failure surfaces as a hang inside the FFI
 //!   trampoline rather than a clean Err.
 //! - **Wrong version.** ort 2.0.0-rc.12 with `api-22` expects ORT
-//!   ≥1.22. A system-installed `libonnxruntime.dylib` from an older
+//!   ≥1.24. A system-installed `libonnxruntime.dylib` from an older
 //!   ORT (e.g. 1.16 via an old brew install) loads via dlopen but
 //!   exposes a different C ABI; the resulting function-pointer
 //!   dispatch is undefined behaviour. Hang / segfault / corrupted
@@ -287,7 +287,7 @@ fn run_init() -> (OrtStatus, String) {
         }
         Ok(Err(e)) => {
             let err = format!(
-                "ort::init_from({}) failed: {e} — likely a version / arch mismatch (ort api-22 needs onnxruntime \u{2265}1.22)",
+                "ort::init_from({}) failed: {e} — likely a version / arch mismatch (ort 2.0.0-rc.12 ships bindings for onnxruntime 1.24; the runtime must match)",
                 existing.display()
             );
             (
