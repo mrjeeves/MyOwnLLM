@@ -910,6 +910,25 @@
     transcribeUi.pendingChunks * transcribeUi.chunkSeconds,
   );
 
+  // Live pipeline activity, surfaced so the user sees the parallel work
+  // happening — capture is always lossless, transcription/labelling trail
+  // and catch up. Drives the activity row in the recording header.
+  let isCapturing = $derived(
+    isMyRecording && !transcribeUi.paused && !transcribeUi.draining,
+  );
+  // "REC" = the lossless full-audio recorder is running (keep-audio on).
+  let isRecordingAudio = $derived(isCapturing && keepAudio);
+  // Transcription is actively catching up on a backlog vs. keeping pace.
+  let transcribeBehind = $derived(isMyRecording && backlogSeconds >= 1.5);
+  // Distinct speakers seen so far this session (from the live labels map).
+  let liveSpeakerCount = $derived(
+    new Set(
+      renderedTurns
+        .map((t) => t.speaker)
+        .filter((s) => s !== null && s !== undefined),
+    ).size,
+  );
+
   // The live, still-refining caption for the active streaming session.
   // Rendered tentatively beneath the confirmed transcript and never
   // persisted. Empty unless this view owns the active recording and a
@@ -1105,11 +1124,40 @@
       {/if}
       <header class="pane-head">
         <span class="pane-title">Transcription</span>
-        {#if isMyRecording && !transcribeUi.paused}
-          <span class="rec-dot" aria-hidden="true"></span>
-          <span class="rec-time">{fmtElapsed(transcribeUi.elapsed)}</span>
-        {:else if isMyRecording && transcribeUi.paused}
-          <span class="rec-paused">paused</span>
+        {#if isMyRecording}
+          <span class="live-activity" aria-live="polite">
+            {#if transcribeUi.paused}
+              <span class="rec-paused">paused</span>
+            {:else if transcribeUi.draining}
+              <span class="act act-finishing">⏳ finishing</span>
+            {:else}
+              {#if isRecordingAudio}
+                <span class="act act-rec" title="Recording full audio losslessly">
+                  <span class="rec-dot" aria-hidden="true"></span>REC
+                </span>
+              {:else}
+                <span class="act act-live">
+                  <span class="rec-dot" aria-hidden="true"></span>live
+                </span>
+              {/if}
+              <span class="rec-time">{fmtElapsed(transcribeUi.elapsed)}</span>
+              {#if transcribeBehind}
+                <span
+                  class="act act-behind"
+                  title="Audio is captured and safe; transcription is catching up."
+                >
+                  ✍ +{backlogSeconds.toFixed(backlogSeconds >= 10 ? 0 : 1)}s
+                </span>
+              {:else}
+                <span class="act act-transcribing">✍ transcribing</span>
+              {/if}
+              {#if diarizeEnabled && liveSpeakerCount > 0}
+                <span class="act act-speakers" title="Speakers identified so far">
+                  🗣 {liveSpeakerCount}
+                </span>
+              {/if}
+            {/if}
+          </span>
         {/if}
         <label class="diarize-toggle" title="Identify speakers in the transcript">
           <input
@@ -1195,8 +1243,8 @@
         {:else}
           <div class="placeholder">
             {#if isMyRecording}
-              Listening… transcription will stream in here every few
-              seconds.
+              Recording… your audio is being captured now; the transcript
+              streams in here and catches up as it processes.
             {:else}
               Press <strong>Record</strong> to start a session. The live
               transcript will appear in this pane.
@@ -1685,6 +1733,46 @@
     color: #d4a64a;
     text-transform: uppercase;
     letter-spacing: .05em;
+  }
+  .live-activity {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .act {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.72rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .act-rec {
+    color: #f0c0c0;
+    background: #2e1414;
+    border: 1px solid #5a2a2a;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+  }
+  .act-live {
+    color: #e35a5a;
+  }
+  .act-transcribing {
+    color: #6fae6f;
+  }
+  .act-behind {
+    color: #d4a64a;
+    background: #1f1812;
+    border: 1px solid #4a3a1a;
+  }
+  .act-speakers {
+    color: #9a8ad0;
+  }
+  .act-finishing {
+    color: #b9a8d8;
   }
   .pane-body {
     flex: 1;
