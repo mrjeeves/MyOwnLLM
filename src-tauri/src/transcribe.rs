@@ -41,6 +41,7 @@ use std::time::Duration;
 use tauri::WebviewWindow;
 
 use crate::asr::streaming::{LocalAgreement, SilenceEndpointer, StreamWindow};
+use crate::asr::vad::{SileroVad, SpeechGate};
 use crate::asr::{self, AsrBackend, AsrCaps, AsrSegment, AsrToken};
 use crate::diarize::{self, DiarizeBackend, SpeakerTurn};
 use crate::frame_sink::FrameSink;
@@ -1941,6 +1942,93 @@ fn ingest_loop(
 /// diarizer (when enabled) and the dominant speaker is attached to the
 /// final segment; interim captions carry no speaker — it settles when
 /// the line finalizes.
+///
+/// Endpointing is [`HopGate`]: Silero VAD when installed, RMS otherwise.
+
+/// Per-hop speech gate for the streaming loop. Wraps either Silero VAD
+/// (precise neural speech probability) or the RMS energy fallback behind
+/// one `observe → (speechy, endpoint)` call. Chosen once at loop start
+/// from whether the Silero model is installed and loads; if Silero errors
+/// at inference mid-session it degrades to RMS for the rest of the
+/// session rather than failing — endpointing must never break the live
+/// feature.
+enum HopGate {
+    Silero {
+        vad: SileroVad,
+        gate: SpeechGate,
+        /// RMS gate kept warm as the per-hop fallback if a Silero
+        /// inference call fails.
+        rms: SilenceEndpointer,
+    },
+    Rms(SilenceEndpointer),
+}
+
+impl HopGate {
+    fn new(endpoint_silence_ms: u64) -> Self {
+        if SileroVad::is_available() {
+            match SileroVad::load() {
+                Ok(vad) => {
+                    return HopGate::Silero {
+                        vad,
+                        gate: SpeechGate::new(endpoint_silence_ms),
+                        rms: SilenceEndpointer::new(SILENCE_RMS_THRESHOLD, endpoint_silence_ms),
+                    };
+                }
+                Err(e) => {
+                    eprintln!("[transcribe] silero VAD load failed, using RMS: {e:#}");
+                }
+            }
+        }
+        HopGate::Rms(SilenceEndpointer::new(
+            SILENCE_RMS_THRESHOLD,
+            endpoint_silence_ms,
+        ))
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            HopGate::Silero { .. } => "silero-vad",
+            HopGate::Rms(_) => "rms",
+        }
+    }
+
+    /// Decide whether `hop_audio` is speech and whether this hop closes
+    /// an utterance. `hop_ms` is the hop's wall duration for the
+    /// trailing-silence clock.
+    fn observe(&mut self, hop_audio: &[f32], hop_ms: u64, cancel: &AtomicBool) -> (bool, bool) {
+        match self {
+            HopGate::Silero { vad, gate, rms } => match vad.speech_prob(hop_audio, cancel) {
+                Ok(prob) => gate.observe(prob, hop_ms),
+                Err(e) => {
+                    // One-off inference failure: fall back to RMS for
+                    // this hop (and keep the RMS clock in sync) instead
+                    // of dropping the endpoint decision.
+                    eprintln!("[transcribe] silero VAD inference failed, RMS this hop: {e:#}");
+                    let r = chunk_rms(hop_audio);
+                    let speechy = r >= SILENCE_RMS_THRESHOLD;
+                    (speechy, rms.observe(r, hop_ms))
+                }
+            },
+            HopGate::Rms(ep) => {
+                let r = chunk_rms(hop_audio);
+                let speechy = r >= SILENCE_RMS_THRESHOLD;
+                (speechy, ep.observe(r, hop_ms))
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            HopGate::Silero { vad, gate, rms } => {
+                vad.reset();
+                gate.reset();
+                rms.reset();
+            }
+            HopGate::Rms(ep) => ep.reset(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_streaming_loop(
     rx: Receiver<Vec<f32>>,
@@ -1956,7 +2044,13 @@ fn run_streaming_loop(
 ) -> Result<()> {
     let mut window = StreamWindow::new(TARGET_SR, caps.max_context_seconds);
     let mut agree = LocalAgreement::new();
-    let mut endpointer = SilenceEndpointer::new(SILENCE_RMS_THRESHOLD, ENDPOINT_SILENCE_MS);
+    // Endpointing: Silero VAD when its model is installed (precise
+    // per-hop speech probability), else the RMS energy gate. Both expose
+    // the same `(speechy, endpoint)` decision via `HopGate`, so the loop
+    // body below is identical either way. Silero is best-effort — a
+    // missing/broken model silently uses RMS, never breaking the feature.
+    let mut gate = HopGate::new(ENDPOINT_SILENCE_MS);
+    eprintln!("[transcribe] endpointer: {}", gate.kind());
 
     let hop_samples = (TARGET_SR as f32 * caps.hop_seconds).max(1.0) as usize;
     let hop_ms = (caps.hop_seconds * 1000.0) as u64;
@@ -1991,17 +2085,13 @@ fn run_streaming_loop(
         }
         new_samples = 0;
 
-        // RMS of the most recent hop drives endpointing and the
-        // silent-idle skip.
+        // The most recent hop drives endpointing and the silent-idle
+        // skip. `HopGate` returns (speechy, endpoint) from either Silero
+        // VAD or the RMS fallback.
         let win = window.samples();
         let tail = hop_samples.min(win.len());
-        let hop_rms = if tail > 0 {
-            chunk_rms(&win[win.len() - tail..])
-        } else {
-            0.0
-        };
-        let speechy = hop_rms >= SILENCE_RMS_THRESHOLD;
-        let endpoint = endpointer.observe(hop_rms, hop_ms);
+        let hop_audio = &win[win.len() - tail..];
+        let (speechy, endpoint) = gate.observe(hop_audio, hop_ms, &cancel);
 
         // Decode voiced hops only: silence yields empty/hallucinated
         // tokens and would clobber the interim tail. A quiet hop just
@@ -2098,7 +2188,7 @@ fn run_streaming_loop(
                 overlap,
             );
             cur_seg_id = 0;
-            endpointer.reset();
+            gate.reset();
             window.reset_to(window.base_ms() + window.duration_ms());
         } else if cur_seg_id == 0 && !speechy {
             // Idle silence: drop it so the window doesn't grow between

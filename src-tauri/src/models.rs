@@ -20,7 +20,7 @@
 //! artifact_index, artifact_count }`. The UI displays the aggregate over
 //! all artifacts.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -265,6 +265,23 @@ pub const REGISTRY: &[ModelSpec] = &[
             },
         ],
     },
+    // Silero VAD v5 — ~2.2 MB neural voice-activity detector. Optional
+    // accuracy upgrade for the live streaming endpointer: replaces the
+    // RMS speech gate with a per-hop speech probability so background
+    // noise doesn't keep an utterance open and quiet talkers still
+    // finalize. Filed under ASR (it's part of the ASR live path). The
+    // streaming loop falls back to RMS when this isn't installed, so the
+    // pull is best-effort, not a hard dependency.
+    ModelSpec {
+        name: "silero-vad-v5",
+        kind: ModelKind::Asr,
+        artifacts: &[Artifact {
+            filename: "silero_vad.onnx",
+            url: "https://huggingface.co/onnx-community/silero-vad/resolve/main/onnx/model.onnx",
+            approx_bytes: 2_200_000,
+            min_bytes: 1_000_000,
+        }],
+    },
     // ---- Diarize ------------------------------------------------------
     // pyannote-segmentation-3.0 via the sherpa-onnx ungated mirror.
     // ~6 MB segmenter that emits powerset speaker activity over 10 s
@@ -320,6 +337,55 @@ pub const REGISTRY: &[ModelSpec] = &[
 /// before triggering a download.
 pub fn find(name: &str, kind: ModelKind) -> Option<&'static ModelSpec> {
     REGISTRY.iter().find(|m| m.name == name && m.kind == kind)
+}
+
+/// Fetch a model's artifacts with no UI/progress channel — for optional
+/// companion models (e.g. the Silero VAD upgrade) pulled best-effort in
+/// the background. Atomic per artifact (`.partial` → rename), size-
+/// validated, and a no-op when everything is already present. Returns
+/// `Ok(true)` if the model is fully installed afterward. Errors are the
+/// caller's to swallow: a failed companion fetch must not break anything.
+pub async fn fetch_model_quiet(name: &str, kind: ModelKind) -> Result<bool> {
+    let spec = find(name, kind).ok_or_else(|| anyhow!("unknown model: {name}"))?;
+    if is_installed(spec) {
+        return Ok(true);
+    }
+    let dir = model_dir(kind, name)?;
+    std::fs::create_dir_all(&dir)?;
+    let client = reqwest::Client::builder()
+        .user_agent(concat!(
+            "MyOwnLLM/",
+            env!("CARGO_PKG_VERSION"),
+            " (model-fetch-quiet; +https://github.com/mrjeeves/MyOwnLLM)"
+        ))
+        .build()?;
+    for artifact in spec.artifacts {
+        let final_path = dir.join(artifact.filename);
+        if let Ok(meta) = std::fs::metadata(&final_path) {
+            if meta.len() >= artifact.min_bytes {
+                continue;
+            }
+            let _ = std::fs::remove_file(&final_path);
+        }
+        let resp = client.get(artifact.url).send().await?;
+        if !resp.status().is_success() {
+            bail!("HTTP {} fetching {}", resp.status(), artifact.url);
+        }
+        let bytes = resp.bytes().await?;
+        if (bytes.len() as u64) < artifact.min_bytes {
+            bail!(
+                "{} fetched {} bytes (< min {}) — likely an error page",
+                artifact.filename,
+                bytes.len(),
+                artifact.min_bytes
+            );
+        }
+        let tmp = dir.join(format!("{}.partial", artifact.filename));
+        std::fs::write(&tmp, &bytes).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &final_path)
+            .with_context(|| format!("rename {} into place", artifact.filename))?;
+    }
+    Ok(is_installed(spec))
 }
 
 /// Resolve a composite diarize name (e.g. `pyannote-seg-3.0+wespeaker-r34`)
@@ -394,6 +460,13 @@ pub fn is_installed(spec: &ModelSpec) -> bool {
 /// as "missing artifact" on every poll buried the actual diagnostics.
 pub fn is_installed_quiet(spec: &ModelSpec) -> bool {
     check_installed(spec).is_ok()
+}
+
+/// Quiet install check by logical name. `false` for an unknown name (so
+/// a caller treats it as "needs fetching" and the fetch surfaces the
+/// real "unknown model" error).
+pub fn is_installed_quiet_by_name(name: &str, kind: ModelKind) -> bool {
+    find(name, kind).map(is_installed_quiet).unwrap_or(false)
 }
 
 /// `true` if every component of a composite name is installed.

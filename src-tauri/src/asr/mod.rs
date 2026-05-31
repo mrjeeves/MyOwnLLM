@@ -25,6 +25,7 @@ use std::sync::atomic::AtomicBool;
 pub mod moonshine;
 pub mod parakeet;
 pub mod streaming;
+pub mod vad;
 
 /// Capabilities a backend advertises. Drives the ingest thread's chunk
 /// slicing, the UI's pending-chunks display ("X s behind realtime"),

@@ -356,6 +356,28 @@ fn transcribe_start(
     diarize_model: Option<String>,
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
+    // Best-effort, fire-and-forget fetch of the Silero VAD upgrade. It's
+    // an optional accuracy improvement for the endpointer — the streaming
+    // loop runs fine on the RMS fallback meanwhile, and this session
+    // already started, so a failure here is silent and harmless. Ready
+    // for the next session once the ~2 MB download lands.
+    if !crate::models::is_installed_quiet_by_name(
+        crate::asr::vad::SILERO_MODEL,
+        models::ModelKind::Asr,
+    ) {
+        tauri::async_runtime::spawn(async {
+            match crate::models::fetch_model_quiet(
+                crate::asr::vad::SILERO_MODEL,
+                models::ModelKind::Asr,
+            )
+            .await
+            {
+                Ok(true) => eprintln!("[transcribe] silero VAD ready for next session"),
+                Ok(false) => {}
+                Err(e) => eprintln!("[transcribe] silero VAD background fetch failed: {e:#}"),
+            }
+        });
+    }
     transcribe::start(stream_id, runtime, model, device, diarize_model, window)
         .map_err(|e| e.to_string())
 }
