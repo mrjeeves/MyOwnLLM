@@ -46,6 +46,22 @@ interface TranscribeFrame {
     decoded_ms: number;
     processed_ms: number;
   } | null;
+  /** Emitted once at session end: speakers the diarizer captured a clip
+   *  for, with ranked profile suggestions. Drives the review strip.
+   *  Mirrors `transcribe::SpeakerReviewItem`. */
+  speaker_review?: SpeakerReviewItem[] | null;
+}
+
+export interface SpeakerSuggestion {
+  profile_id: number;
+  name: string;
+  similarity: number;
+}
+export interface SpeakerReviewItem {
+  speaker: number;
+  duration_ms: number;
+  suggestions: SpeakerSuggestion[];
+  auto_matched?: number | null;
 }
 
 /** Per-stream pending entry returned by the recovery probe. Mirror of
@@ -137,6 +153,12 @@ export const transcribeUi = $state({
   uploadProgress: null as
     | { total_ms: number | null; decoded_ms: number; processed_ms: number }
     | null,
+  /** End-of-session speaker review: clip-backed speakers the diarizer
+   *  wants the user to confirm/correct, plus the stream id the captured
+   *  clips are stashed under (the key for the review commands). Set when
+   *  the final frame carries `speaker_review`; cleared once the user
+   *  resolves or dismisses the strip. */
+  review: null as { streamId: string; items: SpeakerReviewItem[] } | null,
 });
 
 let unlistenStream: UnlistenFn | null = null;
@@ -212,6 +234,9 @@ async function attachListener(streamId: string) {
       }
       if (typeof f.chunk_seconds === "number" && f.chunk_seconds > 0) {
         transcribeUi.chunkSeconds = f.chunk_seconds;
+      }
+      if (Array.isArray(f.speaker_review) && f.speaker_review.length > 0) {
+        transcribeUi.review = { streamId, items: f.speaker_review };
       }
       if (f.upload_progress) {
         transcribeUi.uploadProgress = {

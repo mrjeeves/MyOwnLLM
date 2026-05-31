@@ -10,6 +10,7 @@
   import SettingsPanel from "./SettingsPanel.svelte";
   import ConflictModal from "./ConflictModal.svelte";
   import DownloadOverlay from "./DownloadOverlay.svelte";
+  import SpeakerReviewStrip from "./SpeakerReviewStrip.svelte";
   import type { SettingsTab } from "../update-state.svelte";
   import {
     transcribeUi,
@@ -802,6 +803,26 @@
     );
   }
 
+  /** A speaker was attributed via the end-of-session review strip. The
+   *  backend already wrote the clip + anchored the profile; reflect the
+   *  confirmed name into this transcript's labels (so the turns relabel
+   *  immediately) and the registry-name fallback map (so future sessions
+   *  show it too). Then clear the strip when nothing's left to review. */
+  function onSpeakerResolved(speaker: number, _profileId: number, name: string) {
+    speakerLabels = { ...speakerLabels, [speaker]: name };
+    registryLabels = { ...registryLabels, [speaker]: name };
+    persist().catch((e) => console.warn("save speaker label failed:", e));
+    if (transcribeUi.review) {
+      const remaining = transcribeUi.review.items.filter(
+        (it) => it.speaker !== speaker,
+      );
+      transcribeUi.review =
+        remaining.length > 0
+          ? { ...transcribeUi.review, items: remaining }
+          : null;
+    }
+  }
+
   function onRenameKey(e: KeyboardEvent) {
     if (e.key === "Enter") {
       e.preventDefault();
@@ -1152,6 +1173,15 @@
           </p>
         {/if}
       </div>
+      {#if transcribeUi.review}
+        <SpeakerReviewStrip
+          streamId={transcribeUi.review.streamId}
+          items={transcribeUi.review.items}
+          labelFor={speakerLabel}
+          onResolved={onSpeakerResolved}
+          onDismiss={() => (transcribeUi.review = null)}
+        />
+      {/if}
       <TranscribeBar
         activeModel={activeModel}
         activeFamily={activeFamily}
