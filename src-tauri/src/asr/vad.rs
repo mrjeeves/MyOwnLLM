@@ -50,10 +50,14 @@ const STATE_SHAPE: [usize; 3] = [2, 1, 128];
 const SPEECH_ENTER: f32 = 0.5;
 const SPEECH_EXIT: f32 = 0.35;
 
-/// Silero v5 expects 32 ms frames at 16 kHz = 512 samples. We feed whole
-/// hops (≥ this) and the model handles the internal framing, but we floor
-/// the input so a stub hop doesn't trip a shape error.
-const MIN_VAD_SAMPLES: usize = 512;
+/// Silero v5's fixed analysis window: EXACTLY 512 samples (32 ms) at
+/// 16 kHz per inference call. The model does NOT frame longer input
+/// itself — feed it a whole hop and it reshapes the audio into N frames
+/// internally and hands its LSTM a 5-D tensor, which errors ("Input X
+/// must have 3 dimensions only. Actual:{1,1,1,128,16}", where 16 is the
+/// frame count). So the streaming path chops each hop into 512-sample
+/// frames and runs them in sequence.
+const SILERO_FRAME: usize = 512;
 
 /// Loaded Silero session + carried RNN state. One per live session.
 pub struct SileroVad {
@@ -64,6 +68,11 @@ pub struct SileroVad {
     out_prob_name: String,
     out_state_name: String,
     state: Array3<f32>,
+    /// Sub-frame remainder carried to the next hop so 512-sample framing
+    /// stays aligned across hop boundaries (keeps RNN state continuous).
+    residual: Vec<f32>,
+    /// One-shot guard for the fed-shape debug line.
+    logged_shapes: bool,
 }
 
 impl SileroVad {
@@ -139,6 +148,22 @@ impl SileroVad {
         let out_state_name =
             out_state_name.ok_or_else(|| anyhow!("silero VAD: couldn't find a state output"))?;
 
+        eprintln!(
+            "[vad-debug] silero loaded: inputs=[{}] outputs=[{}]",
+            session
+                .inputs()
+                .iter()
+                .map(|i| i.name().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            session
+                .outputs()
+                .iter()
+                .map(|o| o.name().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+
         let mut vad = Self {
             session,
             input_name,
@@ -147,20 +172,20 @@ impl SileroVad {
             out_prob_name,
             out_state_name,
             state: Array3::zeros(STATE_SHAPE),
+            residual: Vec::new(),
+            logged_shapes: false,
         };
 
-        // Validate with one probe inference before trusting this model on
-        // the live path. Silero exports differ (snakers4 vs the
-        // onnx-community build) and ONNX Runtime versions disagree on how
-        // they shape the model's internal LSTM — so a model that *loads*
-        // can still error on *every* hop (observed on Windows: "Input X
-        // must have 3 dimensions only"). Without this probe that surfaces
-        // as thousands of per-hop errors and a broken-feeling transcript.
-        // Failing here instead routes the whole session to the proven RMS
-        // endpointer with a single log line — the graceful degradation
-        // this module promises. The probe uses a 512-sample frame, the
-        // same rank the live hops feed, so a shape mismatch is caught.
-        let probe = vec![0.0f32; MIN_VAD_SAMPLES];
+        // Validate with a probe inference before trusting this model on the
+        // live path. The probe runs the SAME 512-frame path the live hops
+        // use (two frames here), so load-time behaviour is exactly live
+        // behaviour: if the model errors, load() returns Err and the
+        // streaming loop falls back to the proven RMS endpointer — so
+        // inference is never attempted per hop and the log stays clean. A
+        // model that probes clean engages normally. (The earlier probe fed
+        // a single 512 frame, the one size that *can't* reproduce the
+        // whole-hop reshape bug, so it passed and the live path flooded.)
+        let probe = vec![0.0f32; SILERO_FRAME * 2];
         vad.speech_prob(&probe, &AtomicBool::new(false))
             .context("silero VAD failed its load-time probe inference")?;
         vad.reset();
@@ -171,20 +196,43 @@ impl SileroVad {
     /// starts clean.
     pub fn reset(&mut self) {
         self.state = Array3::zeros(STATE_SHAPE);
+        self.residual.clear();
     }
 
-    /// Speech probability for one hop of 16 kHz mono audio, advancing the
-    /// RNN state. `Err` on any inference problem (caller falls back).
+    /// Speech probability for a hop of 16 kHz mono audio, advancing the RNN
+    /// state. Frames the hop into Silero's fixed [`SILERO_FRAME`]-sample
+    /// windows — buffering the sub-frame remainder across hops so framing
+    /// stays aligned — and returns the max speech probability over the
+    /// hop's frames. `Err` on any inference problem (caller falls back).
     pub fn speech_prob(&mut self, pcm16k_mono: &[f32], cancel: &AtomicBool) -> Result<f32> {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(0.0);
         }
-        let n = pcm16k_mono.len().max(MIN_VAD_SAMPLES);
-        let mut buf = pcm16k_mono.to_vec();
-        buf.resize(n, 0.0);
+        // Join the previous hop's leftover so framing stays 512-aligned and
+        // RNN state flows continuously across hop boundaries.
+        let mut samples = std::mem::take(&mut self.residual);
+        samples.extend_from_slice(pcm16k_mono);
 
-        let audio: Array2<f32> =
-            Array2::from_shape_vec((1, n), buf).map_err(|e| anyhow!("vad shape audio: {e}"))?;
+        let mut max_prob = 0.0f32;
+        let mut consumed = 0;
+        while consumed + SILERO_FRAME <= samples.len() {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(max_prob);
+            }
+            let p = self.infer_frame(&samples[consumed..consumed + SILERO_FRAME])?;
+            max_prob = max_prob.max(p);
+            consumed += SILERO_FRAME;
+        }
+        // Carry the remainder (< one frame) to the next hop.
+        self.residual = samples[consumed..].to_vec();
+        Ok(max_prob.clamp(0.0, 1.0))
+    }
+
+    /// Run Silero on exactly one [`SILERO_FRAME`]-sample frame, advancing
+    /// the RNN state, returning that frame's speech probability.
+    fn infer_frame(&mut self, frame: &[f32]) -> Result<f32> {
+        let audio: Array2<f32> = Array2::from_shape_vec((1, frame.len()), frame.to_vec())
+            .map_err(|e| anyhow!("vad shape audio: {e}"))?;
         let audio_t = Tensor::from_array(audio).map_err(|e| anyhow!("vad tensor audio: {e}"))?;
         let state_t = Tensor::from_array(self.state.clone().into_dyn())
             .map_err(|e| anyhow!("vad tensor state: {e}"))?;
@@ -232,6 +280,21 @@ impl SileroVad {
             .try_extract_array::<f32>()
             .map_err(|e| anyhow!("vad extract prob: {e}"))?;
         let prob = prob_view.iter().copied().next().unwrap_or(0.0);
+
+        // One-shot debug: the exact shapes fed + the first prob, so a
+        // working VAD (or a future mismatch) is visible in the log without
+        // a rebuild.
+        if !self.logged_shapes {
+            self.logged_shapes = true;
+            eprintln!(
+                "[vad-debug] first frame ran: audio=[1, {}] state={:?} sr_in={} -> prob={:.3}",
+                frame.len(),
+                STATE_SHAPE,
+                self.sr_name.is_some(),
+                prob,
+            );
+        }
+
         Ok(prob.clamp(0.0, 1.0))
     }
 }

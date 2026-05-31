@@ -1987,11 +1987,15 @@ enum HopGate {
 }
 
 /// Silero VAD + its hysteresis gate, plus an RMS endpointer kept warm as
-/// the per-hop fallback when a Silero inference call fails mid-session.
+/// the fallback if a Silero inference call ever fails mid-session.
 struct SileroGate {
     vad: SileroVad,
     gate: SpeechGate,
     rms: SilenceEndpointer,
+    /// Latched on the first mid-session inference failure: once set, this
+    /// session stays on RMS and stops logging, so a recurring failure can
+    /// never flood the console.
+    degraded: bool,
 }
 
 impl HopGate {
@@ -2003,6 +2007,7 @@ impl HopGate {
                         vad,
                         gate: SpeechGate::new(endpoint_silence_ms),
                         rms: SilenceEndpointer::new(SILENCE_RMS_THRESHOLD, endpoint_silence_ms),
+                        degraded: false,
                     }));
                 }
                 Err(e) => {
