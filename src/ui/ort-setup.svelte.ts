@@ -26,50 +26,68 @@ class OrtSetupState {
 export const ortSetup = new OrtSetupState();
 
 let unlisten: UnlistenFn | null = null;
+let polling = false;
 
 /**
- * Subscribe to startup progress + query current readiness. Idempotent;
- * call once from the app shell's `onMount`. Querying on mount closes the
- * race where the startup `ort-install-progress` event fires before this
- * listener attaches — the usual case when ORT is already installed and
- * `ensure_ready` reports "ready" immediately.
+ * Subscribe to startup progress + poll readiness until setup resolves.
+ * Idempotent; call once from the app shell's `onMount`.
+ *
+ * Polling (not just listening) closes two gaps: the startup
+ * `ort-install-progress` event can fire before this listener attaches
+ * (the usual already-installed case), and a load wedged in `LoadLibrary`
+ * (Windows Defender scanning the dll) emits no further events — we just
+ * keep showing "setting up…" until it resolves. Crucially, the backend's
+ * "not yet run" sentinel is NEVER treated as a failure; only a recorded
+ * (`started`) error is terminal.
  */
 export async function initOrtSetup(): Promise<void> {
-  if (!unlisten) {
-    unlisten = await listen<{ stage: string; error: string | null }>(
-      "myownllm://ort-install-progress",
-      (e) => {
-        const { stage, error } = e.payload;
-        if (stage === "ready") {
-          ortSetup.ready = true;
-          ortSetup.error = null;
-          ortSetup.message = null;
-        } else if (stage === "error") {
-          ortSetup.ready = false;
-          ortSetup.error = error ?? "speech engine setup failed";
-        } else {
-          // Any other stage is human-readable progress text from
-          // `ensure_ready` ("Downloading the speech engine…", "Loading…").
-          ortSetup.message = stage;
-        }
-      },
-    );
-  }
+  if (polling) return;
+  polling = true;
 
-  try {
-    const s = await invoke<{ initialized: boolean; error: string | null }>(
-      "ort_setup_status",
-    );
+  unlisten = await listen<{ stage: string; error: string | null }>(
+    "myownllm://ort-install-progress",
+    (e) => {
+      const { stage, error } = e.payload;
+      if (stage === "ready") {
+        ortSetup.ready = true;
+        ortSetup.error = null;
+        ortSetup.message = null;
+      } else if (stage === "error") {
+        ortSetup.ready = false;
+        ortSetup.error = error ?? "speech engine setup failed";
+      } else {
+        // Any other stage is human-readable progress text from
+        // `ensure_ready` ("Downloading the speech engine…", "Loading…").
+        ortSetup.message = stage;
+      }
+    },
+  );
+
+  for (;;) {
+    let s: { initialized: boolean; started: boolean; error: string | null };
+    try {
+      s = await invoke<{
+        initialized: boolean;
+        started: boolean;
+        error: string | null;
+      }>("ort_setup_status");
+    } catch {
+      break; // command unavailable (older backend) — rely on events
+    }
+    ortSetup.checked = true;
     if (s.initialized) {
       ortSetup.ready = true;
       ortSetup.error = null;
       ortSetup.message = null;
-    } else if (s.error && !ortSetup.ready) {
-      ortSetup.error = s.error;
+      break;
     }
-  } catch {
-    // Command unavailable (older backend) — fall back to the event.
-  } finally {
-    ortSetup.checked = true;
+    if (s.started && s.error) {
+      // Setup ran and genuinely failed (download/load error) — terminal.
+      ortSetup.error = s.error;
+      break;
+    }
+    if (ortSetup.ready) break; // a "ready" event resolved us meanwhile
+    // Still in flight (sentinel / downloading / loading) — keep waiting.
+    await new Promise((r) => setTimeout(r, 800));
   }
 }

@@ -118,6 +118,15 @@ pub fn status() -> OrtStatus {
         })
 }
 
+/// True once a setup attempt has recorded a result (success *or* a real
+/// failure) into `STATUS`. `false` means setup hasn't finished yet — and
+/// `status().error` is then just the "not called" sentinel, which must
+/// not be shown as a failure. Lets the UI tell "still setting up" apart
+/// from "tried and failed".
+pub fn has_run() -> bool {
+    STATUS.lock().ok().map(|g| g.is_some()).unwrap_or(false)
+}
+
 /// Find + load the onnxruntime dylib and commit `ort::init`. Safe to
 /// call multiple times — once a successful load has been recorded we
 /// keep the result; otherwise we retry (the dylib may have been

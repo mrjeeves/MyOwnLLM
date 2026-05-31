@@ -330,6 +330,10 @@ async fn remote_ui_kick(disable: bool) -> Result<RemoteUiStatus, String> {
 #[derive(serde::Serialize)]
 struct OrtSetupStatus {
     initialized: bool,
+    /// Whether a setup attempt has finished (success or real failure).
+    /// When false, `error` is just the "not yet run" sentinel — the UI
+    /// shows "setting up…", not a failure.
+    started: bool,
     error: Option<String>,
 }
 
@@ -338,6 +342,7 @@ fn ort_setup_status() -> OrtSetupStatus {
     let s = ort_setup::status();
     OrtSetupStatus {
         initialized: s.initialized,
+        started: ort_setup::has_run(),
         error: s.error,
     }
 }
