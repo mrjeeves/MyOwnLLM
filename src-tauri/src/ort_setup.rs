@@ -252,9 +252,32 @@ fn run_init() -> (OrtStatus, String) {
         );
     };
 
-    match ort::init_from(&existing) {
-        Ok(builder) => {
-            let _ = builder.with_name("myownllm").commit();
+    // Eager-load on a watchdog thread. `ort::init_from` does the actual
+    // `LoadLibrary`/`dlopen`, which on Windows can *hang* — Defender
+    // real-time-scanning the unsigned dll, or a half-resolved dependency
+    // — rather than returning an error (the failure mode this module's
+    // header warns about). Unguarded, that wedges setup forever with the
+    // UI stuck on "Setting up…". Cap it: on timeout we leak the
+    // (uninterruptible C++ FFI) thread and report an actionable error,
+    // so the user gets a real diagnosis instead of an infinite spinner.
+    const ORT_INIT_TIMEOUT_SECS: u64 = 90;
+    eprintln!(
+        "[ort_setup] loading onnxruntime from {}…",
+        existing.display()
+    );
+    let load_path = existing.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = ort::init_from(&load_path)
+            .map(|b| {
+                let _ = b.with_name("myownllm").commit();
+            })
+            .map_err(|e| e.to_string());
+        let _ = tx.send(r);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(ORT_INIT_TIMEOUT_SECS)) {
+        Ok(Ok(())) => {
             let line = format!("onnxruntime loaded from {}", existing.display());
             (
                 OrtStatus {
@@ -266,9 +289,24 @@ fn run_init() -> (OrtStatus, String) {
                 line,
             )
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let err = format!(
                 "ort::init_from({}) failed: {e} — likely a version / arch mismatch (ort api-22 needs onnxruntime \u{2265}1.20)",
+                existing.display()
+            );
+            (
+                OrtStatus {
+                    initialized: false,
+                    dylib_path: None,
+                    searched,
+                    error: Some(err.clone()),
+                },
+                err,
+            )
+        }
+        Err(_) => {
+            let err = format!(
+                "loading onnxruntime from {} timed out after {ORT_INIT_TIMEOUT_SECS}s — the file is present but the load didn't finish. On Windows this is almost always antivirus scanning the unsigned dll, or a missing Microsoft Visual C++ Redistributable. Fix: install the x64 VC++ runtime (https://aka.ms/vs/17/release/vc_redist.x64.exe) and/or add a Microsoft Defender exclusion for that folder, then relaunch.",
                 existing.display()
             );
             (
