@@ -131,6 +131,7 @@ impl ClipCollector {
     }
 
     /// Number of speakers with a captured clip.
+    #[allow(dead_code)] // exercised by tests; the loop uses `is_empty`
     pub fn len(&self) -> usize {
         self.best.len()
     }

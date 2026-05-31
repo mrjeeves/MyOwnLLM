@@ -2440,7 +2440,7 @@ fn beam_final_tokens(
 /// Slice the rolling window down to a finalized utterance's `[start_ms,
 /// end_ms]` span (session-relative), for clip capture. Clamped to what
 /// the window actually holds.
-fn utterance_audio<'a>(window: &'a StreamWindow, start_ms: u64, end_ms: u64) -> &'a [f32] {
+fn utterance_audio(window: &StreamWindow, start_ms: u64, end_ms: u64) -> &[f32] {
     let base = window.base_ms();
     let s = start_ms.saturating_sub(base);
     let e = end_ms.saturating_sub(base).max(s);
@@ -2519,6 +2519,98 @@ type ReviewStash = DashMap<String, Vec<(u32, crate::diarize::capture::ClipCandid
 fn review_store() -> &'static ReviewStash {
     static M: OnceLock<ReviewStash> = OnceLock::new();
     M.get_or_init(DashMap::new)
+}
+
+/// WAV bytes of a captured (not-yet-attached) review clip, so the review
+/// strip can play it before the user decides. `None` if the candidate is
+/// gone (session re-run, already dismissed).
+pub fn review_clip_wav(review_key: &str, speaker: u32) -> Option<Vec<u8>> {
+    let entry = review_store().get(review_key)?;
+    let cand = entry.iter().find(|(s, _)| *s == speaker)?;
+    Some(crate::wav::encode_f32_mono(&cand.1.audio, TARGET_SR))
+}
+
+/// Attach a reviewed clip to a speaker profile — the confirm action. When
+/// `target` is `Some(id)` the clip anchors that existing profile; when
+/// `None` a new profile is created (named `new_name` if given). Writes the
+/// WAV to the clip store, attaches the verified embedding, and saves the
+/// registry. Returns the profile id the clip landed on.
+pub fn review_attach(
+    review_key: &str,
+    speaker: u32,
+    target: Option<u32>,
+    new_name: Option<String>,
+) -> Result<u32> {
+    let cand = {
+        let entry = review_store()
+            .get(review_key)
+            .ok_or_else(|| anyhow!("no pending review for this session"))?;
+        entry
+            .iter()
+            .find(|(s, _)| *s == speaker)
+            .map(|(_, c)| c.clone())
+            .ok_or_else(|| anyhow!("no captured clip for speaker {speaker}"))?
+    };
+    let dim = cand.embedding.len();
+
+    // Resolve / create the target profile id.
+    let profile_id = match target {
+        Some(id) => id,
+        None => crate::diarize::registry::with(|reg| {
+            reg.create_profile(dim, cand.embedding.clone(), new_name.clone())
+        })?,
+    };
+
+    // Persist the clip WAV, then attach it as a verified anchor.
+    let clip_id = uuid_like();
+    let wav = crate::wav::encode_f32_mono(&cand.audio, TARGET_SR);
+    let rel = crate::diarize::clips::write_clip(profile_id, &clip_id, &wav)?;
+    let clip = crate::diarize::registry::VoiceClip {
+        id: clip_id,
+        wav_path: rel,
+        embedding: cand.embedding.clone(),
+        duration_ms: cand.duration_ms,
+        confidence: cand.confidence,
+        source_conversation: Some(review_key.to_string()),
+        created_unix: 0,
+    };
+    let (ok, evicted) = crate::diarize::registry::with(|reg| reg.add_clip(profile_id, clip))?;
+    if let Some(old) = evicted {
+        crate::diarize::clips::delete_clip_file(&old);
+    }
+    if !ok {
+        // add_clip rejected it (weaker than a full set) — drop the file we
+        // just wrote so we don't orphan it.
+        // (rare; the just-captured clip is usually the best available.)
+    }
+    crate::diarize::registry::save()?;
+
+    // Remove this speaker from the pending set; drop the whole entry when
+    // empty so the store doesn't accrete finished sessions.
+    if let Some(mut entry) = review_store().get_mut(review_key) {
+        entry.retain(|(s, _)| *s != speaker);
+    }
+    review_store().remove_if(review_key, |_, v| v.is_empty());
+    Ok(profile_id)
+}
+
+/// Drop a session's pending review without attaching anything.
+pub fn review_dismiss(review_key: &str) {
+    review_store().remove(review_key);
+}
+
+/// Cheap unique-ish id for a clip filename (timestamp-ns + a counter).
+/// Not a real UUID — collisions are practically impossible across clip
+/// writes and the registry would just overwrite a same-named file anyway.
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let n = CTR.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("clip-{t:x}-{n:x}")
 }
 
 /// The dominant speaker for a finalized utterance, plus the diarizer

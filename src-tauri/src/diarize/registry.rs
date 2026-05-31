@@ -307,6 +307,42 @@ impl SpeakerRegistry {
         &self.doc.speakers
     }
 
+    /// Create a fresh profile seeded with an embedding (and optional
+    /// name). Used when the user attributes a reviewed clip to a *new*
+    /// person. The centroid starts as the seed embedding and is
+    /// re-anchored when the clip is added. Returns the new id. Caller
+    /// saves.
+    pub fn create_profile(&mut self, dim: usize, embedding: Vec<f32>, name: Option<String>) -> u32 {
+        let id = self.doc.next_id;
+        self.doc.next_id += 1;
+        self.doc.speakers.push(SpeakerProfile {
+            id,
+            dim,
+            centroid: embedding,
+            total_count: 0,
+            label: name.filter(|s| !s.trim().is_empty()),
+            clips: Vec::new(),
+            last_seen_unix: unix_now(),
+        });
+        id
+    }
+
+    /// A profile's clip WAV paths (relative), for the settings tab's
+    /// playback list. Empty when the id is unknown or un-anchored.
+    pub fn clip_paths(&self, id: u32) -> Vec<(String, String)> {
+        self.doc
+            .speakers
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| {
+                p.clips
+                    .iter()
+                    .map(|c| (c.id.clone(), c.wav_path.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Assign or clear a human label for a speaker id. Returns false if
     /// no such id. Caller saves.
     #[allow(dead_code)]

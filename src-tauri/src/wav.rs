@@ -47,7 +47,9 @@ pub fn encode_f32_mono(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 /// Decode a 16-bit PCM mono WAV produced by [`encode_f32_mono`] back to
 /// `f32`. Tolerant of extra header chunks: it scans for `data` rather
 /// than assuming a fixed 44-byte header. Returns `(samples, sample_rate)`.
-/// Used by tests and any future re-embedding of a stored clip.
+/// Used by tests and reserved for re-embedding a stored clip (e.g. if the
+/// embedder model changes and anchors need recomputing).
+#[allow(dead_code)]
 pub fn decode_f32_mono(bytes: &[u8]) -> Option<(Vec<f32>, u32)> {
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return None;
