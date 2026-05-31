@@ -25,6 +25,7 @@ use anyhow::Result;
 use serde::Serialize;
 use std::sync::atomic::AtomicBool;
 
+pub mod clips;
 pub mod cluster;
 pub mod embedder;
 pub mod fbank;

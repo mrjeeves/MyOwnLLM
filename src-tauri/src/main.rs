@@ -24,6 +24,7 @@ mod self_update;
 mod transcribe;
 mod usage;
 mod watcher;
+mod wav;
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -445,14 +446,20 @@ fn speaker_registry_rename(id: u32, label: Option<String>) -> Result<bool, Strin
     Ok(ok)
 }
 
-/// Forget a persisted speaker profile.
+/// Forget a persisted speaker profile, deleting any voice clips it owned.
 #[tauri::command]
 fn speaker_registry_forget(id: u32) -> Result<bool, String> {
-    let ok = diarize::registry::with(|reg| reg.forget(id)).map_err(|e| e.to_string())?;
-    if ok {
-        diarize::registry::save().map_err(|e| e.to_string())?;
+    let removed = diarize::registry::with(|reg| reg.forget(id)).map_err(|e| e.to_string())?;
+    match removed {
+        Some(paths) => {
+            for rel in &paths {
+                diarize::clips::delete_clip_file(rel);
+            }
+            diarize::registry::save().map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        None => Ok(false),
     }
-    Ok(ok)
 }
 
 #[tauri::command]

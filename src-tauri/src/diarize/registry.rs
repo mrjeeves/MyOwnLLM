@@ -62,6 +62,33 @@ const MATCH_SIM: f32 = 0.62;
 /// the file from accreting one-off voices forever. ~180 days.
 const PROFILE_TTL_SECS: u64 = 180 * 24 * 60 * 60;
 
+/// A human-verified voice sample backing a profile. The embedding is the
+/// ground-truth anchor (it overrides the drifting auto-centroid); the WAV
+/// is what the user hears in the Speakers settings tab. Up to
+/// [`MAX_CLIPS_PER_PROFILE`] are kept per profile — when full, adding one
+/// replaces the lowest-quality existing clip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceClip {
+    /// Stable id; also the WAV filename stem under the clip dir.
+    pub id: String,
+    /// Relative path (under `~/.myownllm/speaker-clips/`) to the WAV.
+    pub wav_path: String,
+    /// L2-normalized embedding of this clip — a verified anchor.
+    pub embedding: Vec<f32>,
+    pub duration_ms: u64,
+    /// Diarizer cosine confidence at capture (clip-selection quality).
+    pub confidence: f32,
+    /// Conversation this clip was captured from, for provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_conversation: Option<String>,
+    pub created_unix: u64,
+}
+
+/// At most this many verified clips per profile — your "three demo
+/// samples". Three anchors average out a single bad capture without
+/// letting a profile hoard audio.
+pub const MAX_CLIPS_PER_PROFILE: usize = 3;
+
 /// One persisted speaker. `centroid` is L2-normalized and lives in the
 /// embedding space of `dim`-dimensional embedder (256 = wespeaker,
 /// 192 = CAM++); profiles are only ever matched against a clusterer of
@@ -74,7 +101,10 @@ pub struct SpeakerProfile {
     pub id: u32,
     /// Embedding dimensionality — the embedder fingerprint.
     pub dim: usize,
-    /// L2-normalized EMA centroid.
+    /// L2-normalized centroid used for matching. When the profile has
+    /// verified clips it's the *mean of their embeddings* (re-derived on
+    /// every clip change); otherwise it's the auto-EMA of session
+    /// centroids. See [`SpeakerProfile::is_anchored`].
     pub centroid: Vec<f32>,
     /// Total slices ever folded in, across all sessions. Diagnostics
     /// only; the EMA doesn't weight by it (that's the point of an EMA).
@@ -83,9 +113,43 @@ pub struct SpeakerProfile {
     /// rendered as the numbered default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Human-verified voice clips. When non-empty the profile is
+    /// *anchored*: its centroid is pinned to these and auto-EMA no longer
+    /// moves it, so the matcher follows the human, not the drift.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clips: Vec<VoiceClip>,
     /// Wall-clock unix seconds of the last session this profile spoke
     /// in. Drives TTL eviction.
     pub last_seen_unix: u64,
+}
+
+impl SpeakerProfile {
+    /// True once at least one human-verified clip backs this profile.
+    /// Anchored profiles match on the clip-mean centroid and are immune
+    /// to auto-EMA drift and TTL eviction.
+    pub fn is_anchored(&self) -> bool {
+        !self.clips.is_empty()
+    }
+
+    /// Recompute the centroid from verified clips (mean of their
+    /// embeddings, renormalized). No-op when there are no clips, so an
+    /// un-anchored profile keeps its auto-EMA centroid.
+    pub fn reanchor(&mut self) {
+        if self.clips.is_empty() {
+            return;
+        }
+        let dim = self.centroid.len();
+        let mut mean = vec![0.0f32; dim];
+        for c in &self.clips {
+            if c.embedding.len() == dim {
+                for (m, &e) in mean.iter_mut().zip(c.embedding.iter()) {
+                    *m += e;
+                }
+            }
+        }
+        l2_normalize(&mut mean);
+        self.centroid = mean;
+    }
 }
 
 /// The on-disk document. Versioned so a future schema change can migrate
@@ -183,7 +247,12 @@ impl SpeakerRegistry {
             match self.best_match(dim, &snap.mean) {
                 Some(idx) => {
                     let p = &mut self.doc.speakers[idx];
-                    ema_merge(&mut p.centroid, &snap.mean, EMA_ALPHA);
+                    // Anchored profiles are pinned to their verified clips
+                    // — auto-EMA must not drag the centroid off the
+                    // human-confirmed identity. Still bump recency/count.
+                    if !p.is_anchored() {
+                        ema_merge(&mut p.centroid, &snap.mean, EMA_ALPHA);
+                    }
                     p.total_count = p.total_count.saturating_add(snap.count);
                     p.last_seen_unix = now;
                 }
@@ -196,6 +265,7 @@ impl SpeakerRegistry {
                         centroid: snap.mean.clone(),
                         total_count: snap.count,
                         label: None,
+                        clips: Vec::new(),
                         last_seen_unix: now,
                     });
                     created += 1;
@@ -223,9 +293,12 @@ impl SpeakerRegistry {
     }
 
     fn evict_stale(&mut self, now: u64) {
+        // Anchored (human-verified) profiles are never auto-evicted —
+        // the user deliberately taught them; only an explicit forget
+        // removes one.
         self.doc
             .speakers
-            .retain(|p| now.saturating_sub(p.last_seen_unix) < PROFILE_TTL_SECS);
+            .retain(|p| p.is_anchored() || now.saturating_sub(p.last_seen_unix) < PROFILE_TTL_SECS);
     }
 
     /// All profiles, for the Settings UI (rename / forget).
@@ -246,12 +319,132 @@ impl SpeakerRegistry {
         }
     }
 
-    /// Forget one speaker. Caller saves.
-    #[allow(dead_code)]
-    pub fn forget(&mut self, id: u32) -> bool {
-        let before = self.doc.speakers.len();
-        self.doc.speakers.retain(|p| p.id != id);
-        self.doc.speakers.len() != before
+    /// Forget one speaker. Caller saves. Returns `Some(wav_paths)` of the
+    /// clips it owned (for file deletion) when the id existed, else
+    /// `None`.
+    pub fn forget(&mut self, id: u32) -> Option<Vec<String>> {
+        let pos = self.doc.speakers.iter().position(|p| p.id == id)?;
+        let removed = self.doc.speakers.remove(pos);
+        Some(removed.clips.into_iter().map(|c| c.wav_path).collect())
+    }
+
+    /// Ranked match candidates for a session embedding, best first:
+    /// `(profile_id, name, cosine_sim)` over profiles in the same
+    /// embedding space. Drives the end-of-session review strip's
+    /// "looks like Chris (87%)" suggestions. Unlike [`best_match`] this
+    /// returns *all* candidates (no threshold) so the UI can show the top
+    /// few even when none is a confident auto-match.
+    pub fn rank_candidates(&self, dim: usize, embedding: &[f32]) -> Vec<(u32, String, f32)> {
+        let mut out: Vec<(u32, String, f32)> = self
+            .doc
+            .speakers
+            .iter()
+            .filter(|p| p.dim == dim && p.centroid.len() == embedding.len())
+            .map(|p| {
+                let sim = dot(&p.centroid, embedding);
+                let name = p
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| format!("Speaker {}", p.id + 1));
+                (p.id, name, sim)
+            })
+            .collect();
+        out.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
+
+    /// Attach a verified clip to a profile, anchoring it. When the
+    /// profile already holds [`MAX_CLIPS_PER_PROFILE`] clips, the
+    /// lowest-confidence one is evicted (its WAV path returned for
+    /// deletion). The centroid is re-derived from the resulting clip set.
+    /// Returns `(ok, evicted_wav_path)`. Caller saves.
+    pub fn add_clip(&mut self, id: u32, clip: VoiceClip) -> (bool, Option<String>) {
+        let Some(p) = self.doc.speakers.iter_mut().find(|p| p.id == id) else {
+            return (false, None);
+        };
+        let mut evicted = None;
+        if p.clips.len() >= MAX_CLIPS_PER_PROFILE {
+            // Evict the weakest existing clip if the newcomer is at least
+            // as good; otherwise drop the newcomer (keep the better set).
+            if let Some((worst_i, worst)) = p
+                .clips
+                .iter()
+                .enumerate()
+                .min_by(|a, b| {
+                    a.1.confidence
+                        .partial_cmp(&b.1.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(i, c)| (i, c.confidence))
+            {
+                if clip.confidence < worst {
+                    return (false, None);
+                }
+                evicted = Some(p.clips.remove(worst_i).wav_path);
+            }
+        }
+        p.clips.push(clip);
+        p.last_seen_unix = unix_now();
+        p.reanchor();
+        (true, evicted)
+    }
+
+    /// Remove a clip by id from a profile. Returns its WAV path (for file
+    /// deletion) when found. Re-derives the centroid; if that was the
+    /// last clip the profile falls back to its (now stale) auto-centroid
+    /// — still matchable, just no longer anchored. Caller saves.
+    pub fn remove_clip(&mut self, id: u32, clip_id: &str) -> Option<String> {
+        let p = self.doc.speakers.iter_mut().find(|p| p.id == id)?;
+        let pos = p.clips.iter().position(|c| c.id == clip_id)?;
+        let path = p.clips.remove(pos).wav_path;
+        p.reanchor();
+        Some(path)
+    }
+
+    /// Merge `src` into `dst` (when the user marks two auto-split
+    /// profiles as the same person). `dst` keeps its id/label; `src`'s
+    /// clips move over (capped, weakest dropped) and counts sum. Returns
+    /// the WAV paths of any clips that couldn't fit (for deletion) plus
+    /// whether the merge happened. Caller saves.
+    pub fn merge(&mut self, dst: u32, src: u32) -> (bool, Vec<String>) {
+        if dst == src {
+            return (false, Vec::new());
+        }
+        let Some(src_idx) = self.doc.speakers.iter().position(|p| p.id == src) else {
+            return (false, Vec::new());
+        };
+        let src_profile = self.doc.speakers.remove(src_idx);
+        let Some(dst_profile) = self.doc.speakers.iter_mut().find(|p| p.id == dst) else {
+            // dst vanished (shouldn't happen) — put src back.
+            self.doc.speakers.push(src_profile);
+            return (false, Vec::new());
+        };
+        dst_profile.total_count = dst_profile
+            .total_count
+            .saturating_add(src_profile.total_count);
+        dst_profile.last_seen_unix = dst_profile.last_seen_unix.max(src_profile.last_seen_unix);
+        if dst_profile.label.is_none() {
+            dst_profile.label = src_profile.label;
+        }
+        // Fold src's clips in, keeping the best MAX by confidence.
+        let mut overflow = Vec::new();
+        let mut all = std::mem::take(&mut dst_profile.clips);
+        all.extend(src_profile.clips);
+        all.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if all.len() > MAX_CLIPS_PER_PROFILE {
+            overflow = all
+                .split_off(MAX_CLIPS_PER_PROFILE)
+                .into_iter()
+                .map(|c| c.wav_path)
+                .collect();
+        }
+        dst_profile.clips = all;
+        dst_profile.reanchor();
+        (true, overflow)
     }
 }
 
@@ -438,9 +631,9 @@ mod tests {
         // Empty label clears.
         assert!(reg.set_label(id, Some("  ".into())));
         assert!(reg.profiles()[0].label.is_none());
-        assert!(reg.forget(id));
+        assert_eq!(reg.forget(id), Some(vec![]), "removed, no clip paths");
         assert!(reg.profiles().is_empty());
-        assert!(!reg.forget(id), "forgetting a gone id is false");
+        assert_eq!(reg.forget(id), None, "forgetting a gone id is None");
     }
 
     #[test]
@@ -453,6 +646,7 @@ mod tests {
             centroid: norm(vec![1.0, 0.0, 0.0]),
             total_count: 1,
             label: None,
+            clips: Vec::new(),
             last_seen_unix: 1, // 1970
         });
         reg.doc.next_id = 1;
@@ -463,5 +657,119 @@ mod tests {
             reg.profiles().iter().all(|p| p.last_seen_unix > 1),
             "ancient profile should have been evicted"
         );
+    }
+
+    fn clip(id: &str, emb: Vec<f32>, conf: f32) -> VoiceClip {
+        VoiceClip {
+            id: id.to_string(),
+            wav_path: format!("0/{id}.wav"),
+            embedding: norm(emb),
+            duration_ms: 3000,
+            confidence: conf,
+            source_conversation: None,
+            created_unix: 0,
+        }
+    }
+
+    #[test]
+    fn adding_clip_anchors_profile_and_pins_centroid() {
+        let mut reg = empty();
+        reg.commit_session(3, &[snap(0, vec![1.0, 0.0, 0.0], 5)]);
+        let id = reg.profiles()[0].id;
+        assert!(!reg.profiles()[0].is_anchored());
+
+        let (ok, evicted) = reg.add_clip(id, clip("c1", vec![0.0, 1.0, 0.0], 0.9));
+        assert!(ok);
+        assert!(evicted.is_none());
+        let p = &reg.profiles()[0];
+        assert!(p.is_anchored(), "a clip anchors the profile");
+        // Centroid re-derived from the clip (not the original [1,0,0]).
+        assert!(p.centroid[1] > 0.9, "centroid moved to the clip direction");
+    }
+
+    #[test]
+    fn anchored_profile_ignores_ema_drift() {
+        let mut reg = empty();
+        reg.commit_session(3, &[snap(0, vec![1.0, 0.0, 0.0], 5)]);
+        let id = reg.profiles()[0].id;
+        reg.add_clip(id, clip("c1", vec![1.0, 0.0, 0.0], 0.9));
+        let before = reg.profiles()[0].centroid.clone();
+        // A new session with a drifted embedding for the same voice must
+        // NOT move an anchored centroid.
+        reg.commit_session(3, &[snap(9, norm(vec![0.8, 0.6, 0.0]), 4)]);
+        assert_eq!(
+            reg.profiles()[0].centroid,
+            before,
+            "anchored centroid must not drift on commit"
+        );
+    }
+
+    #[test]
+    fn clip_cap_evicts_weakest_when_full() {
+        let mut reg = empty();
+        reg.commit_session(3, &[snap(0, vec![1.0, 0.0, 0.0], 5)]);
+        let id = reg.profiles()[0].id;
+        reg.add_clip(id, clip("a", vec![1.0, 0.0, 0.0], 0.70));
+        reg.add_clip(id, clip("b", vec![1.0, 0.0, 0.0], 0.80));
+        reg.add_clip(id, clip("c", vec![1.0, 0.0, 0.0], 0.90));
+        assert_eq!(reg.profiles()[0].clips.len(), MAX_CLIPS_PER_PROFILE);
+        // A stronger clip evicts the weakest ("a", 0.70).
+        let (ok, evicted) = reg.add_clip(id, clip("d", vec![1.0, 0.0, 0.0], 0.95));
+        assert!(ok);
+        assert_eq!(evicted.as_deref(), Some("0/a.wav"));
+        assert!(!reg.profiles()[0].clips.iter().any(|c| c.id == "a"));
+        // A weaker-than-all clip is rejected outright.
+        let (ok2, evicted2) = reg.add_clip(id, clip("e", vec![1.0, 0.0, 0.0], 0.10));
+        assert!(!ok2);
+        assert!(evicted2.is_none());
+        assert_eq!(reg.profiles()[0].clips.len(), MAX_CLIPS_PER_PROFILE);
+    }
+
+    #[test]
+    fn rank_candidates_orders_by_similarity() {
+        let mut reg = empty();
+        reg.commit_session(3, &[snap(0, vec![1.0, 0.0, 0.0], 5)]); // id 0
+        reg.commit_session(3, &[snap(0, vec![0.0, 1.0, 0.0], 5)]); // id 1
+        reg.set_label(0, Some("Chris".into()));
+        // Query near id 0 → Chris first.
+        let ranked = reg.rank_candidates(3, &norm(vec![0.95, 0.1, 0.0]));
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].0, 0);
+        assert_eq!(ranked[0].1, "Chris");
+        assert!(ranked[0].2 > ranked[1].2, "sorted best-first");
+    }
+
+    #[test]
+    fn merge_folds_src_into_dst_and_caps_clips() {
+        let mut reg = empty();
+        reg.commit_session(3, &[snap(0, vec![1.0, 0.0, 0.0], 5)]); // id 0
+        reg.commit_session(3, &[snap(0, vec![0.0, 1.0, 0.0], 5)]); // id 1
+        reg.set_label(0, Some("Chris".into()));
+        reg.add_clip(0, clip("a", vec![1.0, 0.0, 0.0], 0.9));
+        reg.add_clip(0, clip("b", vec![1.0, 0.0, 0.0], 0.8));
+        reg.add_clip(1, clip("x", vec![1.0, 0.0, 0.0], 0.95));
+        reg.add_clip(1, clip("y", vec![1.0, 0.0, 0.0], 0.5));
+        // Merge id1 into id0: 4 clips → capped at 3, weakest (y 0.5) drops.
+        let (ok, overflow) = reg.merge(0, 1);
+        assert!(ok);
+        assert_eq!(overflow, vec!["0/y.wav".to_string()]);
+        assert_eq!(reg.profiles().len(), 1);
+        let p = &reg.profiles()[0];
+        assert_eq!(p.id, 0);
+        assert_eq!(p.label.as_deref(), Some("Chris"));
+        assert_eq!(p.clips.len(), MAX_CLIPS_PER_PROFILE);
+        assert_eq!(p.total_count, 10);
+    }
+
+    #[test]
+    fn removing_last_clip_unanchors() {
+        let mut reg = empty();
+        reg.commit_session(3, &[snap(0, vec![1.0, 0.0, 0.0], 5)]);
+        let id = reg.profiles()[0].id;
+        reg.add_clip(id, clip("a", vec![0.0, 1.0, 0.0], 0.9));
+        assert!(reg.profiles()[0].is_anchored());
+        let path = reg.remove_clip(id, "a");
+        assert_eq!(path.as_deref(), Some("0/a.wav"));
+        assert!(!reg.profiles()[0].is_anchored(), "no clips → not anchored");
     }
 }
