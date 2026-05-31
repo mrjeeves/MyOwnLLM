@@ -147,6 +147,39 @@ pub struct TranscribeFrame {
     /// "uploaded vs transcribed" progress bar on the upload button.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upload_progress: Option<UploadProgress>,
+    /// Emitted once at session end when the diarizer captured voice-clip
+    /// candidates worth reviewing: each session-speaker with a clip, its
+    /// ranked profile suggestions ("looks like Chris 87%"), and whether
+    /// it auto-matched an existing profile. The UI unfolds a non-blocking
+    /// review strip from this; `None` on every other frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_review: Option<Vec<SpeakerReviewItem>>,
+}
+
+/// One reviewable captured speaker: enough for the end-of-session strip
+/// to show "Speaker 2 — looks like Chris (87%)" with a play button and a
+/// confirm/correct control. The clip audio is fetched separately by
+/// `speaker_review_clip` (keeps frames light).
+#[derive(Debug, Serialize, Clone)]
+pub struct SpeakerReviewItem {
+    /// Session-local speaker id (the cluster number shown in the
+    /// transcript).
+    pub speaker: u32,
+    /// Captured clip length, ms.
+    pub duration_ms: u64,
+    /// Ranked profile suggestions, best first: `(profile_id, name, sim)`.
+    pub suggestions: Vec<SpeakerSuggestion>,
+    /// The profile id this speaker auto-matched on commit (if any) — the
+    /// strip pre-selects it so a correct guess is a single confirm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_matched: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SpeakerSuggestion {
+    pub profile_id: u32,
+    pub name: String,
+    pub similarity: f32,
 }
 
 /// Two-phase upload progress: decode reads the file ahead, ASR
@@ -224,6 +257,7 @@ impl TranscribeFrame {
             chunk_seconds,
             status,
             upload_progress: None,
+            speaker_review: None,
         }
     }
 }
@@ -568,6 +602,7 @@ pub fn start(
                 chunk_seconds: None,
                 status: None,
                 upload_progress: None,
+                speaker_review: None,
             },
             Err(e) => TranscribeFrame {
                 elapsed_ms: 0,
@@ -577,6 +612,7 @@ pub fn start(
                 chunk_seconds: None,
                 status: Some(format!("transcription error: {e:#}")),
                 upload_progress: None,
+                speaker_review: None,
             },
         };
         sink.emit_frame(&event, final_frame);
@@ -669,6 +705,7 @@ pub fn start_drain(
                 chunk_seconds: None,
                 status: None,
                 upload_progress: None,
+                speaker_review: None,
             },
             Err(e) => TranscribeFrame {
                 elapsed_ms: 0,
@@ -678,6 +715,7 @@ pub fn start_drain(
                 chunk_seconds: None,
                 status: Some(format!("transcription error: {e:#}")),
                 upload_progress: None,
+                speaker_review: None,
             },
         };
         sink.emit_frame(&event, final_frame);
@@ -748,6 +786,7 @@ pub fn start_upload(
                 chunk_seconds: None,
                 status: None,
                 upload_progress: None,
+                speaker_review: None,
             },
             Err(e) => TranscribeFrame {
                 elapsed_ms: 0,
@@ -757,6 +796,7 @@ pub fn start_upload(
                 chunk_seconds: None,
                 status: Some(format!("transcription error: {e:#}")),
                 upload_progress: None,
+                speaker_review: None,
             },
         };
         sink.emit_frame(&event, final_frame);
@@ -872,6 +912,7 @@ pub fn start_remote_session(
                 chunk_seconds: None,
                 status: None,
                 upload_progress: None,
+                speaker_review: None,
             },
             Err(e) => TranscribeFrame {
                 elapsed_ms: 0,
@@ -881,6 +922,7 @@ pub fn start_remote_session(
                 chunk_seconds: None,
                 status: Some(format!("transcription error: {e:#}")),
                 upload_progress: None,
+                speaker_review: None,
             },
         };
         sink.emit_frame(&event, final_frame);
@@ -993,6 +1035,7 @@ fn run_remote_session(
         window,
         event,
         started,
+        stream_id,
     );
 
     let _ = std::fs::remove_dir_all(&buffer_dir);
@@ -1227,6 +1270,7 @@ fn run_session(
         window,
         event,
         started,
+        stream_id,
     );
 
     drop(stream);
@@ -1358,6 +1402,7 @@ fn run_drain(
                     chunk_seconds: None,
                     status: None,
                     upload_progress: None,
+                    speaker_review: None,
                 },
             );
         }
@@ -1495,6 +1540,7 @@ fn run_upload(
                 decoded_ms: 0,
                 processed_ms: 0,
             }),
+            speaker_review: None,
         },
     );
 
@@ -1644,6 +1690,7 @@ fn run_upload(
                     decoded_ms: decoded,
                     processed_ms: processed,
                 }),
+                speaker_review: None,
             },
         );
     };
@@ -2043,9 +2090,12 @@ fn run_streaming_loop(
     sink: &Arc<dyn FrameSink>,
     event: &str,
     started: std::time::Instant,
+    review_key: &str,
 ) -> Result<()> {
     let mut window = StreamWindow::new(TARGET_SR, caps.max_context_seconds);
     let mut agree = LocalAgreement::new();
+    // Opportunistic voice-clip capture for the speaker-profiles review.
+    let mut clips = crate::diarize::capture::ClipCollector::new();
     // Endpointing: Silero VAD when its model is installed (precise
     // per-hop speech probability), else the RMS energy gate. Both expose
     // the same `(speechy, endpoint)` decision via `HopGate`, so the loop
@@ -2172,7 +2222,7 @@ fn run_streaming_loop(
                 .unwrap_or(utt_start_ms)
                 .max(utt_start_ms);
             // Diarize the finalized utterance audio before we drop it.
-            let (speaker, overlap) = diarize_speaker(
+            let dia = diarize_speaker(
                 &mut diarize,
                 window.samples(),
                 window.base_ms(),
@@ -2180,6 +2230,17 @@ fn run_streaming_loop(
                 end_ms,
                 &cancel,
             );
+            // Opportunistically keep the best voice clip for this speaker.
+            if let Some(spk) = dia.speaker {
+                clips.consider(
+                    spk,
+                    utterance_audio(&window, utt_start_ms, end_ms),
+                    dia.embedding.as_deref(),
+                    dia.confidence,
+                    dia.overlap,
+                );
+            }
+            let (speaker, overlap) = (dia.speaker, dia.overlap);
             agree.finalize();
             emit_stream_segment(
                 sink,
@@ -2219,7 +2280,7 @@ fn run_streaming_loop(
                 .map(|t| window.base_ms() + t.t_ms)
                 .unwrap_or(utt_start_ms)
                 .max(utt_start_ms);
-            let (speaker, overlap) = diarize_speaker(
+            let dia = diarize_speaker(
                 &mut diarize,
                 window.samples(),
                 window.base_ms(),
@@ -2227,6 +2288,15 @@ fn run_streaming_loop(
                 end_ms,
                 &cancel,
             );
+            if let Some(spk) = dia.speaker {
+                clips.consider(
+                    spk,
+                    utterance_audio(&window, utt_start_ms, end_ms),
+                    dia.embedding.as_deref(),
+                    dia.confidence,
+                    dia.overlap,
+                );
+            }
             emit_stream_segment(
                 sink,
                 event,
@@ -2236,8 +2306,29 @@ fn run_streaming_loop(
                 window.base_ms(),
                 utt_start_ms,
                 false,
-                speaker,
-                overlap,
+                dia.speaker,
+                dia.overlap,
+            );
+        }
+    }
+
+    // Session over: persist any captured clips as pending review and
+    // emit the review strip. Best-effort — capture is a bonus on top of
+    // a working transcript, never a reason to fail the session.
+    if !clips.is_empty() {
+        if let Some(items) = stash_review_candidates(clips.take(), review_key) {
+            sink.emit_frame(
+                event,
+                TranscribeFrame {
+                    elapsed_ms: started.elapsed().as_millis(),
+                    segments: Vec::new(),
+                    is_final: false,
+                    pending_chunks: 0,
+                    chunk_seconds: None,
+                    status: None,
+                    upload_progress: None,
+                    speaker_review: Some(items),
+                },
             );
         }
     }
@@ -2288,6 +2379,7 @@ fn emit_stream_segment(
             chunk_seconds: None,
             status: None,
             upload_progress: None,
+            speaker_review: None,
         },
     );
 }
@@ -2345,11 +2437,105 @@ fn beam_final_tokens(
     }
 }
 
+/// Slice the rolling window down to a finalized utterance's `[start_ms,
+/// end_ms]` span (session-relative), for clip capture. Clamped to what
+/// the window actually holds.
+fn utterance_audio<'a>(window: &'a StreamWindow, start_ms: u64, end_ms: u64) -> &'a [f32] {
+    let base = window.base_ms();
+    let s = start_ms.saturating_sub(base);
+    let e = end_ms.saturating_sub(base).max(s);
+    let s_idx = ((s * TARGET_SR as u64) / 1000) as usize;
+    let e_idx = (((e * TARGET_SR as u64) / 1000) as usize).min(window.samples().len());
+    if e_idx <= s_idx {
+        return &[];
+    }
+    &window.samples()[s_idx..e_idx]
+}
+
+/// At session end, write captured clips to disk and stash them (keyed by
+/// conversation) as pending review, returning the review-strip items with
+/// ranked profile suggestions. `None` when there's nothing to review.
+fn stash_review_candidates(
+    candidates: Vec<crate::diarize::capture::ClipCandidate>,
+    review_key: &str,
+) -> Option<Vec<SpeakerReviewItem>> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut items = Vec::new();
+    let mut pending = Vec::new();
+    for cand in candidates {
+        let dim = cand.embedding.len();
+        // Rank existing profiles for the suggestion list.
+        let ranked =
+            crate::diarize::registry::with(|reg| reg.rank_candidates(dim, &cand.embedding))
+                .unwrap_or_default();
+        let suggestions: Vec<SpeakerSuggestion> = ranked
+            .iter()
+            .take(3)
+            .map(|(id, name, sim)| SpeakerSuggestion {
+                profile_id: *id,
+                name: name.clone(),
+                similarity: *sim,
+            })
+            .collect();
+        // Auto-match: the top suggestion if it's confidently this person.
+        let auto_matched = ranked
+            .first()
+            .filter(|(_, _, sim)| *sim >= REVIEW_AUTOMATCH_SIM)
+            .map(|(id, _, _)| *id);
+        items.push(SpeakerReviewItem {
+            speaker: cand.speaker,
+            duration_ms: cand.duration_ms,
+            suggestions,
+            auto_matched,
+        });
+        pending.push(cand);
+    }
+    // Stash the audio+embeddings so the review commands can play clips
+    // and attach them on confirm.
+    review_store().insert(
+        review_key.to_string(),
+        pending
+            .into_iter()
+            .map(|c| (c.speaker, c))
+            .collect::<Vec<_>>(),
+    );
+    Some(items)
+}
+
+/// Cosine similarity above which a captured clip is treated as auto-
+/// matched to an existing profile (the review strip pre-selects it).
+/// Stricter than the registry's seed-match — a pre-selection the user
+/// just confirms should be near-certain.
+const REVIEW_AUTOMATCH_SIM: f32 = 0.70;
+
+/// Per-conversation stash of captured clip candidates awaiting review,
+/// keyed by conversation id (empty string for an unsaved session). Read
+/// by the `speaker_review_*` commands to play a clip or attach it to a
+/// profile on confirm. Bounded: one session's candidates per key,
+/// replaced on the next session.
+type ReviewStash = DashMap<String, Vec<(u32, crate::diarize::capture::ClipCandidate)>>;
+fn review_store() -> &'static ReviewStash {
+    static M: OnceLock<ReviewStash> = OnceLock::new();
+    M.get_or_init(DashMap::new)
+}
+
+/// The dominant speaker for a finalized utterance, plus the diarizer
+/// signal the clip-capture path needs (confidence + embedding anchor).
+#[derive(Default)]
+struct DiarizeResult {
+    speaker: Option<u32>,
+    overlap: bool,
+    confidence: f32,
+    embedding: Option<Vec<f32>>,
+}
+
 /// Run the diarizer (if enabled) over a finalized utterance's audio and
-/// return the speaker whose turn most overlaps `[start_ms, end_ms]`,
-/// plus whether that turn was flagged as overlapping speech. `(None,
-/// false)` when diarization is off or no turn overlaps — mirrors the
-/// max-overlap assignment `join_segments` uses on the disk path.
+/// return the speaker whose turn most overlaps `[start_ms, end_ms]`, plus
+/// that turn's overlap flag, confidence, and embedding. An empty result
+/// when diarization is off or no turn overlaps — mirrors the max-overlap
+/// assignment `join_segments` uses on the disk path.
 fn diarize_speaker(
     diarize: &mut Option<&mut (dyn DiarizeBackend + 'static)>,
     samples: &[f32],
@@ -2357,31 +2543,39 @@ fn diarize_speaker(
     start_ms: u64,
     end_ms: u64,
     cancel: &AtomicBool,
-) -> (Option<u32>, bool) {
+) -> DiarizeResult {
     let Some(d) = diarize.as_deref_mut() else {
-        return (None, false);
+        return DiarizeResult::default();
     };
     let turns = match d.process_chunk(samples, base_ms, cancel) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("streaming diarize failed: {e}");
-            return (None, false);
+            return DiarizeResult::default();
         }
     };
-    let mut best: Option<(&SpeakerTurn, u64)> = None;
-    for t in &turns {
+    let mut best: Option<(usize, u64)> = None;
+    for (i, t) in turns.iter().enumerate() {
         let lo = start_ms.max(t.start_ms);
         let hi = end_ms.min(t.end_ms);
         if hi > lo {
             let overlap_ms = hi - lo;
             if best.map(|(_, o)| overlap_ms > o).unwrap_or(true) {
-                best = Some((t, overlap_ms));
+                best = Some((i, overlap_ms));
             }
         }
     }
     match best {
-        Some((t, _)) => (Some(t.speaker), t.overlap),
-        None => (None, false),
+        Some((i, _)) => {
+            let t = &turns[i];
+            DiarizeResult {
+                speaker: Some(t.speaker),
+                overlap: t.overlap,
+                confidence: t.confidence.unwrap_or(0.0),
+                embedding: t.embedding.clone(),
+            }
+        }
+        None => DiarizeResult::default(),
     }
 }
 
@@ -2505,6 +2699,7 @@ mod tests {
             speaker,
             overlap,
             confidence: None,
+            embedding: None,
         }
     }
 
@@ -2617,6 +2812,7 @@ mod tests {
             &sink,
             "evt",
             std::time::Instant::now(),
+            "test",
         )
         .unwrap();
         sender.join().unwrap();
@@ -2676,6 +2872,7 @@ mod tests {
             &sink,
             "evt",
             std::time::Instant::now(),
+            "test",
         )
         .unwrap();
         sender.join().unwrap();

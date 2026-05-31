@@ -25,6 +25,7 @@ use anyhow::Result;
 use serde::Serialize;
 use std::sync::atomic::AtomicBool;
 
+pub mod capture;
 pub mod clips;
 pub mod cluster;
 pub mod embedder;
@@ -54,6 +55,13 @@ pub struct SpeakerTurn {
     /// the matched centroid). Surfaced for diagnostics; the UI doesn't
     /// render it today.
     pub confidence: Option<f32>,
+    /// L2-normalized speaker embedding for this turn. Carried so the
+    /// clip-capture path can anchor a profile to the *exact* audio the
+    /// user verifies, without re-embedding. Skipped in serialization —
+    /// it never crosses to the frontend on a frame; only the in-process
+    /// capture collector reads it.
+    #[serde(skip)]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// Interface every diarize backend implements. Today there's only
@@ -289,12 +297,16 @@ impl DiarizeBackend for PyannoteOrtBackend {
                 /*lock_centroid=*/ slice.overlap,
             );
             self.saw_speakers = true;
+            // Carry the embedding for clip capture; drop it for overlap
+            // slices (a mixture of two voices is a poor anchor).
+            let turn_embedding = if slice.overlap { None } else { Some(embedding) };
             turns.push(SpeakerTurn {
                 start_ms: slice.start_ms,
                 end_ms: slice.end_ms,
                 speaker,
                 overlap: slice.overlap,
                 confidence: Some(sim),
+                embedding: turn_embedding,
             });
         }
 
