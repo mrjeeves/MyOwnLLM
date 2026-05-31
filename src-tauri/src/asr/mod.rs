@@ -22,6 +22,7 @@ use anyhow::Result;
 use serde::Serialize;
 use std::sync::atomic::AtomicBool;
 
+pub mod beam;
 pub mod moonshine;
 pub mod parakeet;
 pub mod streaming;
@@ -173,6 +174,21 @@ pub trait AsrBackend: Send {
         chunk_t0_ms: u64,
         cancel: &AtomicBool,
     ) -> Result<AsrChunkOut>;
+
+    /// Decode a **finalized** utterance — the text that gets kept. The
+    /// default delegates to [`process_chunk`](AsrBackend::process_chunk)
+    /// (greedy), so backends with nothing extra to offer are unchanged.
+    /// Backends that can spend more compute for a one-shot accuracy win
+    /// override this (Moonshine runs beam search here, where the extra
+    /// forwards don't cost interim latency because the utterance is over).
+    fn process_final(
+        &mut self,
+        pcm16k_mono: &[f32],
+        chunk_t0_ms: u64,
+        cancel: &AtomicBool,
+    ) -> Result<AsrChunkOut> {
+        self.process_chunk(pcm16k_mono, chunk_t0_ms, cancel)
+    }
 
     /// Reset internal KV / decoder state. Called by the worker every
     /// `caps().state_reset_chunks` chunks to bound long-recording

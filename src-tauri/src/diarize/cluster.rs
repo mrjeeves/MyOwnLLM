@@ -162,12 +162,6 @@ impl OnlineClusterer {
             .collect()
     }
 
-    /// The next speaker id this clusterer would hand out. Persisted so
-    /// the counter is monotonic across sessions.
-    pub fn next_id(&self) -> u32 {
-        self.next_id
-    }
-
     /// Active speaker count. Surfaced via the Settings UI once the
     /// diarize pane lands.
     #[allow(dead_code)]

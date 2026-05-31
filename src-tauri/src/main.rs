@@ -402,6 +402,59 @@ fn transcribe_buffer_size_bytes() -> u64 {
     transcribe::buffer_size_bytes()
 }
 
+/// One persisted speaker for the Settings UI: stable id, the rendered
+/// name (label or "Speaker N"), how many slices have shaped it, and when
+/// it last spoke.
+#[derive(serde::Serialize)]
+struct SpeakerEntry {
+    id: u32,
+    name: String,
+    label: Option<String>,
+    total_count: u64,
+    last_seen_unix: u64,
+}
+
+/// List persisted speaker profiles for the diarize settings pane.
+#[tauri::command]
+fn speaker_registry_list() -> Result<Vec<SpeakerEntry>, String> {
+    diarize::registry::with(|reg| {
+        reg.profiles()
+            .iter()
+            .map(|p| SpeakerEntry {
+                id: p.id,
+                name: p
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| format!("Speaker {}", p.id + 1)),
+                label: p.label.clone(),
+                total_count: p.total_count,
+                last_seen_unix: p.last_seen_unix,
+            })
+            .collect()
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// Assign (or clear, with an empty string) a human name for a speaker.
+#[tauri::command]
+fn speaker_registry_rename(id: u32, label: Option<String>) -> Result<bool, String> {
+    let ok = diarize::registry::with(|reg| reg.set_label(id, label)).map_err(|e| e.to_string())?;
+    if ok {
+        diarize::registry::save().map_err(|e| e.to_string())?;
+    }
+    Ok(ok)
+}
+
+/// Forget a persisted speaker profile.
+#[tauri::command]
+fn speaker_registry_forget(id: u32) -> Result<bool, String> {
+    let ok = diarize::registry::with(|reg| reg.forget(id)).map_err(|e| e.to_string())?;
+    if ok {
+        diarize::registry::save().map_err(|e| e.to_string())?;
+    }
+    Ok(ok)
+}
+
 #[tauri::command]
 fn transcribe_pending_streams() -> Vec<transcribe::PendingStream> {
     transcribe::list_pending_streams()
@@ -1112,6 +1165,9 @@ fn main() {
             mesh::governance::mesh_governance_role_can_grant,
             mesh_file_save_at,
             ort_setup_status,
+            speaker_registry_list,
+            speaker_registry_rename,
+            speaker_registry_forget,
             transcribe_start,
             transcribe_stop,
             transcribe_pause,

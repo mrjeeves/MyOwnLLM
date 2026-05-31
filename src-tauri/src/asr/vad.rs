@@ -136,8 +136,8 @@ impl SileroVad {
         let out_prob_name = out_prob_name
             .or_else(|| session.outputs().first().map(|o| o.name().to_string()))
             .ok_or_else(|| anyhow!("silero VAD: no outputs"))?;
-        let out_state_name = out_state_name
-            .ok_or_else(|| anyhow!("silero VAD: couldn't find a state output"))?;
+        let out_state_name =
+            out_state_name.ok_or_else(|| anyhow!("silero VAD: couldn't find a state output"))?;
 
         Ok(Self {
             session,
@@ -176,8 +176,14 @@ impl SileroVad {
             std::borrow::Cow<'static, str>,
             ort::session::SessionInputValue<'_>,
         )> = vec![
-            (std::borrow::Cow::Owned(self.input_name.clone()), audio_t.into()),
-            (std::borrow::Cow::Owned(self.state_name.clone()), state_t.into()),
+            (
+                std::borrow::Cow::Owned(self.input_name.clone()),
+                audio_t.into(),
+            ),
+            (
+                std::borrow::Cow::Owned(self.state_name.clone()),
+                state_t.into(),
+            ),
         ];
         if let Some(sr) = &self.sr_name {
             let sr_arr: Array1<i64> = Array1::from_vec(vec![16_000]);
@@ -295,8 +301,8 @@ mod tests {
     fn gate_hysteresis_holds_speech_through_a_dip() {
         let mut g = SpeechGate::new(600);
         g.observe(0.9, 100); // enter speech
-        // A dip to 0.4 is below enter (0.5) but above exit (0.35) — still
-        // speech, so no premature endpoint clock.
+                             // A dip to 0.4 is below enter (0.5) but above exit (0.35) — still
+                             // speech, so no premature endpoint clock.
         let (speechy, _) = g.observe(0.4, 100);
         assert!(speechy, "0.4 stays speech under hysteresis");
         // Drop below exit → quiet.
@@ -326,6 +332,10 @@ mod tests {
         assert_eq!(g.observe(0.0, 400), (false, true)); // fire
         assert_eq!(g.observe(0.0, 400), (false, false), "quiet, no re-fire");
         g.observe(0.9, 200); // new speech
-        assert_eq!(g.observe(0.0, 400), (false, true), "fires for next utterance");
+        assert_eq!(
+            g.observe(0.0, 400),
+            (false, true),
+            "fires for next utterance"
+        );
     }
 }
