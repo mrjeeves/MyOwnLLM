@@ -138,10 +138,11 @@
    *  speaker. Loaded once; conversation-local `speakerLabels` win. */
   let registryLabels = $state<Record<number, string>>({});
   let diarizeEnabled = $state(true);
-  /** Opt-in: keep the full session audio on disk so you can scrub back
-   *  and clip speakers by hand later. Off by default (it's ~230 MB/hour);
-   *  the automatic clip capture covers the common case. */
-  let keepAudio = $state(false);
+  /** Keep the full session audio on disk so you can scrub back and clip
+   *  speakers by hand later. On by default: with accuracy favoured over
+   *  realtime latency, the full recording is the source of truth (the
+   *  automatic clips are a convenience on top). ~230 MB/hour. */
+  let keepAudio = $state(true);
   /** Routing pins for the two transcribe-mode bars. Stored as stable
    *  `device_pubkey`s in localStorage (see `routing-pins.svelte.ts`)
    *  so a reload or a peer hop doesn't clear them. Pause/error on
@@ -312,7 +313,7 @@
       transcript = c.transcript ?? [];
       speakerLabels = c.speaker_labels ?? {};
       diarizeEnabled = c.diarize_enabled ?? true;
-      keepAudio = c.keep_audio ?? false;
+      keepAudio = c.keep_audio ?? true;
       talkingPoints = c.talking_points ?? [];
       talkingPointsPrev = c.talking_points_prev ?? [];
       tpActionStatus = "";
@@ -889,6 +890,14 @@
     transcribeUi.active && transcribeUi.conversationId === conversationId,
   );
 
+  // Seconds of captured-but-not-yet-transcribed audio queued for decode.
+  // Surfaced as a gentle "catching up" hint when it's meaningfully behind
+  // — accuracy over realtime means the captions can lag the audio, and
+  // that's fine because every queued chunk still gets processed.
+  let backlogSeconds = $derived(
+    transcribeUi.pendingChunks * transcribeUi.chunkSeconds,
+  );
+
   // The live, still-refining caption for the active streaming session.
   // Rendered tentatively beneath the confirmed transcript and never
   // persisted. Empty unless this view owns the active recording and a
@@ -1185,10 +1194,9 @@
         {#if isMyRecording && transcribeUi.status}
           <p class="transcribe-status">{transcribeUi.status}</p>
         {/if}
-        {#if isMyRecording && transcribeUi.pendingChunks > 0}
-          <p class="transcribe-backlog">
-            {(transcribeUi.pendingChunks * transcribeUi.chunkSeconds).toFixed(0)} s
-            behind realtime
+        {#if isMyRecording && backlogSeconds >= 1.5}
+          <p class="transcribe-backlog" title="Audio is queued for transcription — it will all be processed; the captions are just catching up.">
+            {backlogSeconds.toFixed(backlogSeconds >= 10 ? 0 : 1)}s behind — catching up
           </p>
         {/if}
       </div>

@@ -2118,15 +2118,16 @@ fn run_streaming_loop(
     // Opportunistic voice-clip capture for the speaker-profiles review.
     let mut clips = crate::diarize::capture::ClipCollector::new();
     // Opt-in full-session recorder: streams every 16 kHz sample to a WAV
-    // for later manual scrubbing/clipping. Best-effort — a recorder error
-    // logs and disables itself; it never disrupts live transcription.
+    // for later manual scrubbing/clipping. The actual file writes run on a
+    // dedicated thread fed by a channel, so a disk hiccup never stalls the
+    // hot decode loop (the loop just hands off a Vec and moves on).
+    // Best-effort — a recorder error logs and disables itself; it never
+    // disrupts live transcription.
     let mut recorder = if keep_audio {
-        match session_wav_path(review_key)
-            .and_then(|p| crate::wav::WavWriter::create(&p, TARGET_SR).map_err(|e| anyhow!("{e}")))
-        {
-            Ok(w) => {
+        match SessionRecorder::spawn(review_key) {
+            Ok(r) => {
                 eprintln!("[transcribe] recording full session audio (keep_audio on)");
-                Some(w)
+                Some(r)
             }
             Err(e) => {
                 eprintln!("[transcribe] couldn't start session recorder: {e}");
@@ -2153,6 +2154,13 @@ fn run_streaming_loop(
     let mut utt_start_ms: u64 = 0;
     let mut new_samples: usize = 0;
     let mut consecutive_errors: u32 = 0;
+    // The UI turns the backlog count into "N s behind" via pending_chunks *
+    // chunk_seconds, where each queued item is one capture buffer. Learn
+    // that buffer's wall duration from the first one; emit it to the UI
+    // once, lazily, on the first frame we actually send (so a silent
+    // session emits nothing).
+    let mut capture_chunk_seconds: Option<f32> = None;
+    let mut chunk_seconds_sent = false;
 
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -2163,10 +2171,15 @@ fn run_streaming_loop(
                 if paused.load(Ordering::Relaxed) {
                     continue;
                 }
+                if capture_chunk_seconds.is_none() && !samples.is_empty() && device_sr > 0 {
+                    capture_chunk_seconds = Some(samples.len() as f32 / device_sr as f32);
+                }
                 let pcm = resample_linear(&samples, device_sr, TARGET_SR);
-                if let Some(rec) = recorder.as_mut() {
-                    if let Err(e) = rec.write(&pcm) {
-                        eprintln!("[transcribe] session recorder write failed, disabling: {e}");
+                // Hand the samples to the recorder thread (non-blocking);
+                // drop the recorder if that thread has died.
+                if let Some(rec) = recorder.as_ref() {
+                    if rec.write(&pcm).is_err() {
+                        eprintln!("[transcribe] session recorder thread gone, disabling");
                         recorder = None;
                     }
                 }
@@ -2216,6 +2229,12 @@ fn run_streaming_loop(
                             .chain(agree.interim().iter())
                             .cloned()
                             .collect();
+                        let cs = (!chunk_seconds_sent)
+                            .then_some(capture_chunk_seconds)
+                            .flatten();
+                        if cs.is_some() && !live.is_empty() {
+                            chunk_seconds_sent = true;
+                        }
                         emit_stream_segment(
                             sink,
                             event,
@@ -2227,6 +2246,8 @@ fn run_streaming_loop(
                             true,
                             None,
                             false,
+                            rx.len() as u32,
+                            cs,
                         );
                     }
                 }
@@ -2291,6 +2312,12 @@ fn run_streaming_loop(
             }
             let (speaker, overlap) = (dia.speaker, dia.overlap);
             agree.finalize();
+            let cs = (!chunk_seconds_sent)
+                .then_some(capture_chunk_seconds)
+                .flatten();
+            if cs.is_some() && !final_tokens.is_empty() {
+                chunk_seconds_sent = true;
+            }
             emit_stream_segment(
                 sink,
                 event,
@@ -2302,6 +2329,8 @@ fn run_streaming_loop(
                 false,
                 speaker,
                 overlap,
+                rx.len() as u32,
+                cs,
             );
             cur_seg_id = 0;
             gate.reset();
@@ -2346,6 +2375,9 @@ fn run_streaming_loop(
                     dia.overlap,
                 );
             }
+            let cs = (!chunk_seconds_sent)
+                .then_some(capture_chunk_seconds)
+                .flatten();
             emit_stream_segment(
                 sink,
                 event,
@@ -2357,15 +2389,16 @@ fn run_streaming_loop(
                 false,
                 dia.speaker,
                 dia.overlap,
+                rx.len() as u32,
+                cs,
             );
         }
     }
 
-    // Close the full-session WAV (patches its header lengths).
+    // Close the full-session WAV: flushes the writer thread and patches
+    // the header before we return.
     if let Some(rec) = recorder.take() {
-        if let Err(e) = rec.finalize() {
-            eprintln!("[transcribe] session recorder finalize failed: {e}");
-        }
+        rec.finish();
     }
 
     // Session over: persist any captured clips as pending review and
@@ -2405,6 +2438,8 @@ fn emit_stream_segment(
     partial: bool,
     speaker: Option<u32>,
     overlap: bool,
+    pending_chunks: u32,
+    chunk_seconds: Option<f32>,
 ) {
     let text = join_tokens(tokens);
     if text.is_empty() {
@@ -2431,8 +2466,12 @@ fn emit_stream_segment(
             elapsed_ms: started.elapsed().as_millis(),
             segments: vec![seg],
             is_final: false,
-            pending_chunks: 0,
-            chunk_seconds: None,
+            // How many captured audio chunks are still queued for decode —
+            // the live "N s behind realtime" backlog. Especially relevant
+            // with keep-audio on, where we favour completeness over
+            // shaving latency.
+            pending_chunks,
+            chunk_seconds,
             status: None,
             upload_progress: None,
             speaker_review: None,
@@ -2601,6 +2640,81 @@ fn session_wav_path(review_key: &str) -> Result<PathBuf> {
 pub fn session_audio_path(review_key: &str) -> Option<PathBuf> {
     let p = session_wav_path(review_key).ok()?;
     p.exists().then_some(p)
+}
+
+/// Background full-session WAV writer. The decode loop hands PCM blocks
+/// over a channel (a cheap `Vec` move) and the writer thread does the
+/// actual disk I/O, so a slow/blocking write never stalls transcription —
+/// the fix for the hot-loop hitching observed with keep-audio on. Dropping
+/// the recorder (or calling `finish`) closes the channel; the thread
+/// finalizes the WAV header and exits.
+struct SessionRecorder {
+    tx: Option<crossbeam_channel::Sender<Vec<f32>>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl SessionRecorder {
+    fn spawn(review_key: &str) -> Result<Self> {
+        let path = session_wav_path(review_key)?;
+        let mut writer = crate::wav::WavWriter::create(&path, TARGET_SR)
+            .map_err(|e| anyhow!("create session wav: {e}"))?;
+        // Generous buffer: the writer only falls behind during a disk
+        // stall, and even then we'd rather queue than drop audio. Each
+        // item is one resampled capture block.
+        let (tx, rx) = bounded::<Vec<f32>>(256);
+        let handle = thread::spawn(move || {
+            // Drain until the senders drop (session end), writing each
+            // block. A write error disables further writes but keeps
+            // draining so the channel never wedges the producer.
+            let mut healthy = true;
+            while let Ok(block) = rx.recv() {
+                if healthy {
+                    if let Err(e) = writer.write(&block) {
+                        eprintln!("[transcribe] session recorder write failed, disabling: {e}");
+                        healthy = false;
+                    }
+                }
+            }
+            if let Err(e) = writer.finalize() {
+                eprintln!("[transcribe] session recorder finalize failed: {e}");
+            }
+        });
+        Ok(Self {
+            tx: Some(tx),
+            handle: Some(handle),
+        })
+    }
+
+    /// Hand a PCM block to the writer thread. `Err` only if the thread has
+    /// gone (then the caller drops the recorder). Non-blocking unless the
+    /// 256-deep queue is full (a sustained disk stall), where brief
+    /// back-pressure is preferable to losing the recording.
+    fn write(&self, pcm: &[f32]) -> std::result::Result<(), ()> {
+        match &self.tx {
+            Some(tx) => tx.send(pcm.to_vec()).map_err(|_| ()),
+            None => Err(()),
+        }
+    }
+
+    /// Close the channel and join the writer so the WAV header is patched
+    /// before we return (the file is complete on disk after this).
+    fn finish(mut self) {
+        self.tx.take(); // drop sender → thread sees disconnect
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for SessionRecorder {
+    fn drop(&mut self) {
+        // Safety net if `finish` wasn't called: still close + join so the
+        // file is finalized rather than left with a zeroed header.
+        self.tx.take();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// Rank a candidate against existing profiles into a `SpeakerReviewItem`
@@ -3086,6 +3200,17 @@ mod tests {
                 s.text
             );
         }
+
+        // The backlog cadence is primed exactly once: chunk_seconds is set
+        // on the first emitted frame (8000 samples / 16 kHz = 0.5 s) and
+        // omitted thereafter, so the UI can render "N s behind realtime".
+        let chunk_secs: Vec<f32> = frames.iter().filter_map(|(_, f)| f.chunk_seconds).collect();
+        assert_eq!(chunk_secs.len(), 1, "chunk_seconds sent once");
+        assert!(
+            (chunk_secs[0] - 0.5).abs() < 1e-6,
+            "8000 samples @ 16 kHz = 0.5 s, got {}",
+            chunk_secs[0]
+        );
     }
 
     /// A run that is silent end to end never opens an utterance.
