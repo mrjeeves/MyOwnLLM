@@ -355,6 +355,7 @@ fn transcribe_start(
     model: String,
     device: Option<String>,
     diarize_model: Option<String>,
+    keep_audio: Option<bool>,
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
     // Best-effort, fire-and-forget fetch of the Silero VAD upgrade. It's
@@ -379,8 +380,29 @@ fn transcribe_start(
             }
         });
     }
-    transcribe::start(stream_id, runtime, model, device, diarize_model, window)
-        .map_err(|e| e.to_string())
+    transcribe::start(
+        stream_id,
+        runtime,
+        model,
+        device,
+        diarize_model,
+        keep_audio.unwrap_or(false),
+        window,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Base64 WAV of a session's recorded full audio (opt-in "keep full
+/// audio"), or `None` if it wasn't recorded. For the manual scrub/clip UI.
+#[tauri::command]
+fn transcribe_session_audio(stream_id: String) -> Result<Option<String>, String> {
+    match transcribe::session_audio_path(&stream_id) {
+        Some(path) => {
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            Ok(Some(data_encoding::BASE64.encode(&bytes)))
+        }
+        None => Ok(None),
+    }
 }
 
 #[tauri::command]
@@ -1273,6 +1295,7 @@ fn main() {
             speaker_review_clip_wav,
             speaker_review_attach,
             speaker_review_dismiss,
+            transcribe_session_audio,
             transcribe_start,
             transcribe_stop,
             transcribe_pause,

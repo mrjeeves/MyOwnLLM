@@ -537,6 +537,7 @@ pub fn start(
     model_name: String,
     device_name: Option<String>,
     diarize_model: Option<String>,
+    keep_audio: bool,
     window: WebviewWindow,
 ) -> Result<()> {
     if sessions().contains_key(&stream_id) {
@@ -587,6 +588,7 @@ pub fn start(
             &model_for_thread,
             diarize_for_thread.as_deref(),
             device_name.as_deref(),
+            keep_audio,
             cancel_for_thread,
             paused_for_thread,
             &sink,
@@ -1036,6 +1038,7 @@ fn run_remote_session(
         event,
         started,
         stream_id,
+        /*keep_audio=*/ false, // remote audio is the peer's; not recorded
     );
 
     let _ = std::fs::remove_dir_all(&buffer_dir);
@@ -1132,6 +1135,7 @@ fn run_session(
     model_name: &str,
     diarize_composite: Option<&str>,
     device_name: Option<&str>,
+    keep_audio: bool,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     window: &std::sync::Arc<dyn FrameSink>,
@@ -1271,6 +1275,7 @@ fn run_session(
         event,
         started,
         stream_id,
+        keep_audio,
     );
 
     drop(stream);
@@ -2091,11 +2096,31 @@ fn run_streaming_loop(
     event: &str,
     started: std::time::Instant,
     review_key: &str,
+    keep_audio: bool,
 ) -> Result<()> {
     let mut window = StreamWindow::new(TARGET_SR, caps.max_context_seconds);
     let mut agree = LocalAgreement::new();
     // Opportunistic voice-clip capture for the speaker-profiles review.
     let mut clips = crate::diarize::capture::ClipCollector::new();
+    // Opt-in full-session recorder: streams every 16 kHz sample to a WAV
+    // for later manual scrubbing/clipping. Best-effort — a recorder error
+    // logs and disables itself; it never disrupts live transcription.
+    let mut recorder = if keep_audio {
+        match session_wav_path(review_key)
+            .and_then(|p| crate::wav::WavWriter::create(&p, TARGET_SR).map_err(|e| anyhow!("{e}")))
+        {
+            Ok(w) => {
+                eprintln!("[transcribe] recording full session audio (keep_audio on)");
+                Some(w)
+            }
+            Err(e) => {
+                eprintln!("[transcribe] couldn't start session recorder: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     // Endpointing: Silero VAD when its model is installed (precise
     // per-hop speech probability), else the RMS energy gate. Both expose
     // the same `(speechy, endpoint)` decision via `HopGate`, so the loop
@@ -2124,6 +2149,12 @@ fn run_streaming_loop(
                     continue;
                 }
                 let pcm = resample_linear(&samples, device_sr, TARGET_SR);
+                if let Some(rec) = recorder.as_mut() {
+                    if let Err(e) = rec.write(&pcm) {
+                        eprintln!("[transcribe] session recorder write failed, disabling: {e}");
+                        recorder = None;
+                    }
+                }
                 new_samples += pcm.len();
                 window.push(&pcm);
             }
@@ -2312,6 +2343,13 @@ fn run_streaming_loop(
                 dia.speaker,
                 dia.overlap,
             );
+        }
+    }
+
+    // Close the full-session WAV (patches its header lengths).
+    if let Some(rec) = recorder.take() {
+        if let Err(e) = rec.finalize() {
+            eprintln!("[transcribe] session recorder finalize failed: {e}");
         }
     }
 
@@ -2522,6 +2560,32 @@ type ReviewStash = DashMap<String, Vec<(u32, crate::diarize::capture::ClipCandid
 fn review_store() -> &'static ReviewStash {
     static M: OnceLock<ReviewStash> = OnceLock::new();
     M.get_or_init(DashMap::new)
+}
+
+/// Path of a session's full-audio WAV (opt-in "keep full audio"), under
+/// `~/.myownllm/session-audio/{key}.wav`. The dir is created on demand.
+fn session_wav_path(review_key: &str) -> Result<PathBuf> {
+    let dir = crate::myownllm_dir()?.join("session-audio");
+    std::fs::create_dir_all(&dir)?;
+    // Sanitize the key for a filename (stream ids are uuids, but be safe).
+    let safe: String = review_key
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Ok(dir.join(format!("{safe}.wav")))
+}
+
+/// Absolute path to a session's recorded full audio, if it exists. For
+/// the UI's manual scrub/clip flow.
+pub fn session_audio_path(review_key: &str) -> Option<PathBuf> {
+    let p = session_wav_path(review_key).ok()?;
+    p.exists().then_some(p)
 }
 
 /// Rank a candidate against existing profiles into a `SpeakerReviewItem`
@@ -2976,6 +3040,7 @@ mod tests {
             "evt",
             std::time::Instant::now(),
             "test",
+            false,
         )
         .unwrap();
         sender.join().unwrap();
@@ -3036,6 +3101,7 @@ mod tests {
             "evt",
             std::time::Instant::now(),
             "test",
+            false,
         )
         .unwrap();
         sender.join().unwrap();

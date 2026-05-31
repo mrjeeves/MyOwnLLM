@@ -109,6 +109,9 @@ export interface Conversation {
   /** Whether diarization was enabled for this conversation. Persisted
    *  so a re-open resumes with the toggle in the right state. */
   diarize_enabled?: boolean;
+  /** Opt-in: full-session audio recorded to disk for manual
+   *  scrub/clip. Persisted so a re-open resumes the toggle state. */
+  keep_audio?: boolean;
   /** Whether the user has requested reasoning / "thinking" tokens
    *  for this conversation. Drives the `think` flag we pass to the
    *  local `ollama_chat_stream` and to the mesh's

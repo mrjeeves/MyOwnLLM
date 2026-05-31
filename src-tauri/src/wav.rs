@@ -81,6 +81,79 @@ pub fn decode_f32_mono(bytes: &[u8]) -> Option<(Vec<f32>, u32)> {
     None
 }
 
+/// Streaming 16-bit PCM mono WAV writer for the opt-in "keep full audio"
+/// path. A whole session can be long (hundreds of MB), so we can't buffer
+/// it in RAM and encode at the end: this writes a placeholder header up
+/// front, appends samples as they arrive, and patches the two length
+/// fields closed on `finalize`. Mono, fixed sample rate.
+pub struct WavWriter {
+    file: std::fs::File,
+    sample_rate: u32,
+    samples_written: u32,
+}
+
+impl WavWriter {
+    /// Create `path` and write a placeholder header (lengths zeroed; patched
+    /// in [`finalize`]).
+    pub fn create(path: &std::path::Path, sample_rate: u32) -> std::io::Result<Self> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path)?;
+        // 44-byte header with data/riff lengths left at 0 for now.
+        let mut h = Vec::with_capacity(44);
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&0u32.to_le_bytes()); // riff len (patched)
+        h.extend_from_slice(b"WAVE");
+        h.extend_from_slice(b"fmt ");
+        h.extend_from_slice(&16u32.to_le_bytes());
+        h.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        h.extend_from_slice(&1u16.to_le_bytes()); // mono
+        h.extend_from_slice(&sample_rate.to_le_bytes());
+        h.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+        h.extend_from_slice(&2u16.to_le_bytes()); // block align
+        h.extend_from_slice(&16u16.to_le_bytes()); // bits
+        h.extend_from_slice(b"data");
+        h.extend_from_slice(&0u32.to_le_bytes()); // data len (patched)
+        file.write_all(&h)?;
+        Ok(Self {
+            file,
+            sample_rate,
+            samples_written: 0,
+        })
+    }
+
+    /// Append a block of `f32` samples (clamped, scaled to i16).
+    pub fn write(&mut self, samples: &[f32]) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut bytes = Vec::with_capacity(samples.len() * 2);
+        for &s in samples {
+            let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        self.file.write_all(&bytes)?;
+        self.samples_written = self.samples_written.saturating_add(samples.len() as u32);
+        Ok(())
+    }
+
+    /// Patch the RIFF + data length fields and flush. Consumes the writer.
+    pub fn finalize(mut self) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let data_len = self.samples_written.saturating_mul(2);
+        let riff_len = 36u32.saturating_add(data_len);
+        self.file.seek(SeekFrom::Start(4))?;
+        self.file.write_all(&riff_len.to_le_bytes())?;
+        self.file.seek(SeekFrom::Start(40))?;
+        self.file.write_all(&data_len.to_le_bytes())?;
+        self.file.flush()?;
+        Ok(())
+    }
+
+    /// Seconds written so far (for diagnostics).
+    #[allow(dead_code)]
+    pub fn seconds(&self) -> f32 {
+        self.samples_written as f32 / self.sample_rate as f32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +194,25 @@ mod tests {
     fn rejects_non_wav() {
         assert!(decode_f32_mono(b"not a wav file at all .....").is_none());
         assert!(decode_f32_mono(&[]).is_none());
+    }
+
+    #[test]
+    fn streaming_writer_round_trips() {
+        let dir = std::env::temp_dir().join(format!("wavtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.wav");
+        let mut w = WavWriter::create(&path, 16_000).unwrap();
+        // Write in two blocks to exercise the incremental length tracking.
+        w.write(&[0.5, -0.5, 0.25]).unwrap();
+        w.write(&[0.1, 0.2]).unwrap();
+        assert!((w.seconds() - 5.0 / 16_000.0).abs() < 1e-6);
+        w.finalize().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let (back, sr) = decode_f32_mono(&bytes).expect("decode streamed wav");
+        assert_eq!(sr, 16_000);
+        assert_eq!(back.len(), 5, "all 5 samples present with patched header");
+        assert!((back[0] - 0.5).abs() < 1e-3);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

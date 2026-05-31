@@ -287,6 +287,9 @@ export interface StartArgs {
    *  `"pyannote-seg-3.0+wespeaker-r34"`). `null` to disable
    *  diarization for this session. */
   diarizeModel: string | null;
+  /** Record the full session audio to disk for later manual
+   *  scrubbing/clipping (opt-in "keep full audio"). */
+  keepAudio?: boolean;
 }
 
 export async function startRecording(args: StartArgs): Promise<void> {
@@ -301,6 +304,7 @@ export async function startRecording(args: StartArgs): Promise<void> {
       model: args.model,
       device: args.device,
       diarizeModel: args.diarizeModel,
+      keepAudio: args.keepAudio ?? false,
     });
   } catch (e) {
     unlistenStream?.();

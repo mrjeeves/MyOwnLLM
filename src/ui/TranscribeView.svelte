@@ -138,6 +138,10 @@
    *  speaker. Loaded once; conversation-local `speakerLabels` win. */
   let registryLabels = $state<Record<number, string>>({});
   let diarizeEnabled = $state(true);
+  /** Opt-in: keep the full session audio on disk so you can scrub back
+   *  and clip speakers by hand later. Off by default (it's ~230 MB/hour);
+   *  the automatic clip capture covers the common case. */
+  let keepAudio = $state(false);
   /** Routing pins for the two transcribe-mode bars. Stored as stable
    *  `device_pubkey`s in localStorage (see `routing-pins.svelte.ts`)
    *  so a reload or a peer hop doesn't clear them. Pause/error on
@@ -308,6 +312,7 @@
       transcript = c.transcript ?? [];
       speakerLabels = c.speaker_labels ?? {};
       diarizeEnabled = c.diarize_enabled ?? true;
+      keepAudio = c.keep_audio ?? false;
       talkingPoints = c.talking_points ?? [];
       talkingPointsPrev = c.talking_points_prev ?? [];
       tpActionStatus = "";
@@ -393,6 +398,7 @@
     conv.transcript = transcript;
     conv.speaker_labels = speakerLabels;
     conv.diarize_enabled = diarizeEnabled;
+    conv.keep_audio = keepAudio;
     conv.talking_points = talkingPoints;
     conv.messages = [];
     await saveConversation(conv);
@@ -560,6 +566,7 @@
         device: mic.device_name || null,
         conversationId: conv?.id ?? null,
         diarizeModel,
+        keepAudio,
       });
     } catch (e) {
       transcribeError = String(e);
@@ -1096,6 +1103,18 @@
               Identify speakers
             {/if}
           </span>
+        </label>
+        <label
+          class="diarize-toggle"
+          title="Keep the full session audio so you can scrub back and clip speakers by hand later (~230 MB/hour)"
+        >
+          <input
+            type="checkbox"
+            checked={keepAudio}
+            disabled={isMyRecording}
+            onchange={(e) => (keepAudio = (e.currentTarget as HTMLInputElement).checked)}
+          />
+          <span class="diarize-label">Keep audio</span>
         </label>
       </header>
       <div class="pane-body" use:stickToBottom={transcript}>
