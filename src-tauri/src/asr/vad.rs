@@ -139,7 +139,7 @@ impl SileroVad {
         let out_state_name =
             out_state_name.ok_or_else(|| anyhow!("silero VAD: couldn't find a state output"))?;
 
-        Ok(Self {
+        let mut vad = Self {
             session,
             input_name,
             state_name,
@@ -147,7 +147,24 @@ impl SileroVad {
             out_prob_name,
             out_state_name,
             state: Array3::zeros(STATE_SHAPE),
-        })
+        };
+
+        // Validate with one probe inference before trusting this model on
+        // the live path. Silero exports differ (snakers4 vs the
+        // onnx-community build) and ONNX Runtime versions disagree on how
+        // they shape the model's internal LSTM — so a model that *loads*
+        // can still error on *every* hop (observed on Windows: "Input X
+        // must have 3 dimensions only"). Without this probe that surfaces
+        // as thousands of per-hop errors and a broken-feeling transcript.
+        // Failing here instead routes the whole session to the proven RMS
+        // endpointer with a single log line — the graceful degradation
+        // this module promises. The probe uses a 512-sample frame, the
+        // same rank the live hops feed, so a shape mismatch is caught.
+        let probe = vec![0.0f32; MIN_VAD_SAMPLES];
+        vad.speech_prob(&probe, &AtomicBool::new(false))
+            .context("silero VAD failed its load-time probe inference")?;
+        vad.reset();
+        Ok(vad)
     }
 
     /// Zero the RNN state — called at each endpoint so a new utterance
