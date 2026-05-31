@@ -13,7 +13,7 @@
 //!   loader paths) the failure surfaces as a hang inside the FFI
 //!   trampoline rather than a clean Err.
 //! - **Wrong version.** ort 2.0.0-rc.12 with `api-22` expects ORT
-//!   ≥1.20. A system-installed `libonnxruntime.dylib` from an older
+//!   ≥1.22. A system-installed `libonnxruntime.dylib` from an older
 //!   ORT (e.g. 1.16 via an old brew install) loads via dlopen but
 //!   exposes a different C ABI; the resulting function-pointer
 //!   dispatch is undefined behaviour. Hang / segfault / corrupted
@@ -178,30 +178,26 @@ pub fn ensure_ready(on_stage: &dyn Fn(&str), cancel: &AtomicBool) -> OrtStatus {
         return s;
     }
 
-    // `initialize` only searches + loads; the network fetch lives in
-    // `ort_install`. Download the pinned runtime if it isn't on disk.
-    let need_fetch = crate::ort_install::target_dylib_path()
-        .map(|p| !p.exists())
-        .unwrap_or(true);
-    if need_fetch {
-        on_stage(
-            "Downloading the speech engine (onnxruntime) — one-time setup, may take a minute…",
-        );
-        let noop: Box<crate::ort_install::ProgressFn> = Box::new(|_, _| {});
-        if let Err(e) = crate::ort_install::ensure_runtime_dylib(noop) {
-            let err = format!("onnxruntime download failed: {e:#}");
-            eprintln!("[ort_setup] {err}");
-            let st = OrtStatus {
-                initialized: false,
-                dylib_path: None,
-                searched: Vec::new(),
-                error: Some(err),
-            };
-            if let Ok(mut g) = STATUS.lock() {
-                *g = Some(st.clone());
-            }
-            return st;
+    // Make sure the *pinned* runtime is on disk before loading.
+    // `ensure_runtime_dylib` is version-aware: it refetches when a cached
+    // dll is the wrong onnxruntime version — exactly the stale 1.20 vs
+    // `api-22` mismatch that loads then hangs. A fast no-op once the
+    // correct version is present, so this stays cheap on relaunch.
+    on_stage("Preparing the speech engine (onnxruntime)…");
+    let noop: Box<crate::ort_install::ProgressFn> = Box::new(|_, _| {});
+    if let Err(e) = crate::ort_install::ensure_runtime_dylib(noop) {
+        let err = format!("onnxruntime download failed: {e:#}");
+        eprintln!("[ort_setup] {err}");
+        let st = OrtStatus {
+            initialized: false,
+            dylib_path: None,
+            searched: Vec::new(),
+            error: Some(err),
+        };
+        if let Ok(mut g) = STATUS.lock() {
+            *g = Some(st.clone());
         }
+        return st;
     }
 
     on_stage("Loading the speech engine…");
@@ -291,7 +287,7 @@ fn run_init() -> (OrtStatus, String) {
         }
         Ok(Err(e)) => {
             let err = format!(
-                "ort::init_from({}) failed: {e} — likely a version / arch mismatch (ort api-22 needs onnxruntime \u{2265}1.20)",
+                "ort::init_from({}) failed: {e} — likely a version / arch mismatch (ort api-22 needs onnxruntime \u{2265}1.22)",
                 existing.display()
             );
             (

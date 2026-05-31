@@ -1049,7 +1049,7 @@ fn build_backends(
              Recovery options: \
              (1) check your network and relaunch — MyOwnLLM re-attempts the download each launch; \
              (2) run `myownllm fetch-onnxruntime` from a terminal and restart; \
-             (3) drop a libonnxruntime.{{dll,dylib,so.1}} \u{2265}1.20 into {runtime_dir} and restart; \
+             (3) drop a libonnxruntime.{{dll,dylib,so.1}} \u{2265}1.22 into {runtime_dir} and restart; \
              (4) set ORT_DYLIB_PATH to the absolute path of the dylib and restart.",
             ort_status.diagnostic()
         ));
