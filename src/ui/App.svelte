@@ -38,6 +38,7 @@
     clearAfterPersist,
     type PendingStream,
   } from "./transcribe-state.svelte";
+  import { ortSetup, initOrtSetup } from "./ort-setup.svelte";
   import {
     chatSlot,
     startTalkingPoints,
@@ -209,6 +210,13 @@
         getCurrentWindow().setTitle(`MyOwnLLM ${v}`).catch(() => {});
       })
       .catch(() => {});
+
+    // Track onnxruntime setup. New installs fetch the runtime in the
+    // installer; existing installs (or a failed install fetch) are
+    // caught by the startup `ensure_ready`. Both report via
+    // `myownllm://ort-install-progress` → `ortSetup`, which the Record
+    // button gates on. Fire-and-forget — never blocks the chat path.
+    initOrtSetup();
 
     try {
       const [hw, config] = await Promise.all([
@@ -1187,6 +1195,11 @@
       <button class="warming-skip" onclick={() => (warming = false)}>
         Continue to chat →
       </button>
+      {#if ortSetup.checked && !ortSetup.ready && !ortSetup.error}
+        <p class="splash-version">
+          {ortSetup.message ?? "Setting up speech engine…"}
+        </p>
+      {/if}
       {#if appVersion}
         <p class="splash-version">v{appVersion}</p>
       {/if}

@@ -13,7 +13,7 @@
 //!   loader paths) the failure surfaces as a hang inside the FFI
 //!   trampoline rather than a clean Err.
 //! - **Wrong version.** ort 2.0.0-rc.12 with `api-22` expects ORT
-//!   ≥1.20. A system-installed `libonnxruntime.dylib` from an older
+//!   ≥1.24. A system-installed `libonnxruntime.dylib` from an older
 //!   ORT (e.g. 1.16 via an old brew install) loads via dlopen but
 //!   exposes a different C ABI; the resulting function-pointer
 //!   dispatch is undefined behaviour. Hang / segfault / corrupted
@@ -39,6 +39,7 @@
 
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -93,6 +94,14 @@ impl OrtStatus {
 // before letting a record click through.
 static STATUS: Mutex<Option<OrtStatus>> = Mutex::new(None);
 
+// Serializes the find → download → load sequence. Both the startup hook
+// and a (possibly too-early) record click call `ensure_ready`; without
+// this they could double-download the runtime into the same temp file
+// or both stall in `LoadLibrary` on the same dll. Distinct from the
+// STATUS mutex, which is only held for the brief read/write of the
+// snapshot — this one is held across the whole (slow) fetch + init.
+static SETUP_LOCK: Mutex<()> = Mutex::new(());
+
 /// Process-global status. Returns a sentinel "not yet initialized"
 /// status if [`initialize`] hasn't been called — keeps callers from
 /// having to `Option::unwrap_or_else` on the path.
@@ -107,6 +116,15 @@ pub fn status() -> OrtStatus {
             searched: Vec::new(),
             error: Some("ort_setup::initialize() has not been called".to_string()),
         })
+}
+
+/// True once a setup attempt has recorded a result (success *or* a real
+/// failure) into `STATUS`. `false` means setup hasn't finished yet — and
+/// `status().error` is then just the "not called" sentinel, which must
+/// not be shown as a failure. Lets the UI tell "still setting up" apart
+/// from "tried and failed".
+pub fn has_run() -> bool {
+    STATUS.lock().ok().map(|g| g.is_some()).unwrap_or(false)
 }
 
 /// Find + load the onnxruntime dylib and commit `ort::init`. Safe to
@@ -129,6 +147,62 @@ pub fn initialize() {
     if let Ok(mut g) = STATUS.lock() {
         *g = Some(status);
     }
+}
+
+/// Make onnxruntime ready to use, driving the one-time runtime download
+/// + load *here* rather than assuming the startup hook already finished.
+///
+/// Safe to call from any thread, any number of times: the whole
+/// find/download/load sequence is serialized on `SETUP_LOCK`, so the
+/// startup worker and a record-click worker coalesce onto a single
+/// download/init and then both observe the same status. The common
+/// steady-state case (already loaded) takes the lock-free fast path.
+///
+/// `on_stage` receives coarse progress text ("Downloading…", "Loading…")
+/// for a status frame; `cancel` lets a caller bail before the blocking
+/// download starts. Returns the final [`OrtStatus`] — callers check
+/// `.initialized`.
+pub fn ensure_ready(on_stage: &dyn Fn(&str), cancel: &AtomicBool) -> OrtStatus {
+    // Fast path: already loaded — the common case once setup has run.
+    let s = status();
+    if s.initialized {
+        return s;
+    }
+    let _guard = SETUP_LOCK.lock().expect("ort_setup SETUP_LOCK poisoned");
+    // Another caller may have finished while we waited on the lock.
+    let s = status();
+    if s.initialized {
+        return s;
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return s;
+    }
+
+    // Make sure the *pinned* runtime is on disk before loading.
+    // `ensure_runtime_dylib` is version-aware: it refetches when a cached
+    // dll is the wrong onnxruntime version — exactly the stale 1.20 vs
+    // `api-22` mismatch that loads then hangs. A fast no-op once the
+    // correct version is present, so this stays cheap on relaunch.
+    on_stage("Preparing the speech engine (onnxruntime)…");
+    let noop: Box<crate::ort_install::ProgressFn> = Box::new(|_, _| {});
+    if let Err(e) = crate::ort_install::ensure_runtime_dylib(noop) {
+        let err = format!("onnxruntime download failed: {e:#}");
+        eprintln!("[ort_setup] {err}");
+        let st = OrtStatus {
+            initialized: false,
+            dylib_path: None,
+            searched: Vec::new(),
+            error: Some(err),
+        };
+        if let Ok(mut g) = STATUS.lock() {
+            *g = Some(st.clone());
+        }
+        return st;
+    }
+
+    on_stage("Loading the speech engine…");
+    initialize();
+    status()
 }
 
 fn run_init() -> (OrtStatus, String) {
@@ -174,9 +248,32 @@ fn run_init() -> (OrtStatus, String) {
         );
     };
 
-    match ort::init_from(&existing) {
-        Ok(builder) => {
-            let _ = builder.with_name("myownllm").commit();
+    // Eager-load on a watchdog thread. `ort::init_from` does the actual
+    // `LoadLibrary`/`dlopen`, which on Windows can *hang* — Defender
+    // real-time-scanning the unsigned dll, or a half-resolved dependency
+    // — rather than returning an error (the failure mode this module's
+    // header warns about). Unguarded, that wedges setup forever with the
+    // UI stuck on "Setting up…". Cap it: on timeout we leak the
+    // (uninterruptible C++ FFI) thread and report an actionable error,
+    // so the user gets a real diagnosis instead of an infinite spinner.
+    const ORT_INIT_TIMEOUT_SECS: u64 = 90;
+    eprintln!(
+        "[ort_setup] loading onnxruntime from {}…",
+        existing.display()
+    );
+    let load_path = existing.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = ort::init_from(&load_path)
+            .map(|b| {
+                let _ = b.with_name("myownllm").commit();
+            })
+            .map_err(|e| e.to_string());
+        let _ = tx.send(r);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(ORT_INIT_TIMEOUT_SECS)) {
+        Ok(Ok(())) => {
             let line = format!("onnxruntime loaded from {}", existing.display());
             (
                 OrtStatus {
@@ -188,9 +285,24 @@ fn run_init() -> (OrtStatus, String) {
                 line,
             )
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let err = format!(
-                "ort::init_from({}) failed: {e} — likely a version / arch mismatch (ort api-22 needs onnxruntime \u{2265}1.20)",
+                "ort::init_from({}) failed: {e} — likely a version / arch mismatch (ort 2.0.0-rc.12 ships bindings for onnxruntime 1.24; the runtime must match)",
+                existing.display()
+            );
+            (
+                OrtStatus {
+                    initialized: false,
+                    dylib_path: None,
+                    searched,
+                    error: Some(err.clone()),
+                },
+                err,
+            )
+        }
+        Err(_) => {
+            let err = format!(
+                "loading onnxruntime from {} timed out after {ORT_INIT_TIMEOUT_SECS}s — the file is present but the load didn't finish. On Windows this is almost always antivirus scanning the unsigned dll, or a missing Microsoft Visual C++ Redistributable. Fix: install the x64 VC++ runtime (https://aka.ms/vs/17/release/vc_redist.x64.exe) and/or add a Microsoft Defender exclusion for that folder, then relaunch.",
                 existing.display()
             );
             (

@@ -56,7 +56,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokenizers::Tokenizer;
 
-use crate::asr::{AsrBackend, AsrCaps, AsrChunkOut, AsrSegment};
+use crate::asr::{AsrBackend, AsrCaps, AsrChunkOut, AsrSegment, AsrToken};
 use crate::models::{model_dir, ModelKind};
 use crate::ort_setup;
 
@@ -231,6 +231,14 @@ impl AsrBackend for MoonshineBackend {
             multilingual: false,
             streaming: false,
             state_reset_chunks: 0,
+            // Streaming-loop geometry. Overlap + LocalAgreement removes
+            // the chunk-boundary word-severing that forced the 8 s
+            // disk-shard window, so the live window can be far shorter;
+            // 4 s still gives the encoder-decoder a whole phrase of
+            // context. 0.5 s hop ≈ two interim refreshes per second.
+            window_seconds: 4.0,
+            hop_seconds: 0.5,
+            max_context_seconds: 8.0,
         }
     }
 
@@ -529,11 +537,19 @@ impl AsrBackend for MoonshineBackend {
             return Ok(AsrChunkOut::default());
         }
 
+        let end_ms = (pcm16k_mono.len() as u64 * 1000) / 16_000;
+        // Word-level tokens for the streaming loop's LocalAgreement.
+        // Moonshine's decoder emits no per-token timing, so end times
+        // are spread uniformly across the chunk — an approximation the
+        // loop tolerates: it confirms tokens by text agreement and uses
+        // the times only to place confirmed audio on the session clock.
+        let tokens = AsrToken::words_uniform(trimmed, end_ms);
         let segment = AsrSegment {
             start_ms: 0,
-            end_ms: (pcm16k_mono.len() as u64 * 1000) / 16_000,
+            end_ms,
             text: trimmed.to_string(),
             confidence: None,
+            tokens,
         };
         Ok(AsrChunkOut {
             segments: vec![segment],

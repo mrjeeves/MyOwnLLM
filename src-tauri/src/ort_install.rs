@@ -133,18 +133,35 @@ fn upstream_url() -> Result<(String, ArchiveKind)> {
 
 /// Download the upstream onnxruntime archive and extract the dylib
 /// into `~/.myownllm/runtime/`. Returns the absolute path of the
-/// installed dylib. Re-runnable: a successful install short-circuits;
-/// a half-downloaded `.partial` is overwritten.
+/// installed dylib. Re-runnable + **version-aware**: returns immediately
+/// when the pinned version is already installed (tracked via a
+/// `.ort-version` stamp next to the dylib); a cached dll of the *wrong*
+/// version is deleted and refetched — without this, an old dll (e.g. a
+/// 1.20 from before the `api-22` pin) would load but mismatch the C ABI
+/// the `ort` crate requests (`GetApi(22)` → NULL → UB) and hang on load.
 ///
 /// `on_progress` is called periodically during the download with
 /// `(bytes_downloaded, total_bytes_or_0)`. Pass a no-op for silent
 /// installs.
 pub fn ensure_runtime_dylib(mut on_progress: Box<ProgressFn>) -> Result<PathBuf> {
     let target = target_dylib_path()?;
-    if target.exists() {
-        return Ok(target);
-    }
     let dir = runtime_dir()?;
+    let stamp = dir.join(".ort-version");
+    let want = ort_version();
+    if target.exists() {
+        // Only reuse a cached dll if it matches the pinned version.
+        let have = fs::read_to_string(&stamp)
+            .ok()
+            .map(|s| s.trim().to_string());
+        if have.as_deref() == Some(want) {
+            return Ok(target);
+        }
+        eprintln!(
+            "[ort_install] cached onnxruntime version {} != pinned {want} — refetching",
+            have.as_deref().unwrap_or("unknown")
+        );
+        let _ = fs::remove_file(&target);
+    }
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
     let (url, kind) = upstream_url()?;
@@ -225,8 +242,17 @@ pub fn ensure_runtime_dylib(mut on_progress: Box<ProgressFn>) -> Result<PathBuf>
     // human-inspectable.
     let _ = fs::remove_file(&archive_path);
 
+    // Stamp the installed version so a future `.ort-version` bump
+    // invalidates this cache automatically (self-healing on upgrade).
+    if let Err(e) = fs::write(&stamp, want) {
+        eprintln!(
+            "[ort_install] warning: couldn't write version stamp {}: {e}",
+            stamp.display()
+        );
+    }
+
     eprintln!(
-        "[ort_install] installed onnxruntime to {}",
+        "[ort_install] installed onnxruntime {want} to {}",
         extracted_to.display()
     );
     Ok(extracted_to)

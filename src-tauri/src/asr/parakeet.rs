@@ -19,7 +19,7 @@ use ort::value::Tensor;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::asr::{AsrBackend, AsrCaps, AsrChunkOut, AsrSegment};
+use crate::asr::{AsrBackend, AsrCaps, AsrChunkOut, AsrSegment, AsrToken};
 use crate::models::{model_dir, ModelKind};
 use crate::ort_setup;
 
@@ -79,6 +79,13 @@ impl AsrBackend for ParakeetBackend {
             multilingual: true,
             streaming: true,
             state_reset_chunks: 0,
+            // Streaming-loop geometry. Parakeet is cheap and fast, so
+            // the live window can be tighter than Moonshine's and the
+            // hop snappier — 2 s context, 0.3 s hop (~3 interim
+            // refreshes per second).
+            window_seconds: 2.0,
+            hop_seconds: 0.3,
+            max_context_seconds: 6.0,
         }
     }
 
@@ -274,11 +281,13 @@ impl ParakeetBackend {
             if text.trim().is_empty() {
                 return Vec::new();
             }
+            let tokens = AsrToken::words_uniform(&text, chunk_end_ms);
             return vec![AsrSegment {
                 start_ms: 0,
                 end_ms: chunk_end_ms,
                 text,
                 confidence: None,
+                tokens,
             }];
         };
 
@@ -321,6 +330,7 @@ impl ParakeetBackend {
             end_ms,
             text,
             confidence: None,
+            tokens: pieces_to_tokens(pieces, frames),
         }
     }
 }
@@ -354,6 +364,38 @@ fn stitch_pieces(pieces: &[&str]) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// Group SentencePiece pieces (parallel to their frame indices) into
+/// word-level tokens with real end times, for the streaming loop's
+/// LocalAgreement. A piece starting with the U+2581 word boundary opens
+/// a new word; the word's end time is its last piece's frame end (frame
+/// index + 1, scaled by the 80 ms stride). Word-level rather than
+/// sub-word because whole words are far more stable across the
+/// overlapping re-decodes the agreement compares.
+fn pieces_to_tokens(pieces: &[&str], frames: &[i64]) -> Vec<AsrToken> {
+    let mut out: Vec<AsrToken> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_end_ms: u64 = 0;
+    for (p, f) in pieces.iter().zip(frames.iter()) {
+        if p.is_empty() {
+            continue;
+        }
+        let end_ms = (*f as u64 + 1) * FRAME_STRIDE_MS;
+        if let Some(rest) = p.strip_prefix(WORD_BOUNDARY) {
+            if !cur.is_empty() {
+                out.push(AsrToken::new(std::mem::take(&mut cur), cur_end_ms));
+            }
+            cur.push_str(rest);
+        } else {
+            cur.push_str(p);
+        }
+        cur_end_ms = end_ms;
+    }
+    if !cur.is_empty() {
+        out.push(AsrToken::new(cur, cur_end_ms));
+    }
+    out
 }
 
 #[cfg(test)]

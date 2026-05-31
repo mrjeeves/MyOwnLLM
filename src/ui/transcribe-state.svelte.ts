@@ -12,6 +12,14 @@ export interface EmittedSegment {
   speaker?: number;
   overlap?: boolean;
   provisional?: boolean;
+  /** Stable per-session id for the streaming live path: the UI replaces
+   *  the segment in place as it refines (interim → final). 0/absent on
+   *  the disk-shard path, which has no interim concept. */
+  seg_id?: number;
+  /** True while the streaming loop is still refining this segment's text
+   *  (the live "typing" caption); false/absent once finalized on a
+   *  speech pause, and always absent on the disk-shard path. */
+  partial?: boolean;
 }
 
 /** Frame shape from the Rust side. Mirror of
@@ -106,6 +114,12 @@ export const transcribeUi = $state({
    *  that only need the flat string (notably the Talking Points loop
    *  in chat-slot.svelte.ts). */
   liveDelta: "" as string,
+  /** The single in-flight interim caption for the streaming live path:
+   *  a `partial` segment that refines hop-to-hop, rendered distinctly
+   *  (tentative) but never persisted. Cleared when its utterance
+   *  finalizes (a non-partial segment with the same `seg_id` arrives) or
+   *  on reset. `null` on the disk-shard path, which has no interim. */
+  interimSegment: null as EmittedSegment | null,
   /** True for one tick after every frame so consumers can $effect on
    *  it without having to inspect string length changes that race
    *  against same-text reappends. */
@@ -152,6 +166,7 @@ function resetState() {
   transcribeUi.chunkSeconds = 1.0;
   transcribeUi.liveSegments = [];
   transcribeUi.liveDelta = "";
+  transcribeUi.interimSegment = null;
   transcribeUi.status = "";
   transcribeUi.uploadProgress = null;
 }
@@ -162,14 +177,34 @@ async function attachListener(streamId: string) {
     (e) => {
       const f = e.payload;
       if (Array.isArray(f.segments) && f.segments.length > 0) {
-        transcribeUi.liveSegments = [...transcribeUi.liveSegments, ...f.segments];
-        // Maintain the flat string projection for legacy consumers
-        // (Talking Points). Each segment contributes its text with a
-        // trailing space; whitespace gets collapsed downstream.
-        transcribeUi.liveDelta =
-          transcribeUi.liveDelta +
-          f.segments.map((s) => s.text).join(" ") +
-          " ";
+        // Split interim (partial, the streaming live caption) from final
+        // segments. A partial refines one in-flight line in place and is
+        // never appended or persisted; finals append to the transcript
+        // buffer exactly like the disk-shard path always has.
+        const finals: EmittedSegment[] = [];
+        for (const s of f.segments) {
+          if (s.partial) {
+            transcribeUi.interimSegment = s;
+          } else {
+            finals.push(s);
+            // A finalized streaming segment clears its interim line.
+            if (
+              transcribeUi.interimSegment &&
+              s.seg_id &&
+              transcribeUi.interimSegment.seg_id === s.seg_id
+            ) {
+              transcribeUi.interimSegment = null;
+            }
+          }
+        }
+        if (finals.length > 0) {
+          transcribeUi.liveSegments = [...transcribeUi.liveSegments, ...finals];
+          // Flat string projection for legacy consumers (Talking
+          // Points) — confirmed text only, so it doesn't churn on the
+          // interim refinements.
+          transcribeUi.liveDelta =
+            transcribeUi.liveDelta + finals.map((s) => s.text).join(" ") + " ";
+        }
         transcribeUi.framePulse++;
       }
       if (typeof f.pending_chunks === "number") {

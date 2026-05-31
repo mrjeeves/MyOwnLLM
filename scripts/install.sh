@@ -148,7 +148,7 @@ _runtime_dep_failure() {
   err "  $3"
 }
 
-# MyOwnLLM transcription requires onnxruntime ≥1.20 (ort 2.0.0-rc.12 +
+# MyOwnLLM transcription requires onnxruntime ≥1.24 (ort 2.0.0-rc.12 +
 # api-22). It's not bundled in the release tarball — keeps the artifact
 # lean and lets us ship a single binary per platform — so we fetch
 # Microsoft's prebuilt and drop the dylib next to the binary at install
@@ -171,7 +171,7 @@ install_onnxruntime() {
     ort_version="$(tr -d '[:space:]' < .ort-version)"
   fi
   if [ -z "$ort_version" ]; then
-    ort_version="1.20.1"
+    ort_version="1.24.2"
     warn "couldn't read .ort-version; falling back to ${ort_version}"
   fi
 
