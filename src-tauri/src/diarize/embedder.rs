@@ -168,6 +168,18 @@ impl Embedder {
         self.dim
     }
 
+    /// The embedder's fixed output dimensionality, known from the model
+    /// identity before any inference has run. Used to seed the speaker
+    /// registry at warm-up (the live `dim()` is `None` until the first
+    /// embed). Falls back to the observed `dim` for unknown embedders.
+    pub fn nominal_dim(&self) -> Option<usize> {
+        match self.model_name.as_str() {
+            "wespeaker-r34" => Some(256),
+            "campp-small" => Some(192),
+            _ => self.dim,
+        }
+    }
+
     /// Embed one voiced slice. Returns an L2-normalized vector, or
     /// an empty vector when the slice is too short to embed
     /// usefully. The clusterer treats an empty embedding as
