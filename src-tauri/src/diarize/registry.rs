@@ -260,7 +260,9 @@ impl SpeakerRegistry {
 /// caller's job via [`save`] (kept separate so a read-only query doesn't
 /// rewrite the file).
 pub fn with<R>(f: impl FnOnce(&mut SpeakerRegistry) -> R) -> Result<R> {
-    let mut guard = REGISTRY.lock().map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
+    let mut guard = REGISTRY
+        .lock()
+        .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
     if guard.is_none() {
         *guard = Some(SpeakerRegistry::from_doc(load_doc()));
     }
@@ -269,7 +271,9 @@ pub fn with<R>(f: impl FnOnce(&mut SpeakerRegistry) -> R) -> Result<R> {
 
 /// Persist the current in-memory registry to disk atomically.
 pub fn save() -> Result<()> {
-    let guard = REGISTRY.lock().map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
+    let guard = REGISTRY
+        .lock()
+        .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
     if let Some(reg) = guard.as_ref() {
         save_doc(&reg.doc)?;
     }
@@ -355,7 +359,10 @@ mod tests {
         let mut reg = empty();
         let created = reg.commit_session(
             3,
-            &[snap(0, vec![1.0, 0.0, 0.0], 5), snap(1, vec![0.0, 1.0, 0.0], 3)],
+            &[
+                snap(0, vec![1.0, 0.0, 0.0], 5),
+                snap(1, vec![0.0, 1.0, 0.0], 3),
+            ],
         );
         assert_eq!(created, 2);
         assert_eq!(reg.profiles().len(), 2);
@@ -379,7 +386,11 @@ mod tests {
         let created = reg.commit_session(3, &[snap(7, norm(vec![0.97, 0.05, 0.0]), 4)]);
         assert_eq!(created, 0, "close voice must merge, not duplicate");
         assert_eq!(reg.profiles().len(), 1);
-        assert_eq!(reg.profiles()[0].id, persisted_id, "id is stable across sessions");
+        assert_eq!(
+            reg.profiles()[0].id,
+            persisted_id,
+            "id is stable across sessions"
+        );
         assert_eq!(reg.profiles()[0].total_count, 9, "counts accumulate");
     }
 
@@ -409,7 +420,10 @@ mod tests {
         let mut c = norm(vec![1.0, 0.0, 0.0]);
         ema_merge(&mut c, &norm(vec![0.0, 1.0, 0.0]), EMA_ALPHA);
         // Moved toward the new direction but not all the way.
-        assert!(c[1] > 0.0 && c[1] < c[0], "EMA should lean toward old centroid");
+        assert!(
+            c[1] > 0.0 && c[1] < c[0],
+            "EMA should lean toward old centroid"
+        );
         let mag: f32 = c.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((mag - 1.0).abs() < 1e-5, "EMA centroid must stay unit-norm");
     }
