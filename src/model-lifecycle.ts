@@ -187,6 +187,33 @@ export async function setModeOverride(mode: Mode, modelTag: string | null): Prom
   await saveConfig(config);
 }
 
+/** True when running real-time transcription and keeping the chat model
+ *  resident would fight over the same memory pool — so the chat model must
+ *  be evicted before, and kept out during, a heavyweight Record/Upload
+ *  session.
+ *
+ *  The conflict is about *separate* headroom for the two models, not raw
+ *  RAM:
+ *   - A discrete GPU (nvidia/amd) with ≥ 8 GB VRAM holds the chat model
+ *     off system RAM, leaving RAM free for the ASR + diarize pipeline. No
+ *     conflict, whatever the RAM size — an "8 GB RAM + 8 GB GPU" box is
+ *     fine.
+ *   - Unified-memory hosts (Apple), CPU-only boxes, and small-VRAM GPUs
+ *     share one pool, so an 8 GB-class machine can't hold both at once.
+ *
+ *  Lightweight composer dictation (no diarize, no streaming beam) is cheap
+ *  and intentionally does NOT consult this — it stays available regardless. */
+export function isTranscriptionMemoryTight(hw: HardwareProfile | null): boolean {
+  if (!hw) return false;
+  const roomyDiscreteGpu =
+    (hw.gpu_type === "nvidia" || hw.gpu_type === "amd") &&
+    (hw.vram_gb ?? 0) >= 8;
+  if (roomyDiscreteGpu) return false;
+  // Unified / CPU-only / small-VRAM: the chat model and ASR share ~8 GB.
+  // (A 8 GB Mac reports ram_gb ≈ 8.0; an 8 GB Linux box ≈ 7.7 — both caught.)
+  return hw.ram_gb <= 8;
+}
+
 /** Force a model into "evict on next runCleanup" by backdating its last_recommended. */
 export async function markEvictedNow(tag: string): Promise<void> {
   const cache = await readStatusCache();

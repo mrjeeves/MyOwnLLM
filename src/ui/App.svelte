@@ -1147,6 +1147,8 @@
           {newChatCounter}
           {textModelMissing}
           textModel={pendingTextModel}
+          asrModel={pendingAsrModel}
+          asrRuntime={pendingAsrRuntime}
           onTextDownloaded={onTextDownloaded}
           onModeChange={onModeChange}
           onProviderChange={onProviderChange}

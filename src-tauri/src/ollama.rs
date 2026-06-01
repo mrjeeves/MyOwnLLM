@@ -734,6 +734,40 @@ pub async fn warm(model: &str) -> Result<()> {
     Ok(())
 }
 
+/// Immediately evict `model` from Ollama's memory. A `/api/generate` call
+/// with `keep_alive: 0` and no prompt is Ollama's documented "unload now"
+/// signal — it doesn't generate, it just drops the resident weights (and is
+/// a no-op if the model wasn't loaded). Used on memory-tight hosts to free
+/// RAM for the real-time transcription pipeline before a recording starts,
+/// since the chat LLM and the ASR + diarize models can't coexist there.
+pub async fn unload(model: &str) -> Result<()> {
+    let body = serde_json::json!({
+        "model": model,
+        "keep_alive": 0,
+    })
+    .to_string();
+    let out = quiet_tokio_command("curl")
+        .args([
+            "-sf",
+            "--max-time",
+            "30",
+            "-X",
+            "POST",
+            "http://127.0.0.1:11434/api/generate",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &body,
+        ])
+        .output()
+        .await
+        .context("curl unload")?;
+    if !out.status.success() {
+        return Err(anyhow!("unload call failed for {model}"));
+    }
+    Ok(())
+}
+
 pub async fn stop() -> Result<()> {
     let mut guard = process_lock().lock().await;
     if let Some(mut child) = guard.take() {

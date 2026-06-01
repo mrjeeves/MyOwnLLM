@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { tick } from "svelte";
+  import { tick, onDestroy, untrack } from "svelte";
   import TopBar from "./TopBar.svelte";
   import TextBar from "./TextBar.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
@@ -23,11 +23,18 @@
     releaseChat,
   } from "./chat-slot.svelte";
   import { transcribeUi } from "./transcribe-state.svelte";
+  import {
+    dictation,
+    startDictation,
+    stopDictation,
+    isDictating,
+  } from "./dictation.svelte";
   import { stickToBottom } from "./stick-to-bottom";
   import { renderMarkdown } from "./markdown";
   import { meshClient } from "../mesh-daemon.svelte";
   import { resolvePeerLlm } from "../mesh-capabilities";
   import { routingPins, setTextPin } from "./routing-pins.svelte";
+  import { isTranscriptionMemoryTight } from "../model-lifecycle";
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
   import { runAgent, type AgentEvent } from "../agent-loop";
   import {
@@ -51,6 +58,8 @@
     newChatCounter,
     textModelMissing,
     textModel,
+    asrModel = "",
+    asrRuntime = "",
     onTextDownloaded,
     onModeChange,
     onProviderChange,
@@ -89,6 +98,14 @@
     /** Resolved Ollama tag for the active family's text tier (e.g.
      *  "gemma3:4b"). Empty for non-Ollama text picks. */
     textModel: string;
+    /** Resolved ASR model name for the active family's transcribe tier
+     *  (e.g. "moonshine-small-q8"), powering the composer's dictation
+     *  mic. Empty when the family has no transcribe ladder — the mic is
+     *  hidden in that case. */
+    asrModel?: string;
+    /** ASR runtime that pairs with `asrModel` (e.g. "moonshine",
+     *  "parakeet"). Empty hides the mic. */
+    asrRuntime?: string;
     /** Notify App that a download finished so it can re-check the
      *  missing flag and dismiss the overlay. */
     onTextDownloaded: () => void;
@@ -117,6 +134,29 @@
   let messages = $state<Message[]>([]);
   let input = $state("");
   let streaming = $state(false);
+
+  // --- Dictation (mic → composer) -------------------------------------
+  // The textarea element, needed to read the caret for insertion and to
+  // keep it pinned to the growing dictation tail.
+  let chatTextarea = $state<HTMLTextAreaElement | null>(null);
+  // Anchor model for live dictation: recognized text occupies the region
+  // `[dictBase, dictBase + dictLen)` in `input`. `dictBase` is where the
+  // current utterance begins (the caret when speech started, advanced as
+  // phrases finalize); `dictLen` is the length of the in-flight interim
+  // tail we replace on each frame. Both reset when dictation isn't running.
+  let dictBase = 0;
+  let dictLen = 0;
+
+  /** On memory-tight hosts a live transcribe session keeps the ASR (and
+   *  diarize) models resident; cold-loading the chat model on top of that
+   *  OOMs and stalls the transcription, so we block the chat send until the
+   *  recording stops. "Tight" accounts for a discrete GPU's VRAM (see
+   *  `isTranscriptionMemoryTight`), so an 8 GB-RAM box with a roomy GPU is
+   *  not blocked. This gates the heavyweight Record session only — the
+   *  composer's own mic is lightweight dictation and never trips it. */
+  const recordingBlocksChat = $derived(
+    transcribeUi.active && isTranscriptionMemoryTight(hardware),
+  );
 
   /** Cold-start UX: Ollama loads a model's weights into RAM/VRAM on
    *  the first request after it was evicted (or never loaded this
@@ -348,6 +388,10 @@
   $effect(() => {
     const remote = remoteOpen;
     const id = conversationId;
+    // Switching the open conversation swaps the composer out from under any
+    // live dictation — release the mic so it doesn't keep typing into a
+    // conversation the user just navigated away from.
+    untrack(resetDictation);
     if (remote) {
       let cancelled = false;
       activeConversation = null;
@@ -414,6 +458,7 @@
       _seenInitialNewChat = true;
       return;
     }
+    resetDictation();
     activeConversation = null;
     messages = [];
     input = "";
@@ -700,12 +745,24 @@
   }
 
   function send() {
+    // A live dictation is about to lose its anchor (input gets cleared and
+    // refilled). Commit what's in the box and release the mic first.
+    if (isDictating()) resetDictation();
     const text = input.trim();
     // Allow sending pure-attachment messages (e.g. "here's a JSON
     // file" with no typed prompt) — useful for the "import this for
     // me" flow the user wants.
     const hasContent = text || pendingAttachments.length > 0;
     if (!hasContent || streaming) return;
+    // On a memory-tight host, a running transcription session owns the ASR
+    // models; loading the chat model on top would stall it. Refuse the send
+    // and point the user at the fix rather than silently OOMing the machine.
+    if (recordingBlocksChat) {
+      routeBlockedReason =
+        "A recording is in progress. This machine can't run live transcription " +
+        "and the chat model at once — stop the recording to free memory, then send.";
+      return;
+    }
     // Refuse the send when the pinned peer is offline — surface why
     // and let the user decide rather than silently fall back to local
     // and route their message to a model they didn't pick.
@@ -743,6 +800,8 @@
   async function doSend(text: string, images: string[] = []) {
     if (streaming) return;
     input = "";
+    dictBase = 0;
+    dictLen = 0;
     const wasFreshChat = messages.length === 0;
 
     // Host info gates which shell + system prompt the agent loop
@@ -1035,6 +1094,102 @@
       send();
     }
   }
+
+  // --- Dictation wiring ------------------------------------------------
+
+  /** Prefix a single separating space when the recognized text would butt
+   *  up against a non-space character already in the box. ASR segments
+   *  arrive without surrounding spaces, so we own the spacing. */
+  function dictSep(pos: number, text: string): string {
+    const t = text.replace(/^\s+/, "");
+    if (!t) return "";
+    const needsSpace = pos > 0 && !/\s/.test(input.charAt(pos - 1));
+    return (needsSpace ? " " : "") + t;
+  }
+
+  /** Fold an ASR frame into the textarea. `committed` finalizes the
+   *  current utterance (becomes permanent, advancing the anchor);
+   *  `interim` is the live tail we redraw in place each frame. */
+  function applyDictation(committed: string, interim: string) {
+    // The user may have edited `input` between frames — keep anchors valid.
+    if (dictBase > input.length) dictBase = input.length;
+    let regionEnd = Math.min(dictBase + dictLen, input.length);
+
+    if (committed) {
+      const finalText = dictSep(dictBase, committed);
+      input = input.slice(0, dictBase) + finalText + input.slice(regionEnd);
+      dictBase += finalText.length;
+      dictLen = 0;
+      regionEnd = dictBase;
+    }
+
+    const tail = dictSep(dictBase, interim);
+    input = input.slice(0, dictBase) + tail + input.slice(regionEnd);
+    dictLen = tail.length;
+
+    const caret = dictBase + dictLen;
+    void tick().then(() => {
+      const el = chatTextarea;
+      if (!el) return;
+      try {
+        el.selectionStart = el.selectionEnd = caret;
+      } catch {
+        // Some webviews throw if the element isn't focusable yet; the
+        // text still lands, only the caret nudge is skipped.
+      }
+      el.scrollTop = el.scrollHeight;
+    });
+  }
+
+  /** User typed/pasted while the mic is live. Re-anchor to the new caret
+   *  and drop interim tracking so the next recognized phrase lands at the
+   *  caret instead of overwriting what they just edited. Fires only on
+   *  real user input — programmatic `input = …` doesn't dispatch it. */
+  function onComposerInput() {
+    if (!isDictating()) return;
+    const el = chatTextarea;
+    dictBase = el ? el.selectionStart : input.length;
+    dictLen = 0;
+  }
+
+  /** Mic toggle. First click anchors at the caret and starts listening;
+   *  a second click stops instantly and leaves the text for editing. */
+  async function toggleMic() {
+    if (isDictating()) {
+      await stopDictation();
+      return;
+    }
+    const el = chatTextarea;
+    el?.focus();
+    dictBase = el ? el.selectionStart : input.length;
+    dictLen = 0;
+    await startDictation({
+      runtime: asrRuntime,
+      model: asrModel,
+      onRender: applyDictation,
+    });
+  }
+
+  /** Stop the mic and clear anchors. Called whenever the composer's text
+   *  is about to change out from under dictation (send, new chat, switch
+   *  conversation, unmount). */
+  function resetDictation() {
+    if (isDictating()) void stopDictation();
+    dictBase = 0;
+    dictLen = 0;
+  }
+
+  const micTitle = $derived(
+    dictation.starting
+      ? "Starting dictation…"
+      : dictation.active
+        ? "Listening — click to stop and edit"
+        : "Dictate — speak to type into the message",
+  );
+
+  onDestroy(() => {
+    if (isDictating()) void stopDictation();
+  });
 
   async function handleModeChange(mode: Mode) {
     // Defensive: App also gates this while a chat is streaming so the slot's
@@ -1395,6 +1550,12 @@
         Pinned peer is offline — pick another host or 'this device' in the bar
         above to resume.
       </div>
+    {:else if recordingBlocksChat}
+      <div class="route-blocked" role="status">
+        A recording is in progress. This machine can't run live transcription and
+        the chat model at the same time — stop the recording (top bar) to free
+        memory, then send.
+      </div>
     {:else if routeBlockedReason}
       <div class="route-blocked" role="status">{routeBlockedReason}</div>
     {/if}
@@ -1429,6 +1590,21 @@
         {/if}
       </div>
     {/if}
+    {#if dictation.error}
+      <div class="dictate-status error" role="alert">
+        {dictation.error}
+        <button class="dictate-dismiss" onclick={() => (dictation.error = "")} aria-label="Dismiss">✕</button>
+      </div>
+    {:else if dictation.active || dictation.starting}
+      <div class="dictate-status" role="status" aria-live="polite">
+        <span class="dictate-dot"></span>
+        {dictation.status
+          ? dictation.status
+          : dictation.starting
+            ? "Starting dictation…"
+            : "Listening — speak now. Click the mic again to stop and edit."}
+      </div>
+    {/if}
     <div class="input-row">
       <button
         class="attach-btn"
@@ -1452,8 +1628,10 @@
         onchange={onChatFilesPicked}
       />
       <textarea
+        bind:this={chatTextarea}
         bind:value={input}
         onkeydown={onKeydown}
+        oninput={onComposerInput}
         placeholder={textModelMissing && !routeViaDevicePubkey ? "Download the text model to start chatting…" : "Message…"}
         rows="1"
         disabled={textModelMissing && !routeViaDevicePubkey}
@@ -1461,10 +1639,41 @@
       {#if streaming}
         <button class="stop" onclick={stop} title="Stop generating">Stop</button>
       {:else}
+        {#if asrRuntime && asrModel}
+          <!-- Dictation mic: a toggle. Click to start live speech-to-text
+               into the message at the caret; the button shifts to a calm
+               "listening" state so it reads as "click again to stop and
+               edit". Hidden when the family has no transcribe tier, and
+               disabled while a heavyweight Record session owns the mic. -->
+          <button
+            class="mic-btn"
+            class:recording={dictation.active}
+            class:working={dictation.starting}
+            onclick={toggleMic}
+            disabled={dictation.starting || transcribeUi.active || (textModelMissing && !routeViaDevicePubkey)}
+            title={transcribeUi.active ? "The mic is busy with a transcription session" : micTitle}
+            aria-label={dictation.active ? "Stop dictation" : "Start dictation"}
+            aria-pressed={dictation.active}
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"
+              />
+            </svg>
+          </button>
+        {/if}
         <button
+          class="send-btn"
           onclick={send}
-          disabled={(!input.trim() && pendingAttachments.length === 0) || (textModelMissing && !routeViaDevicePubkey)}
-        >Send</button>
+          disabled={(!input.trim() && pendingAttachments.length === 0) || (textModelMissing && !routeViaDevicePubkey) || recordingBlocksChat}
+          title="Send message"
+          aria-label="Send message"
+        >
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <path fill="currentColor" d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2 .01 7z" />
+          </svg>
+        </button>
       {/if}
     </div>
   {/if}
@@ -2042,6 +2251,104 @@
   button:disabled { opacity: .4; cursor: default; }
   button.stop { background: #b04444; }
   button.stop:hover { background: #c25050; }
+
+  /* Composer action buttons. Square icon footprint matching .attach-btn's
+     width; class selectors out-specify the generic `button` rules above so
+     they don't inherit the purple pill padding/background. */
+  .mic-btn,
+  .send-btn {
+    flex-shrink: 0;
+    width: 40px;
+    padding: 0;
+    border-radius: 8px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 0;
+  }
+  /* Send keeps the primary-accent fill (paperplane icon) so it stays the
+     obvious commit affordance next to the neutral mic. */
+  .send-btn {
+    background: #6e6ef7;
+    color: #fff;
+    border: 1px solid transparent;
+  }
+  .send-btn:hover:not(:disabled) { background: #5a5ae0; }
+  .send-btn:disabled { opacity: .4; cursor: default; }
+  /* Mic is neutral at rest like the + button. */
+  .mic-btn {
+    background: #1a1a1a;
+    color: #9a9a9a;
+    border: 1px solid #2a2a2a;
+    transition: background .12s, color .12s, border-color .12s, box-shadow .12s;
+  }
+  .mic-btn:hover:not(:disabled) {
+    background: #232323;
+    color: #cdeaff;
+    border-color: #3a3a55;
+  }
+  .mic-btn:disabled { opacity: .4; cursor: default; }
+  .mic-btn.working { color: #cdeaff; border-color: #3a3a55; }
+  /* Listening: a calm, muted "live" tint (not an alarming red) with a slow
+     pulse — enough to read as "active, click again to stop", not enough to
+     shout. */
+  .mic-btn.recording {
+    background: #2a1a1d;
+    color: #ec9a9a;
+    border-color: #5a3236;
+    animation: mic-pulse 2s ease-in-out infinite;
+  }
+  .mic-btn.recording:hover:not(:disabled) {
+    background: #341f23;
+    color: #f4b4b4;
+    border-color: #6e3c40;
+  }
+  @keyframes mic-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(220, 90, 90, 0); }
+    50% { box-shadow: 0 0 0 3px rgba(220, 90, 90, .16); }
+  }
+
+  /* Live-dictation subtitle above the input row. Mirrors the muted-accent
+     palette of the transcribe chrome so it reads as "speech, not error",
+     and shares the route-blocked banner's footprint. */
+  .dictate-status {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    padding: .4rem .85rem;
+    font-size: .75rem;
+    line-height: 1.4;
+    color: #e0b9b9;
+    background: #1c1214;
+    border-top: 1px solid #3a2226;
+  }
+  .dictate-status.error {
+    color: #f0c47a;
+    background: #2a1f0e;
+    border-top-color: #5a4220;
+  }
+  .dictate-status .dictate-dot {
+    flex-shrink: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #e06464;
+    box-shadow: 0 0 8px #e06464;
+    animation: blink 1.4s ease-in-out infinite;
+  }
+  .dictate-dismiss {
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: .8rem;
+    padding: 0 .25rem;
+    opacity: .75;
+    font-weight: 400;
+  }
+  .dictate-dismiss:hover:not(:disabled) { opacity: 1; background: none; }
 
   .tp-takeover {
     flex: 1;
