@@ -39,7 +39,7 @@ interprocess = { version = "2", features = ["tokio"] }
 # workspace dep); matching it here keeps the lockfile from picking up a
 # second sync-primitives crate.
 parking_lot = "0.12"
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.7", features = ["macros", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 hyper = "1"

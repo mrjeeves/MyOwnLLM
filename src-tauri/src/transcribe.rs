@@ -978,6 +978,28 @@ pub fn start_remote_session(
     sample_rate: u32,
     window: WebviewWindow,
 ) -> Result<()> {
+    start_remote_session_with_sink(
+        stream_id,
+        runtime,
+        model_name,
+        diarize_model,
+        sample_rate,
+        Arc::new(window),
+    )
+}
+
+/// As [`start_remote_session`] but driven by an arbitrary [`FrameSink`] rather
+/// than a Tauri window — so headless callers (the `serve` WebSocket streaming
+/// route) can run the same live, model-warm streaming ASR and forward its
+/// interim→final caption frames wherever they like.
+pub fn start_remote_session_with_sink(
+    stream_id: String,
+    runtime: String,
+    model_name: String,
+    diarize_model: Option<String>,
+    sample_rate: u32,
+    sink: Arc<dyn FrameSink>,
+) -> Result<()> {
     if sessions().contains_key(&stream_id) {
         return Err(anyhow!("transcription {stream_id} is already running"));
     }
@@ -1023,7 +1045,6 @@ pub fn start_remote_session(
     let runtime_for_thread = runtime.clone();
     let model_for_thread = model_name.clone();
     let diarize_for_thread = diarize_model.clone();
-    let sink: Arc<dyn FrameSink> = Arc::new(window);
     thread::spawn(move || {
         // Distinct event channel name from the local flow so a
         // mesh-served session running alongside a local user

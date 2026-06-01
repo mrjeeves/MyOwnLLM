@@ -10,6 +10,7 @@
 
 use anyhow::{anyhow, Result};
 use axum::body::Body;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response, Sse};
@@ -17,7 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
@@ -29,6 +30,8 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::api_models::{
     ChatCompletionRequest, CompletionRequest, EmbeddingsRequest, ModelList, ModelObject,
 };
+use crate::frame_sink::FrameSink;
+use crate::transcribe::TranscribeFrame;
 
 const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 
@@ -75,6 +78,7 @@ pub async fn serve(
         .route("/v1/myownllm/preload", post(api_preload))
         .route("/v1/myownllm/status", get(api_status))
         .route("/v1/audio/transcriptions", post(transcriptions))
+        .route("/v1/audio/stream", get(audio_stream_ws))
         .with_state(state.clone());
 
     if cors_all {
@@ -550,6 +554,163 @@ async fn transcriptions(
             e.to_string(),
         ),
     }
+}
+
+/// `GET /v1/audio/stream` (WebSocket) — **live** streaming transcription.
+///
+/// `/v1/audio/transcriptions` rebuilds the model per request and returns once;
+/// this drives the same real-time pipeline the desktop app uses
+/// (`start_remote_session` → `run_streaming_loop`: VAD + LocalAgreement-2),
+/// keeping the model warm for the whole connection and emitting **interim**
+/// captions as the user speaks plus a **final** segment per utterance — so a
+/// client like Myo gets true live dictation + full-duplex (it can keep
+/// streaming, and read finals, even while replying).
+///
+/// Protocol: the client streams **binary** frames of 16 kHz mono **i16 LE PCM**;
+/// a text `"end"` or a socket close ends the stream. The server sends back JSON
+/// `TranscribeFrame`s — each `segments[].partial` flags interim vs final.
+async fn audio_stream_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+    ws.on_upgrade(handle_audio_stream)
+}
+
+/// The live stream's wire sample rate — 16 kHz mono, the ASR backends' training
+/// rate (the client resamples before sending).
+const TRANSCRIBE_WS_SAMPLE_RATE: u32 = 16_000;
+
+async fn handle_audio_stream(socket: WebSocket) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // onnxruntime must be loaded before the backend builds (idempotent; the
+    // first call may download the dylib).
+    let ort = tokio::task::spawn_blocking(|| {
+        let never = std::sync::atomic::AtomicBool::new(false);
+        crate::ort_setup::ensure_ready(&|s| eprintln!("[asr-ws] ort: {s}"), &never)
+    })
+    .await;
+    if !matches!(&ort, Ok(s) if s.initialized) {
+        let _ = ws_tx
+            .send(Message::Text(
+                json!({"error": "speech engine (onnxruntime) not ready"}).to_string(),
+            ))
+            .await;
+        return;
+    }
+
+    // Resolve + ensure the transcribe model is on disk.
+    let (model, runtime) = match crate::resolver::resolve_pair("transcribe").await {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = ws_tx
+                .send(Message::Text(
+                    json!({ "error": format!("resolve failed: {e}") }).to_string(),
+                ))
+                .await;
+            return;
+        }
+    };
+    if !matches!(
+        crate::models::fetch_model_quiet(&model, crate::models::ModelKind::Asr).await,
+        Ok(true)
+    ) {
+        let _ = ws_tx
+            .send(Message::Text(
+                json!({ "error": format!("ASR model '{model}' unavailable") }).to_string(),
+            ))
+            .await;
+        return;
+    }
+
+    // Start a warm, live streaming session; caption frames land on a channel
+    // we pump back out over the socket.
+    let stream_id = format!(
+        "ws-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<TranscribeFrame>();
+    let sink: Arc<dyn FrameSink> = Arc::new(WsSink { tx: frame_tx });
+    eprintln!("[asr-ws] stream {stream_id}: runtime={runtime} model={model}");
+    if let Err(e) = crate::transcribe::start_remote_session_with_sink(
+        stream_id.clone(),
+        runtime,
+        model,
+        None, // diarization off for the live dictation surface
+        TRANSCRIBE_WS_SAMPLE_RATE,
+        sink,
+    ) {
+        let _ = ws_tx
+            .send(Message::Text(
+                json!({ "error": format!("could not start session: {e:#}") }).to_string(),
+            ))
+            .await;
+        return;
+    }
+
+    // Forward caption frames → socket until the session emits its final frame.
+    let forward = tokio::spawn(async move {
+        while let Some(frame) = frame_rx.recv().await {
+            let is_final = frame.is_final;
+            let payload = serde_json::to_string(&frame).unwrap_or_else(|_| "{}".into());
+            if ws_tx.send(Message::Text(payload)).await.is_err() {
+                break;
+            }
+            if is_final {
+                let _ = ws_tx.send(Message::Close(None)).await;
+                break;
+            }
+        }
+    });
+
+    // Pump incoming audio → the session until the client ends or disconnects.
+    while let Some(Ok(msg)) = ws_rx.next().await {
+        match msg {
+            Message::Binary(bytes) => {
+                let samples = pcm_i16le_to_f32(&bytes);
+                if !samples.is_empty() {
+                    let _ = crate::transcribe::feed_remote_audio(&stream_id, samples, false);
+                }
+            }
+            Message::Text(t) if t.trim() == "end" => break,
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    // Client gone or ended → tear the session down; the final frame flushes,
+    // then the forward task closes the socket.
+    crate::transcribe::end_remote_audio(&stream_id);
+    let _ = forward.await;
+    eprintln!("[asr-ws] stream {stream_id}: closed");
+}
+
+/// A [`FrameSink`] that forwards the streaming pipeline's caption frames onto a
+/// channel the WebSocket handler drains.
+struct WsSink {
+    tx: tokio::sync::mpsc::UnboundedSender<TranscribeFrame>,
+}
+
+impl FrameSink for WsSink {
+    fn emit_frame(&self, _event: &str, frame: TranscribeFrame) {
+        let _ = self.tx.send(frame);
+    }
+}
+
+/// Decode interleaved 16-bit little-endian PCM into mono f32 in [-1, 1].
+fn pcm_i16le_to_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
