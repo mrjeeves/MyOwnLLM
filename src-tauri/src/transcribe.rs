@@ -1157,17 +1157,30 @@ fn build_backends(
     // here, but on hardware where one of those sub-loads stalls the
     // user sees the same generic message for minutes and can't tell
     // whether anything is wrong.
+    let t_asr = std::time::Instant::now();
     let mut asr = asr::make_backend(runtime, model_name)?;
     asr.warm_up(on_stage, cancel)?;
     let caps = asr.caps();
+    perf_log(&format!(
+        "[perf] ASR backend ready: runtime={runtime} model={model_name} warm_up={:.0}ms \
+         (hop={:.2}s window<={:.1}s)",
+        t_asr.elapsed().as_secs_f64() * 1000.0,
+        caps.hop_seconds,
+        caps.max_context_seconds,
+    ));
 
     if cancel.load(Ordering::Relaxed) {
         return Err(anyhow!("ASR warm-up cancelled"));
     }
 
     let diarize = if let Some(name) = diarize_composite {
+        let t_dia = std::time::Instant::now();
         let mut d = diarize::make_backend("pyannote-diarize", name)?;
         d.warm_up(on_stage, cancel)?;
+        perf_log(&format!(
+            "[perf] diarize backend ready: {name} warm_up={:.0}ms",
+            t_dia.elapsed().as_secs_f64() * 1000.0
+        ));
         Some(d)
     } else {
         None
@@ -2202,6 +2215,163 @@ impl HopGate {
     }
 }
 
+/// Write one perf line to stderr AND append it to `~/.myownllm/perf.log`,
+/// so the numbers can be ferried back by attaching a single file instead
+/// of scraping terminal scrollback. Best-effort: a file error just falls
+/// back to stderr only. Each line is timestamped (seconds since the unix
+/// epoch) so separate sessions are distinguishable.
+fn perf_log(line: &str) {
+    eprintln!("{line}");
+    if let Ok(dir) = crate::myownllm_dir() {
+        use std::io::Write;
+        let path = dir.join("perf.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(f, "{ts} {line}");
+        }
+    }
+}
+
+/// Per-stage timing for the live decode loop, so we can see exactly where
+/// wall time goes vs. realtime audio. Accumulates totals + counts + worst
+/// case for each stage and prints a `[perf]` summary every few seconds —
+/// grep `[perf]` (or read ~/.myownllm/perf.log) to ferry the numbers back.
+/// Cheap: a few adds per hop.
+#[derive(Default)]
+struct StageStat {
+    total: Duration,
+    count: u64,
+    max: Duration,
+}
+
+impl StageStat {
+    fn record(&mut self, d: Duration) {
+        self.total += d;
+        self.count += 1;
+        if d > self.max {
+            self.max = d;
+        }
+    }
+    /// Mean milliseconds, or 0 when never run.
+    fn mean_ms(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.total.as_secs_f64() * 1000.0 / self.count as f64
+        }
+    }
+    fn max_ms(&self) -> f64 {
+        self.max.as_secs_f64() * 1000.0
+    }
+}
+
+struct PerfTracker {
+    enabled: bool,
+    last_report: std::time::Instant,
+    report_every: Duration,
+    // Stages.
+    vad: StageStat,
+    asr_chunk: StageStat,
+    beam: StageStat,
+    diarize: StageStat,
+    // Realtime accounting.
+    audio_secs: f64, // seconds of audio actually processed (decoded hops)
+    speechy_hops: u64,
+    silent_hops: u64,
+}
+
+impl PerfTracker {
+    fn new() -> Self {
+        // Default on; set MYOWNLLM_PERF=0 to silence.
+        let enabled = std::env::var("MYOWNLLM_PERF")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        Self {
+            enabled,
+            last_report: std::time::Instant::now(),
+            report_every: Duration::from_secs(5),
+            vad: StageStat::default(),
+            asr_chunk: StageStat::default(),
+            beam: StageStat::default(),
+            diarize: StageStat::default(),
+            audio_secs: 0.0,
+            speechy_hops: 0,
+            silent_hops: 0,
+        }
+    }
+
+    /// Time a closure, recording into `stage`. Returns the closure's value.
+    #[inline]
+    fn time<T>(stat: &mut StageStat, f: impl FnOnce() -> T) -> T {
+        let t = std::time::Instant::now();
+        let out = f();
+        stat.record(t.elapsed());
+        out
+    }
+
+    /// Emit a `[perf]` line if the report interval has elapsed. `backlog`
+    /// is the current inference-channel depth (chunks waiting); `behind_s`
+    /// is that as seconds of audio. The headline number is the realtime
+    /// factor (RTF): processing wall-time / audio-time. < 1.0 keeps up.
+    fn maybe_report(&mut self, backlog: usize, behind_s: f64) {
+        if !self.enabled || self.last_report.elapsed() < self.report_every {
+            return;
+        }
+        let window_wall = self.last_report.elapsed().as_secs_f64();
+        // Wall time spent in the heavy stages over this window.
+        let busy = self.vad.total.as_secs_f64()
+            + self.asr_chunk.total.as_secs_f64()
+            + self.beam.total.as_secs_f64()
+            + self.diarize.total.as_secs_f64();
+        let rtf = if self.audio_secs > 0.0 {
+            busy / self.audio_secs
+        } else {
+            0.0
+        };
+        perf_log(&format!(
+            "[perf] RTF={:.2} (busy {:.1}s / audio {:.1}s, wall {:.1}s) backlog={} behind={:.1}s | \
+             vad {:.0}/{:.0}ms x{} | asr_chunk {:.0}/{:.0}ms x{} | beam {:.0}/{:.0}ms x{} | \
+             diarize {:.0}/{:.0}ms x{} | hops speechy={} silent={}",
+            rtf,
+            busy,
+            self.audio_secs,
+            window_wall,
+            backlog,
+            behind_s,
+            self.vad.mean_ms(),
+            self.vad.max_ms(),
+            self.vad.count,
+            self.asr_chunk.mean_ms(),
+            self.asr_chunk.max_ms(),
+            self.asr_chunk.count,
+            self.beam.mean_ms(),
+            self.beam.max_ms(),
+            self.beam.count,
+            self.diarize.mean_ms(),
+            self.diarize.max_ms(),
+            self.diarize.count,
+            self.speechy_hops,
+            self.silent_hops,
+        ));
+        // Reset the window.
+        self.last_report = std::time::Instant::now();
+        self.vad = StageStat::default();
+        self.asr_chunk = StageStat::default();
+        self.beam = StageStat::default();
+        self.diarize = StageStat::default();
+        self.audio_secs = 0.0;
+        self.speechy_hops = 0;
+        self.silent_hops = 0;
+    }
+}
+
 /// In-memory streaming decode loop for the **live** ASR path — the
 /// streaming counterpart to `ingest_loop` + the disk-shard poll loop in
 /// `run_session`.
@@ -2276,6 +2446,10 @@ fn run_streaming_loop(
     // Announce the drain phase once, so the UI can show "finishing
     // transcription…" instead of looking frozen after Stop.
     let mut drain_announced = false;
+    // Per-stage perf instrumentation: prints a `[perf]` line every few
+    // seconds (grep it to ferry back). Off with MYOWNLLM_PERF=0.
+    let mut perf = PerfTracker::new();
+    let hop_secs = caps.hop_seconds as f64;
 
     eprintln!("[transcribe] streaming loop started (device_sr={device_sr})");
     loop {
@@ -2340,19 +2514,44 @@ fn run_streaming_loop(
         }
         new_samples = 0;
 
+        // Each decoded hop represents `hop_secs` of audio; tally it for the
+        // realtime-factor accounting.
+        perf.audio_secs += hop_secs;
+
         // The most recent hop drives endpointing and the silent-idle
         // skip. `HopGate` returns (speechy, endpoint) from either Silero
         // VAD or the RMS fallback.
         let win = window.samples();
         let tail = hop_samples.min(win.len());
         let hop_audio = &win[win.len() - tail..];
-        let (speechy, endpoint) = gate.observe(hop_audio, hop_ms, &cancel);
+        let (speechy, endpoint) =
+            PerfTracker::time(&mut perf.vad, || gate.observe(hop_audio, hop_ms, &cancel));
+        if speechy {
+            perf.speechy_hops += 1;
+        } else {
+            perf.silent_hops += 1;
+        }
 
         // Decode voiced hops only: silence yields empty/hallucinated
         // tokens and would clobber the interim tail. A quiet hop just
         // advances the endpoint clock, preserving the pending tail.
         if speechy {
-            match asr.process_chunk(window.samples(), window.base_ms(), &cancel) {
+            let win_len = window.samples().len();
+            let t_chunk = std::time::Instant::now();
+            let chunk_result = asr.process_chunk(window.samples(), window.base_ms(), &cancel);
+            let chunk_dt = t_chunk.elapsed();
+            perf.asr_chunk.record(chunk_dt);
+            // Surface a single pathologically slow decode right away (not
+            // just in the 5 s summary), with the window size that caused it.
+            if chunk_dt > Duration::from_millis(1200) {
+                perf_log(&format!(
+                    "[perf] slow asr_chunk {:.0}ms on ~{:.1}s window ({} samples)",
+                    chunk_dt.as_secs_f64() * 1000.0,
+                    win_len as f64 / TARGET_SR as f64,
+                    win_len,
+                ));
+            }
+            match chunk_result {
                 Ok(out) => {
                     consecutive_errors = 0;
                     let hyp: Vec<AsrToken> = out
@@ -2426,21 +2625,25 @@ fn run_streaming_loop(
                 .chain(agree.interim().iter())
                 .cloned()
                 .collect();
-            let final_tokens = beam_final_tokens(asr, &window, &cancel, agreed_tokens);
+            let final_tokens = PerfTracker::time(&mut perf.beam, || {
+                beam_final_tokens(asr, &window, &cancel, agreed_tokens)
+            });
             let end_ms = final_tokens
                 .last()
                 .map(|t| window.base_ms() + t.t_ms)
                 .unwrap_or(utt_start_ms)
                 .max(utt_start_ms);
             // Diarize the finalized utterance audio before we drop it.
-            let dia = diarize_speaker(
-                &mut diarize,
-                window.samples(),
-                window.base_ms(),
-                utt_start_ms,
-                end_ms,
-                &cancel,
-            );
+            let dia = PerfTracker::time(&mut perf.diarize, || {
+                diarize_speaker(
+                    &mut diarize,
+                    window.samples(),
+                    window.base_ms(),
+                    utt_start_ms,
+                    end_ms,
+                    &cancel,
+                )
+            });
             // Opportunistically keep the best voice clip for this speaker;
             // on a first capture, stash it live + emit an in-session chip.
             if let Some(spk) = dia.speaker {
@@ -2484,6 +2687,11 @@ fn run_streaming_loop(
             // utterances.
             window.reset_to(window.base_ms() + window.duration_ms());
         }
+
+        // Periodic perf summary. backlog = inference chunks still queued;
+        // behind = that as seconds of captured-but-not-yet-decoded audio.
+        let backlog = rx.len();
+        perf.maybe_report(backlog, backlog as f64 * hop_secs);
     }
 
     // Stop / mic disconnect with an utterance still in flight: finalize
