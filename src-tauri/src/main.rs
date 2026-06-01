@@ -93,6 +93,14 @@ async fn ollama_warm(model: String) -> Result<(), String> {
     ollama::warm(&model).await.map_err(|e| e.to_string())
 }
 
+/// Evict `model` from Ollama's memory now. On memory-tight hosts the chat
+/// LLM is unloaded before a transcription session starts so the ASR +
+/// diarize models have room. Best-effort from the caller's side.
+#[tauri::command]
+async fn ollama_unload(model: String) -> Result<(), String> {
+    ollama::unload(&model).await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn ollama_delete_model(name: String) -> Result<(), String> {
     ollama::delete_model(&name).await.map_err(|e| e.to_string())
@@ -1254,6 +1262,7 @@ fn main() {
             ollama_list_models,
             ollama_model_loaded,
             ollama_warm,
+            ollama_unload,
             ollama_delete_model,
             preload_modes,
             ensure_tracked_models,

@@ -35,7 +35,7 @@
   import { stickToBottom } from "./stick-to-bottom";
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
   import { loadConfig } from "../config";
-  import { pinDownloadedModel } from "../model-lifecycle";
+  import { pinDownloadedModel, isTranscriptionMemoryTight } from "../model-lifecycle";
   import {
     loadConversation,
     saveConversation,
@@ -425,6 +425,29 @@
     persist().catch((e) => console.warn("save title failed:", e));
   }
 
+  /** On a memory-tight host (see `isTranscriptionMemoryTight` — unified /
+   *  CPU-only / small-VRAM, but NOT an 8 GB box with a roomy discrete GPU),
+   *  the chat LLM and the real-time ASR + diarize models can't both stay
+   *  resident: Ollama holding the chat weights starves the transcription
+   *  pipeline and it never keeps up. Evict the chat model before the heavy
+   *  session starts so the ASR side has room; `Chat` separately blocks the
+   *  chat model from reloading while the session runs. Best-effort and
+   *  low-mem-only — full-size machines keep their model warm. The
+   *  lightweight composer mic doesn't call this. */
+  async function freeChatModelForTranscription(): Promise<void> {
+    if (!isTranscriptionMemoryTight(hardware)) return;
+    // `textModel` is the resolved Ollama chat tag (empty for non-Ollama text
+    // picks, which aren't the memory-heavy case). Only unload if it's
+    // actually resident, so we never pay a cold load just to unload.
+    if (!textModel) return;
+    try {
+      const loaded = await invoke<boolean>("ollama_model_loaded", { model: textModel });
+      if (loaded) await invoke("ollama_unload", { model: textModel });
+    } catch (e) {
+      console.warn("chat-model unload before transcription failed:", e);
+    }
+  }
+
   /** Pre-flight: confirm the configured ASR model is downloaded. */
   async function asrModelInstalled(name: string): Promise<boolean> {
     try {
@@ -565,6 +588,9 @@
     }
 
     const conv = await persist({ force: true });
+    // Memory-tight hosts: make room by evicting the chat model before the
+    // ASR (+ diarize) models load, so real-time transcription isn't starved.
+    await freeChatModelForTranscription();
     try {
       await startRecording({
         runtime,
@@ -679,6 +705,9 @@
       diarizeModel = defaultDiarizeModel;
     }
     const conv = await persist({ force: true });
+    // Same memory-tight guard as Record: an upload runs the full ASR
+    // pipeline, so free the chat model first on small machines.
+    await freeChatModelForTranscription();
     try {
       await startUpload({
         runtime,
