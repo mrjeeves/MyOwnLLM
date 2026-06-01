@@ -105,6 +105,18 @@ pub struct OnlineClusterer {
     next_id: u32,
 }
 
+/// A centroid lifted out for persistence: speaker id, its L2-normalized
+/// mean embedding, the number of slices folded into it, and the last
+/// time it spoke (session-relative ms). The registry converts the time
+/// to/from wall-clock on the way to disk.
+#[derive(Debug, Clone)]
+pub struct CentroidSnapshot {
+    pub id: u32,
+    pub mean: Vec<f32>,
+    pub count: u64,
+    pub last_seen_ms: u64,
+}
+
 impl OnlineClusterer {
     pub fn new(cfg: ClusterConfig) -> Self {
         Self {
@@ -112,6 +124,42 @@ impl OnlineClusterer {
             centroids: Vec::new(),
             next_id: 0,
         }
+    }
+
+    /// Build a clusterer pre-seeded with persisted speaker profiles so
+    /// the same person keeps their number across sessions. `seed`
+    /// carries `(id, mean, count, last_seen_ms)`; `next_id` continues
+    /// the global counter so a fresh speaker this session doesn't
+    /// collide with a persisted id.
+    pub fn seeded(cfg: ClusterConfig, seed: Vec<CentroidSnapshot>, next_id: u32) -> Self {
+        let centroids = seed
+            .into_iter()
+            .map(|s| Centroid {
+                id: s.id,
+                mean: s.mean,
+                count: s.count,
+                last_seen_ms: s.last_seen_ms,
+            })
+            .collect();
+        Self {
+            cfg,
+            centroids,
+            next_id,
+        }
+    }
+
+    /// Lift the current centroids out for persistence. The registry
+    /// folds these back into the on-disk profiles when the session ends.
+    pub fn snapshot(&self) -> Vec<CentroidSnapshot> {
+        self.centroids
+            .iter()
+            .map(|c| CentroidSnapshot {
+                id: c.id,
+                mean: c.mean.clone(),
+                count: c.count,
+                last_seen_ms: c.last_seen_ms,
+            })
+            .collect()
     }
 
     /// Active speaker count. Surfaced via the Settings UI once the

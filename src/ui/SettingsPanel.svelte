@@ -4,6 +4,7 @@
   import StorageSection from "./settings/StorageSection.svelte";
   import HardwareSection from "./settings/HardwareSection.svelte";
   import PerformanceSection from "./settings/PerformanceSection.svelte";
+  import SpeakersSection from "./settings/SpeakersSection.svelte";
   import UsageSection from "./settings/UsageSection.svelte";
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import CloudMeshSection from "./settings/CloudMeshSection.svelte";
@@ -20,6 +21,7 @@
     | "permissions"
     | "hardware"
     | "performance"
+    | "speakers"
     | "storage"
     | "usage"
     | "cloud-mesh"
@@ -84,6 +86,7 @@
     { id: "permissions", label: "Permissions" },
     { id: "hardware", label: "Hardware" },
     { id: "performance", label: "Performance" },
+    { id: "speakers", label: "Speakers" },
     { id: "storage", label: "Storage" },
     { id: "usage", label: "Usage" },
     { id: "updates", label: "Updates" },
@@ -156,6 +159,8 @@
         <HardwareSection setActive={(t) => (active = t)} />
       {:else if active === "performance"}
         <PerformanceSection />
+      {:else if active === "speakers"}
+        <SpeakersSection />
       {:else if active === "usage"}
         <UsageSection />
       {:else if active === "cloud-mesh"}

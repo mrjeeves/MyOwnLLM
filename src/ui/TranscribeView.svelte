@@ -10,12 +10,14 @@
   import SettingsPanel from "./SettingsPanel.svelte";
   import ConflictModal from "./ConflictModal.svelte";
   import DownloadOverlay from "./DownloadOverlay.svelte";
+  import SpeakerReviewStrip from "./SpeakerReviewStrip.svelte";
   import type { SettingsTab } from "../update-state.svelte";
   import {
     transcribeUi,
     startRecording,
     startUpload,
     stopRecording,
+    abortRecording,
     pauseRecording,
     resumeRecording,
     takeLiveSegments,
@@ -131,7 +133,17 @@
   let activeConversation = $state<Conversation | null>(null);
   let transcript = $state<TranscriptSegment[]>([]);
   let speakerLabels = $state<Record<number, string>>({});
+  /** Names from the persistent cross-session registry, used as a
+   *  fallback when this conversation has no local override for a speaker
+   *  id — so a name set in an earlier session shows on a returning
+   *  speaker. Loaded once; conversation-local `speakerLabels` win. */
+  let registryLabels = $state<Record<number, string>>({});
   let diarizeEnabled = $state(true);
+  /** Keep the full session audio on disk so you can scrub back and clip
+   *  speakers by hand later. On by default: with accuracy favoured over
+   *  realtime latency, the full recording is the source of truth (the
+   *  automatic clips are a convenience on top). ~230 MB/hour. */
+  let keepAudio = $state(true);
   /** Routing pins for the two transcribe-mode bars. Stored as stable
    *  `device_pubkey`s in localStorage (see `routing-pins.svelte.ts`)
    *  so a reload or a peer hop doesn't clear them. Pause/error on
@@ -302,6 +314,7 @@
       transcript = c.transcript ?? [];
       speakerLabels = c.speaker_labels ?? {};
       diarizeEnabled = c.diarize_enabled ?? true;
+      keepAudio = c.keep_audio ?? true;
       talkingPoints = c.talking_points ?? [];
       talkingPointsPrev = c.talking_points_prev ?? [];
       tpActionStatus = "";
@@ -313,27 +326,35 @@
   });
 
   // Reset on "+ New" presses. Same skip-first-tick trick as Chat.svelte.
+  // IMPORTANT: this effect must react to `newChatCounter` ONLY. Everything
+  // else it touches (transcribeUi.active / .conversationId) is read inside
+  // `untrack` so Svelte doesn't subscribe the effect to them — otherwise
+  // `startRecording()` flipping `active` true would re-fire this body and
+  // immediately stop the session it just started (the "record then instant
+  // stop" bug).
   let _seenInitial = false;
   $effect(() => {
     void newChatCounter;
-    if (!_seenInitial) {
-      _seenInitial = true;
-      return;
-    }
-    activeConversation = null;
-    transcript = [];
-    speakerLabels = {};
-    diarizeEnabled = true;
-    talkingPoints = [];
-    talkingPointsPrev = [];
-    tpActionStatus = "";
-    sessionName = "";
-    if (transcribeUi.active && transcribeUi.conversationId === conversationId) {
-      stopRecording().then(() => {
-        flushLiveSegments();
-        clearAfterPersist();
-      });
-    }
+    untrack(() => {
+      if (!_seenInitial) {
+        _seenInitial = true;
+        return;
+      }
+      activeConversation = null;
+      transcript = [];
+      speakerLabels = {};
+      diarizeEnabled = true;
+      talkingPoints = [];
+      talkingPointsPrev = [];
+      tpActionStatus = "";
+      sessionName = "";
+      if (transcribeUi.active && transcribeUi.conversationId === conversationId) {
+        stopRecording().then(() => {
+          flushLiveSegments();
+          clearAfterPersist();
+        });
+      }
+    });
   });
 
   // Watch the global store: when a frame arrives for our conversation,
@@ -387,6 +408,7 @@
     conv.transcript = transcript;
     conv.speaker_labels = speakerLabels;
     conv.diarize_enabled = diarizeEnabled;
+    conv.keep_audio = keepAudio;
     conv.talking_points = talkingPoints;
     conv.messages = [];
     await saveConversation(conv);
@@ -554,6 +576,7 @@
         device: mic.device_name || null,
         conversationId: conv?.id ?? null,
         diarizeModel,
+        keepAudio,
       });
     } catch (e) {
       transcribeError = String(e);
@@ -565,6 +588,17 @@
     flushLiveSegments();
     clearAfterPersist();
     persist().catch((e) => console.warn("save after stop failed:", e));
+  }
+
+  /** Force-cancel a draining session: cut it off now, discard the
+   *  not-yet-transcribed backlog. Whatever was already transcribed (and the
+   *  full-audio recording + captured speaker clips) is still saved. Same
+   *  persist flow as a graceful stop, just reached via transcribe_abort. */
+  async function forceStop() {
+    await abortRecording();
+    flushLiveSegments();
+    clearAfterPersist();
+    persist().catch((e) => console.warn("save after force-stop failed:", e));
   }
 
   /** Extensions Symphonia's built-in features handle (audio +
@@ -748,8 +782,26 @@
     return `hsl(${hue}, 60%, 50%)`;
   }
 
+  /** Load persisted speaker names once so returning speakers show their
+   *  registry name when this conversation hasn't renamed them locally. */
+  async function loadRegistryLabels() {
+    try {
+      const entries = await invoke<
+        Array<{ id: number; label: string | null }>
+      >("speaker_registry_list");
+      const map: Record<number, string> = {};
+      for (const e of entries) {
+        if (e.label) map[e.id] = e.label;
+      }
+      registryLabels = map;
+    } catch (e) {
+      console.warn("load speaker registry failed:", e);
+    }
+  }
+  loadRegistryLabels();
+
   function speakerLabel(id: number): string {
-    return speakerLabels[id] ?? `Speaker ${id + 1}`;
+    return speakerLabels[id] ?? registryLabels[id] ?? `Speaker ${id + 1}`;
   }
 
   function startRename(id: number) {
@@ -770,6 +822,33 @@
       speakerLabels = { ...speakerLabels, [id]: trimmed };
     }
     persist().catch((e) => console.warn("save speaker label failed:", e));
+    // Write through to the persistent cross-session registry so this
+    // name follows the speaker into future conversations, not just this
+    // one. Best-effort — the conversation-local label above is the
+    // source of truth for the current transcript regardless.
+    invoke("speaker_registry_rename", { id, label: trimmed || null }).catch(
+      (e) => console.warn("persist speaker name failed:", e),
+    );
+  }
+
+  /** A speaker was attributed via the end-of-session review strip. The
+   *  backend already wrote the clip + anchored the profile; reflect the
+   *  confirmed name into this transcript's labels (so the turns relabel
+   *  immediately) and the registry-name fallback map (so future sessions
+   *  show it too). Then clear the strip when nothing's left to review. */
+  function onSpeakerResolved(speaker: number, _profileId: number, name: string) {
+    speakerLabels = { ...speakerLabels, [speaker]: name };
+    registryLabels = { ...registryLabels, [speaker]: name };
+    persist().catch((e) => console.warn("save speaker label failed:", e));
+    if (transcribeUi.review) {
+      const remaining = transcribeUi.review.items.filter(
+        (it) => it.speaker !== speaker,
+      );
+      transcribeUi.review =
+        remaining.length > 0
+          ? { ...transcribeUi.review, items: remaining }
+          : null;
+    }
   }
 
   function onRenameKey(e: KeyboardEvent) {
@@ -829,6 +908,33 @@
   // to draw the rec dot in the local pane chrome.
   let isMyRecording = $derived(
     transcribeUi.active && transcribeUi.conversationId === conversationId,
+  );
+
+  // Seconds of captured-but-not-yet-transcribed audio queued for decode.
+  // Surfaced as a gentle "catching up" hint when it's meaningfully behind
+  // — accuracy over realtime means the captions can lag the audio, and
+  // that's fine because every queued chunk still gets processed.
+  let backlogSeconds = $derived(
+    transcribeUi.pendingChunks * transcribeUi.chunkSeconds,
+  );
+
+  // Live pipeline activity, surfaced so the user sees the parallel work
+  // happening — capture is always lossless, transcription/labelling trail
+  // and catch up. Drives the activity row in the recording header.
+  let isCapturing = $derived(
+    isMyRecording && !transcribeUi.paused && !transcribeUi.draining,
+  );
+  // "REC" = the lossless full-audio recorder is running (keep-audio on).
+  let isRecordingAudio = $derived(isCapturing && keepAudio);
+  // Transcription is actively catching up on a backlog vs. keeping pace.
+  let transcribeBehind = $derived(isMyRecording && backlogSeconds >= 1.5);
+  // Distinct speakers seen so far this session (from the live labels map).
+  let liveSpeakerCount = $derived(
+    new Set(
+      renderedTurns
+        .map((t) => t.speaker)
+        .filter((s) => s !== null && s !== undefined),
+    ).size,
   );
 
   // The live, still-refining caption for the active streaming session.
@@ -1026,11 +1132,40 @@
       {/if}
       <header class="pane-head">
         <span class="pane-title">Transcription</span>
-        {#if isMyRecording && !transcribeUi.paused}
-          <span class="rec-dot" aria-hidden="true"></span>
-          <span class="rec-time">{fmtElapsed(transcribeUi.elapsed)}</span>
-        {:else if isMyRecording && transcribeUi.paused}
-          <span class="rec-paused">paused</span>
+        {#if isMyRecording}
+          <span class="live-activity" aria-live="polite">
+            {#if transcribeUi.paused}
+              <span class="rec-paused">paused</span>
+            {:else if transcribeUi.draining}
+              <span class="act act-finishing">⏳ finishing</span>
+            {:else}
+              {#if isRecordingAudio}
+                <span class="act act-rec" title="Recording full audio losslessly">
+                  <span class="rec-dot" aria-hidden="true"></span>REC
+                </span>
+              {:else}
+                <span class="act act-live">
+                  <span class="rec-dot" aria-hidden="true"></span>live
+                </span>
+              {/if}
+              <span class="rec-time">{fmtElapsed(transcribeUi.elapsed)}</span>
+              {#if transcribeBehind}
+                <span
+                  class="act act-behind"
+                  title="Audio is captured and safe; transcription is catching up."
+                >
+                  ✍ +{backlogSeconds.toFixed(backlogSeconds >= 10 ? 0 : 1)}s
+                </span>
+              {:else}
+                <span class="act act-transcribing">✍ transcribing</span>
+              {/if}
+              {#if diarizeEnabled && liveSpeakerCount > 0}
+                <span class="act act-speakers" title="Speakers identified so far">
+                  🗣 {liveSpeakerCount}
+                </span>
+              {/if}
+            {/if}
+          </span>
         {/if}
         <label class="diarize-toggle" title="Identify speakers in the transcript">
           <input
@@ -1045,6 +1180,18 @@
               Identify speakers
             {/if}
           </span>
+        </label>
+        <label
+          class="diarize-toggle"
+          title="Keep the full session audio so you can scrub back and clip speakers by hand later (~230 MB/hour)"
+        >
+          <input
+            type="checkbox"
+            checked={keepAudio}
+            disabled={isMyRecording}
+            onchange={(e) => (keepAudio = (e.currentTarget as HTMLInputElement).checked)}
+          />
+          <span class="diarize-label">Keep audio</span>
         </label>
       </header>
       <div class="pane-body" use:stickToBottom={transcript}>
@@ -1104,8 +1251,8 @@
         {:else}
           <div class="placeholder">
             {#if isMyRecording}
-              Listening… transcription will stream in here every few
-              seconds.
+              Recording… your audio is being captured now; the transcript
+              streams in here and catches up as it processes.
             {:else}
               Press <strong>Record</strong> to start a session. The live
               transcript will appear in this pane.
@@ -1115,13 +1262,38 @@
         {#if isMyRecording && transcribeUi.status}
           <p class="transcribe-status">{transcribeUi.status}</p>
         {/if}
-        {#if isMyRecording && transcribeUi.pendingChunks > 0}
-          <p class="transcribe-backlog">
-            {(transcribeUi.pendingChunks * transcribeUi.chunkSeconds).toFixed(0)} s
-            behind realtime
+        {#if isMyRecording && backlogSeconds >= 1.5}
+          <p class="transcribe-backlog" title="Audio is queued for transcription — it will all be processed; the captions are just catching up.">
+            {backlogSeconds.toFixed(backlogSeconds >= 10 ? 0 : 1)}s behind — catching up
           </p>
         {/if}
+        {#if isMyRecording && transcribeUi.draining}
+          <div class="drain-banner">
+            <span class="drain-msg">
+              Finishing transcription{backlogSeconds >= 1.5
+                ? ` — ${backlogSeconds.toFixed(backlogSeconds >= 10 ? 0 : 1)}s of audio left`
+                : "…"}
+            </span>
+            <button
+              class="force-stop"
+              onclick={forceStop}
+              title="Stop immediately and discard the audio that hasn't been transcribed yet. The recording and any speaker clips captured so far are still saved."
+            >
+              Force stop &amp; discard backlog
+            </button>
+          </div>
+        {/if}
       </div>
+      {#if transcribeUi.review}
+        <SpeakerReviewStrip
+          streamId={transcribeUi.review.streamId}
+          items={transcribeUi.review.items}
+          labelFor={speakerLabel}
+          compact={isMyRecording}
+          onResolved={onSpeakerResolved}
+          onDismiss={() => (transcribeUi.review = null)}
+        />
+      {/if}
       <TranscribeBar
         activeModel={activeModel}
         activeFamily={activeFamily}
@@ -1570,6 +1742,46 @@
     text-transform: uppercase;
     letter-spacing: .05em;
   }
+  .live-activity {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .act {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.72rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .act-rec {
+    color: #f0c0c0;
+    background: #2e1414;
+    border: 1px solid #5a2a2a;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+  }
+  .act-live {
+    color: #e35a5a;
+  }
+  .act-transcribing {
+    color: #6fae6f;
+  }
+  .act-behind {
+    color: #d4a64a;
+    background: #1f1812;
+    border: 1px solid #4a3a1a;
+  }
+  .act-speakers {
+    color: #9a8ad0;
+  }
+  .act-finishing {
+    color: #b9a8d8;
+  }
   .pane-body {
     flex: 1;
     min-height: 0;
@@ -1787,6 +1999,37 @@
     border-radius: 6px;
     line-height: 1.3;
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+
+  .drain-banner {
+    margin-top: 0.4rem;
+    padding: 0.4rem 0.55rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    background: #1a1622;
+    border: 1px solid #3a3050;
+    border-radius: 6px;
+  }
+  .drain-msg {
+    font-size: 0.76rem;
+    color: #b9a8d8;
+  }
+  .force-stop {
+    flex-shrink: 0;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.74rem;
+    color: #f0d0d0;
+    background: #3a1f1f;
+    border: 1px solid #6a3535;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .force-stop:hover {
+    background: #4d2727;
+    border-color: #8a4040;
   }
 
   .mic-error {

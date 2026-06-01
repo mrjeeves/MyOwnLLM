@@ -65,12 +65,40 @@ use crate::ort_setup;
 const START_TOKEN: i64 = 1;
 const EOS_TOKEN: i64 = 2;
 
-/// Cap on decoded tokens per chunk. Defends against pathological
-/// decoder loops on noisy / out-of-distribution audio. At ~6 BPE
-/// tokens per second of speech an 8 s chunk produces ≤ ~50 tokens
-/// in normal use; 256 gives plenty of headroom for dense speech
-/// while still bounding the worst-case forward count.
+/// Absolute ceiling on decoded tokens per chunk. Defends against
+/// pathological decoder loops on noisy / out-of-distribution audio. At
+/// ~6 BPE tokens per second of speech an 8 s chunk produces ≤ ~50 tokens
+/// in normal use; 256 is the last-resort hard stop.
 const MAX_DECODE_STEPS: usize = 256;
+
+/// Per-chunk decode-step budget, scaled to the audio length.
+///
+/// The flat `MAX_DECODE_STEPS` ceiling is far too loose for the short
+/// rolling chunks the streaming path decodes: a 0.5 s (8000-sample) chunk
+/// can only legitimately hold a handful of tokens, but greedy decode
+/// occasionally fails to emit EOS and loops on repetition. With the KV
+/// cache disabled every step re-decodes the whole growing sequence
+/// (O(n²) in tokens), so an unbounded runaway on a tiny chunk burned
+/// ~8.6 s in the field — freezing captions and exploding the backlog.
+///
+/// Moonshine generates ~6.5 BPE tokens per second of speech; budget a
+/// generous `ceil(seconds * 8) + 8` (headroom over the nominal rate plus
+/// a floor for very short chunks) and clamp to `MAX_DECODE_STEPS`. Normal
+/// speech hits EOS well inside this; only runaways feel the cap, and they
+/// now cost milliseconds instead of seconds.
+fn decode_step_budget(n_samples: usize) -> usize {
+    const TOKENS_PER_SEC: f32 = 8.0;
+    const MARGIN: usize = 8;
+    let seconds = n_samples as f32 / 16_000.0;
+    let budget = (seconds * TOKENS_PER_SEC).ceil() as usize + MARGIN;
+    budget.min(MAX_DECODE_STEPS)
+}
+
+/// Beam width for finalized-utterance decoding (`process_final`). 4 is
+/// the usual ASR sweet spot — most of the WER win over greedy lands by
+/// width 4, and each step costs `width` decoder forwards, so wider buys
+/// little for linearly more compute. Interim hops stay greedy (width 1).
+const FINAL_BEAM_WIDTH: usize = 4;
 
 /// One past-KV input the decoder graph declares, plus the model's
 /// static-vs-dynamic dim layout for it. `-1` means "this dim is
@@ -481,7 +509,8 @@ impl AsrBackend for MoonshineBackend {
         let mut kv = DecoderKvCache::empty(self.past_kv_inputs.len());
         let mut tokens: Vec<i64> = vec![START_TOKEN];
         let mut hit_eos_on_first_step = false;
-        for step in 0..MAX_DECODE_STEPS {
+        let step_budget = decode_step_budget(pcm16k_mono.len());
+        for step in 0..step_budget {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
@@ -491,7 +520,7 @@ impl AsrBackend for MoonshineBackend {
             } else {
                 &tokens
             };
-            let next = self.run_decoder(input_ids, &enc_hidden, &mut kv, use_cache)?;
+            let (next, _logits) = self.run_decoder(input_ids, &enc_hidden, &mut kv, use_cache)?;
             if next == EOS_TOKEN {
                 if step == 0 {
                     hit_eos_on_first_step = true;
@@ -557,12 +586,104 @@ impl AsrBackend for MoonshineBackend {
         })
     }
 
+    fn process_final(
+        &mut self,
+        pcm16k_mono: &[f32],
+        chunk_t0_ms: u64,
+        cancel: &AtomicBool,
+    ) -> Result<AsrChunkOut> {
+        if pcm16k_mono.len() < 16_000 / 10 {
+            return Ok(AsrChunkOut::default());
+        }
+        // Beam search over the finalized utterance for a one-shot
+        // accuracy win. On any failure fall back to the greedy path so a
+        // final caption is never lost to a beam-search bug.
+        match self.decode_beam(pcm16k_mono, cancel) {
+            Ok(Some(text)) => Ok(self.chunk_out_from_text(&text, pcm16k_mono.len())),
+            Ok(None) => Ok(AsrChunkOut::default()),
+            Err(e) => {
+                eprintln!("[moonshine] beam decode failed, falling back to greedy: {e:#}");
+                self.process_chunk(pcm16k_mono, chunk_t0_ms, cancel)
+            }
+        }
+    }
+
     fn reset_state(&mut self) {
         // Each `process_chunk` is independent — no carried state.
     }
 }
 
 impl MoonshineBackend {
+    /// Build an `AsrChunkOut` from decoded text + the chunk's sample
+    /// length. Shared by the greedy and beam paths so timing/token
+    /// construction stays identical.
+    fn chunk_out_from_text(&self, trimmed: &str, n_samples: usize) -> AsrChunkOut {
+        let trimmed = trimmed.trim();
+        if trimmed.is_empty() {
+            return AsrChunkOut::default();
+        }
+        let end_ms = (n_samples as u64 * 1000) / 16_000;
+        let tokens = AsrToken::words_uniform(trimmed, end_ms);
+        AsrChunkOut {
+            segments: vec![AsrSegment {
+                start_ms: 0,
+                end_ms,
+                text: trimmed.to_string(),
+                confidence: None,
+                tokens,
+            }],
+            used_state: false,
+        }
+    }
+
+    /// Beam-search decode of a whole utterance. Returns `Some(text)` on
+    /// success, `None` if the utterance decoded empty. Uses the no-cache
+    /// decoder path (every beam re-decodes its full token sequence each
+    /// step), mirroring the greedy path's `cache_available = false`.
+    fn decode_beam(&mut self, pcm16k_mono: &[f32], cancel: &AtomicBool) -> Result<Option<String>> {
+        use crate::asr::beam::BeamSearch;
+
+        let enc_hidden = self.run_encoder(pcm16k_mono)?;
+        let mut search = BeamSearch::new(FINAL_BEAM_WIDTH, EOS_TOKEN, vec![START_TOKEN]);
+
+        let step_budget = decode_step_budget(pcm16k_mono.len());
+        for _ in 0..step_budget {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if search.all_finished() {
+                break;
+            }
+            let active = search.active_beams();
+            let mut rows: Vec<Vec<f32>> = Vec::with_capacity(active.len());
+            for seq in &active {
+                // No-cache decode: a throwaway KV cache per forward, the
+                // full sequence as input (same contract the greedy path
+                // uses with `use_cache = false`).
+                let mut kv = DecoderKvCache::empty(self.past_kv_inputs.len());
+                let (_argmax, logits) = self.run_decoder(seq, &enc_hidden, &mut kv, false)?;
+                rows.push(logits);
+            }
+            search.expand(&rows);
+        }
+
+        let best = search.best();
+        let ids: Vec<u32> = best.iter().skip(1).map(|&t| t.max(0) as u32).collect();
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow!("Moonshine tokenizer not loaded"))?;
+        let text = tokenizer
+            .decode(&ids, true)
+            .map_err(|e| anyhow!("tokenizer decode: {e}"))?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+
     /// Encoder forward. Returns the owned `[1, T, D]` hidden array
     /// (cloned out of ORT's session arena so it survives across
     /// decoder steps).
@@ -602,15 +723,17 @@ impl MoonshineBackend {
     /// new position before emitting the extended present-KV.
     ///
     /// Either way we capture the present-KV outputs back into `kv`
-    /// so the next call has the right past state, then return the
-    /// argmax of the logits at the last position.
+    /// so the next call has the right past state, then return the argmax
+    /// of the logits at the last position **and** that logits row (for
+    /// beam search, which needs the full distribution, not just the
+    /// winner). Greedy callers ignore the row.
     fn run_decoder(
         &mut self,
         input_ids: &[i64],
         enc_hidden: &ArrayD<f32>,
         kv: &mut DecoderKvCache,
         use_cache: bool,
-    ) -> Result<i64> {
+    ) -> Result<(i64, Vec<f32>)> {
         let decoder = self
             .decoder
             .as_mut()
@@ -756,10 +879,12 @@ impl MoonshineBackend {
         }
         let last = shape[1] - 1;
         let vocab = shape[2];
+        let mut row = Vec::with_capacity(vocab);
         let mut best_i = 0usize;
         let mut best_v = f32::NEG_INFINITY;
         for v in 0..vocab {
             let s = logits_view[[0, last, v]];
+            row.push(s);
             if s > best_v {
                 best_v = s;
                 best_i = v;
@@ -780,7 +905,7 @@ impl MoonshineBackend {
             kv.values[idx] = Some(view.to_owned());
         }
 
-        Ok(next)
+        Ok((next, row))
     }
 }
 
@@ -825,4 +950,46 @@ fn check_file_plausible(path: &std::path::Path, min_bytes: u64, label: &str) -> 
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn step_budget_is_tight_for_short_chunks() {
+        // The streaming path's smallest decodable chunk is ~0.1 s; a 0.5 s
+        // (8000-sample) chunk is the size that burned 8.6 s in the field.
+        // Every short chunk budgets a handful of steps, nowhere near 256,
+        // and a sub-100ms chunk still keeps the +8 floor (never zero).
+        assert_eq!(decode_step_budget(8_000), 12); // ceil(0.5*8)=4, +8
+        assert_eq!(decode_step_budget(16_000), 16); // ceil(1.0*8)=8, +8
+        assert_eq!(decode_step_budget(1_600), 9); // ceil(0.1*8)=1, +8
+        assert!(decode_step_budget(0) >= 8); // floored, never zero
+    }
+
+    #[test]
+    fn step_budget_clamps_to_the_hard_ceiling() {
+        // The 8 s rolling window stays well under the ceiling, but absurd
+        // inputs can never exceed MAX_DECODE_STEPS.
+        assert_eq!(decode_step_budget(8 * 16_000), 72); // ceil(8*8)=64, +8
+        assert_eq!(decode_step_budget(10_000 * 16_000), MAX_DECODE_STEPS);
+    }
+
+    #[test]
+    fn step_budget_leaves_headroom_over_real_speech() {
+        // Moonshine emits ~6.5 tokens/s; the budget must sit above that
+        // for every chunk size so normal speech hits EOS before the cap
+        // and is never truncated. Check across the streaming range.
+        for &secs in &[0.25_f32, 0.5, 1.0, 2.0, 4.0, 8.0] {
+            let samples = (secs * 16_000.0) as usize;
+            let nominal_tokens = (secs * 6.5).ceil() as usize;
+            assert!(
+                decode_step_budget(samples) > nominal_tokens,
+                "budget {} must exceed ~{} real tokens at {secs}s",
+                decode_step_budget(samples),
+                nominal_tokens,
+            );
+        }
+    }
 }

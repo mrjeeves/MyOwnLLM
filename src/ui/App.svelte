@@ -33,6 +33,7 @@
   import {
     transcribeUi,
     stopRecording,
+    abortRecording,
     startDrain,
     clearLiveDelta,
     clearAfterPersist,
@@ -832,7 +833,10 @@
       hint: "Pending audio chunks will be discarded when you confirm.",
       confirmLabel: "Stop & start here",
       confirm: async () => {
-        await stopRecording();
+        // The user wants to start a new recording now, and the dialog
+        // promised the pending backlog would be discarded — so force-cancel
+        // (cut it off + clean up) rather than waiting for a graceful drain.
+        await abortRecording();
         clearLiveDelta();
         clearAfterPersist();
         // TP, if it was running on the now-stopped session, has nothing

@@ -46,6 +46,22 @@ interface TranscribeFrame {
     decoded_ms: number;
     processed_ms: number;
   } | null;
+  /** Emitted once at session end: speakers the diarizer captured a clip
+   *  for, with ranked profile suggestions. Drives the review strip.
+   *  Mirrors `transcribe::SpeakerReviewItem`. */
+  speaker_review?: SpeakerReviewItem[] | null;
+}
+
+export interface SpeakerSuggestion {
+  profile_id: number;
+  name: string;
+  similarity: number;
+}
+export interface SpeakerReviewItem {
+  speaker: number;
+  duration_ms: number;
+  suggestions: SpeakerSuggestion[];
+  auto_matched?: number | null;
 }
 
 /** Per-stream pending entry returned by the recovery probe. Mirror of
@@ -70,6 +86,11 @@ export interface PendingStream {
 export const transcribeUi = $state({
   /** True while a session is in flight (capturing or post-stop draining). */
   active: false,
+  /** True after a graceful Stop while the buffered backlog is still being
+   *  transcribed (mic capture has halted). Drives the "Finishing
+   *  transcription…" state and the Force-stop control. Cleared on the
+   *  final frame / reset. */
+  draining: false,
   /** True when the user has explicitly paused mic capture. The inference
    *  loop keeps draining the backlog regardless. */
   paused: false,
@@ -137,6 +158,12 @@ export const transcribeUi = $state({
   uploadProgress: null as
     | { total_ms: number | null; decoded_ms: number; processed_ms: number }
     | null,
+  /** End-of-session speaker review: clip-backed speakers the diarizer
+   *  wants the user to confirm/correct, plus the stream id the captured
+   *  clips are stashed under (the key for the review commands). Set when
+   *  the final frame carries `speaker_review`; cleared once the user
+   *  resolves or dismisses the strip. */
+  review: null as { streamId: string; items: SpeakerReviewItem[] } | null,
 });
 
 let unlistenStream: UnlistenFn | null = null;
@@ -153,6 +180,7 @@ function clearTimers() {
 
 function resetState() {
   transcribeUi.active = false;
+  transcribeUi.draining = false;
   transcribeUi.paused = false;
   transcribeUi.drainOnly = false;
   transcribeUi.uploadOnly = false;
@@ -213,6 +241,9 @@ async function attachListener(streamId: string) {
       if (typeof f.chunk_seconds === "number" && f.chunk_seconds > 0) {
         transcribeUi.chunkSeconds = f.chunk_seconds;
       }
+      if (Array.isArray(f.speaker_review) && f.speaker_review.length > 0) {
+        transcribeUi.review = { streamId, items: f.speaker_review };
+      }
       if (f.upload_progress) {
         transcribeUi.uploadProgress = {
           total_ms: f.upload_progress.total_ms ?? null,
@@ -243,6 +274,7 @@ async function attachListener(streamId: string) {
           transcribeUi.error = f.status;
         }
         transcribeUi.active = false;
+        transcribeUi.draining = false;
         const r = stopResolver;
         stopResolver = null;
         r?.();
@@ -262,6 +294,9 @@ export interface StartArgs {
    *  `"pyannote-seg-3.0+wespeaker-r34"`). `null` to disable
    *  diarization for this session. */
   diarizeModel: string | null;
+  /** Record the full session audio to disk for later manual
+   *  scrubbing/clipping (opt-in "keep full audio"). */
+  keepAudio?: boolean;
 }
 
 export async function startRecording(args: StartArgs): Promise<void> {
@@ -276,6 +311,7 @@ export async function startRecording(args: StartArgs): Promise<void> {
       model: args.model,
       device: args.device,
       diarizeModel: args.diarizeModel,
+      keepAudio: args.keepAudio ?? false,
     });
   } catch (e) {
     unlistenStream?.();
@@ -361,12 +397,17 @@ export async function resumeRecording(): Promise<void> {
   transcribeUi.startedAt = Date.now() - transcribeUi.elapsed * 1000;
 }
 
-/** Cancel the running session. Resolves once the Rust worker has emitted
- *  its final frame, so callers can safely persist the transcript right
- *  after `await`. */
+/** Gracefully stop the running session: halt mic capture, but let the
+ *  buffered backlog finish transcribing first. Resolves once the Rust
+ *  worker has emitted its final frame (after the drain completes), so
+ *  callers can safely persist the transcript right after `await`. */
 export async function stopRecording(): Promise<void> {
   const id = transcribeUi.streamId;
   if (!id) return;
+  // Capture has stopped; the session is now draining its backlog until the
+  // final frame arrives. Surfaces the "Finishing transcription…" state and
+  // the Force-stop control.
+  transcribeUi.draining = true;
   const done = new Promise<void>((resolve) => {
     stopResolver = resolve;
   });
@@ -374,11 +415,39 @@ export async function stopRecording(): Promise<void> {
     await invoke("transcribe_stop", { streamId: id });
   } catch (e) {
     console.warn("transcribe_stop failed:", e);
+    transcribeUi.draining = false;
     const r = stopResolver;
     stopResolver = null;
     r?.();
   }
   await done;
+}
+
+/** Force-cancel a draining session: cut it off where it is, dropping the
+ *  unprocessed backlog. The Rust side still finalizes the recording + any
+ *  review clips cleanly, then emits the final frame. Resolves on that
+ *  frame, like `stopRecording`. Safe to call whether or not a graceful
+ *  stop is already in flight. */
+export async function abortRecording(): Promise<void> {
+  const id = transcribeUi.streamId;
+  if (!id) return;
+  // If no graceful stop preceded this, make sure the awaited `done` promise
+  // is wired so the caller still blocks until the final frame.
+  const done = stopResolver
+    ? null
+    : new Promise<void>((resolve) => {
+        stopResolver = resolve;
+      });
+  try {
+    await invoke("transcribe_abort", { streamId: id });
+  } catch (e) {
+    console.warn("transcribe_abort failed:", e);
+    transcribeUi.draining = false;
+    const r = stopResolver;
+    stopResolver = null;
+    r?.();
+  }
+  if (done) await done;
 }
 
 /** Spin up an inference-only session against a stream id whose buffer

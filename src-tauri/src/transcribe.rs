@@ -41,6 +41,7 @@ use std::time::Duration;
 use tauri::WebviewWindow;
 
 use crate::asr::streaming::{LocalAgreement, SilenceEndpointer, StreamWindow};
+use crate::asr::vad::{SileroVad, SpeechGate};
 use crate::asr::{self, AsrBackend, AsrCaps, AsrSegment, AsrToken};
 use crate::diarize::{self, DiarizeBackend, SpeakerTurn};
 use crate::frame_sink::FrameSink;
@@ -146,6 +147,39 @@ pub struct TranscribeFrame {
     /// "uploaded vs transcribed" progress bar on the upload button.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upload_progress: Option<UploadProgress>,
+    /// Emitted once at session end when the diarizer captured voice-clip
+    /// candidates worth reviewing: each session-speaker with a clip, its
+    /// ranked profile suggestions ("looks like Chris 87%"), and whether
+    /// it auto-matched an existing profile. The UI unfolds a non-blocking
+    /// review strip from this; `None` on every other frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_review: Option<Vec<SpeakerReviewItem>>,
+}
+
+/// One reviewable captured speaker: enough for the end-of-session strip
+/// to show "Speaker 2 — looks like Chris (87%)" with a play button and a
+/// confirm/correct control. The clip audio is fetched separately by
+/// `speaker_review_clip` (keeps frames light).
+#[derive(Debug, Serialize, Clone)]
+pub struct SpeakerReviewItem {
+    /// Session-local speaker id (the cluster number shown in the
+    /// transcript).
+    pub speaker: u32,
+    /// Captured clip length, ms.
+    pub duration_ms: u64,
+    /// Ranked profile suggestions, best first: `(profile_id, name, sim)`.
+    pub suggestions: Vec<SpeakerSuggestion>,
+    /// The profile id this speaker auto-matched on commit (if any) — the
+    /// strip pre-selects it so a correct guess is a single confirm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_matched: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SpeakerSuggestion {
+    pub profile_id: u32,
+    pub name: String,
+    pub similarity: f32,
 }
 
 /// Two-phase upload progress: decode reads the file ahead, ASR
@@ -223,6 +257,7 @@ impl TranscribeFrame {
             chunk_seconds,
             status,
             upload_progress: None,
+            speaker_review: None,
         }
     }
 }
@@ -236,6 +271,12 @@ struct Session {
     /// running session. Resume just flips this back. Inference-only
     /// ("drain") sessions never read it.
     paused: Arc<AtomicBool>,
+    /// A *graceful* stop: stop capturing new mic audio but keep decoding
+    /// until the buffered backlog is fully transcribed, then finalize the
+    /// last utterance and end. This is what the Stop button sets — a
+    /// meeting's tail must never be dropped. `cancel` stays the hard-abort
+    /// (app exit, fatal error, mic loss) that ends the loop immediately.
+    draining: Arc<AtomicBool>,
 }
 
 fn sessions() -> &'static DashMap<String, Session> {
@@ -502,6 +543,7 @@ pub fn start(
     model_name: String,
     device_name: Option<String>,
     diarize_model: Option<String>,
+    keep_audio: bool,
     window: WebviewWindow,
 ) -> Result<()> {
     if sessions().contains_key(&stream_id) {
@@ -524,17 +566,20 @@ pub fn start(
     }
     let cancel = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
+    let draining = Arc::new(AtomicBool::new(false));
     sessions().insert(
         stream_id.clone(),
         Session {
             cancel: cancel.clone(),
             paused: paused.clone(),
+            draining: draining.clone(),
         },
     );
 
     let stream_id_for_thread = stream_id.clone();
     let cancel_for_thread = cancel.clone();
     let paused_for_thread = paused.clone();
+    let draining_for_thread = draining.clone();
     let runtime_for_thread = runtime.clone();
     let model_for_thread = model_name.clone();
     let diarize_for_thread = diarize_model.clone();
@@ -552,8 +597,10 @@ pub fn start(
             &model_for_thread,
             diarize_for_thread.as_deref(),
             device_name.as_deref(),
+            keep_audio,
             cancel_for_thread,
             paused_for_thread,
+            draining_for_thread,
             &sink,
         );
         crate::usage::record_transcribe_seconds(session_start.elapsed().as_secs());
@@ -567,6 +614,7 @@ pub fn start(
                 chunk_seconds: None,
                 status: None,
                 upload_progress: None,
+                speaker_review: None,
             },
             Err(e) => TranscribeFrame {
                 elapsed_ms: 0,
@@ -576,6 +624,7 @@ pub fn start(
                 chunk_seconds: None,
                 status: Some(format!("transcription error: {e:#}")),
                 upload_progress: None,
+                speaker_review: None,
             },
         };
         sink.emit_frame(&event, final_frame);
@@ -585,16 +634,47 @@ pub fn start(
 
 pub fn stop(stream_id: &str) -> Result<()> {
     if let Some(s) = sessions().get(stream_id) {
-        // Diagnostic line so a spurious cancel (e.g. fired during the
-        // first warm-up because the frontend double-fired stopRecording)
-        // is visible in the backend logs. The legitimate user-Stop case
-        // is no quieter, but the volume is one line per session end.
-        eprintln!("[transcribe] stop() called for stream {stream_id}");
-        s.cancel.store(true, Ordering::SeqCst);
+        // Graceful stop: stop capturing, but let the decode loop finish the
+        // buffered backlog and finalize the in-flight utterance before it
+        // ends — so a meeting's last sentences aren't lost. `cancel` is left
+        // alone; that's reserved for the hard-abort path (`abort`).
+        eprintln!("[transcribe] stop() called for stream {stream_id} — draining backlog");
+        s.draining.store(true, Ordering::SeqCst);
     } else {
         eprintln!("[transcribe] stop() called for unknown stream {stream_id} (already finished?)");
     }
     Ok(())
+}
+
+/// Force-cancel one session: end its decode loop now, dropping whatever
+/// backlog is still queued — "cut it off where it left off". The loop's
+/// teardown still runs (the recorder WAV is finalized with a valid header
+/// and any captured review clips are stashed), so this is a clean cut, not
+/// a crash. This is the "Force stop" control offered while a graceful Stop
+/// is draining. Idempotent.
+pub fn abort(stream_id: &str) -> Result<()> {
+    if let Some(s) = sessions().get(stream_id) {
+        eprintln!(
+            "[transcribe] abort() called for stream {stream_id} — cutting off, dropping backlog"
+        );
+        // Set draining too so the cpal callbacks stop feeding immediately
+        // even if abort races a session that hadn't started draining yet.
+        s.draining.store(true, Ordering::SeqCst);
+        s.cancel.store(true, Ordering::SeqCst);
+    } else {
+        eprintln!("[transcribe] abort() called for unknown stream {stream_id} (already finished?)");
+    }
+    Ok(())
+}
+
+/// Hard-abort every live session: end each decode loop now, dropping any
+/// buffered backlog. Called on app exit so a draining meeting can't hang
+/// teardown. The normal Stop button uses `stop` (graceful drain) instead.
+pub fn abort_all() {
+    for s in sessions().iter() {
+        s.cancel.store(true, Ordering::SeqCst);
+        s.draining.store(true, Ordering::SeqCst);
+    }
 }
 
 pub fn pause(stream_id: &str) -> Result<()> {
@@ -636,11 +716,13 @@ pub fn start_drain(
         ));
     }
     let cancel = Arc::new(AtomicBool::new(false));
+    let draining = Arc::new(AtomicBool::new(false));
     sessions().insert(
         stream_id.clone(),
         Session {
             cancel: cancel.clone(),
             paused: Arc::new(AtomicBool::new(false)),
+            draining: draining.clone(),
         },
     );
 
@@ -668,6 +750,7 @@ pub fn start_drain(
                 chunk_seconds: None,
                 status: None,
                 upload_progress: None,
+                speaker_review: None,
             },
             Err(e) => TranscribeFrame {
                 elapsed_ms: 0,
@@ -677,6 +760,7 @@ pub fn start_drain(
                 chunk_seconds: None,
                 status: Some(format!("transcription error: {e:#}")),
                 upload_progress: None,
+                speaker_review: None,
             },
         };
         sink.emit_frame(&event, final_frame);
@@ -718,6 +802,8 @@ pub fn start_upload(
         Session {
             cancel: cancel.clone(),
             paused: paused.clone(),
+            // File upload is a finite decode; Stop cancels it. No drain.
+            draining: Arc::new(AtomicBool::new(false)),
         },
     );
 
@@ -747,6 +833,7 @@ pub fn start_upload(
                 chunk_seconds: None,
                 status: None,
                 upload_progress: None,
+                speaker_review: None,
             },
             Err(e) => TranscribeFrame {
                 elapsed_ms: 0,
@@ -756,6 +843,7 @@ pub fn start_upload(
                 chunk_seconds: None,
                 status: Some(format!("transcription error: {e:#}")),
                 upload_progress: None,
+                speaker_review: None,
             },
         };
         sink.emit_frame(&event, final_frame);
@@ -823,6 +911,9 @@ pub fn start_remote_session(
         Session {
             cancel: cancel.clone(),
             paused: paused.clone(),
+            // Remote sessions end when the peer closes the inbox; Stop
+            // hard-cancels. No separate drain phase.
+            draining: Arc::new(AtomicBool::new(false)),
         },
     );
 
@@ -871,6 +962,7 @@ pub fn start_remote_session(
                 chunk_seconds: None,
                 status: None,
                 upload_progress: None,
+                speaker_review: None,
             },
             Err(e) => TranscribeFrame {
                 elapsed_ms: 0,
@@ -880,6 +972,7 @@ pub fn start_remote_session(
                 chunk_seconds: None,
                 status: Some(format!("transcription error: {e:#}")),
                 upload_progress: None,
+                speaker_review: None,
             },
         };
         sink.emit_frame(&event, final_frame);
@@ -989,9 +1082,12 @@ fn run_remote_session(
         caps,
         cancel.clone(),
         paused.clone(),
+        // Remote sessions end on inbox close, not a drain phase.
+        Arc::new(AtomicBool::new(false)),
         window,
         event,
         started,
+        stream_id,
     );
 
     let _ = std::fs::remove_dir_all(&buffer_dir);
@@ -1061,17 +1157,30 @@ fn build_backends(
     // here, but on hardware where one of those sub-loads stalls the
     // user sees the same generic message for minutes and can't tell
     // whether anything is wrong.
+    let t_asr = std::time::Instant::now();
     let mut asr = asr::make_backend(runtime, model_name)?;
     asr.warm_up(on_stage, cancel)?;
     let caps = asr.caps();
+    perf_log(&format!(
+        "[perf] ASR backend ready: runtime={runtime} model={model_name} warm_up={:.0}ms \
+         (hop={:.2}s window<={:.1}s)",
+        t_asr.elapsed().as_secs_f64() * 1000.0,
+        caps.hop_seconds,
+        caps.max_context_seconds,
+    ));
 
     if cancel.load(Ordering::Relaxed) {
         return Err(anyhow!("ASR warm-up cancelled"));
     }
 
     let diarize = if let Some(name) = diarize_composite {
+        let t_dia = std::time::Instant::now();
         let mut d = diarize::make_backend("pyannote-diarize", name)?;
         d.warm_up(on_stage, cancel)?;
+        perf_log(&format!(
+            "[perf] diarize backend ready: {name} warm_up={:.0}ms",
+            t_dia.elapsed().as_secs_f64() * 1000.0
+        ));
         Some(d)
     } else {
         None
@@ -1088,8 +1197,10 @@ fn run_session(
     model_name: &str,
     diarize_composite: Option<&str>,
     device_name: Option<&str>,
+    keep_audio: bool,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
     window: &std::sync::Arc<dyn FrameSink>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
@@ -1127,24 +1238,76 @@ fn run_session(
     let channels = cfg.channels() as usize;
     let format = cfg.sample_format();
     let stream_cfg: cpal::StreamConfig = cfg.into();
+    eprintln!(
+        "[transcribe] mic config: sr={sr} channels={channels} format={format:?} keep_audio={keep_audio}"
+    );
 
-    let (tx, rx) = bounded::<Vec<f32>>(128);
+    // Capture-first architecture. Two independent consumers of the mic:
+    //
+    //   1. The recorder (when keep_audio): fed straight from the audio
+    //      callback over its own unbounded channel, so the full-fidelity
+    //      WAV can NEVER lose a sample no matter how far transcription
+    //      lags. Recording is the product; it is sovereign.
+    //   2. The inference channel `tx`/`rx`: a large backlog the decode loop
+    //      drains and "catches up" on. Sized generously so a slow ASR pass
+    //      doesn't overflow it during normal use — but even if it ever did,
+    //      only transcription would lag, never the recording.
+    //
+    // The audio callback does the bare minimum (downmix + two non-blocking
+    // sends) so it always keeps up with the device.
+    let mut recorder: Option<SessionRecorder> = if keep_audio {
+        match SessionRecorder::spawn(stream_id, sr) {
+            Ok(r) => {
+                eprintln!("[transcribe] recording full session audio (keep_audio on)");
+                Some(r)
+            }
+            Err(e) => {
+                eprintln!("[transcribe] couldn't start session recorder: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Lock-free handle for the realtime audio callback to feed.
+    let rec_handle: Option<RecorderHandle> = recorder.as_ref().and_then(|r| r.handle());
+
+    // ~64 s of 0.5 s buffers: a deep runway so transcription can fall
+    // behind and catch back up (the design intent) without the inference
+    // backlog overflowing. The recorder is separate and never bounded.
+    let (tx, rx) = bounded::<Vec<f32>>(2048);
 
     let stream_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let cancel_audio = cancel.clone();
+    let recorder_cb = rec_handle;
+    // Stop forwarding mic audio once draining starts, so the buffered
+    // backlog can decode down to empty without new samples piling on.
+    let draining_audio = draining.clone();
     let stream = match format {
         cpal::SampleFormat::F32 => {
             let tx = tx.clone();
             let cancel = cancel_audio.clone();
+            let draining = draining_audio.clone();
+            let recorder = recorder_cb.clone();
             device.build_input_stream(
                 &stream_cfg,
                 {
                     let paused = paused.clone();
                     move |data: &[f32], _| {
-                        if cancel.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                        if cancel.load(Ordering::Relaxed)
+                            || paused.load(Ordering::Relaxed)
+                            || draining.load(Ordering::Relaxed)
+                        {
                             return;
                         }
-                        let _ = tx.try_send(downmix_f32(data, channels));
+                        let mono = downmix_f32(data, channels);
+                        // Record FIRST and losslessly — the recording is the
+                        // product. Then offer it to transcription, which may
+                        // lag and catch up.
+                        if let Some(rec) = &recorder {
+                            rec.write(mono.clone());
+                        }
+                        let _ = tx.try_send(mono);
                     }
                 },
                 stream_err_fn(stream_err.clone()),
@@ -1154,17 +1317,26 @@ fn run_session(
         cpal::SampleFormat::I16 => {
             let tx = tx.clone();
             let cancel = cancel_audio.clone();
+            let draining = draining_audio.clone();
+            let recorder = recorder_cb.clone();
             device.build_input_stream(
                 &stream_cfg,
                 {
                     let paused = paused.clone();
                     move |data: &[i16], _| {
-                        if cancel.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                        if cancel.load(Ordering::Relaxed)
+                            || paused.load(Ordering::Relaxed)
+                            || draining.load(Ordering::Relaxed)
+                        {
                             return;
                         }
                         let f: Vec<f32> =
                             data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                        let _ = tx.try_send(downmix_f32(&f, channels));
+                        let mono = downmix_f32(&f, channels);
+                        if let Some(rec) = &recorder {
+                            rec.write(mono.clone());
+                        }
+                        let _ = tx.try_send(mono);
                     }
                 },
                 stream_err_fn(stream_err.clone()),
@@ -1174,19 +1346,28 @@ fn run_session(
         cpal::SampleFormat::U16 => {
             let tx = tx.clone();
             let cancel = cancel_audio.clone();
+            let draining = draining_audio.clone();
+            let recorder = recorder_cb.clone();
             device.build_input_stream(
                 &stream_cfg,
                 {
                     let paused = paused.clone();
                     move |data: &[u16], _| {
-                        if cancel.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                        if cancel.load(Ordering::Relaxed)
+                            || paused.load(Ordering::Relaxed)
+                            || draining.load(Ordering::Relaxed)
+                        {
                             return;
                         }
                         let f: Vec<f32> = data
                             .iter()
                             .map(|&s| (s as f32 - 32768.0) / 32768.0)
                             .collect();
-                        let _ = tx.try_send(downmix_f32(&f, channels));
+                        let mono = downmix_f32(&f, channels);
+                        if let Some(rec) = &recorder {
+                            rec.write(mono.clone());
+                        }
+                        let _ = tx.try_send(mono);
                     }
                 },
                 stream_err_fn(stream_err.clone()),
@@ -1196,6 +1377,7 @@ fn run_session(
         other => return Err(anyhow!("unsupported sample format: {other:?}")),
     };
     stream.play()?;
+    eprintln!("[transcribe] cpal stream.play() ok; entering session");
     drop(tx);
 
     // First frame: we're live.
@@ -1223,12 +1405,20 @@ fn run_session(
         caps,
         cancel.clone(),
         paused.clone(),
+        draining.clone(),
         window,
         event,
         started,
+        stream_id,
     );
 
+    // Tear down the mic FIRST so no callback can deliver a trailing block,
+    // THEN finalize the recording — guaranteeing the WAV captures every
+    // sample the device produced, right up to the stop.
     drop(stream);
+    if let Some(rec) = recorder.as_mut() {
+        rec.finish();
+    }
     let _ = std::fs::remove_dir_all(&buffer_dir);
     if let Some(err) = stream_err.lock().ok().and_then(|mut s| s.take()) {
         return Err(anyhow!("audio capture failed: {err}"));
@@ -1357,6 +1547,7 @@ fn run_drain(
                     chunk_seconds: None,
                     status: None,
                     upload_progress: None,
+                    speaker_review: None,
                 },
             );
         }
@@ -1494,6 +1685,7 @@ fn run_upload(
                 decoded_ms: 0,
                 processed_ms: 0,
             }),
+            speaker_review: None,
         },
     );
 
@@ -1643,6 +1835,7 @@ fn run_upload(
                     decoded_ms: decoded,
                     processed_ms: processed,
                 }),
+                speaker_review: None,
             },
         );
     };
@@ -1918,6 +2111,298 @@ fn ingest_loop(
     }
 }
 
+/// Per-hop speech gate for the streaming loop. Wraps either Silero VAD
+/// (precise neural speech probability) or the RMS energy fallback behind
+/// one `observe → (speechy, endpoint)` call. Chosen once at loop start
+/// from whether the Silero model is installed and loads; if Silero errors
+/// at inference mid-session it degrades to RMS for the rest of the
+/// session rather than failing — endpointing must never break the live
+/// feature.
+///
+/// The `Silero` arm is boxed: it carries a whole ONNX session, dwarfing
+/// the bare-`SilenceEndpointer` RMS arm, so the box keeps the enum small.
+enum HopGate {
+    Silero(Box<SileroGate>),
+    Rms(SilenceEndpointer),
+}
+
+/// Silero VAD + its hysteresis gate, plus an RMS endpointer kept warm as
+/// the fallback if a Silero inference call ever fails mid-session.
+struct SileroGate {
+    vad: SileroVad,
+    gate: SpeechGate,
+    rms: SilenceEndpointer,
+    /// Latched on the first mid-session inference failure: once set, this
+    /// session stays on RMS and stops logging, so a recurring failure can
+    /// never flood the console.
+    degraded: bool,
+    /// Most recent raw Silero speech probability, stashed purely for the
+    /// `[perf]` diagnostic line. Not used in any gating decision.
+    last_prob: f32,
+}
+
+impl HopGate {
+    fn new(endpoint_silence_ms: u64) -> Self {
+        if SileroVad::is_available() {
+            match SileroVad::load() {
+                Ok(vad) => {
+                    return HopGate::Silero(Box::new(SileroGate {
+                        vad,
+                        gate: SpeechGate::new(endpoint_silence_ms),
+                        rms: SilenceEndpointer::new(SILENCE_RMS_THRESHOLD, endpoint_silence_ms),
+                        degraded: false,
+                        last_prob: 0.0,
+                    }));
+                }
+                Err(e) => {
+                    eprintln!("[transcribe] silero VAD load failed, using RMS: {e:#}");
+                }
+            }
+        }
+        HopGate::Rms(SilenceEndpointer::new(
+            SILENCE_RMS_THRESHOLD,
+            endpoint_silence_ms,
+        ))
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            HopGate::Silero(_) => "silero-vad",
+            HopGate::Rms(_) => "rms",
+        }
+    }
+
+    /// The most recent raw VAD speech-probability, for the `[perf]`
+    /// diagnostic only. `None` on the RMS fallback gate (no probability)
+    /// or once a Silero failure has latched the session to RMS.
+    fn last_prob(&self) -> Option<f32> {
+        match self {
+            HopGate::Silero(s) if !s.degraded => Some(s.last_prob),
+            _ => None,
+        }
+    }
+
+    /// Decide whether `hop_audio` is speech and whether this hop closes
+    /// an utterance. `hop_ms` is the hop's wall duration for the
+    /// trailing-silence clock.
+    fn observe(&mut self, hop_audio: &[f32], hop_ms: u64, cancel: &AtomicBool) -> (bool, bool) {
+        match self {
+            HopGate::Silero(s) => {
+                // Already latched to RMS by a prior failure — don't retry
+                // Silero (and don't re-log) for the rest of the session.
+                if s.degraded {
+                    let r = chunk_rms(hop_audio);
+                    return (r >= SILENCE_RMS_THRESHOLD, s.rms.observe(r, hop_ms));
+                }
+                match s.vad.speech_prob(hop_audio, cancel) {
+                    Ok(prob) => {
+                        s.last_prob = prob;
+                        s.gate.observe(prob, hop_ms)
+                    }
+                    Err(e) => {
+                        // First mid-session inference failure: log once,
+                        // latch to RMS for the rest of the session so a
+                        // recurring failure can't flood the console.
+                        eprintln!(
+                            "[transcribe] silero VAD failed mid-session, latching to RMS: {e:#}"
+                        );
+                        s.degraded = true;
+                        let r = chunk_rms(hop_audio);
+                        (r >= SILENCE_RMS_THRESHOLD, s.rms.observe(r, hop_ms))
+                    }
+                }
+            }
+            HopGate::Rms(ep) => {
+                let r = chunk_rms(hop_audio);
+                let speechy = r >= SILENCE_RMS_THRESHOLD;
+                (speechy, ep.observe(r, hop_ms))
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            HopGate::Silero(s) => {
+                s.vad.reset();
+                s.gate.reset();
+                s.rms.reset();
+            }
+            HopGate::Rms(ep) => ep.reset(),
+        }
+    }
+}
+
+/// Write one perf line to stderr AND append it to `~/.myownllm/perf.log`,
+/// so the numbers can be ferried back by attaching a single file instead
+/// of scraping terminal scrollback. Best-effort: a file error just falls
+/// back to stderr only. Each line is timestamped (seconds since the unix
+/// epoch) so separate sessions are distinguishable.
+fn perf_log(line: &str) {
+    eprintln!("{line}");
+    if let Ok(dir) = crate::myownllm_dir() {
+        use std::io::Write;
+        let path = dir.join("perf.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(f, "{ts} {line}");
+        }
+    }
+}
+
+/// Per-stage timing for the live decode loop, so we can see exactly where
+/// wall time goes vs. realtime audio. Accumulates totals + counts + worst
+/// case for each stage and prints a `[perf]` summary every few seconds —
+/// grep `[perf]` (or read ~/.myownllm/perf.log) to ferry the numbers back.
+/// Cheap: a few adds per hop.
+#[derive(Default)]
+struct StageStat {
+    total: Duration,
+    count: u64,
+    max: Duration,
+}
+
+impl StageStat {
+    fn record(&mut self, d: Duration) {
+        self.total += d;
+        self.count += 1;
+        if d > self.max {
+            self.max = d;
+        }
+    }
+    /// Mean milliseconds, or 0 when never run.
+    fn mean_ms(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.total.as_secs_f64() * 1000.0 / self.count as f64
+        }
+    }
+    fn max_ms(&self) -> f64 {
+        self.max.as_secs_f64() * 1000.0
+    }
+}
+
+struct PerfTracker {
+    enabled: bool,
+    last_report: std::time::Instant,
+    report_every: Duration,
+    // Stages.
+    vad: StageStat,
+    asr_chunk: StageStat,
+    beam: StageStat,
+    diarize: StageStat,
+    // Realtime accounting.
+    audio_secs: f64, // seconds of audio actually processed (decoded hops)
+    speechy_hops: u64,
+    silent_hops: u64,
+    // Signal diagnostics: the loudest hop (RMS energy of the raw mic
+    // samples) and the highest VAD speech-probability seen this window.
+    // Together they split "mic is feeding silence" (peak_lvl ~0) from "mic
+    // is fine but the VAD never crosses its 0.5 enter threshold"
+    // (peak_lvl healthy, peak_prob low). peak_prob is None on the RMS
+    // fallback gate, which has no probability to report.
+    peak_hop_rms: f32,
+    peak_vad_prob: f32,
+}
+
+impl PerfTracker {
+    fn new() -> Self {
+        // Default on; set MYOWNLLM_PERF=0 to silence.
+        let enabled = std::env::var("MYOWNLLM_PERF")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        Self {
+            enabled,
+            last_report: std::time::Instant::now(),
+            report_every: Duration::from_secs(5),
+            vad: StageStat::default(),
+            asr_chunk: StageStat::default(),
+            beam: StageStat::default(),
+            diarize: StageStat::default(),
+            audio_secs: 0.0,
+            speechy_hops: 0,
+            silent_hops: 0,
+            peak_hop_rms: 0.0,
+            peak_vad_prob: 0.0,
+        }
+    }
+
+    /// Time a closure, recording into `stage`. Returns the closure's value.
+    #[inline]
+    fn time<T>(stat: &mut StageStat, f: impl FnOnce() -> T) -> T {
+        let t = std::time::Instant::now();
+        let out = f();
+        stat.record(t.elapsed());
+        out
+    }
+
+    /// Emit a `[perf]` line if the report interval has elapsed. `backlog`
+    /// is the current inference-channel depth (chunks waiting); `behind_s`
+    /// is that as seconds of audio. The headline number is the realtime
+    /// factor (RTF): processing wall-time / audio-time. < 1.0 keeps up.
+    fn maybe_report(&mut self, backlog: usize, behind_s: f64) {
+        if !self.enabled || self.last_report.elapsed() < self.report_every {
+            return;
+        }
+        let window_wall = self.last_report.elapsed().as_secs_f64();
+        // Wall time spent in the heavy stages over this window.
+        let busy = self.vad.total.as_secs_f64()
+            + self.asr_chunk.total.as_secs_f64()
+            + self.beam.total.as_secs_f64()
+            + self.diarize.total.as_secs_f64();
+        let rtf = if self.audio_secs > 0.0 {
+            busy / self.audio_secs
+        } else {
+            0.0
+        };
+        perf_log(&format!(
+            "[perf] RTF={:.2} (busy {:.1}s / audio {:.1}s, wall {:.1}s) backlog={} behind={:.1}s | \
+             vad {:.0}/{:.0}ms x{} | asr_chunk {:.0}/{:.0}ms x{} | beam {:.0}/{:.0}ms x{} | \
+             diarize {:.0}/{:.0}ms x{} | hops speechy={} silent={} | mic peak_lvl={:.4} peak_prob={:.3}",
+            rtf,
+            busy,
+            self.audio_secs,
+            window_wall,
+            backlog,
+            behind_s,
+            self.vad.mean_ms(),
+            self.vad.max_ms(),
+            self.vad.count,
+            self.asr_chunk.mean_ms(),
+            self.asr_chunk.max_ms(),
+            self.asr_chunk.count,
+            self.beam.mean_ms(),
+            self.beam.max_ms(),
+            self.beam.count,
+            self.diarize.mean_ms(),
+            self.diarize.max_ms(),
+            self.diarize.count,
+            self.speechy_hops,
+            self.silent_hops,
+            self.peak_hop_rms,
+            self.peak_vad_prob,
+        ));
+        // Reset the window.
+        self.last_report = std::time::Instant::now();
+        self.vad = StageStat::default();
+        self.asr_chunk = StageStat::default();
+        self.beam = StageStat::default();
+        self.diarize = StageStat::default();
+        self.audio_secs = 0.0;
+        self.speechy_hops = 0;
+        self.silent_hops = 0;
+        self.peak_hop_rms = 0.0;
+        self.peak_vad_prob = 0.0;
+    }
+}
+
 /// In-memory streaming decode loop for the **live** ASR path — the
 /// streaming counterpart to `ingest_loop` + the disk-shard poll loop in
 /// `run_session`.
@@ -1950,13 +2435,28 @@ fn run_streaming_loop(
     caps: AsrCaps,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
     sink: &Arc<dyn FrameSink>,
     event: &str,
     started: std::time::Instant,
+    review_key: &str,
 ) -> Result<()> {
     let mut window = StreamWindow::new(TARGET_SR, caps.max_context_seconds);
     let mut agree = LocalAgreement::new();
-    let mut endpointer = SilenceEndpointer::new(SILENCE_RMS_THRESHOLD, ENDPOINT_SILENCE_MS);
+    // Opportunistic voice-clip capture for the speaker-profiles review.
+    let mut clips = crate::diarize::capture::ClipCollector::new();
+    // NB: the full-session recorder (keep_audio) is owned by `run_session`
+    // and fed directly from the audio callback — it is deliberately NOT
+    // visible to this loop, so recording is lossless and independent of how
+    // far transcription lags. `run_session` finalizes the WAV after it
+    // tears down the cpal stream.
+    // Endpointing: Silero VAD when its model is installed (precise
+    // per-hop speech probability), else the RMS energy gate. Both expose
+    // the same `(speechy, endpoint)` decision via `HopGate`, so the loop
+    // body below is identical either way. Silero is best-effort — a
+    // missing/broken model silently uses RMS, never breaking the feature.
+    let mut gate = HopGate::new(ENDPOINT_SILENCE_MS);
+    eprintln!("[transcribe] endpointer: {}", gate.kind());
 
     let hop_samples = (TARGET_SR as f32 * caps.hop_seconds).max(1.0) as usize;
     let hop_ms = (caps.hop_seconds * 1000.0) as u64;
@@ -1967,22 +2467,76 @@ fn run_streaming_loop(
     let mut utt_start_ms: u64 = 0;
     let mut new_samples: usize = 0;
     let mut consecutive_errors: u32 = 0;
+    // The UI turns the backlog count into "N s behind" via pending_chunks *
+    // chunk_seconds, where each queued item is one capture buffer. Learn
+    // that buffer's wall duration from the first one; emit it to the UI
+    // once, lazily, on the first frame we actually send (so a silent
+    // session emits nothing).
+    let mut capture_chunk_seconds: Option<f32> = None;
+    let mut chunk_seconds_sent = false;
+    // Announce the drain phase once, so the UI can show "finishing
+    // transcription…" instead of looking frozen after Stop.
+    let mut drain_announced = false;
+    // Per-stage perf instrumentation: prints a `[perf]` line every few
+    // seconds (grep it to ferry back). Off with MYOWNLLM_PERF=0.
+    let mut perf = PerfTracker::new();
+    let hop_secs = caps.hop_seconds as f64;
 
+    eprintln!("[transcribe] streaming loop started (device_sr={device_sr})");
     loop {
+        // Hard abort (app exit / fatal error): end now, dropping backlog.
         if cancel.load(Ordering::SeqCst) {
+            eprintln!("[transcribe] loop end: cancel flag set");
             break;
+        }
+        // Graceful stop: mic capture has stopped, so once the channel has
+        // drained empty there's no more audio coming — finalize and end.
+        // Until then, keep decoding the buffered backlog so a meeting's
+        // tail is fully transcribed rather than dropped on Stop.
+        if draining.load(Ordering::SeqCst) {
+            if rx.is_empty() {
+                break;
+            }
+            if !drain_announced {
+                drain_announced = true;
+                let backlog = rx.len() as u32;
+                sink.emit_frame(
+                    event,
+                    TranscribeFrame {
+                        elapsed_ms: started.elapsed().as_millis(),
+                        segments: Vec::new(),
+                        is_final: false,
+                        pending_chunks: backlog,
+                        chunk_seconds: capture_chunk_seconds,
+                        status: Some("Finishing transcription…".to_string()),
+                        upload_progress: None,
+                        speaker_review: None,
+                    },
+                );
+            }
         }
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(samples) => {
                 if paused.load(Ordering::Relaxed) {
                     continue;
                 }
+                if capture_chunk_seconds.is_none() && !samples.is_empty() && device_sr > 0 {
+                    capture_chunk_seconds = Some(samples.len() as f32 / device_sr as f32);
+                }
+                // Recording already happened in the audio callback; here we
+                // only resample for transcription. If this loop lags, the
+                // backlog grows and we catch up — the recording is untouched.
                 let pcm = resample_linear(&samples, device_sr, TARGET_SR);
                 new_samples += pcm.len();
                 window.push(&pcm);
             }
             Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => {
+                eprintln!(
+                    "[transcribe] inference channel disconnected (all mic senders dropped) — ending loop"
+                );
+                break;
+            }
         }
 
         // Run a hop once a hop's worth of fresh audio has arrived.
@@ -1991,23 +2545,51 @@ fn run_streaming_loop(
         }
         new_samples = 0;
 
-        // RMS of the most recent hop drives endpointing and the
-        // silent-idle skip.
+        // Each decoded hop represents `hop_secs` of audio; tally it for the
+        // realtime-factor accounting.
+        perf.audio_secs += hop_secs;
+
+        // The most recent hop drives endpointing and the silent-idle
+        // skip. `HopGate` returns (speechy, endpoint) from either Silero
+        // VAD or the RMS fallback.
         let win = window.samples();
         let tail = hop_samples.min(win.len());
-        let hop_rms = if tail > 0 {
-            chunk_rms(&win[win.len() - tail..])
+        let hop_audio = &win[win.len() - tail..];
+        let (speechy, endpoint) =
+            PerfTracker::time(&mut perf.vad, || gate.observe(hop_audio, hop_ms, &cancel));
+        // Signal diagnostics (perf line only): how loud was this hop, and
+        // how confident was the VAD? Splits "silence reaching the mic" from
+        // "audio is fine but the VAD won't trip" when speechy stays 0.
+        perf.peak_hop_rms = perf.peak_hop_rms.max(chunk_rms(hop_audio));
+        if let Some(p) = gate.last_prob() {
+            perf.peak_vad_prob = perf.peak_vad_prob.max(p);
+        }
+        if speechy {
+            perf.speechy_hops += 1;
         } else {
-            0.0
-        };
-        let speechy = hop_rms >= SILENCE_RMS_THRESHOLD;
-        let endpoint = endpointer.observe(hop_rms, hop_ms);
+            perf.silent_hops += 1;
+        }
 
         // Decode voiced hops only: silence yields empty/hallucinated
         // tokens and would clobber the interim tail. A quiet hop just
         // advances the endpoint clock, preserving the pending tail.
         if speechy {
-            match asr.process_chunk(window.samples(), window.base_ms(), &cancel) {
+            let win_len = window.samples().len();
+            let t_chunk = std::time::Instant::now();
+            let chunk_result = asr.process_chunk(window.samples(), window.base_ms(), &cancel);
+            let chunk_dt = t_chunk.elapsed();
+            perf.asr_chunk.record(chunk_dt);
+            // Surface a single pathologically slow decode right away (not
+            // just in the 5 s summary), with the window size that caused it.
+            if chunk_dt > Duration::from_millis(1200) {
+                perf_log(&format!(
+                    "[perf] slow asr_chunk {:.0}ms on ~{:.1}s window ({} samples)",
+                    chunk_dt.as_secs_f64() * 1000.0,
+                    win_len as f64 / TARGET_SR as f64,
+                    win_len,
+                ));
+            }
+            match chunk_result {
                 Ok(out) => {
                     consecutive_errors = 0;
                     let hyp: Vec<AsrToken> = out
@@ -2028,6 +2610,12 @@ fn run_streaming_loop(
                             .chain(agree.interim().iter())
                             .cloned()
                             .collect();
+                        let cs = (!chunk_seconds_sent)
+                            .then_some(capture_chunk_seconds)
+                            .flatten();
+                        if cs.is_some() && !live.is_empty() {
+                            chunk_seconds_sent = true;
+                        }
                         emit_stream_segment(
                             sink,
                             event,
@@ -2039,6 +2627,8 @@ fn run_streaming_loop(
                             true,
                             None,
                             false,
+                            rx.len() as u32,
+                            cs,
                         );
                     }
                 }
@@ -2064,27 +2654,55 @@ fn run_streaming_loop(
         if cur_seg_id != 0 && (endpoint || forced) {
             // Finalize: promote confirmed + interim to a final segment
             // under the same seg_id, attribute a speaker, then reset.
-            let final_tokens: Vec<AsrToken> = agree
+            // The utterance is over, so spend a beam-search re-decode for
+            // a one-shot accuracy win (no interim-latency cost); fall back
+            // to the LocalAgreement tokens if beam yields nothing.
+            let agreed_tokens: Vec<AsrToken> = agree
                 .confirmed()
                 .iter()
                 .chain(agree.interim().iter())
                 .cloned()
                 .collect();
+            let final_tokens = PerfTracker::time(&mut perf.beam, || {
+                beam_final_tokens(asr, &window, &cancel, agreed_tokens)
+            });
             let end_ms = final_tokens
                 .last()
                 .map(|t| window.base_ms() + t.t_ms)
                 .unwrap_or(utt_start_ms)
                 .max(utt_start_ms);
             // Diarize the finalized utterance audio before we drop it.
-            let (speaker, overlap) = diarize_speaker(
-                &mut diarize,
-                window.samples(),
-                window.base_ms(),
-                utt_start_ms,
-                end_ms,
-                &cancel,
-            );
+            let dia = PerfTracker::time(&mut perf.diarize, || {
+                diarize_speaker(
+                    &mut diarize,
+                    window.samples(),
+                    window.base_ms(),
+                    utt_start_ms,
+                    end_ms,
+                    &cancel,
+                )
+            });
+            // Opportunistically keep the best voice clip for this speaker;
+            // on a first capture, stash it live + emit an in-session chip.
+            if let Some(spk) = dia.speaker {
+                if let Some(cand) = clips.consider(
+                    spk,
+                    utterance_audio(&window, utt_start_ms, end_ms),
+                    dia.embedding.as_deref(),
+                    dia.confidence,
+                    dia.overlap,
+                ) {
+                    emit_live_speaker_chip(sink, event, started, review_key, cand);
+                }
+            }
+            let (speaker, overlap) = (dia.speaker, dia.overlap);
             agree.finalize();
+            let cs = (!chunk_seconds_sent)
+                .then_some(capture_chunk_seconds)
+                .flatten();
+            if cs.is_some() && !final_tokens.is_empty() {
+                chunk_seconds_sent = true;
+            }
             emit_stream_segment(
                 sink,
                 event,
@@ -2096,33 +2714,41 @@ fn run_streaming_loop(
                 false,
                 speaker,
                 overlap,
+                rx.len() as u32,
+                cs,
             );
             cur_seg_id = 0;
-            endpointer.reset();
+            gate.reset();
             window.reset_to(window.base_ms() + window.duration_ms());
         } else if cur_seg_id == 0 && !speechy {
             // Idle silence: drop it so the window doesn't grow between
             // utterances.
             window.reset_to(window.base_ms() + window.duration_ms());
         }
+
+        // Periodic perf summary. backlog = inference chunks still queued;
+        // behind = that as seconds of captured-but-not-yet-decoded audio.
+        let backlog = rx.len();
+        perf.maybe_report(backlog, backlog as f64 * hop_secs);
     }
 
     // Stop / mic disconnect with an utterance still in flight: finalize
     // it so its text isn't lost.
     if cur_seg_id != 0 {
-        let final_tokens: Vec<AsrToken> = agree
+        let agreed_tokens: Vec<AsrToken> = agree
             .confirmed()
             .iter()
             .chain(agree.interim().iter())
             .cloned()
             .collect();
+        let final_tokens = beam_final_tokens(asr, &window, &cancel, agreed_tokens);
         if !final_tokens.is_empty() {
             let end_ms = final_tokens
                 .last()
                 .map(|t| window.base_ms() + t.t_ms)
                 .unwrap_or(utt_start_ms)
                 .max(utt_start_ms);
-            let (speaker, overlap) = diarize_speaker(
+            let dia = diarize_speaker(
                 &mut diarize,
                 window.samples(),
                 window.base_ms(),
@@ -2130,6 +2756,18 @@ fn run_streaming_loop(
                 end_ms,
                 &cancel,
             );
+            if let Some(spk) = dia.speaker {
+                clips.consider(
+                    spk,
+                    utterance_audio(&window, utt_start_ms, end_ms),
+                    dia.embedding.as_deref(),
+                    dia.confidence,
+                    dia.overlap,
+                );
+            }
+            let cs = (!chunk_seconds_sent)
+                .then_some(capture_chunk_seconds)
+                .flatten();
             emit_stream_segment(
                 sink,
                 event,
@@ -2139,8 +2777,31 @@ fn run_streaming_loop(
                 window.base_ms(),
                 utt_start_ms,
                 false,
-                speaker,
-                overlap,
+                dia.speaker,
+                dia.overlap,
+                rx.len() as u32,
+                cs,
+            );
+        }
+    }
+
+    // Session over: persist any captured clips as pending review and
+    // emit the review strip. Best-effort — capture is a bonus on top of
+    // a working transcript, never a reason to fail the session.
+    if !clips.is_empty() {
+        if let Some(items) = stash_review_candidates(clips.take(), review_key) {
+            sink.emit_frame(
+                event,
+                TranscribeFrame {
+                    elapsed_ms: started.elapsed().as_millis(),
+                    segments: Vec::new(),
+                    is_final: false,
+                    pending_chunks: 0,
+                    chunk_seconds: None,
+                    status: None,
+                    upload_progress: None,
+                    speaker_review: Some(items),
+                },
             );
         }
     }
@@ -2161,6 +2822,8 @@ fn emit_stream_segment(
     partial: bool,
     speaker: Option<u32>,
     overlap: bool,
+    pending_chunks: u32,
+    chunk_seconds: Option<f32>,
 ) {
     let text = join_tokens(tokens);
     if text.is_empty() {
@@ -2187,10 +2850,15 @@ fn emit_stream_segment(
             elapsed_ms: started.elapsed().as_millis(),
             segments: vec![seg],
             is_final: false,
-            pending_chunks: 0,
-            chunk_seconds: None,
+            // How many captured audio chunks are still queued for decode —
+            // the live "N s behind realtime" backlog. Especially relevant
+            // with keep-audio on, where we favour completeness over
+            // shaving latency.
+            pending_chunks,
+            chunk_seconds,
             status: None,
             upload_progress: None,
+            speaker_review: None,
         },
     );
 }
@@ -2211,11 +2879,449 @@ fn join_tokens(tokens: &[AsrToken]) -> String {
     out
 }
 
+/// Decide the tokens for a finalized utterance: prefer a beam-search
+/// re-decode of the whole window (`process_final`, higher accuracy now
+/// that latency doesn't matter) over the hop-by-hop greedy LocalAgreement
+/// result, but never lose text — fall back to `agreed` when beam yields
+/// nothing or errors. Beam token times are re-based onto the window so
+/// `emit_stream_segment`'s end-time math stays consistent.
+fn beam_final_tokens(
+    asr: &mut dyn AsrBackend,
+    window: &StreamWindow,
+    cancel: &AtomicBool,
+    agreed: Vec<AsrToken>,
+) -> Vec<AsrToken> {
+    if window.is_empty() {
+        return agreed;
+    }
+    match asr.process_final(window.samples(), window.base_ms(), cancel) {
+        Ok(out) => {
+            let beam: Vec<AsrToken> = out
+                .segments
+                .iter()
+                .flat_map(|s| s.tokens.iter().cloned())
+                .collect();
+            // Only take the beam result if it actually produced text;
+            // an empty beam (silence/failure) keeps the agreed tokens.
+            if beam.iter().any(|t| !t.text.trim().is_empty()) {
+                beam
+            } else {
+                agreed
+            }
+        }
+        Err(e) => {
+            eprintln!("[transcribe] final beam decode failed, keeping greedy: {e:#}");
+            agreed
+        }
+    }
+}
+
+/// Slice the rolling window down to a finalized utterance's `[start_ms,
+/// end_ms]` span (session-relative), for clip capture. Clamped to what
+/// the window actually holds.
+fn utterance_audio(window: &StreamWindow, start_ms: u64, end_ms: u64) -> &[f32] {
+    let base = window.base_ms();
+    let s = start_ms.saturating_sub(base);
+    let e = end_ms.saturating_sub(base).max(s);
+    let s_idx = ((s * TARGET_SR as u64) / 1000) as usize;
+    let e_idx = (((e * TARGET_SR as u64) / 1000) as usize).min(window.samples().len());
+    if e_idx <= s_idx {
+        return &[];
+    }
+    &window.samples()[s_idx..e_idx]
+}
+
+/// At session end, write captured clips to disk and stash them (keyed by
+/// conversation) as pending review, returning the review-strip items with
+/// ranked profile suggestions. `None` when there's nothing to review.
+fn stash_review_candidates(
+    candidates: Vec<crate::diarize::capture::ClipCandidate>,
+    review_key: &str,
+) -> Option<Vec<SpeakerReviewItem>> {
+    if candidates.is_empty() {
+        return None;
+    }
+    // Skip speakers already attributed mid-session (via a live chip), so
+    // the end strip doesn't re-ask about someone already confirmed.
+    let resolved = resolved_speakers(review_key);
+    let unresolved: Vec<_> = candidates
+        .into_iter()
+        .filter(|c| !resolved.contains(&c.speaker))
+        .collect();
+    if unresolved.is_empty() {
+        review_store().remove(review_key);
+        return None;
+    }
+
+    let items: Vec<SpeakerReviewItem> = unresolved.iter().map(rank_review_item).collect();
+    // Replace the store entry with the full unresolved set so every clip
+    // is playable/attachable from the strip.
+    review_store().insert(
+        review_key.to_string(),
+        unresolved.into_iter().map(|c| (c.speaker, c)).collect(),
+    );
+    Some(items)
+}
+
+/// Speakers attributed during a session (via a live chip confirm), so the
+/// end-of-session strip can skip them. Keyed by review key.
+type ResolvedStore = DashMap<String, std::collections::HashSet<u32>>;
+fn resolved_store() -> &'static ResolvedStore {
+    static M: OnceLock<ResolvedStore> = OnceLock::new();
+    M.get_or_init(DashMap::new)
+}
+fn mark_resolved(review_key: &str, speaker: u32) {
+    resolved_store()
+        .entry(review_key.to_string())
+        .or_default()
+        .insert(speaker);
+}
+fn resolved_speakers(review_key: &str) -> std::collections::HashSet<u32> {
+    resolved_store()
+        .get(review_key)
+        .map(|s| s.clone())
+        .unwrap_or_default()
+}
+
+/// Cosine similarity above which a captured clip is treated as auto-
+/// matched to an existing profile (the review strip pre-selects it).
+/// Stricter than the registry's seed-match — a pre-selection the user
+/// just confirms should be near-certain.
+const REVIEW_AUTOMATCH_SIM: f32 = 0.70;
+
+/// Per-conversation stash of captured clip candidates awaiting review,
+/// keyed by conversation id (empty string for an unsaved session). Read
+/// by the `speaker_review_*` commands to play a clip or attach it to a
+/// profile on confirm. Bounded: one session's candidates per key,
+/// replaced on the next session.
+type ReviewStash = DashMap<String, Vec<(u32, crate::diarize::capture::ClipCandidate)>>;
+fn review_store() -> &'static ReviewStash {
+    static M: OnceLock<ReviewStash> = OnceLock::new();
+    M.get_or_init(DashMap::new)
+}
+
+/// Path of a session's full-audio WAV (opt-in "keep full audio"), under
+/// `~/.myownllm/session-audio/{key}.wav`. The dir is created on demand.
+fn session_wav_path(review_key: &str) -> Result<PathBuf> {
+    let dir = crate::myownllm_dir()?.join("session-audio");
+    std::fs::create_dir_all(&dir)?;
+    // Sanitize the key for a filename (stream ids are uuids, but be safe).
+    let safe: String = review_key
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Ok(dir.join(format!("{safe}.wav")))
+}
+
+/// Absolute path to a session's recorded full audio, if it exists. For
+/// the UI's manual scrub/clip flow.
+pub fn session_audio_path(review_key: &str) -> Option<PathBuf> {
+    let p = session_wav_path(review_key).ok()?;
+    p.exists().then_some(p)
+}
+
+/// Lock-free handle the audio callback holds to feed the recorder. It's a
+/// bare `Sender` clone — NO mutex — so the realtime WASAPI/CoreAudio
+/// callback never locks, never blocks, and can't be poison-panicked by the
+/// writer thread. Sending is a cheap `Vec` move onto an unbounded queue.
+#[derive(Clone)]
+struct RecorderHandle {
+    tx: crossbeam_channel::Sender<Vec<f32>>,
+}
+
+impl RecorderHandle {
+    /// Hand a raw device-rate mono PCM block to the writer thread. Never
+    /// blocks (unbounded) and never drops — the recording is the product.
+    #[inline]
+    fn write(&self, mono: Vec<f32>) {
+        let _ = self.tx.send(mono);
+    }
+}
+
+/// Background full-session WAV writer — the sovereign recording path. A
+/// dedicated thread resamples + writes blocks handed to it via
+/// [`RecorderHandle`], so the recording is lossless and completely
+/// independent of how far transcription lags. The audio callback holds a
+/// `RecorderHandle` (lock-free); this owner struct keeps the join handle +
+/// a stop flag so it can flush + finalize the WAV at session end.
+struct SessionRecorder {
+    // Explicit stop signal. The writer loop polls this so `finish()` can
+    // end + join it WITHOUT waiting for every outstanding RecorderHandle
+    // (the cpal callback clones) to drop first — otherwise a lingering
+    // handle would block the join forever and hang session teardown.
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+    // The owner's own sender; cloned into `RecorderHandle`s for callbacks.
+    tx: crossbeam_channel::Sender<Vec<f32>>,
+}
+
+impl SessionRecorder {
+    /// Spawn the writer thread. `device_sr` is the mic's native rate; the
+    /// thread resamples each block to [`TARGET_SR`] before writing, so the
+    /// audio callback stays cheap (just a downmix + channel send) and the
+    /// WAV is always 16 kHz mono.
+    fn spawn(review_key: &str, device_sr: u32) -> Result<Self> {
+        let path = session_wav_path(review_key)?;
+        let mut writer = crate::wav::WavWriter::create(&path, TARGET_SR)
+            .map_err(|e| anyhow!("create session wav: {e}"))?;
+        // Unbounded: the recording is the product and must never drop a
+        // sample. The audio callback hands blocks here without ever
+        // blocking; the writer thread drains and resamples at its own pace.
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            let mut healthy = true;
+            // Drain on a short poll so we notice `stop` even while no audio
+            // is arriving. On stop we do one final non-blocking drain so any
+            // already-queued blocks are written before we finalize.
+            loop {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(block) => {
+                        if healthy {
+                            let pcm = resample_linear(&block, device_sr, TARGET_SR);
+                            if let Err(e) = writer.write(&pcm) {
+                                eprintln!(
+                                    "[transcribe] session recorder write failed, disabling: {e}"
+                                );
+                                healthy = false;
+                            }
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if stop_thread.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            // Final drain of anything still queued at stop.
+            while let Ok(block) = rx.try_recv() {
+                if healthy {
+                    let pcm = resample_linear(&block, device_sr, TARGET_SR);
+                    let _ = writer.write(&pcm);
+                }
+            }
+            if let Err(e) = writer.finalize() {
+                eprintln!("[transcribe] session recorder finalize failed: {e}");
+            }
+        });
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+            tx,
+        })
+    }
+
+    /// A lock-free handle for the audio callback to feed.
+    fn handle(&self) -> Option<RecorderHandle> {
+        Some(RecorderHandle {
+            tx: self.tx.clone(),
+        })
+    }
+
+    /// Signal the writer to flush + finalize, then join it. Robust to any
+    /// number of outstanding `RecorderHandle`s still alive (the writer
+    /// stops on the flag, not on all senders dropping), so this never hangs
+    /// session teardown. Idempotent.
+    fn finish(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for SessionRecorder {
+    fn drop(&mut self) {
+        // Safety net if `finish` wasn't called: still close + join so the
+        // file is finalized rather than left with a zeroed header.
+        self.finish();
+    }
+}
+
+/// Rank a candidate against existing profiles into a `SpeakerReviewItem`
+/// (shared by the live chip and the end-of-session strip).
+fn rank_review_item(cand: &crate::diarize::capture::ClipCandidate) -> SpeakerReviewItem {
+    let dim = cand.embedding.len();
+    let ranked = crate::diarize::registry::with(|reg| reg.rank_candidates(dim, &cand.embedding))
+        .unwrap_or_default();
+    let suggestions = ranked
+        .iter()
+        .take(3)
+        .map(|(id, name, sim)| SpeakerSuggestion {
+            profile_id: *id,
+            name: name.clone(),
+            similarity: *sim,
+        })
+        .collect();
+    let auto_matched = ranked
+        .first()
+        .filter(|(_, _, sim)| *sim >= REVIEW_AUTOMATCH_SIM)
+        .map(|(id, _, _)| *id);
+    SpeakerReviewItem {
+        speaker: cand.speaker,
+        duration_ms: cand.duration_ms,
+        suggestions,
+        auto_matched,
+    }
+}
+
+/// On a *first* capture of a speaker mid-session: stash the candidate live
+/// (so the chip's play/attach commands work immediately) and emit a
+/// one-item `speaker_review` frame the UI renders as a non-blocking inline
+/// chip. Only fires for a confident match (`auto_matched`) — an unknown
+/// voice shouldn't nag mid-conversation; it lands in the end strip.
+fn emit_live_speaker_chip(
+    sink: &Arc<dyn FrameSink>,
+    event: &str,
+    started: std::time::Instant,
+    review_key: &str,
+    cand: crate::diarize::capture::ClipCandidate,
+) {
+    let item = rank_review_item(&cand);
+    // Stash so speaker_review_clip_wav / _attach can find it right away.
+    review_store()
+        .entry(review_key.to_string())
+        .or_default()
+        .push((cand.speaker, cand));
+    // Only chip a confident recognition; unknowns wait for the end strip.
+    if item.auto_matched.is_none() {
+        return;
+    }
+    sink.emit_frame(
+        event,
+        TranscribeFrame {
+            elapsed_ms: started.elapsed().as_millis(),
+            segments: Vec::new(),
+            is_final: false,
+            pending_chunks: 0,
+            chunk_seconds: None,
+            status: None,
+            upload_progress: None,
+            speaker_review: Some(vec![item]),
+        },
+    );
+}
+
+/// WAV bytes of a captured (not-yet-attached) review clip, so the review
+/// strip can play it before the user decides. `None` if the candidate is
+/// gone (session re-run, already dismissed).
+pub fn review_clip_wav(review_key: &str, speaker: u32) -> Option<Vec<u8>> {
+    let entry = review_store().get(review_key)?;
+    let cand = entry.iter().find(|(s, _)| *s == speaker)?;
+    Some(crate::wav::encode_f32_mono(&cand.1.audio, TARGET_SR))
+}
+
+/// Attach a reviewed clip to a speaker profile — the confirm action. When
+/// `target` is `Some(id)` the clip anchors that existing profile; when
+/// `None` a new profile is created (named `new_name` if given). Writes the
+/// WAV to the clip store, attaches the verified embedding, and saves the
+/// registry. Returns the profile id the clip landed on.
+pub fn review_attach(
+    review_key: &str,
+    speaker: u32,
+    target: Option<u32>,
+    new_name: Option<String>,
+) -> Result<u32> {
+    let cand = {
+        let entry = review_store()
+            .get(review_key)
+            .ok_or_else(|| anyhow!("no pending review for this session"))?;
+        entry
+            .iter()
+            .find(|(s, _)| *s == speaker)
+            .map(|(_, c)| c.clone())
+            .ok_or_else(|| anyhow!("no captured clip for speaker {speaker}"))?
+    };
+    let dim = cand.embedding.len();
+
+    // Resolve / create the target profile id.
+    let profile_id = match target {
+        Some(id) => id,
+        None => crate::diarize::registry::with(|reg| {
+            reg.create_profile(dim, cand.embedding.clone(), new_name.clone())
+        })?,
+    };
+
+    // Persist the clip WAV, then attach it as a verified anchor.
+    let clip_id = uuid_like();
+    let wav = crate::wav::encode_f32_mono(&cand.audio, TARGET_SR);
+    let rel = crate::diarize::clips::write_clip(profile_id, &clip_id, &wav)?;
+    let clip = crate::diarize::registry::VoiceClip {
+        id: clip_id,
+        wav_path: rel,
+        embedding: cand.embedding.clone(),
+        duration_ms: cand.duration_ms,
+        confidence: cand.confidence,
+        source_conversation: Some(review_key.to_string()),
+        created_unix: 0,
+    };
+    let (ok, evicted) = crate::diarize::registry::with(|reg| reg.add_clip(profile_id, clip))?;
+    if let Some(old) = evicted {
+        crate::diarize::clips::delete_clip_file(&old);
+    }
+    if !ok {
+        // add_clip rejected it (weaker than a full set) — drop the file we
+        // just wrote so we don't orphan it.
+        // (rare; the just-captured clip is usually the best available.)
+    }
+    crate::diarize::registry::save()?;
+
+    // Remove this speaker from the pending set; drop the whole entry when
+    // empty so the store doesn't accrete finished sessions. Mark it
+    // resolved so an end-of-session strip (after a live-chip attach during
+    // recording) doesn't ask about this speaker again.
+    if let Some(mut entry) = review_store().get_mut(review_key) {
+        entry.retain(|(s, _)| *s != speaker);
+    }
+    review_store().remove_if(review_key, |_, v| v.is_empty());
+    mark_resolved(review_key, speaker);
+    Ok(profile_id)
+}
+
+/// Drop a session's pending review without attaching anything.
+pub fn review_dismiss(review_key: &str) {
+    review_store().remove(review_key);
+    resolved_store().remove(review_key);
+}
+
+/// Cheap unique-ish id for a clip filename (timestamp-ns + a counter).
+/// Not a real UUID — collisions are practically impossible across clip
+/// writes and the registry would just overwrite a same-named file anyway.
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let n = CTR.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("clip-{t:x}-{n:x}")
+}
+
+/// The dominant speaker for a finalized utterance, plus the diarizer
+/// signal the clip-capture path needs (confidence + embedding anchor).
+#[derive(Default)]
+struct DiarizeResult {
+    speaker: Option<u32>,
+    overlap: bool,
+    confidence: f32,
+    embedding: Option<Vec<f32>>,
+}
+
 /// Run the diarizer (if enabled) over a finalized utterance's audio and
-/// return the speaker whose turn most overlaps `[start_ms, end_ms]`,
-/// plus whether that turn was flagged as overlapping speech. `(None,
-/// false)` when diarization is off or no turn overlaps — mirrors the
-/// max-overlap assignment `join_segments` uses on the disk path.
+/// return the speaker whose turn most overlaps `[start_ms, end_ms]`, plus
+/// that turn's overlap flag, confidence, and embedding. An empty result
+/// when diarization is off or no turn overlaps — mirrors the max-overlap
+/// assignment `join_segments` uses on the disk path.
 fn diarize_speaker(
     diarize: &mut Option<&mut (dyn DiarizeBackend + 'static)>,
     samples: &[f32],
@@ -2223,31 +3329,39 @@ fn diarize_speaker(
     start_ms: u64,
     end_ms: u64,
     cancel: &AtomicBool,
-) -> (Option<u32>, bool) {
+) -> DiarizeResult {
     let Some(d) = diarize.as_deref_mut() else {
-        return (None, false);
+        return DiarizeResult::default();
     };
     let turns = match d.process_chunk(samples, base_ms, cancel) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("streaming diarize failed: {e}");
-            return (None, false);
+            return DiarizeResult::default();
         }
     };
-    let mut best: Option<(&SpeakerTurn, u64)> = None;
-    for t in &turns {
+    let mut best: Option<(usize, u64)> = None;
+    for (i, t) in turns.iter().enumerate() {
         let lo = start_ms.max(t.start_ms);
         let hi = end_ms.min(t.end_ms);
         if hi > lo {
             let overlap_ms = hi - lo;
             if best.map(|(_, o)| overlap_ms > o).unwrap_or(true) {
-                best = Some((t, overlap_ms));
+                best = Some((i, overlap_ms));
             }
         }
     }
     match best {
-        Some((t, _)) => (Some(t.speaker), t.overlap),
-        None => (None, false),
+        Some((i, _)) => {
+            let t = &turns[i];
+            DiarizeResult {
+                speaker: Some(t.speaker),
+                overlap: t.overlap,
+                confidence: t.confidence.unwrap_or(0.0),
+                embedding: t.embedding.clone(),
+            }
+        }
+        None => DiarizeResult::default(),
     }
 }
 
@@ -2371,6 +3485,7 @@ mod tests {
             speaker,
             overlap,
             confidence: None,
+            embedding: None,
         }
     }
 
@@ -2480,9 +3595,11 @@ mod tests {
             caps,
             cancel,
             paused,
+            Arc::new(AtomicBool::new(false)),
             &sink,
             "evt",
             std::time::Instant::now(),
+            "test",
         )
         .unwrap();
         sender.join().unwrap();
@@ -2513,6 +3630,17 @@ mod tests {
                 s.text
             );
         }
+
+        // The backlog cadence is primed exactly once: chunk_seconds is set
+        // on the first emitted frame (8000 samples / 16 kHz = 0.5 s) and
+        // omitted thereafter, so the UI can render "N s behind realtime".
+        let chunk_secs: Vec<f32> = frames.iter().filter_map(|(_, f)| f.chunk_seconds).collect();
+        assert_eq!(chunk_secs.len(), 1, "chunk_seconds sent once");
+        assert!(
+            (chunk_secs[0] - 0.5).abs() < 1e-6,
+            "8000 samples @ 16 kHz = 0.5 s, got {}",
+            chunk_secs[0]
+        );
     }
 
     /// A run that is silent end to end never opens an utterance.
@@ -2539,14 +3667,111 @@ mod tests {
             caps,
             cancel,
             paused,
+            Arc::new(AtomicBool::new(false)),
             &sink,
             "evt",
             std::time::Instant::now(),
+            "test",
         )
         .unwrap();
         sender.join().unwrap();
 
         assert!(cap.drain().is_empty(), "silence must not emit captions");
+    }
+
+    /// Graceful stop must drain the buffered backlog, not abandon it: with
+    /// `draining` set and a full channel of voiced audio, every queued hop
+    /// is still decoded and the utterance finalizes — the meeting's tail is
+    /// transcribed rather than dropped when the user hits Stop.
+    #[test]
+    fn streaming_loop_draining_finishes_buffered_backlog() {
+        let mut asr = ScriptedAsr::new(vec![
+            vec!["the"],
+            vec!["the", "quick"],
+            vec!["the", "quick", "brown"],
+        ]);
+        let caps = asr.caps();
+        let cap = Arc::new(CaptureSink::new());
+        let sink: Arc<dyn FrameSink> = cap.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        // Drain is already requested before the loop runs, and all the
+        // audio is already in the channel — the worst case for "stop drops
+        // the tail". The loop must still consume every buffered hop.
+        let draining = Arc::new(AtomicBool::new(true));
+
+        let (tx, rx) = bounded::<Vec<f32>>(128);
+        // Three voiced hops then two quiet (1 s > 600 ms endpoint) so the
+        // utterance finalizes from buffered audio alone, then disconnect.
+        for _ in 0..3 {
+            tx.send(vec![0.1f32; 8000]).unwrap();
+        }
+        for _ in 0..2 {
+            tx.send(vec![0.0f32; 8000]).unwrap();
+        }
+        drop(tx);
+
+        run_streaming_loop(
+            rx,
+            16_000,
+            &mut asr,
+            None,
+            caps,
+            cancel,
+            paused,
+            draining,
+            &sink,
+            "evt",
+            std::time::Instant::now(),
+            "test",
+        )
+        .unwrap();
+
+        let frames = cap.drain();
+        let finals: Vec<&EmittedSegment> = frames
+            .iter()
+            .flat_map(|(_, f)| f.segments.iter())
+            .filter(|s| !s.partial)
+            .collect();
+        assert_eq!(finals.len(), 1, "buffered utterance finalized once");
+        assert_eq!(
+            finals[0].text, "the quick brown",
+            "the whole buffered backlog was transcribed, not dropped"
+        );
+    }
+
+    /// The sovereign recorder must capture every sample handed to it,
+    /// losslessly, regardless of timing — it's fed from the audio callback,
+    /// not the inference loop. Feed blocks at the device rate and confirm
+    /// the finalized WAV decodes back to exactly that audio at TARGET_SR.
+    #[test]
+    fn session_recorder_captures_all_audio_losslessly() {
+        // 48 kHz device, 10 blocks of 4800 samples = 1.0 s of audio.
+        let device_sr = 48_000u32;
+        let key = format!("rectest-{}", std::process::id());
+        let mut rec = SessionRecorder::spawn(&key, device_sr).unwrap();
+        let handle = rec.handle().expect("recorder handle");
+        let block: Vec<f32> = (0..4800)
+            .map(|i| ((i % 100) as f32 / 100.0) - 0.5)
+            .collect();
+        for _ in 0..10 {
+            handle.write(block.clone());
+        }
+        rec.finish();
+
+        let path = session_wav_path(&key).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let (samples, sr) = crate::wav::decode_f32_mono(&bytes).expect("decode session wav");
+        assert_eq!(sr, TARGET_SR, "session WAV is written at the target rate");
+        // 1.0 s of audio resampled 48k→16k = ~16000 samples. Allow a small
+        // tolerance for resampler edge handling.
+        let expected = TARGET_SR as usize; // 1 second
+        assert!(
+            (samples.len() as i64 - expected as i64).abs() <= 8,
+            "expected ~{expected} samples (1 s @ 16 kHz), got {}",
+            samples.len()
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

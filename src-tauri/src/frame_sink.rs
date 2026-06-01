@@ -94,6 +94,7 @@ mod tests {
             chunk_seconds: None,
             status: None,
             upload_progress: None,
+            speaker_review: None,
         }
     }
 

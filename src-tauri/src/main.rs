@@ -24,6 +24,7 @@ mod self_update;
 mod transcribe;
 mod usage;
 mod watcher;
+mod wav;
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -354,15 +355,67 @@ fn transcribe_start(
     model: String,
     device: Option<String>,
     diarize_model: Option<String>,
+    keep_audio: Option<bool>,
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    transcribe::start(stream_id, runtime, model, device, diarize_model, window)
-        .map_err(|e| e.to_string())
+    // Best-effort, fire-and-forget fetch of the Silero VAD upgrade. It's
+    // an optional accuracy improvement for the endpointer — the streaming
+    // loop runs fine on the RMS fallback meanwhile, and this session
+    // already started, so a failure here is silent and harmless. Ready
+    // for the next session once the ~2 MB download lands.
+    if !crate::models::is_installed_quiet_by_name(
+        crate::asr::vad::SILERO_MODEL,
+        models::ModelKind::Asr,
+    ) {
+        tauri::async_runtime::spawn(async {
+            match crate::models::fetch_model_quiet(
+                crate::asr::vad::SILERO_MODEL,
+                models::ModelKind::Asr,
+            )
+            .await
+            {
+                Ok(true) => eprintln!("[transcribe] silero VAD ready for next session"),
+                Ok(false) => {}
+                Err(e) => eprintln!("[transcribe] silero VAD background fetch failed: {e:#}"),
+            }
+        });
+    }
+    transcribe::start(
+        stream_id,
+        runtime,
+        model,
+        device,
+        diarize_model,
+        keep_audio.unwrap_or(false),
+        window,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Base64 WAV of a session's recorded full audio (opt-in "keep full
+/// audio"), or `None` if it wasn't recorded. For the manual scrub/clip UI.
+#[tauri::command]
+fn transcribe_session_audio(stream_id: String) -> Result<Option<String>, String> {
+    match transcribe::session_audio_path(&stream_id) {
+        Some(path) => {
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            Ok(Some(data_encoding::BASE64.encode(&bytes)))
+        }
+        None => Ok(None),
+    }
 }
 
 #[tauri::command]
 fn transcribe_stop(stream_id: String) -> Result<(), String> {
     transcribe::stop(&stream_id).map_err(|e| e.to_string())
+}
+
+/// Force-cancel a session that's currently draining its backlog: cut it off
+/// where it is, dropping the unprocessed tail, but still finalize the
+/// recording + review clips cleanly.
+#[tauri::command]
+fn transcribe_abort(stream_id: String) -> Result<(), String> {
+    transcribe::abort(&stream_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -378,6 +431,157 @@ fn transcribe_resume(stream_id: String) -> Result<(), String> {
 #[tauri::command]
 fn transcribe_buffer_size_bytes() -> u64 {
     transcribe::buffer_size_bytes()
+}
+
+/// One voice clip on a profile, for the settings tab's playback list.
+#[derive(serde::Serialize)]
+struct SpeakerClipEntry {
+    id: String,
+    duration_ms: u64,
+    confidence: f32,
+}
+
+/// One persisted speaker for the Settings UI: stable id, the rendered
+/// name (label or "Speaker N"), shaping counts, recency, whether it's
+/// human-anchored, and its verified clips.
+#[derive(serde::Serialize)]
+struct SpeakerEntry {
+    id: u32,
+    name: String,
+    label: Option<String>,
+    total_count: u64,
+    last_seen_unix: u64,
+    anchored: bool,
+    clips: Vec<SpeakerClipEntry>,
+}
+
+/// List persisted speaker profiles for the Speakers settings pane.
+#[tauri::command]
+fn speaker_registry_list() -> Result<Vec<SpeakerEntry>, String> {
+    diarize::registry::with(|reg| {
+        reg.profiles()
+            .iter()
+            .map(|p| SpeakerEntry {
+                id: p.id,
+                name: p
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| format!("Speaker {}", p.id + 1)),
+                label: p.label.clone(),
+                total_count: p.total_count,
+                last_seen_unix: p.last_seen_unix,
+                anchored: p.is_anchored(),
+                clips: p
+                    .clips
+                    .iter()
+                    .map(|c| SpeakerClipEntry {
+                        id: c.id.clone(),
+                        duration_ms: c.duration_ms,
+                        confidence: c.confidence,
+                    })
+                    .collect(),
+            })
+            .collect()
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// Base64 WAV of a profile's verified clip, for `<audio>` playback.
+#[tauri::command]
+fn speaker_profile_clip_wav(id: u32, clip_id: String) -> Result<String, String> {
+    let rel = diarize::registry::with(|reg| {
+        reg.clip_paths(id)
+            .into_iter()
+            .find(|(cid, _)| *cid == clip_id)
+            .map(|(_, path)| path)
+    })
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "clip not found".to_string())?;
+    let bytes = diarize::clips::read_clip(&rel).map_err(|e| e.to_string())?;
+    Ok(data_encoding::BASE64.encode(&bytes))
+}
+
+/// Remove one verified clip from a profile (deletes its WAV).
+#[tauri::command]
+fn speaker_profile_remove_clip(id: u32, clip_id: String) -> Result<bool, String> {
+    let removed =
+        diarize::registry::with(|reg| reg.remove_clip(id, &clip_id)).map_err(|e| e.to_string())?;
+    match removed {
+        Some(path) => {
+            diarize::clips::delete_clip_file(&path);
+            diarize::registry::save().map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Merge speaker `src` into `dst` (same person, two auto-split profiles).
+#[tauri::command]
+fn speaker_profile_merge(dst: u32, src: u32) -> Result<bool, String> {
+    let (ok, overflow) =
+        diarize::registry::with(|reg| reg.merge(dst, src)).map_err(|e| e.to_string())?;
+    for rel in &overflow {
+        diarize::clips::delete_clip_file(rel);
+    }
+    if ok {
+        diarize::registry::save().map_err(|e| e.to_string())?;
+    }
+    Ok(ok)
+}
+
+/// Base64 WAV of a *pending-review* captured clip (before attaching), so
+/// the end-of-session review strip can play it.
+#[tauri::command]
+fn speaker_review_clip_wav(stream_id: String, speaker: u32) -> Result<String, String> {
+    let bytes = transcribe::review_clip_wav(&stream_id, speaker)
+        .ok_or_else(|| "no captured clip for this speaker".to_string())?;
+    Ok(data_encoding::BASE64.encode(&bytes))
+}
+
+/// Confirm a reviewed speaker: attach its clip to an existing profile
+/// (`target_id`) or create a new one (`new_name`). Returns the profile id.
+#[tauri::command]
+fn speaker_review_attach(
+    stream_id: String,
+    speaker: u32,
+    target_id: Option<u32>,
+    new_name: Option<String>,
+) -> Result<u32, String> {
+    transcribe::review_attach(&stream_id, speaker, target_id, new_name).map_err(|e| e.to_string())
+}
+
+/// Dismiss a session's pending speaker review without attaching anything.
+#[tauri::command]
+fn speaker_review_dismiss(stream_id: String) -> Result<(), String> {
+    transcribe::review_dismiss(&stream_id);
+    Ok(())
+}
+
+/// Assign (or clear, with an empty string) a human name for a speaker.
+#[tauri::command]
+fn speaker_registry_rename(id: u32, label: Option<String>) -> Result<bool, String> {
+    let ok = diarize::registry::with(|reg| reg.set_label(id, label)).map_err(|e| e.to_string())?;
+    if ok {
+        diarize::registry::save().map_err(|e| e.to_string())?;
+    }
+    Ok(ok)
+}
+
+/// Forget a persisted speaker profile, deleting any voice clips it owned.
+#[tauri::command]
+fn speaker_registry_forget(id: u32) -> Result<bool, String> {
+    let removed = diarize::registry::with(|reg| reg.forget(id)).map_err(|e| e.to_string())?;
+    match removed {
+        Some(paths) => {
+            for rel in &paths {
+                diarize::clips::delete_clip_file(rel);
+            }
+            diarize::registry::save().map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 #[tauri::command]
@@ -1090,8 +1294,19 @@ fn main() {
             mesh::governance::mesh_governance_role_can_grant,
             mesh_file_save_at,
             ort_setup_status,
+            speaker_registry_list,
+            speaker_registry_rename,
+            speaker_registry_forget,
+            speaker_profile_clip_wav,
+            speaker_profile_remove_clip,
+            speaker_profile_merge,
+            speaker_review_clip_wav,
+            speaker_review_attach,
+            speaker_review_dismiss,
+            transcribe_session_audio,
             transcribe_start,
             transcribe_stop,
+            transcribe_abort,
             transcribe_pause,
             transcribe_resume,
             transcribe_buffer_size_bytes,
@@ -1413,6 +1628,9 @@ fn main() {
         .expect("error building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // Hard-abort any live transcription so a draining meeting
+                // can't hang process teardown waiting for its backlog.
+                transcribe::abort_all();
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async {
                     let _ = ollama::stop().await;
