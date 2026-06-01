@@ -53,7 +53,6 @@
     activeFamily,
     supportedModes,
     hardware,
-    sidebarOpen,
     conversationId,
     newChatCounter,
     textModelMissing,
@@ -63,7 +62,6 @@
     asrRuntime,
     onTextDownloaded,
     onAsrDownloaded,
-    onToggleSidebar,
     onModeChange,
     onProviderChange,
     onConversationChanged,
@@ -79,7 +77,6 @@
     activeFamily: string;
     supportedModes: Set<Mode>;
     hardware: HardwareProfile | null;
-    sidebarOpen: boolean;
     conversationId: string | null;
     newChatCounter: number;
     /** Left pane (transcription) is covered by a DownloadOverlay until
@@ -93,7 +90,6 @@
     asrRuntime: string;
     onTextDownloaded: () => void;
     onAsrDownloaded: () => void;
-    onToggleSidebar: () => void;
     onModeChange: (mode: Mode) => void;
     onProviderChange: () => void;
     onConversationChanged: (id: string) => void;
@@ -1107,8 +1103,6 @@
   <TopBar
     current={activeMode}
     supported={supportedModes}
-    {sidebarOpen}
-    {onToggleSidebar}
     onChange={handleModeChange}
     onOpenSettings={(tab) => (settingsTab = tab)}
     onRequestStopTranscribe={() => onRequestStopTranscribe()}

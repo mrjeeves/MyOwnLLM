@@ -8,6 +8,7 @@
   import TranscribeView from "./TranscribeView.svelte";
   import Sidebar from "./Sidebar.svelte";
   import LoadingPulse from "./LoadingPulse.svelte";
+  import LoadingBar from "./LoadingBar.svelte";
   import PermissionPromptModal from "./PermissionPromptModal.svelte";
   import { loadConfig, updateConfig } from "../config";
   import { getActiveManifest } from "../providers";
@@ -1051,6 +1052,7 @@
     <div class="splash">
       <div class="spinner"></div>
       <p>Detecting hardware…</p>
+      <LoadingBar />
       {#if appVersion}
         <p class="splash-version">v{appVersion}</p>
       {/if}
@@ -1079,6 +1081,28 @@
         onDeleteFolder={onDeleteFolder}
         onClose={() => (sidebarOpen = false)}
       />
+      {#if !sidebarOpen}
+        <!-- Reopen handle: the sidebar's own collapse button slides off
+             with it, and the hamburger now opens Settings, so this edge
+             tab is the only way back to a hidden sidebar. -->
+        <button
+          class="sidebar-reopen"
+          onclick={() => (sidebarOpen = true)}
+          title="Show conversations"
+          aria-label="Show conversations"
+        >
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <path
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              d="M9 6l6 6-6 6"
+            />
+          </svg>
+        </button>
+      {/if}
       {#if remoteOpenError}
         <div class="remote-open-error" role="alert">
           Couldn't open remote conversation: {remoteOpenError}
@@ -1092,7 +1116,6 @@
           activeFamily={activeFamilyName}
           {supportedModes}
           {hardware}
-          {sidebarOpen}
           conversationId={activeConversationId}
           {newChatCounter}
           {textModelMissing}
@@ -1102,7 +1125,6 @@
           asrRuntime={pendingAsrRuntime}
           onTextDownloaded={onTextDownloaded}
           onAsrDownloaded={onAsrDownloaded}
-          onToggleSidebar={() => (sidebarOpen = !sidebarOpen)}
           onModeChange={onModeChange}
           onProviderChange={onProviderChange}
           onConversationChanged={onConversationChanged}
@@ -1120,14 +1142,12 @@
           activeFamily={activeFamilyName}
           {supportedModes}
           {hardware}
-          {sidebarOpen}
           conversationId={activeConversationId}
           remoteOpen={remoteOpen}
           {newChatCounter}
           {textModelMissing}
           textModel={pendingTextModel}
           onTextDownloaded={onTextDownloaded}
-          onToggleSidebar={() => (sidebarOpen = !sidebarOpen)}
           onModeChange={onModeChange}
           onProviderChange={onProviderChange}
           onConversationChanged={onConversationChanged}
@@ -1195,7 +1215,7 @@
          indicator, under the spinner. -->
     <div class="warming-overlay">
       <div class="spinner"></div>
-      <LoadingPulse showStats={true} />
+      <LoadingPulse showStats={true} showProgress={true} />
       {#if ortSetup.checked && !ortSetup.ready && !ortSetup.error}
         <p class="splash-version">
           {ortSetup.message ?? "Setting up speech engine…"}
@@ -1330,6 +1350,32 @@
     flex: 1;
     display: flex;
     min-height: 0;
+    position: relative;
+  }
+  .sidebar-reopen {
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 48px;
+    padding: 0;
+    background: #131316;
+    border: 1px solid #1f1f24;
+    border-left: none;
+    border-radius: 0 8px 8px 0;
+    color: #777;
+    cursor: pointer;
+    transition: width .12s, background .12s, color .12s;
+  }
+  .sidebar-reopen:hover {
+    width: 22px;
+    background: #1a1a20;
+    color: #ccc;
   }
   .error-banner {
     background: #3a1717;

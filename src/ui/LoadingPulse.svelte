@@ -7,8 +7,15 @@
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import type { LiveSnapshot } from "../types";
+  import LoadingBar from "./LoadingBar.svelte";
 
-  let { showStats = true }: { showStats?: boolean } = $props();
+  // `showProgress` adds an indeterminate activity bar between the word and
+  // the stats line — used by the startup loading screen, left off in the
+  // in-chat bubble where it'd be noise.
+  let {
+    showStats = true,
+    showProgress = false,
+  }: { showStats?: boolean; showProgress?: boolean } = $props();
 
   // Deliberately ambiguous about *what's* happening: this same indicator
   // covers both a cold model load and a slow in-progress turn, so phrases
@@ -64,6 +71,9 @@
   {#key wordIdx}
     <span class="loading-word">{WORDS[wordIdx]}</span>
   {/key}
+  {#if showProgress}
+    <LoadingBar />
+  {/if}
   {#if showStats && live}
     <span class="loading-meta">
       {#if live.cpu_total_pct != null}CPU {Math.round(live.cpu_total_pct)}%{/if}
