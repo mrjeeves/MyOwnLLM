@@ -147,6 +147,154 @@
   let dictBase = 0;
   let dictLen = 0;
 
+  // --- Composer auto-grow + resizable max height -----------------------
+  // The message box grows with its content up to a cap, then scrolls. The
+  // cap defaults to four text lines and is itself draggable (the grip on the
+  // composer's top edge): dragging resizes *the cap* — how tall the box may
+  // grow before it scrolls — not the resting one-line size. Floor = that
+  // one-line static size; ceiling = half the viewport. The chosen cap is
+  // persisted so it survives reloads. Auto-grow also runs while dictation
+  // streams text in (see applyDictation), keeping the box pinned to the tail.
+  const COMPOSER_CAP_KEY = "composer.maxGrowPx";
+  const COMPOSER_DEFAULT_LINES = 4;
+  // Box metrics measured once from the live element so the math follows the
+  // real font / padding / border instead of hard-coded pixels.
+  let composerMeasured = false;
+  let composerPadY = 0;
+  let composerBorderY = 0;
+  let composerLinePx = 0;
+  let composerMinPx = 38; // one-line static size; refined on first measure
+  // User's chosen cap in px, or null to use the COMPOSER_DEFAULT_LINES default.
+  let composerCapPx = $state<number | null>(loadComposerCap());
+  // Live viewport height so the half-viewport ceiling tracks window resizes.
+  let viewportH = $state(typeof window !== "undefined" ? window.innerHeight : 800);
+  let composerResizing = $state(false);
+
+  function loadComposerCap(): number | null {
+    try {
+      const v = localStorage.getItem(COMPOSER_CAP_KEY);
+      if (v == null) return null;
+      const n = parseFloat(v);
+      return Number.isFinite(n) ? n : null;
+    } catch {
+      // localStorage may be unavailable in some embedded webviews.
+      return null;
+    }
+  }
+
+  function saveComposerCap(px: number) {
+    try {
+      localStorage.setItem(COMPOSER_CAP_KEY, String(Math.round(px)));
+    } catch {
+      // Best-effort: a missing persist only forgets the cap next reload.
+    }
+  }
+
+  /** Measure padding / border / line-height from the live textarea. Runs
+   *  once; the values drive both the auto-grow fit and the four-line cap. */
+  function measureComposer(el: HTMLTextAreaElement) {
+    const cs = getComputedStyle(el);
+    composerPadY = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+    composerBorderY =
+      parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth);
+    // `line-height: normal` reports non-numeric; fall back to a typical ratio.
+    let line = parseFloat(cs.lineHeight);
+    if (!Number.isFinite(line)) line = parseFloat(cs.fontSize) * 1.2;
+    composerLinePx = line;
+    composerMinPx = Math.round(line + composerPadY + composerBorderY);
+    composerMeasured = true;
+  }
+
+  /** The cap (max grow height) in px, clamped to [one line, half viewport].
+   *  Defaults to COMPOSER_DEFAULT_LINES lines until the user drags the grip. */
+  function composerCap(): number {
+    const minPx = composerMinPx;
+    const maxPx = Math.max(minPx, Math.round(viewportH / 2));
+    const fourLines =
+      composerLinePx > 0
+        ? Math.round(minPx + (COMPOSER_DEFAULT_LINES - 1) * composerLinePx)
+        : 140;
+    const want = composerCapPx ?? fourLines;
+    return Math.max(minPx, Math.min(want, maxPx));
+  }
+
+  /** Size the textarea to its content, capped by composerCap(); reveal the
+   *  scrollbar only once the content exceeds the cap. Idempotent and safe to
+   *  call wherever the text or the cap may have changed. */
+  function autoGrowComposer() {
+    const el = chatTextarea;
+    if (!el) return;
+    if (!composerMeasured) measureComposer(el);
+    const cap = composerCap();
+    el.style.height = "auto";
+    // scrollHeight = content + padding (border excluded); add the border back
+    // since the global box-sizing is border-box.
+    const fit = el.scrollHeight + composerBorderY;
+    el.style.height = Math.max(composerMinPx, Math.min(fit, cap)) + "px";
+    el.style.overflowY = fit > cap ? "auto" : "hidden";
+  }
+
+  // Dragging the grip resizes the cap, not the resting size. Drag up = taller.
+  let resizeStartY = 0;
+  let resizeStartCap = 0;
+
+  function startComposerResize(e: PointerEvent) {
+    e.preventDefault();
+    const el = chatTextarea;
+    if (el && !composerMeasured) measureComposer(el);
+    composerResizing = true;
+    resizeStartY = e.clientY;
+    resizeStartCap = composerCap();
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      // Pointer capture is a nicety; the window listeners drive the drag.
+    }
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "ns-resize";
+    window.addEventListener("pointermove", onComposerResizeMove);
+    window.addEventListener("pointerup", endComposerResize, { once: true });
+  }
+
+  function onComposerResizeMove(e: PointerEvent) {
+    const minPx = composerMinPx;
+    const maxPx = Math.max(minPx, Math.round(viewportH / 2));
+    // Dragging up (clientY decreases) raises the cap.
+    const next = resizeStartCap + (resizeStartY - e.clientY);
+    composerCapPx = Math.max(minPx, Math.min(next, maxPx));
+    autoGrowComposer();
+  }
+
+  function endComposerResize() {
+    composerResizing = false;
+    document.body.style.userSelect = "";
+    document.body.style.cursor = "";
+    window.removeEventListener("pointermove", onComposerResizeMove);
+    if (composerCapPx != null) saveComposerCap(composerCapPx);
+  }
+
+  // Re-grow whenever the text, the cap, the bound element, or the viewport
+  // changes. Effects run after the DOM updates, so scrollHeight reflects the
+  // new text — this is what makes dictation (which assigns `input`
+  // programmatically, bypassing the oninput handler) grow the box too.
+  $effect(() => {
+    void input;
+    void composerCapPx;
+    void viewportH;
+    void chatTextarea;
+    autoGrowComposer();
+  });
+
+  // Keep the half-viewport ceiling live as the window resizes.
+  $effect(() => {
+    if (typeof window === "undefined") return;
+    const onResize = () => {
+      viewportH = window.innerHeight;
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  });
+
   /** On memory-tight hosts a live transcribe session keeps the ASR (and
    *  diarize) models resident; cold-loading the chat model on top of that
    *  OOMs and stalls the transcription, so we block the chat send until the
@@ -1137,6 +1285,11 @@
         // Some webviews throw if the element isn't focusable yet; the
         // text still lands, only the caret nudge is skipped.
       }
+      // Grow to fit the freshly-folded text, then pin to the tail so the
+      // live caption stays visible as it streams (auto-scroll while
+      // transcribing). The $effect on `input` also grows the box, but we
+      // re-run here so the scroll below lands after the height settles.
+      autoGrowComposer();
       el.scrollTop = el.scrollHeight;
     });
   }
@@ -1189,6 +1342,11 @@
 
   onDestroy(() => {
     if (isDictating()) void stopDictation();
+    // Drop any in-flight composer resize so its window listener + body style
+    // overrides don't outlive the component.
+    window.removeEventListener("pointermove", onComposerResizeMove);
+    document.body.style.userSelect = "";
+    document.body.style.cursor = "";
   });
 
   async function handleModeChange(mode: Mode) {
@@ -1606,6 +1764,18 @@
       </div>
     {/if}
     <div class="input-row">
+      <!-- Drag handle on the composer's top edge. Resizes the *cap* (how
+           tall the box may grow before it scrolls), not the resting size —
+           floor is the one-line static size, ceiling is half the viewport. -->
+      <div
+        class="composer-grip"
+        class:active={composerResizing}
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="Resize how tall the message box grows before it scrolls"
+        title="Drag to set how tall the message box grows before it scrolls"
+        onpointerdown={startComposerResize}
+      ></div>
       <button
         class="attach-btn"
         onclick={openFilePicker}
@@ -2110,6 +2280,8 @@
   .input-row {
     display: flex;
     gap: .4rem;
+    /* Anchor for the absolutely-positioned resize grip. */
+    position: relative;
     /* Left padding is a touch tighter than the right because the + button
        reads as a control, not as content — leaving the same .75rem on
        both sides made the icon float in a noticeably wider gutter. */
@@ -2226,9 +2398,14 @@
     padding: .6rem .75rem;
     font-size: .9rem;
     font-family: inherit;
+    /* Native resize is disabled — the .composer-grip resizes the *cap* (the
+       max auto-grow height) rather than the resting size. JS drives the
+       actual height; min-height is the one-line floor / static size and the
+       cap (set inline, up to half the viewport) replaces the old fixed
+       max-height. overflow-y is toggled inline: hidden until the content
+       passes the cap, then auto for the scrollbar. */
     resize: none;
     min-height: 38px;
-    max-height: 140px;
     overflow-y: auto;
   }
   textarea:focus { outline: none; border-color: #6e6ef7; }
@@ -2236,6 +2413,36 @@
     opacity: .55;
     cursor: not-allowed;
     color: #777;
+  }
+  /* Resize grip straddling the composer's top edge. A small centred zone so
+     it doesn't steal clicks from the textarea below; dragging it up/down sets
+     how tall the box may grow before it scrolls. */
+  .composer-grip {
+    position: absolute;
+    top: -4px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 52px;
+    height: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: ns-resize;
+    touch-action: none;
+    z-index: 3;
+  }
+  .composer-grip::before {
+    content: "";
+    width: 34px;
+    height: 3px;
+    border-radius: 999px;
+    background: #2f2f2f;
+    transition: background .12s, width .12s;
+  }
+  .composer-grip:hover::before,
+  .composer-grip.active::before {
+    background: #6e6ef7;
+    width: 44px;
   }
   button {
     padding: 0 1rem;
