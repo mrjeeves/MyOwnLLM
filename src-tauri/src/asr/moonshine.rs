@@ -958,21 +958,21 @@ mod tests {
 
     #[test]
     fn step_budget_is_tight_for_short_chunks() {
-        // The streaming path's smallest decodable chunk is ~0.1 s; a
-        // 0.5 s (8000-sample) chunk is the size that burned 8.6 s in the
-        // field. Both must budget a handful of steps, nowhere near 256.
+        // The streaming path's smallest decodable chunk is ~0.1 s; a 0.5 s
+        // (8000-sample) chunk is the size that burned 8.6 s in the field.
+        // Every short chunk budgets a handful of steps, nowhere near 256,
+        // and a sub-100ms chunk still keeps the +8 floor (never zero).
         assert_eq!(decode_step_budget(8_000), 12); // ceil(0.5*8)=4, +8
         assert_eq!(decode_step_budget(16_000), 16); // ceil(1.0*8)=8, +8
-        // Even a tiny sub-100ms chunk keeps the +8 floor and never zero.
         assert_eq!(decode_step_budget(1_600), 9); // ceil(0.1*8)=1, +8
-        assert!(decode_step_budget(0) >= 8);
+        assert!(decode_step_budget(0) >= 8); // floored, never zero
     }
 
     #[test]
     fn step_budget_clamps_to_the_hard_ceiling() {
-        // The 8 s rolling window stays well under the ceiling…
+        // The 8 s rolling window stays well under the ceiling, but absurd
+        // inputs can never exceed MAX_DECODE_STEPS.
         assert_eq!(decode_step_budget(8 * 16_000), 72); // ceil(8*8)=64, +8
-        // …but absurd inputs can never exceed MAX_DECODE_STEPS.
         assert_eq!(decode_step_budget(10_000 * 16_000), MAX_DECODE_STEPS);
     }
 
