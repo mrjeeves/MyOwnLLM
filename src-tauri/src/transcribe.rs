@@ -3560,6 +3560,70 @@ mod tests {
     use crate::frame_sink::CaptureSink;
     use std::collections::VecDeque;
 
+    /// A minimal mono 16-bit PCM WAV of `ms` ms of silence at `sr` Hz — the
+    /// shape the mic-capture and warm-up paths feed the transcription route.
+    fn pcm_wav_silence(sr: u32, ms: u32) -> Vec<u8> {
+        let samples = (sr as u64 * ms as u64 / 1000) as u32;
+        let data_len = samples * 2;
+        let mut w = Vec::with_capacity(44 + data_len as usize);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + data_len).to_le_bytes());
+        w.extend_from_slice(b"WAVE");
+        w.extend_from_slice(b"fmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        w.extend_from_slice(&1u16.to_le_bytes()); // mono
+        w.extend_from_slice(&sr.to_le_bytes());
+        w.extend_from_slice(&(sr * 2).to_le_bytes());
+        w.extend_from_slice(&2u16.to_le_bytes());
+        w.extend_from_slice(&16u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&data_len.to_le_bytes());
+        w.resize(44 + data_len as usize, 0);
+        w
+    }
+
+    /// Regression guard for the symphonia `pcm` codec feature. `run_upload`
+    /// probes a WAV and builds a decoder for its codec; a 16-bit PCM WAV — what
+    /// the transcription path feeds — needs `symphonia-codec-pcm`. Without it,
+    /// `get_codecs().make()` fails with "unsupported codec", which is the
+    /// HTTP 500 `/v1/audio/transcriptions` returned before the feature was added.
+    #[test]
+    fn pcm_wav_decoder_can_be_built() {
+        use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+        use symphonia::core::formats::FormatOptions;
+        use symphonia::core::io::MediaSourceStream;
+        use symphonia::core::meta::MetadataOptions;
+        use symphonia::core::probe::Hint;
+
+        let wav = pcm_wav_silence(16_000, 100);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.wav");
+        std::fs::write(&path, &wav).unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let mut hint = Hint::new();
+        hint.with_extension("wav");
+        let probed = symphonia::default::get_probe()
+            .format(
+                &hint,
+                mss,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .expect("symphonia should probe a PCM WAV (the `wav` format feature)");
+        let track = probed
+            .format
+            .tracks()
+            .iter()
+            .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+            .expect("PCM WAV should expose an audio track");
+        symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())
+            .expect("a PCM decoder must be available (needs the symphonia `pcm` codec feature)");
+    }
+
     fn seg(start_ms: u64, end_ms: u64, text: &str) -> AsrSegment {
         AsrSegment {
             start_ms,

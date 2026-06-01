@@ -108,11 +108,14 @@ ndarray = "0.17"
 # SentencePiece-style `tokens.txt` we parse ourselves so it doesn't
 # touch this.
 tokenizers = { version = "0.20", default-features = false, features = ["unstable_wasm"] }
-# Audio file decoding for the "Upload audio" flow. symphonia is pure Rust
-# (no extra system deps) and handles wav / flac / mp3 / aac / ogg-vorbis /
-# m4a out of the box — enough for the realistic set of files a user is
-# likely to drop in.
-symphonia = { version = "0.5", default-features = false, features = ["wav", "flac", "mp3", "aac", "isomp4", "ogg", "vorbis"] }
+# Audio file decoding for the "Upload audio" flow (and the HTTP transcription
+# route). symphonia is pure Rust (no extra system deps). NB: in symphonia the
+# container *format* and the sample *codec* are separate features — `wav` is
+# only the RIFF demuxer; decoding PCM samples needs `pcm` (and `adpcm` for the
+# compressed WAV variants). Without them a plain 16-bit PCM WAV — the most
+# common WAV, and exactly what the mic/transcription path produces — probes
+# fine but fails at `get_codecs().make()` with "unsupported codec".
+symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "adpcm", "flac", "mp3", "aac", "isomp4", "ogg", "vorbis"] }
 # Real-input FFT for the diarize embedder's kaldi-compatible 80-dim
 # fbank front-end. wespeaker-r34 and CAM++ both consume `[B, T, 80]`
 # log-mel filterbank features rather than raw audio (the ONNX exports
