@@ -851,6 +851,98 @@ pub fn start_upload(
     Ok(())
 }
 
+/// A [`FrameSink`] that accumulates an upload session's emitted segments
+/// instead of forwarding them to a UI. The upload (disk-shard) path emits
+/// only finalized, non-overlapping segments — `seg_id` 0, never interim or
+/// partial (see `run_upload` / `join_segments`) — so collecting every
+/// frame's segments and joining their text in time order reconstructs the
+/// whole transcript. Heartbeat / progress frames (empty `segments`) are
+/// ignored.
+#[derive(Default)]
+struct CollectSink {
+    segments: Mutex<Vec<EmittedSegment>>,
+}
+
+impl CollectSink {
+    /// Drain the collected segments into one transcript, ordered by start
+    /// time, space-joined, with empty/whitespace pieces dropped.
+    fn take_text(&self) -> String {
+        let mut segs = std::mem::take(&mut *self.segments.lock().expect("CollectSink poisoned"));
+        segs.sort_by_key(|s| s.start_ms);
+        let mut out = String::new();
+        for s in &segs {
+            let t = s.text.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(t);
+        }
+        out
+    }
+}
+
+impl FrameSink for CollectSink {
+    fn emit_frame(&self, _event: &str, frame: TranscribeFrame) {
+        if frame.segments.is_empty() {
+            return;
+        }
+        self.segments
+            .lock()
+            .expect("CollectSink poisoned")
+            .extend(frame.segments);
+    }
+}
+
+/// Transcribe an audio file to plain text, **synchronously and headless** —
+/// no Tauri window, no background session, no retained audio. This is the
+/// entry point the OpenAI-compatible `POST /v1/audio/transcriptions` HTTP
+/// route drives so `myownllm serve` can transcribe for callers (e.g. Myo's
+/// open-mic loop) that only have the `:1473` sidecar, not the desktop IPC.
+///
+/// It reuses [`run_upload`] — the same decode→resample→ASR pipeline the
+/// "Upload audio" button runs — with a [`CollectSink`] in place of the
+/// window, and blocks on the calling thread until the file is fully
+/// transcribed. Diarization is intentionally off: this surface answers
+/// "what was said", not "who said it". The caller owns `file_path` and is
+/// expected to delete it afterwards — nothing here writes the audio to the
+/// session store, so transcription leaves no trace on disk.
+pub fn transcribe_file_blocking(
+    runtime: &str,
+    model_name: &str,
+    file_path: &Path,
+) -> Result<String> {
+    if !models::find(model_name, ModelKind::Asr)
+        .map(models::is_installed)
+        .unwrap_or(false)
+    {
+        return Err(anyhow!(
+            "ASR model '{model_name}' isn't installed — preload it or open the desktop app once to fetch it."
+        ));
+    }
+    if !file_path.exists() {
+        return Err(anyhow!("audio file not found: {}", file_path.display()));
+    }
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    let sink = Arc::new(CollectSink::default());
+    let dyn_sink: Arc<dyn FrameSink> = sink.clone();
+    run_upload(
+        "myownllm://transcribe-upload/http",
+        runtime,
+        model_name,
+        file_path,
+        None, // diarization off for the HTTP transcription surface
+        cancel,
+        paused,
+        &dyn_sink,
+    )?;
+    Ok(sink.take_text())
+}
+
 /// Remote-audio session inboxes. Keyed by stream id, value is the
 /// f32-PCM sender feeding the ingest loop. Populated by
 /// [`start_remote_session`], drained by [`feed_remote_audio`],
