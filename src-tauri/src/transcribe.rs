@@ -2136,6 +2136,9 @@ struct SileroGate {
     /// session stays on RMS and stops logging, so a recurring failure can
     /// never flood the console.
     degraded: bool,
+    /// Most recent raw Silero speech probability, stashed purely for the
+    /// `[perf]` diagnostic line. Not used in any gating decision.
+    last_prob: f32,
 }
 
 impl HopGate {
@@ -2148,6 +2151,7 @@ impl HopGate {
                         gate: SpeechGate::new(endpoint_silence_ms),
                         rms: SilenceEndpointer::new(SILENCE_RMS_THRESHOLD, endpoint_silence_ms),
                         degraded: false,
+                        last_prob: 0.0,
                     }));
                 }
                 Err(e) => {
@@ -2168,6 +2172,16 @@ impl HopGate {
         }
     }
 
+    /// The most recent raw VAD speech-probability, for the `[perf]`
+    /// diagnostic only. `None` on the RMS fallback gate (no probability)
+    /// or once a Silero failure has latched the session to RMS.
+    fn last_prob(&self) -> Option<f32> {
+        match self {
+            HopGate::Silero(s) if !s.degraded => Some(s.last_prob),
+            _ => None,
+        }
+    }
+
     /// Decide whether `hop_audio` is speech and whether this hop closes
     /// an utterance. `hop_ms` is the hop's wall duration for the
     /// trailing-silence clock.
@@ -2181,7 +2195,10 @@ impl HopGate {
                     return (r >= SILENCE_RMS_THRESHOLD, s.rms.observe(r, hop_ms));
                 }
                 match s.vad.speech_prob(hop_audio, cancel) {
-                    Ok(prob) => s.gate.observe(prob, hop_ms),
+                    Ok(prob) => {
+                        s.last_prob = prob;
+                        s.gate.observe(prob, hop_ms)
+                    }
                     Err(e) => {
                         // First mid-session inference failure: log once,
                         // latch to RMS for the rest of the session so a
@@ -2285,6 +2302,14 @@ struct PerfTracker {
     audio_secs: f64, // seconds of audio actually processed (decoded hops)
     speechy_hops: u64,
     silent_hops: u64,
+    // Signal diagnostics: the loudest hop (RMS energy of the raw mic
+    // samples) and the highest VAD speech-probability seen this window.
+    // Together they split "mic is feeding silence" (peak_lvl ~0) from "mic
+    // is fine but the VAD never crosses its 0.5 enter threshold"
+    // (peak_lvl healthy, peak_prob low). peak_prob is None on the RMS
+    // fallback gate, which has no probability to report.
+    peak_hop_rms: f32,
+    peak_vad_prob: f32,
 }
 
 impl PerfTracker {
@@ -2304,6 +2329,8 @@ impl PerfTracker {
             audio_secs: 0.0,
             speechy_hops: 0,
             silent_hops: 0,
+            peak_hop_rms: 0.0,
+            peak_vad_prob: 0.0,
         }
     }
 
@@ -2338,7 +2365,7 @@ impl PerfTracker {
         perf_log(&format!(
             "[perf] RTF={:.2} (busy {:.1}s / audio {:.1}s, wall {:.1}s) backlog={} behind={:.1}s | \
              vad {:.0}/{:.0}ms x{} | asr_chunk {:.0}/{:.0}ms x{} | beam {:.0}/{:.0}ms x{} | \
-             diarize {:.0}/{:.0}ms x{} | hops speechy={} silent={}",
+             diarize {:.0}/{:.0}ms x{} | hops speechy={} silent={} | mic peak_lvl={:.4} peak_prob={:.3}",
             rtf,
             busy,
             self.audio_secs,
@@ -2359,6 +2386,8 @@ impl PerfTracker {
             self.diarize.count,
             self.speechy_hops,
             self.silent_hops,
+            self.peak_hop_rms,
+            self.peak_vad_prob,
         ));
         // Reset the window.
         self.last_report = std::time::Instant::now();
@@ -2369,6 +2398,8 @@ impl PerfTracker {
         self.audio_secs = 0.0;
         self.speechy_hops = 0;
         self.silent_hops = 0;
+        self.peak_hop_rms = 0.0;
+        self.peak_vad_prob = 0.0;
     }
 }
 
@@ -2526,6 +2557,13 @@ fn run_streaming_loop(
         let hop_audio = &win[win.len() - tail..];
         let (speechy, endpoint) =
             PerfTracker::time(&mut perf.vad, || gate.observe(hop_audio, hop_ms, &cancel));
+        // Signal diagnostics (perf line only): how loud was this hop, and
+        // how confident was the VAD? Splits "silence reaching the mic" from
+        // "audio is fine but the VAD won't trip" when speechy stays 0.
+        perf.peak_hop_rms = perf.peak_hop_rms.max(chunk_rms(hop_audio));
+        if let Some(p) = gate.last_prob() {
+            perf.peak_vad_prob = perf.peak_vad_prob.max(p);
+        }
         if speechy {
             perf.speechy_hops += 1;
         } else {
