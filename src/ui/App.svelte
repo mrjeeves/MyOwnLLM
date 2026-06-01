@@ -9,6 +9,7 @@
   import Sidebar from "./Sidebar.svelte";
   import LoadingPulse from "./LoadingPulse.svelte";
   import LoadingBar from "./LoadingBar.svelte";
+  import { startupProgress } from "./startup-progress.svelte";
   import PermissionPromptModal from "./PermissionPromptModal.svelte";
   import { loadConfig, updateConfig } from "../config";
   import { getActiveManifest } from "../providers";
@@ -228,6 +229,9 @@
       hardware = hw;
       activeMode = config.active_mode;
       activeFamilyName = config.active_family;
+      // Hardware + config are in; the catalog read is next. (The tracker
+      // starts on the "hardware" step, so this is the first advance.)
+      startupProgress.start("manifest");
 
       // Background auto-cleanups. Each pass is gated by its toggle in
       // Settings → Storage so users can opt out per area; defaults are
@@ -282,6 +286,7 @@
       // ASR runtime for ''". onModeChange / onProviderChange still
       // refresh it, but the initial paint needs the same value.
       activeModel = displayModelFor(activeMode, hw, manifest, config);
+      startupProgress.start("models");
       await recomputeMissing(hw, manifest, config);
 
       // Always reveal the workspace immediately — the Chat / Transcribe
@@ -292,7 +297,6 @@
       // binary isn't installed yet (the overlay's Download button will
       // run the install lazily).
       view = "chat";
-      invoke("ollama_ensure_running").catch(() => {});
 
       // Warm the chat model so the first message doesn't pay the cold-load
       // wait. On by default; the load runs under the configured throttle
@@ -311,11 +315,29 @@
         config.ollama_keep_alive !== "0"
       ) {
         warming = true;
-        invoke("ollama_warm", { model: pendingTextModel })
+        startupProgress.start("ollama");
+        // Bring the daemon up first so the bar can step from "starting the
+        // server" to "loading the model"; `ollama_warm` re-ensures it, but
+        // that second call is idempotent and returns fast. The `.catch`
+        // before `.then` mirrors the old fire-and-forget: even if the ping
+        // fails (binary not installed yet) we still attempt the warm, which
+        // re-runs ensure_running and surfaces the real error.
+        invoke("ollama_ensure_running")
+          .catch(() => {})
+          .then(() => {
+            startupProgress.start("warm");
+            return invoke("ollama_warm", { model: pendingTextModel });
+          })
           .catch(() => {})
           .finally(() => {
             warming = false;
+            startupProgress.done();
           });
+      } else {
+        // No warm: the daemon still needs to be up for the first message,
+        // but there's no slow load to track — so the bar is already done.
+        invoke("ollama_ensure_running").catch(() => {});
+        startupProgress.done();
       }
 
       kickUpdateCheck();
@@ -427,6 +449,7 @@
       console.error("MyOwnLLM startup failed:", e);
       error = String(e);
       view = "chat"; // Show chat anyway with whatever we have
+      startupProgress.done(); // don't leave the tracker dangling mid-step
     }
   });
 
@@ -1051,7 +1074,6 @@
   {#if view === "loading"}
     <div class="splash">
       <div class="spinner"></div>
-      <p>Detecting hardware…</p>
       <LoadingBar />
       {#if appVersion}
         <p class="splash-version">v{appVersion}</p>

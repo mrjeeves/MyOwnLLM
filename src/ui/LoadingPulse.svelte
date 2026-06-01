@@ -9,9 +9,10 @@
   import type { LiveSnapshot } from "../types";
   import LoadingBar from "./LoadingBar.svelte";
 
-  // `showProgress` adds an indeterminate activity bar between the word and
-  // the stats line — used by the startup loading screen, left off in the
-  // in-chat bubble where it'd be noise.
+  // `showProgress` swaps the vague rotating word for the determinate startup
+  // tracker (a real 0→100% bar with a per-step status line) — used by the
+  // startup loading screen. Left off in the in-chat bubble, where there's no
+  // startup to track and the rotating reassurance word is all we want.
   let {
     showStats = true,
     showProgress = false,
@@ -52,9 +53,13 @@
   }
 
   onMount(() => {
-    wordTimer = setInterval(() => {
-      wordIdx = (wordIdx + 1) % WORDS.length;
-    }, WORD_MS);
+    // The determinate bar's status line replaces the rotating word, so only
+    // spin it when the word is actually on screen.
+    if (!showProgress) {
+      wordTimer = setInterval(() => {
+        wordIdx = (wordIdx + 1) % WORDS.length;
+      }, WORD_MS);
+    }
     if (showStats) {
       void refresh(); // prime the CPU delta cache immediately
       statsTimer = setInterval(() => void refresh(), STATS_POLL_MS);
@@ -68,11 +73,12 @@
 </script>
 
 <div class="loading-inline" aria-live="polite">
-  {#key wordIdx}
-    <span class="loading-word">{WORDS[wordIdx]}</span>
-  {/key}
   {#if showProgress}
     <LoadingBar />
+  {:else}
+    {#key wordIdx}
+      <span class="loading-word">{WORDS[wordIdx]}</span>
+    {/key}
   {/if}
   {#if showStats && live}
     <span class="loading-meta">

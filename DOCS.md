@@ -634,10 +634,16 @@ Launch the GUI by running `myownllm` with no arguments, or open the application 
 **First run** (auto-transitions, no user choices required):
 
 ```
-"Detecting hardware…"
-"Best model for your system: Qwen2.5 14B — Downloading 8.9 GB…"
-  [progress bar]
-→ chat opens automatically
+A single progress bar fills 0 → 100% as startup advances, with a short
+status line naming whichever step is currently in flight:
+
+  Detecting hardware → Reading the model catalog → Checking installed
+  models → Starting the model server → Loading the model into memory
+
+  [▓▓▓▓▓▓░░░░░] 56%   Loading the model into memory
+
+→ chat opens once the model is warm. A model that isn't on disk yet
+  downloads in place via its own overlay instead of blocking startup.
 ```
 
 **Main window:**
