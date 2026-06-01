@@ -96,6 +96,9 @@ A tier carries three RAM/VRAM thresholds because Apple Silicon and discrete GPUs
 | `hardware.rs` | nvidia-smi / rocm-smi / sysctl / /proc detection. |
 | `ollama.rs` | spawn/stop `ollama serve`, pull, list, delete, warm, has_model. |
 | `purge.rs` | Danger-zone resets: `purge_models` / `purge_conversations` / `purge_all`. Shared between the Storage tab's "Danger zone" Tauri commands and `myownllm purge` in the CLI. |
+| `transcribe.rs` | Live transcription orchestrator. Owns mic capture (cpal), the streaming decode loop, endpointing, interim→final caption emission, and the diarize-in-loop wiring; emits segments on `myownllm://transcribe-segment/<id>`. Also drives the remote (mesh-host) path via `*_remote_session` / `feed_remote_audio`. Carries the `[perf]` instrumentation — realtime factor, per-stage timings, backlog, mic level / VAD probability — gated on `MYOWNLLM_PERF` (default on; logs to stderr + `~/.myownllm/perf.log`). |
+| `asr/` | Speech-to-text backends + streaming policy. `streaming.rs` — overlapping-window decode with **LocalAgreement-2** (commit the prefix two successive hypotheses agree on) for stable interim→final captions, plus the RMS `SilenceEndpointer` fallback. `vad.rs` — **Silero VAD v5** neural endpointing (replaces the RMS gate; falls back to RMS on load/inference failure). `moonshine.rs` — UsefulSensors Moonshine v2 (raw-PCM encoder/decoder ONNX; greedy interim decode, length-bounded per chunk). `parakeet.rs` — NVIDIA Parakeet TDT 0.6B v3 (25 languages). `beam.rs` — width-4 beam search for finalized utterances (greedy still drives the live interim text). |
+| `diarize/` | Speaker diarization + cross-session **Speaker Profiles**. `segmenter.rs` — pyannote-segmentation-3.0 (powerset per-frame speaker activity on 10 s windows). `embedder.rs` — wespeaker-r34 / CAM++ speaker embeddings (`fbank.rs` = kaldi-compatible log-mel features). `cluster.rs` — online unit-hypersphere clustering (stable IDs within a session). `registry.rs` — durable cross-session registry (EMA centroids, cosine match, anchored-to-verified-clips, atomic JSON write, TTL eviction). `capture.rs` — opportunistic best-clip capture per speaker; `clips.rs` — on-disk WAV clip store under `speaker-clips/`. |
 | `mesh/` | Cloud Mesh substrate. The transport itself (identity, signing, roster, networks, WebRTC + ICE, signaling, governance, peer-level RPC + typed channels) is the [MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh) daemon — bundled as a Tauri sidecar via `build.rs` and pinned by `.myownmesh-rev`. `daemon.rs` spawns (or attaches to) `myownmesh serve` at startup with `MYOWNMESH_HOME=~/.myownllm` so existing users keep their pubkey + roster files; the detect-and-share order is `~/.myownmesh/daemon.sock` (shared with the MyOwnMesh GUI when running), then `~/.myownllm/daemon.sock` (LLM-owned). A `ControlClient` over the daemon's line-delimited JSON IPC socket dispatches requests; the daemon's event stream is forwarded to the frontend as `mesh://event`. `daemon_commands.rs` exposes 30 thin Tauri commands covering the full daemon IPC surface (`mesh_daemon_status`, identity, networks, peers + roster, governance, RPC register/call/respond/stream, channel subscribe/send, capabilities). The legacy single-file Rust mesh module — `identity.rs`, `signing.rs`, `roster.rs` — is a thin re-export of `myownmesh_core` (same `~/.myownllm/.secrets/identity.json` and `~/.myownllm/mesh/rosters/{network_id}.json` layout) so headless CLI ops + tests still work without a running daemon. `commands.rs` retains a small surface of GUI-side helpers (`mesh_file_save_at` for user-confirmed writes, identity label set / Network ID normalize); the LLM-specific protocol on top of the daemon (capability advertisement, catalog gossip, remote inference, file transfer, Move, transcribe) lives in the TS layer (`src/mesh-*`). `governance.rs` houses the LLM-side helpers for the daemon's signed-proposal governance flow. |
 
 ## Modules (TypeScript)
@@ -132,6 +135,94 @@ The TS layer is the GUI's source of truth. The Rust layer reads the same on-disk
 | `ui/settings-route.svelte.ts` | Cross-component "open settings" request channel. Sidebar calls `settingsRoute.open("cloud-mesh", { meshSubTab: "connections" })`; whichever main surface is mounted (Chat / TranscribeView) reads the signal via `$effect`, copies it into its local `settingsTab` state, and clears the signal. Avoids prop-drilling settings callbacks through both surfaces. |
 | `settings-attention.svelte.ts` | Generic per-tab attention indicator registry. `SettingsPanel` renders dots from this store; the legacy `updateUi.available` signal is mirrored into it so the existing Updates dot keeps working through the unified path. New tabs that need a dot just call `settingsAttention.set(tabId, …)`. |
 | `ui/*.svelte` | Svelte 5 UI. |
+
+## Transcription pipeline
+
+Both the local-mic and the remote-peer (mesh-host) paths feed the **same** in-process pipeline, orchestrated by `transcribe.rs`: endpointing decides utterance boundaries, the streaming ASR emits interim captions that firm up into a beam-searched final, and — when *Identify speakers* is on — the `diarize/` stages attach a speaker label before each segment is emitted on `myownllm://transcribe-segment/<id>`. The remote path swaps the mic for the `transcribe_audio` typed channel and streams the segments back over the `transcribe` RPC (see `mesh-transcribe.ts`); everything between is identical.
+
+```mermaid
+flowchart TB
+    Mic["Local mic · cpal · 16 kHz mono f32"]
+    Peer["Remote peer audio<br/>transcribe_audio channel · i16 LE PCM"]
+    VAD["Endpointing · asr/vad.rs<br/>Silero VAD v5 (RMS fallback)"]
+
+    subgraph ASR["asr/ · streaming ASR"]
+      direction TB
+      Stream["streaming.rs<br/>overlapping windows · LocalAgreement-2"]
+      Backend["moonshine.rs / parakeet.rs (per tier)"]
+      Interim["interim · greedy decode"]
+      Final["final · beam.rs width-4"]
+      Stream --> Backend --> Interim
+      Interim -->|on endpoint| Final
+    end
+
+    subgraph DIA["diarize/ · speaker labels (opt-in)"]
+      direction TB
+      Seg["segmenter.rs<br/>pyannote-segmentation-3.0 · powerset"]
+      Emb["embedder.rs<br/>wespeaker-r34 / CAM++ · fbank.rs log-mel"]
+      Clu["cluster.rs<br/>online clustering → session IDs"]
+      Reg["registry.rs<br/>cross-session profile<br/>EMA · cosine · clip-anchored"]
+      Cap["capture.rs + clips.rs<br/>best clip → speaker-clips/"]
+      Seg --> Emb --> Clu --> Reg
+      Clu --> Cap
+      Reg --> Cap
+    end
+
+    Evt["Segment event<br/>myownllm://transcribe-segment/&lt;id&gt;<br/>text · speaker? · overlap? · start_ms? · end_ms?"]
+    UICap["UI · live captions (interim → final)"]
+    Chips["UI · speaker chips + review strip"]
+    TP["Talking Points · live LLM summary"]
+
+    Mic --> VAD
+    Peer -. feed_remote_audio .-> VAD
+    VAD --> Stream
+    VAD -. finalized utterance audio .-> Seg
+    Interim -->|text| Evt
+    Final -->|text| Evt
+    Reg -. speaker label .-> Evt
+    Evt --> UICap
+    Evt --> Chips
+    Evt --> TP
+    Evt -. streamed back via transcribe RPC .-> Peer
+```
+
+Same pipeline, plain-text (renders anywhere — terminals, plain diff viewers):
+
+```
+   local mic   cpal · 16 kHz mono f32
+   remote peer transcribe_audio channel · i16 LE PCM
+   └───────────────────────────────────┐
+                                       │ feed_remote_audio
+                                       ▼
+ ┌────────────────────────────────────────────────────────────────────────────┐
+ │ ENDPOINTING   asr/vad.rs                                                   │
+ │   Silero VAD v5   (RMS SilenceEndpointer fallback)                         │
+ └─────────────────────────────────────┬──────────────────────────────────────┘
+                                       │ endpointed utterance
+                   ┌───────────────────┴───────────────────┐
+                   ▼ audio           audio (if diarize on) ▼
+ ┌───────────────────────────────────┐   ┌────────────────────────────────────┐
+ │ STREAMING ASR   asr/streaming.rs  │   │ DIARIZE   diarize/                 │
+ │   overlapping windows ·           │   │   segmenter.rs  pyannote-seg-3.0   │
+ │   LocalAgreement-2                │   │     ▼  embedder.rs   wespeaker /   │
+ │   backend: moonshine.rs |         │   │     ▼     CAM++ (fbank.rs log-mel) │
+ │            parakeet.rs            │   │     ▼  cluster.rs  → session IDs   │
+ │   interim (greedy)                │   │     ▼  registry.rs cross-session   │
+ │     ──▶ final (beam.rs · width-4) │   │          EMA·cosine·clip-anchored  │
+ │                                   │   │   capture/clips → speaker-clips/   │
+ └─────────────────┬─────────────────┘   └─────────────────┬──────────────────┘
+                   │ text (interim → final)   speaker label│
+                   └───────────────────┬───────────────────┘
+                                       ▼
+ ┌────────────────────────────────────────────────────────────────────────────┐
+ │ SEGMENT EVENT   myownllm://transcribe-segment/<id>                         │
+ │   { text, speaker?, overlap?, start_ms?, end_ms? }                         │
+ └────────┬───────────────────┬─────────────────┬───────────────────┬─────────┘
+          ▼                   ▼                 ▼                   ▼
+   live captions          speaker chips     Talking Points     remote: streamed
+   (interim →             + review strip    (live LLM loop)    back to peer via
+    final)                                                     `transcribe` RPC
+```
 
 ## Live update lifecycle
 
@@ -234,5 +325,11 @@ Redirecting the release feed: set `auto_update.stable_url` / `auto_update.beta_u
 │   └── rosters/{network_id}.json     (per-network approved peers; daemon-owned)
 ├── daemon.sock                       (LLM-owned myownmesh IPC socket; only present when no
 │                                      shared ~/.myownmesh/daemon.sock was attached at startup)
-└── transcribe-buffer/                (orphan ASR session chunks; cleared on launch)
+├── transcribe-buffer/                (orphan ASR session chunks; cleared on launch)
+├── speaker-registry.json             (cross-session Speaker Profiles: EMA centroids, names,
+│                                      verified-clip anchors — atomic write, TTL eviction)
+├── speaker-clips/                    (verified speaker voice-clip WAVs; referenced by
+│                                      relative path from speaker-registry.json)
+└── session-audio/                    (full-session WAVs, only when a conversation's
+                                       "Keep audio" toggle is on)
 ```
