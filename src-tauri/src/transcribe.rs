@@ -1225,6 +1225,9 @@ fn run_session(
     let channels = cfg.channels() as usize;
     let format = cfg.sample_format();
     let stream_cfg: cpal::StreamConfig = cfg.into();
+    eprintln!(
+        "[transcribe] mic config: sr={sr} channels={channels} format={format:?} keep_audio={keep_audio}"
+    );
 
     // Capture-first architecture. Two independent consumers of the mic:
     //
@@ -1239,11 +1242,11 @@ fn run_session(
     //
     // The audio callback does the bare minimum (downmix + two non-blocking
     // sends) so it always keeps up with the device.
-    let recorder: Option<Arc<SessionRecorder>> = if keep_audio {
+    let mut recorder: Option<SessionRecorder> = if keep_audio {
         match SessionRecorder::spawn(stream_id, sr) {
             Ok(r) => {
                 eprintln!("[transcribe] recording full session audio (keep_audio on)");
-                Some(Arc::new(r))
+                Some(r)
             }
             Err(e) => {
                 eprintln!("[transcribe] couldn't start session recorder: {e}");
@@ -1253,6 +1256,8 @@ fn run_session(
     } else {
         None
     };
+    // Lock-free handle for the realtime audio callback to feed.
+    let rec_handle: Option<RecorderHandle> = recorder.as_ref().and_then(|r| r.handle());
 
     // ~64 s of 0.5 s buffers: a deep runway so transcription can fall
     // behind and catch back up (the design intent) without the inference
@@ -1261,7 +1266,7 @@ fn run_session(
 
     let stream_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let cancel_audio = cancel.clone();
-    let recorder_cb = recorder.clone();
+    let recorder_cb = rec_handle;
     // Stop forwarding mic audio once draining starts, so the buffered
     // backlog can decode down to empty without new samples piling on.
     let draining_audio = draining.clone();
@@ -1287,7 +1292,7 @@ fn run_session(
                         // product. Then offer it to transcription, which may
                         // lag and catch up.
                         if let Some(rec) = &recorder {
-                            let _ = rec.write(&mono);
+                            rec.write(mono.clone());
                         }
                         let _ = tx.try_send(mono);
                     }
@@ -1316,7 +1321,7 @@ fn run_session(
                             data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
                         let mono = downmix_f32(&f, channels);
                         if let Some(rec) = &recorder {
-                            let _ = rec.write(&mono);
+                            rec.write(mono.clone());
                         }
                         let _ = tx.try_send(mono);
                     }
@@ -1347,7 +1352,7 @@ fn run_session(
                             .collect();
                         let mono = downmix_f32(&f, channels);
                         if let Some(rec) = &recorder {
-                            let _ = rec.write(&mono);
+                            rec.write(mono.clone());
                         }
                         let _ = tx.try_send(mono);
                     }
@@ -1359,6 +1364,7 @@ fn run_session(
         other => return Err(anyhow!("unsupported sample format: {other:?}")),
     };
     stream.play()?;
+    eprintln!("[transcribe] cpal stream.play() ok; entering session");
     drop(tx);
 
     // First frame: we're live.
@@ -1397,7 +1403,7 @@ fn run_session(
     // THEN finalize the recording — guaranteeing the WAV captures every
     // sample the device produced, right up to the stop.
     drop(stream);
-    if let Some(rec) = recorder.as_ref() {
+    if let Some(rec) = recorder.as_mut() {
         rec.finish();
     }
     let _ = std::fs::remove_dir_all(&buffer_dir);
@@ -2271,9 +2277,11 @@ fn run_streaming_loop(
     // transcription…" instead of looking frozen after Stop.
     let mut drain_announced = false;
 
+    eprintln!("[transcribe] streaming loop started (device_sr={device_sr})");
     loop {
         // Hard abort (app exit / fatal error): end now, dropping backlog.
         if cancel.load(Ordering::SeqCst) {
+            eprintln!("[transcribe] loop end: cancel flag set");
             break;
         }
         // Graceful stop: mic capture has stopped, so once the channel has
@@ -2318,7 +2326,12 @@ fn run_streaming_loop(
                 window.push(&pcm);
             }
             Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => {
+                eprintln!(
+                    "[transcribe] inference channel disconnected (all mic senders dropped) — ending loop"
+                );
+                break;
+            }
         }
 
         // Run a hop once a hop's worth of fresh audio has arrived.
@@ -2767,19 +2780,39 @@ pub fn session_audio_path(review_key: &str) -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// Background full-session WAV writer — the sovereign recording path. The
-/// audio callback hands raw mic blocks straight here over an unbounded
-/// channel (a cheap `Vec` move), and a dedicated thread resamples + writes
-/// them, so the recording is lossless and completely independent of how
-/// far transcription lags. Shared via `Arc` between the audio callback (the
-/// producer) and the decode loop (which only `finish`es it); both `finish`
-/// and `Drop` close the channel and join the writer, idempotently.
+/// Lock-free handle the audio callback holds to feed the recorder. It's a
+/// bare `Sender` clone — NO mutex — so the realtime WASAPI/CoreAudio
+/// callback never locks, never blocks, and can't be poison-panicked by the
+/// writer thread. Sending is a cheap `Vec` move onto an unbounded queue.
+#[derive(Clone)]
+struct RecorderHandle {
+    tx: crossbeam_channel::Sender<Vec<f32>>,
+}
+
+impl RecorderHandle {
+    /// Hand a raw device-rate mono PCM block to the writer thread. Never
+    /// blocks (unbounded) and never drops — the recording is the product.
+    #[inline]
+    fn write(&self, mono: Vec<f32>) {
+        let _ = self.tx.send(mono);
+    }
+}
+
+/// Background full-session WAV writer — the sovereign recording path. A
+/// dedicated thread resamples + writes blocks handed to it via
+/// [`RecorderHandle`], so the recording is lossless and completely
+/// independent of how far transcription lags. The audio callback holds a
+/// `RecorderHandle` (lock-free); this owner struct keeps the join handle +
+/// a stop flag so it can flush + finalize the WAV at session end.
 struct SessionRecorder {
-    // Interior mutability so the shared `Arc<SessionRecorder>` can be
-    // finalized through `&self` (the audio callback and the loop both hold
-    // clones; neither can move out of the Arc).
-    tx: Mutex<Option<crossbeam_channel::Sender<Vec<f32>>>>,
-    handle: Mutex<Option<thread::JoinHandle<()>>>,
+    // Explicit stop signal. The writer loop polls this so `finish()` can
+    // end + join it WITHOUT waiting for every outstanding RecorderHandle
+    // (the cpal callback clones) to drop first — otherwise a lingering
+    // handle would block the join forever and hang session teardown.
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+    // The owner's own sender; cloned into `RecorderHandle`s for callbacks.
+    tx: crossbeam_channel::Sender<Vec<f32>>,
 }
 
 impl SessionRecorder {
@@ -2794,18 +2827,40 @@ impl SessionRecorder {
         // Unbounded: the recording is the product and must never drop a
         // sample. The audio callback hands blocks here without ever
         // blocking; the writer thread drains and resamples at its own pace.
-        // A meeting of mic buffers is tiny next to the audio itself.
         let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
         let handle = thread::spawn(move || {
             let mut healthy = true;
-            while let Ok(block) = rx.recv() {
-                if !healthy {
-                    continue;
+            // Drain on a short poll so we notice `stop` even while no audio
+            // is arriving. On stop we do one final non-blocking drain so any
+            // already-queued blocks are written before we finalize.
+            loop {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(block) => {
+                        if healthy {
+                            let pcm = resample_linear(&block, device_sr, TARGET_SR);
+                            if let Err(e) = writer.write(&pcm) {
+                                eprintln!(
+                                    "[transcribe] session recorder write failed, disabling: {e}"
+                                );
+                                healthy = false;
+                            }
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if stop_thread.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
-                let pcm = resample_linear(&block, device_sr, TARGET_SR);
-                if let Err(e) = writer.write(&pcm) {
-                    eprintln!("[transcribe] session recorder write failed, disabling: {e}");
-                    healthy = false;
+            }
+            // Final drain of anything still queued at stop.
+            while let Ok(block) = rx.try_recv() {
+                if healthy {
+                    let pcm = resample_linear(&block, device_sr, TARGET_SR);
+                    let _ = writer.write(&pcm);
                 }
             }
             if let Err(e) = writer.finalize() {
@@ -2813,30 +2868,26 @@ impl SessionRecorder {
             }
         });
         Ok(Self {
-            tx: Mutex::new(Some(tx)),
-            handle: Mutex::new(Some(handle)),
+            stop,
+            handle: Some(handle),
+            tx,
         })
     }
 
-    /// Hand a raw device-rate mono PCM block to the writer thread. Never
-    /// blocks (unbounded queue) and never drops — the recording is the
-    /// product. `Err` only if the recorder has already been finished.
-    fn write(&self, pcm: &[f32]) -> std::result::Result<(), ()> {
-        match &*self.tx.lock().unwrap() {
-            Some(tx) => tx.send(pcm.to_vec()).map_err(|_| ()),
-            None => Err(()),
-        }
+    /// A lock-free handle for the audio callback to feed.
+    fn handle(&self) -> Option<RecorderHandle> {
+        Some(RecorderHandle {
+            tx: self.tx.clone(),
+        })
     }
 
-    /// Close the channel and join the writer so the WAV header is patched
-    /// before we return (the file is complete on disk after this). Takes
-    /// `&self` so it works through the shared `Arc`; idempotent, so a later
-    /// `Drop` is a no-op.
-    fn finish(&self) {
-        // Drop the sender → the writer thread sees the channel disconnect,
-        // finalizes the header, and exits.
-        self.tx.lock().unwrap().take();
-        if let Some(h) = self.handle.lock().unwrap().take() {
+    /// Signal the writer to flush + finalize, then join it. Robust to any
+    /// number of outstanding `RecorderHandle`s still alive (the writer
+    /// stops on the flag, not on all senders dropping), so this never hangs
+    /// session teardown. Idempotent.
+    fn finish(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
@@ -3452,12 +3503,13 @@ mod tests {
         // 48 kHz device, 10 blocks of 4800 samples = 1.0 s of audio.
         let device_sr = 48_000u32;
         let key = format!("rectest-{}", std::process::id());
-        let rec = SessionRecorder::spawn(&key, device_sr).unwrap();
+        let mut rec = SessionRecorder::spawn(&key, device_sr).unwrap();
+        let handle = rec.handle().expect("recorder handle");
         let block: Vec<f32> = (0..4800)
             .map(|i| ((i % 100) as f32 / 100.0) - 0.5)
             .collect();
         for _ in 0..10 {
-            rec.write(&block).unwrap();
+            handle.write(block.clone());
         }
         rec.finish();
 
