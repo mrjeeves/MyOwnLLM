@@ -47,6 +47,33 @@ pub async fn resolve(mode: &str) -> Result<String> {
     resolve_with_hardware(mode, &hw, None).await
 }
 
+/// Resolve a mode to **both** its model and the runtime that serves it.
+///
+/// The headless ASR HTTP route needs the pair together: `build_backends`
+/// dispatches on the runtime, so a Parakeet model handed to the Moonshine
+/// backend (or vice-versa) would mis-load. The model honours the same
+/// override precedence as [`resolve`]; the runtime is read from the active
+/// family's manifest tier (`mode_runtime`), falling back to
+/// [`default_runtime_for`] when no manifest/tier is available.
+pub async fn resolve_pair(mode: &str) -> Result<(String, String)> {
+    let model = resolve(mode).await?;
+    let runtime = match load_config_value() {
+        Ok(cfg) => {
+            let family = cfg["active_family"].as_str().unwrap_or("").to_string();
+            match active_provider_url(&cfg) {
+                Some(url) => fetch_or_load_manifest(&url)
+                    .await
+                    .ok()
+                    .and_then(|m| mode_runtime(&m, mode, &family))
+                    .unwrap_or_else(|| default_runtime_for(mode).to_string()),
+                None => default_runtime_for(mode).to_string(),
+            }
+        }
+        Err(_) => default_runtime_for(mode).to_string(),
+    };
+    Ok((model, runtime))
+}
+
 /// As `resolve`, but with a one-off manifest URL override (for `--profile`).
 pub async fn resolve_with_hardware(
     mode: &str,

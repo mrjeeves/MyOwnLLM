@@ -74,6 +74,7 @@ pub async fn serve(
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/myownllm/preload", post(api_preload))
         .route("/v1/myownllm/status", get(api_status))
+        .route("/v1/audio/transcriptions", post(transcriptions))
         .with_state(state.clone());
 
     if cors_all {
@@ -410,6 +411,145 @@ async fn api_status(State(_state): State<AppState>) -> impl IntoResponse {
         "ollama": ollama_up,
         "tracked": tracked,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Transcription (speech-to-text)
+// ---------------------------------------------------------------------------
+
+/// `POST /v1/audio/transcriptions` — speech-to-text over HTTP.
+///
+/// MyOwnLLM's ASR engine is otherwise desktop-only (driven by Tauri IPC).
+/// This route exposes the same upload pipeline over the `serve` API so
+/// loopback callers that only have the `:1473` sidecar — notably Myo's
+/// open-mic loop — can transcribe. The request body is the **raw audio
+/// bytes** (WAV / MP3 / FLAC / OGG / M4A — anything symphonia decodes); the
+/// response is `{"text": "..."}`. The audio lives only in a temp file that
+/// is deleted the instant transcription finishes — nothing is retained.
+///
+/// The first call on a cold machine may block while the onnxruntime dylib
+/// and the resolved ASR model download, so clients should use a generous
+/// timeout. Diarization is off (this surface answers "what was said").
+async fn transcriptions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+    if body.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "empty_audio",
+            "request body was empty — POST raw audio bytes (e.g. a WAV file)",
+        );
+    }
+    eprintln!("[asr-http] transcription request: {} bytes", body.len());
+
+    // 1. onnxruntime must be loaded before any ASR backend builds a session.
+    //    `ensure_ready` is idempotent + serialized; the first call may
+    //    download the runtime dylib, so keep it off the async worker.
+    let ort = tokio::task::spawn_blocking(|| {
+        let never = std::sync::atomic::AtomicBool::new(false);
+        crate::ort_setup::ensure_ready(&|stage| eprintln!("[asr-http] ort: {stage}"), &never)
+    })
+    .await;
+    match ort {
+        Ok(s) if s.initialized => {}
+        Ok(s) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ort_unavailable",
+                format!(
+                    "speech engine (onnxruntime) not ready: {}",
+                    s.error.unwrap_or_else(|| "unknown error".into())
+                ),
+            )
+        }
+        Err(e) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "ort_join", e.to_string())
+        }
+    }
+
+    // 2. Resolve this machine's transcribe model + the runtime that serves it.
+    let (model, runtime) = match crate::resolver::resolve_pair("transcribe").await {
+        Ok(pair) => pair,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "resolve_failed",
+                format!("could not resolve a transcribe model: {e}"),
+            )
+        }
+    };
+    eprintln!("[asr-http] resolved transcribe → runtime={runtime} model={model}");
+
+    // 3. Make sure the ASR model is on disk (no-op once installed; first
+    //    call downloads it).
+    match crate::models::fetch_model_quiet(&model, crate::models::ModelKind::Asr).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "model_unavailable",
+                format!("ASR model '{model}' could not be installed"),
+            )
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "model_fetch_failed",
+                format!("fetching ASR model '{model}': {e}"),
+            )
+        }
+    }
+
+    // 4. Persist to a transient temp file, transcribe on a blocking thread,
+    //    then delete the audio immediately — retain nothing.
+    let tmp = std::env::temp_dir().join(format!(
+        "myownllm-asr-{}-{}.wav",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    if let Err(e) = std::fs::write(&tmp, &body) {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "tmp_write",
+            format!("could not buffer audio: {e}"),
+        );
+    }
+    let job_path = tmp.clone();
+    let job_model = model.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::transcribe::transcribe_file_blocking(&runtime, &job_model, &job_path)
+    })
+    .await;
+    let _ = std::fs::remove_file(&tmp);
+
+    match result {
+        Ok(Ok(text)) => {
+            eprintln!(
+                "[asr-http] transcript ({} chars): {:?}",
+                text.len(),
+                text.chars().take(120).collect::<String>()
+            );
+            Json(json!({ "text": text, "model": model })).into_response()
+        }
+        Ok(Err(e)) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "transcribe_failed",
+            format!("{e:#}"),
+        ),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "transcribe_join",
+            e.to_string(),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
