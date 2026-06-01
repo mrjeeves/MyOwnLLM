@@ -392,21 +392,43 @@ async function runTpCycle(): Promise<void> {
   const streamId = crypto.randomUUID();
   tpInFlightStreamId = streamId;
   let collected = "";
+  // Bullets captured so far — handed to the model as "already noted"
+  // context so it can skip points they already cover instead of
+  // re-condensing a recurring topic into a near-duplicate bullet. We
+  // still ask for only the *new* points, so the output stays 1-3
+  // bullets and the existing append-then-cap logic below is unchanged.
+  // Bounded: `talking_points` is capped at TP_MAX_BULLETS, so this
+  // context can't grow without limit and the prompt stays small enough
+  // to not starve the ASR worker on a memory-tight machine.
+  const existingPoints = conv.talking_points ?? [];
+  const dedupe = existingPoints.length > 0;
   // Shared message body — used by both the local ollama path and the
   // mesh `infer_request` path so a routed TP behaves identically.
   const messages = [
     {
       role: "system" as const,
-      content:
-        "You condense passages of a live meeting transcript into bullet notes. " +
-        "Reply with 1-3 bullets, one per line, prefixed with '- '. " +
-        "Each bullet < 12 words. No preamble, no commentary, just the bullets. " +
-        "If the passage is filler or small talk with no substance, reply with nothing.",
+      content: dedupe
+        ? "You condense passages of a live meeting transcript into bullet notes. " +
+          "You are given the notes already captured earlier; add only points this " +
+          "passage introduces that those notes don't already cover. " +
+          "Reply with 0-3 bullets, one per line, prefixed with '- '. " +
+          "Each bullet < 12 words. No preamble, no commentary, just the bullets. " +
+          "If the passage is filler, small talk, or already covered, reply with nothing."
+        : "You condense passages of a live meeting transcript into bullet notes. " +
+          "Reply with 1-3 bullets, one per line, prefixed with '- '. " +
+          "Each bullet < 12 words. No preamble, no commentary, just the bullets. " +
+          "If the passage is filler or small talk with no substance, reply with nothing.",
     },
     {
       role: "user" as const,
-      content:
-        "Condense this passage into 1-3 bullet notes:\n\n" + newSlice,
+      content: dedupe
+        ? "Notes already captured:\n" +
+          existingPoints.map((b) => "- " + b).join("\n") +
+          "\n\nNew passage:\n\n" +
+          newSlice +
+          "\n\nAdd 1-3 bullets for anything new above not already captured; " +
+          "if it's all already covered, reply with nothing."
+        : "Condense this passage into 1-3 bullet notes:\n\n" + newSlice,
     },
   ];
   try {
