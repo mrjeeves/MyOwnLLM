@@ -5,6 +5,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     match args.first().map(|s| s.as_str()) {
         Some("run") => cmd_run(&args[1..]).await,
         Some("serve") => crate::api::cmd_serve(&args[1..]).await,
+        Some("transcribe") => cmd_transcribe(&args[1..]).await,
         Some("preload") => cmd_preload(&args[1..]).await,
         Some("status") => cmd_status(&args[1..]).await,
         Some("stop") => cmd_stop().await,
@@ -45,6 +46,8 @@ USAGE:
 COMMANDS:
   run           Start chat (terminal)
   serve         Start the OpenAI-compatible HTTP server
+  transcribe <file>
+                Transcribe an audio file to text (prints the transcript to stdout)
   preload       Pull and warm models for one or more modes
   status        Show current state (provider, family, recommended models)
   stop          Stop ollama serve
@@ -903,6 +906,47 @@ async fn cmd_purge(args: &[String]) -> Result<()> {
             eprintln!("Restart MyOwnLLM to come back up against compiled-in defaults.");
         }
     }
+    Ok(())
+}
+
+/// `myownllm transcribe <audio-file>` — one-shot speech-to-text for a single
+/// file, printing the transcript to **stdout** (all diagnostics go to stderr).
+///
+/// This is the headless, no-server path: a caller (e.g. Myo) spawns the bundled
+/// `myownllm` directly instead of POSTing to a shared `serve` port, so there's
+/// no HTTP endpoint to collide with — or to attach to a stale instance of. It
+/// reuses the same decode→ASR pipeline as the "Upload audio" flow.
+async fn cmd_transcribe(args: &[String]) -> Result<()> {
+    let path = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .ok_or_else(|| anyhow!("usage: myownllm transcribe <audio-file>"))?;
+    let path = std::path::PathBuf::from(path);
+    if !path.exists() {
+        return Err(anyhow!("audio file not found: {}", path.display()));
+    }
+
+    // onnxruntime must be loaded before the ASR backend builds a session
+    // (idempotent; first run may download the runtime dylib).
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let ort = crate::ort_setup::ensure_ready(&|stage| eprintln!("[transcribe] {stage}"), &never);
+    if !ort.initialized {
+        return Err(anyhow!(
+            "speech engine (onnxruntime) not ready: {}",
+            ort.error.unwrap_or_else(|| "unknown error".into())
+        ));
+    }
+
+    // Resolve this machine's transcribe model + runtime, and ensure it's on disk.
+    let (model, runtime) = crate::resolver::resolve_pair("transcribe").await?;
+    eprintln!("[transcribe] runtime={runtime} model={model}");
+    if !crate::models::fetch_model_quiet(&model, crate::models::ModelKind::Asr).await? {
+        return Err(anyhow!("ASR model '{model}' could not be installed"));
+    }
+
+    // Decode + transcribe; the transcript is the only thing on stdout.
+    let text = crate::transcribe::transcribe_file_blocking(&runtime, &model, &path)?;
+    println!("{text}");
     Ok(())
 }
 
