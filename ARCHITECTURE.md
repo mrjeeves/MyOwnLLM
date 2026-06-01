@@ -136,6 +136,94 @@ The TS layer is the GUI's source of truth. The Rust layer reads the same on-disk
 | `settings-attention.svelte.ts` | Generic per-tab attention indicator registry. `SettingsPanel` renders dots from this store; the legacy `updateUi.available` signal is mirrored into it so the existing Updates dot keeps working through the unified path. New tabs that need a dot just call `settingsAttention.set(tabId, …)`. |
 | `ui/*.svelte` | Svelte 5 UI. |
 
+## Transcription pipeline
+
+Both the local-mic and the remote-peer (mesh-host) paths feed the **same** in-process pipeline, orchestrated by `transcribe.rs`: endpointing decides utterance boundaries, the streaming ASR emits interim captions that firm up into a beam-searched final, and — when *Identify speakers* is on — the `diarize/` stages attach a speaker label before each segment is emitted on `myownllm://transcribe-segment/<id>`. The remote path swaps the mic for the `transcribe_audio` typed channel and streams the segments back over the `transcribe` RPC (see `mesh-transcribe.ts`); everything between is identical.
+
+```mermaid
+flowchart TB
+    Mic["Local mic · cpal · 16 kHz mono f32"]
+    Peer["Remote peer audio<br/>transcribe_audio channel · i16 LE PCM"]
+    VAD["Endpointing · asr/vad.rs<br/>Silero VAD v5 (RMS fallback)"]
+
+    subgraph ASR["asr/ · streaming ASR"]
+      direction TB
+      Stream["streaming.rs<br/>overlapping windows · LocalAgreement-2"]
+      Backend["moonshine.rs / parakeet.rs (per tier)"]
+      Interim["interim · greedy decode"]
+      Final["final · beam.rs width-4"]
+      Stream --> Backend --> Interim
+      Interim -->|on endpoint| Final
+    end
+
+    subgraph DIA["diarize/ · speaker labels (opt-in)"]
+      direction TB
+      Seg["segmenter.rs<br/>pyannote-segmentation-3.0 · powerset"]
+      Emb["embedder.rs<br/>wespeaker-r34 / CAM++ · fbank.rs log-mel"]
+      Clu["cluster.rs<br/>online clustering → session IDs"]
+      Reg["registry.rs<br/>cross-session profile<br/>EMA · cosine · clip-anchored"]
+      Cap["capture.rs + clips.rs<br/>best clip → speaker-clips/"]
+      Seg --> Emb --> Clu --> Reg
+      Clu --> Cap
+      Reg --> Cap
+    end
+
+    Evt["Segment event<br/>myownllm://transcribe-segment/&lt;id&gt;<br/>text · speaker? · overlap? · start_ms? · end_ms?"]
+    UICap["UI · live captions (interim → final)"]
+    Chips["UI · speaker chips + review strip"]
+    TP["Talking Points · live LLM summary"]
+
+    Mic --> VAD
+    Peer -. feed_remote_audio .-> VAD
+    VAD --> Stream
+    VAD -. finalized utterance audio .-> Seg
+    Interim -->|text| Evt
+    Final -->|text| Evt
+    Reg -. speaker label .-> Evt
+    Evt --> UICap
+    Evt --> Chips
+    Evt --> TP
+    Evt -. streamed back via transcribe RPC .-> Peer
+```
+
+Same pipeline, plain-text (renders anywhere — terminals, plain diff viewers):
+
+```
+   local mic   cpal · 16 kHz mono f32
+   remote peer transcribe_audio channel · i16 LE PCM
+   └───────────────────────────────────┐
+                                       │ feed_remote_audio
+                                       ▼
+ ┌────────────────────────────────────────────────────────────────────────────┐
+ │ ENDPOINTING   asr/vad.rs                                                   │
+ │   Silero VAD v5   (RMS SilenceEndpointer fallback)                         │
+ └─────────────────────────────────────┬──────────────────────────────────────┘
+                                       │ endpointed utterance
+                   ┌───────────────────┴───────────────────┐
+                   ▼ audio           audio (if diarize on) ▼
+ ┌───────────────────────────────────┐   ┌────────────────────────────────────┐
+ │ STREAMING ASR   asr/streaming.rs  │   │ DIARIZE   diarize/                 │
+ │   overlapping windows ·           │   │   segmenter.rs  pyannote-seg-3.0   │
+ │   LocalAgreement-2                │   │     ▼  embedder.rs   wespeaker /   │
+ │   backend: moonshine.rs |         │   │     ▼     CAM++ (fbank.rs log-mel) │
+ │            parakeet.rs            │   │     ▼  cluster.rs  → session IDs   │
+ │   interim (greedy)                │   │     ▼  registry.rs cross-session   │
+ │     ──▶ final (beam.rs · width-4) │   │          EMA·cosine·clip-anchored  │
+ │                                   │   │   capture/clips → speaker-clips/   │
+ └─────────────────┬─────────────────┘   └─────────────────┬──────────────────┘
+                   │ text (interim → final)   speaker label│
+                   └───────────────────┬───────────────────┘
+                                       ▼
+ ┌────────────────────────────────────────────────────────────────────────────┐
+ │ SEGMENT EVENT   myownllm://transcribe-segment/<id>                         │
+ │   { text, speaker?, overlap?, start_ms?, end_ms? }                         │
+ └────────┬───────────────────┬─────────────────┬───────────────────┬─────────┘
+          ▼                   ▼                 ▼                   ▼
+   live captions          speaker chips     Talking Points     remote: streamed
+   (interim →             + review strip    (live LLM loop)    back to peer via
+    final)                                                     `transcribe` RPC
+```
+
 ## Live update lifecycle
 
 ```
