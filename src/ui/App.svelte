@@ -90,7 +90,7 @@
    *  loading screen up (rather than dropping into a chat that feels
    *  sluggish because it's competing with the cold load) until the model
    *  is resident. The chat still mounts behind it, so it's fully ready
-   *  when the screen lifts. A "Continue" button is the escape hatch. */
+   *  when the screen lifts. */
   let warming = $state(false);
   let appVersion = $state("");
   let hardware = $state<HardwareProfile | null>(null);
@@ -1192,13 +1192,10 @@
     <!-- Startup warm: keep a loading screen up until the model is
          resident. The chat mounts behind this, so it's ready the moment
          the screen lifts. Same shining word + live CPU/RAM as the in-chat
-         indicator, under the spinner. Continue is the escape hatch. -->
+         indicator, under the spinner. -->
     <div class="warming-overlay">
       <div class="spinner"></div>
       <LoadingPulse showStats={true} />
-      <button class="warming-skip" onclick={() => (warming = false)}>
-        Continue to chat →
-      </button>
       {#if ortSetup.checked && !ortSetup.ready && !ortSetup.error}
         <p class="splash-version">
           {ortSetup.message ?? "Setting up speech engine…"}
@@ -1396,21 +1393,6 @@
     justify-content: center;
     gap: 1rem;
     color: #888;
-  }
-  .warming-skip {
-    margin-top: 0.25rem;
-    background: none;
-    border: 1px solid #2a2a2a;
-    color: #888;
-    padding: 0.4rem 0.8rem;
-    border-radius: 6px;
-    font-size: 0.8rem;
-    cursor: pointer;
-    transition: color 0.12s, border-color 0.12s;
-  }
-  .warming-skip:hover {
-    color: #ccc;
-    border-color: #3a3a55;
   }
   .spinner {
     width: 28px;
