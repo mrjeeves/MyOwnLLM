@@ -403,8 +403,8 @@ myownllm run --profile https://example.com/manifest.json   # one-off manifest UR
 | Mode | What it loads | Notes |
 |------|---------------|-------|
 | `text` | General-purpose LLM | Default; served as virtual ID `myownllm` |
-| `transcribe` | Moonshine / Parakeet (per tier) | Activates mic; outputs transcribed text. Pi 5 → Moonshine (English only); capable hardware → Parakeet TDT 0.6B v3 (25 languages). Served as virtual ID `myownllm-transcribe`. |
-| `diarize`    | pyannote pipeline | Internal sub-feature of transcribe (opt-in via the transcribe pane's "Identify speakers" toggle). Tags each segment with a speaker ID; click the pill to rename. Not exposed as a virtual ID. |
+| `transcribe` | Moonshine / Parakeet (per tier) | Activates mic; streams live captions (interim text that firms up as you speak, Silero VAD endpointing, beam search on finalized utterances). Pi 5 → Moonshine (English only); capable hardware → Parakeet TDT 0.6B v3 (25 languages). Served as virtual ID `myownllm-transcribe`. |
+| `diarize`    | pyannote pipeline | Internal sub-feature of transcribe (opt-in via the transcribe pane's "Identify speakers" toggle). Tags each segment with a speaker ID; click the pill to rename. With **Speaker Profiles**, a confirmed voice keeps its name across *future* sessions — confirm the inline chip once and its clip anchors the profile (manage them in the Speakers settings tab). Not exposed as a virtual ID. |
 
 Exit chat: `Ctrl+C` or type `exit`.
 
@@ -665,6 +665,7 @@ Launch the GUI by running `myownllm` with no arguments, or open the application 
 - **Providers tab** — list of saved providers. Click any provider to switch (model and family hot-swap immediately to the new manifest's default family).
 - **Models tab** — every pulled model with its size, recommendation status, and pin/override controls.
 - **Storage tab** — per-area auto-cleanup toggles and a "Clean now" button per area (models, transcribe buffer, legacy runtimes, update leftovers, orphaned conversation files). The conversations folder lives here too. At the bottom: a **Danger zone** card with one-click resets — Delete all models, Delete all conversations, Delete all app data and downloads. Each is gated behind a typed challenge phrase and mirrors the matching `myownllm purge` subcommand. All three force-reload the app window after the delete completes — any open chat or in-flight recording goes with it.
+- **Speakers tab** — manage cross-session **Speaker Profiles**. List every known voice, play its anchor clip, rename it, remove a clip, **merge** two profiles that turn out to be the same person, or forget one. Profiles are built during diarized sessions: when a voice is confidently recognised an inline chip offers a one-tap confirm, and an end-of-session review strip lets you name anyone still unconfirmed. A confirmed clip *anchors* the profile (its centroid pins to verified clips, ignoring drift), so each correction makes future auto-attribution more confident. Per-conversation **Keep audio** (in the transcribe pane) records the full session WAV for manual scrubbing instead of just the auto-captured clips.
 
 **Model status panel** (click "⊞ Models"):
 - Every pulled model: size, which providers recommend it, age if unrecommended.
