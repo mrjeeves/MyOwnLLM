@@ -46,14 +46,12 @@
     activeFamily,
     supportedModes,
     hardware,
-    sidebarOpen,
     conversationId,
     remoteOpen,
     newChatCounter,
     textModelMissing,
     textModel,
     onTextDownloaded,
-    onToggleSidebar,
     onModeChange,
     onProviderChange,
     onConversationChanged,
@@ -68,7 +66,6 @@
     activeFamily: string;
     supportedModes: Set<Mode>;
     hardware: HardwareProfile | null;
-    sidebarOpen: boolean;
     conversationId: string | null;
     /** Phase 3 click-to-open: when set, the panel is rendering a
      *  conversation that lives on a peer's disk. Inference routes
@@ -95,7 +92,6 @@
     /** Notify App that a download finished so it can re-check the
      *  missing flag and dismiss the overlay. */
     onTextDownloaded: () => void;
-    onToggleSidebar: () => void;
     onModeChange: (mode: Mode) => void;
     onProviderChange: () => void;
     onConversationChanged: (id: string) => void;
@@ -1172,8 +1168,6 @@
   <TopBar
     current={activeMode}
     supported={supportedModes}
-    {sidebarOpen}
-    {onToggleSidebar}
     onChange={handleModeChange}
     onOpenSettings={(tab) => (settingsTab = tab)}
     onRequestStopTranscribe={() => onRequestStopTranscribe()}

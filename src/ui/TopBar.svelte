@@ -14,8 +14,6 @@
   let {
     current,
     supported,
-    sidebarOpen,
-    onToggleSidebar,
     onChange,
     onOpenSettings,
     onRequestStopTranscribe,
@@ -23,8 +21,6 @@
   } = $props<{
     current: Mode;
     supported: Set<Mode>;
-    sidebarOpen: boolean;
-    onToggleSidebar: () => void;
     onChange: (mode: Mode) => void;
     onOpenSettings: (tab: SettingsTab) => void;
     onRequestStopTranscribe: () => void;
@@ -110,12 +106,13 @@
 </script>
 
 <div class="top-bar">
+  <!-- Opens Settings, same as the cog at the far right. Slated to grow
+       into a full app menu later; for now it's a second Settings entry. -->
   <button
     class="hamburger"
-    onclick={onToggleSidebar}
-    title={sidebarOpen ? "Hide conversations" : "Show conversations"}
-    aria-label="Toggle conversations"
-    aria-expanded={sidebarOpen}
+    onclick={openSettings}
+    title="Settings"
+    aria-label="Settings"
   >
     <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
       <path
