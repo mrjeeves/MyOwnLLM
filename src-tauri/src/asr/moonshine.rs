@@ -65,12 +65,34 @@ use crate::ort_setup;
 const START_TOKEN: i64 = 1;
 const EOS_TOKEN: i64 = 2;
 
-/// Cap on decoded tokens per chunk. Defends against pathological
-/// decoder loops on noisy / out-of-distribution audio. At ~6 BPE
-/// tokens per second of speech an 8 s chunk produces ≤ ~50 tokens
-/// in normal use; 256 gives plenty of headroom for dense speech
-/// while still bounding the worst-case forward count.
+/// Absolute ceiling on decoded tokens per chunk. Defends against
+/// pathological decoder loops on noisy / out-of-distribution audio. At
+/// ~6 BPE tokens per second of speech an 8 s chunk produces ≤ ~50 tokens
+/// in normal use; 256 is the last-resort hard stop.
 const MAX_DECODE_STEPS: usize = 256;
+
+/// Per-chunk decode-step budget, scaled to the audio length.
+///
+/// The flat `MAX_DECODE_STEPS` ceiling is far too loose for the short
+/// rolling chunks the streaming path decodes: a 0.5 s (8000-sample) chunk
+/// can only legitimately hold a handful of tokens, but greedy decode
+/// occasionally fails to emit EOS and loops on repetition. With the KV
+/// cache disabled every step re-decodes the whole growing sequence
+/// (O(n²) in tokens), so an unbounded runaway on a tiny chunk burned
+/// ~8.6 s in the field — freezing captions and exploding the backlog.
+///
+/// Moonshine generates ~6.5 BPE tokens per second of speech; budget a
+/// generous `ceil(seconds * 8) + 8` (headroom over the nominal rate plus
+/// a floor for very short chunks) and clamp to `MAX_DECODE_STEPS`. Normal
+/// speech hits EOS well inside this; only runaways feel the cap, and they
+/// now cost milliseconds instead of seconds.
+fn decode_step_budget(n_samples: usize) -> usize {
+    const TOKENS_PER_SEC: f32 = 8.0;
+    const MARGIN: usize = 8;
+    let seconds = n_samples as f32 / 16_000.0;
+    let budget = (seconds * TOKENS_PER_SEC).ceil() as usize + MARGIN;
+    budget.min(MAX_DECODE_STEPS)
+}
 
 /// Beam width for finalized-utterance decoding (`process_final`). 4 is
 /// the usual ASR sweet spot — most of the WER win over greedy lands by
@@ -487,7 +509,8 @@ impl AsrBackend for MoonshineBackend {
         let mut kv = DecoderKvCache::empty(self.past_kv_inputs.len());
         let mut tokens: Vec<i64> = vec![START_TOKEN];
         let mut hit_eos_on_first_step = false;
-        for step in 0..MAX_DECODE_STEPS {
+        let step_budget = decode_step_budget(pcm16k_mono.len());
+        for step in 0..step_budget {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
@@ -623,7 +646,8 @@ impl MoonshineBackend {
         let enc_hidden = self.run_encoder(pcm16k_mono)?;
         let mut search = BeamSearch::new(FINAL_BEAM_WIDTH, EOS_TOKEN, vec![START_TOKEN]);
 
-        for _ in 0..MAX_DECODE_STEPS {
+        let step_budget = decode_step_budget(pcm16k_mono.len());
+        for _ in 0..step_budget {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
@@ -926,4 +950,46 @@ fn check_file_plausible(path: &std::path::Path, min_bytes: u64, label: &str) -> 
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn step_budget_is_tight_for_short_chunks() {
+        // The streaming path's smallest decodable chunk is ~0.1 s; a
+        // 0.5 s (8000-sample) chunk is the size that burned 8.6 s in the
+        // field. Both must budget a handful of steps, nowhere near 256.
+        assert_eq!(decode_step_budget(8_000), 12); // ceil(0.5*8)=4, +8
+        assert_eq!(decode_step_budget(16_000), 16); // ceil(1.0*8)=8, +8
+        // Even a tiny sub-100ms chunk keeps the +8 floor and never zero.
+        assert_eq!(decode_step_budget(1_600), 9); // ceil(0.1*8)=1, +8
+        assert!(decode_step_budget(0) >= 8);
+    }
+
+    #[test]
+    fn step_budget_clamps_to_the_hard_ceiling() {
+        // The 8 s rolling window stays well under the ceiling…
+        assert_eq!(decode_step_budget(8 * 16_000), 72); // ceil(8*8)=64, +8
+        // …but absurd inputs can never exceed MAX_DECODE_STEPS.
+        assert_eq!(decode_step_budget(10_000 * 16_000), MAX_DECODE_STEPS);
+    }
+
+    #[test]
+    fn step_budget_leaves_headroom_over_real_speech() {
+        // Moonshine emits ~6.5 tokens/s; the budget must sit above that
+        // for every chunk size so normal speech hits EOS before the cap
+        // and is never truncated. Check across the streaming range.
+        for &secs in &[0.25_f32, 0.5, 1.0, 2.0, 4.0, 8.0] {
+            let samples = (secs * 16_000.0) as usize;
+            let nominal_tokens = (secs * 6.5).ceil() as usize;
+            assert!(
+                decode_step_budget(samples) > nominal_tokens,
+                "budget {} must exceed ~{} real tokens at {secs}s",
+                decode_step_budget(samples),
+                nominal_tokens,
+            );
+        }
+    }
 }
