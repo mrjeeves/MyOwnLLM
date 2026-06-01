@@ -326,27 +326,35 @@
   });
 
   // Reset on "+ New" presses. Same skip-first-tick trick as Chat.svelte.
+  // IMPORTANT: this effect must react to `newChatCounter` ONLY. Everything
+  // else it touches (transcribeUi.active / .conversationId) is read inside
+  // `untrack` so Svelte doesn't subscribe the effect to them — otherwise
+  // `startRecording()` flipping `active` true would re-fire this body and
+  // immediately stop the session it just started (the "record then instant
+  // stop" bug).
   let _seenInitial = false;
   $effect(() => {
     void newChatCounter;
-    if (!_seenInitial) {
-      _seenInitial = true;
-      return;
-    }
-    activeConversation = null;
-    transcript = [];
-    speakerLabels = {};
-    diarizeEnabled = true;
-    talkingPoints = [];
-    talkingPointsPrev = [];
-    tpActionStatus = "";
-    sessionName = "";
-    if (transcribeUi.active && transcribeUi.conversationId === conversationId) {
-      stopRecording().then(() => {
-        flushLiveSegments();
-        clearAfterPersist();
-      });
-    }
+    untrack(() => {
+      if (!_seenInitial) {
+        _seenInitial = true;
+        return;
+      }
+      activeConversation = null;
+      transcript = [];
+      speakerLabels = {};
+      diarizeEnabled = true;
+      talkingPoints = [];
+      talkingPointsPrev = [];
+      tpActionStatus = "";
+      sessionName = "";
+      if (transcribeUi.active && transcribeUi.conversationId === conversationId) {
+        stopRecording().then(() => {
+          flushLiveSegments();
+          clearAfterPersist();
+        });
+      }
+    });
   });
 
   // Watch the global store: when a frame arrives for our conversation,
