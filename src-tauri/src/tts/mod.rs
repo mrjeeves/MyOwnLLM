@@ -14,20 +14,18 @@
 //! resolve `(runtime, model)`, make sure the voice model is on disk, build
 //! the backend, warm it, synthesize one utterance, hand back the bytes.
 //!
-//! ## Status — the synthesis inference is the staged step
+//! Synthesis is real: text → espeak-ng IPA ([`phonemes`]) → phoneme/token ids
+//! → the model's ONNX forward → PCM → WAV ([`pcm_to_wav`]). The espeak-ng
+//! phonemizer is a bundled sidecar (falling back to a system install); the
+//! voice models load via the shared `ort_setup`. The format-specific bits —
+//! Piper's `phoneme_id_map`/scales, Kokoro's `vocab`/`voices.bin` — are read
+//! from the downloaded artifacts at runtime and validated, so a mismatch is a
+//! clean error (the consumer degrades to WebSpeech) rather than garbage audio.
 //!
-//! Everything around the backends — the resolver `speak` ladder, the model
-//! registry entries, the `/v1/audio/speech` route, preload — is wired and
-//! exercised. The one piece deliberately left for the next step is the
-//! **grapheme→phoneme front-end + the ONNX forward pass** inside
-//! [`kokoro`] / [`piper`]. Both Kokoro and Piper need an espeak-ng / misaki
-//! g2p stage plus its data files bundled per target triple, and the result
-//! has to be proven on real hardware (notably aarch64 / Pi) before it can
-//! ship — it's the riskiest bit, not the ORT plumbing. Until then the
-//! backends load their ONNX session (so model delivery + session build are
-//! validated) and [`TtsBackend::synthesize`] returns a clear error rather
-//! than fabricated audio. Myo degrades to its WebSpeech tier-4 fallback on
-//! that error, so the route is safe to expose meanwhile.
+//! Verification note: the pure logic (id mapping, style selection, WAV) is
+//! unit-tested; the espeak subprocess + ONNX forward need a real voice model
+//! and espeak-ng present, so end-to-end *audio* is confirmed on a machine that
+//! has them (the dev sandbox has neither), not in CI.
 
 use anyhow::{anyhow, Result};
 use std::sync::atomic::AtomicBool;
@@ -35,6 +33,7 @@ use std::sync::atomic::AtomicBool;
 use crate::models::{self, ModelKind};
 
 pub mod kokoro;
+pub mod phonemes;
 pub mod piper;
 
 /// Capabilities a voice backend advertises. The analogue of
