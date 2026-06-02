@@ -366,6 +366,14 @@ pub const REGISTRY: &[ModelSpec] = &[
                 approx_bytes: 27_000_000,
                 min_bytes: 5_000_000,
             },
+            // The IPA-symbol → token-id `vocab` lives here; the backend reads
+            // it at runtime so tokenization tracks the actual export.
+            Artifact {
+                filename: "config.json",
+                url: "https://huggingface.co/onnx-community/Kokoro-82M-ONNX/resolve/main/config.json",
+                approx_bytes: 20_000,
+                min_bytes: 1_000,
+            },
         ],
     },
     // Piper en_US-lessac medium (MIT) via rhasspy/piper-voices — VITS graph

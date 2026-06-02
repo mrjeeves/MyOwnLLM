@@ -29,7 +29,11 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libssl-dev \
-            libasound2-dev
+            libasound2-dev \
+            espeak-ng
+        # `espeak-ng`: the TTS phonemizer (tts/phonemes.rs). The release
+        # build bundles it as a sidecar per triple; CI just installs the
+        # system package so the speech path is exercisable on the runner.
         # `cmake` is no longer in the dep list — whisper-rs was the only
         # consumer (it built whisper.cpp from source) and the new ASR
         # stack uses the `ort` crate with a dynamically-loaded
