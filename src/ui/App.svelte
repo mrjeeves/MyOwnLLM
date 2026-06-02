@@ -7,7 +7,6 @@
   import Chat from "./Chat.svelte";
   import TranscribeView from "./TranscribeView.svelte";
   import Sidebar from "./Sidebar.svelte";
-  import LoadingPulse from "./LoadingPulse.svelte";
   import LoadingBar from "./LoadingBar.svelte";
   import { startupProgress } from "./startup-progress.svelte";
   import PermissionPromptModal from "./PermissionPromptModal.svelte";
@@ -41,7 +40,7 @@
     clearAfterPersist,
     type PendingStream,
   } from "./transcribe-state.svelte";
-  import { ortSetup, initOrtSetup } from "./ort-setup.svelte";
+  import { initOrtSetup } from "./ort-setup.svelte";
   import {
     chatSlot,
     startTalkingPoints,
@@ -88,12 +87,6 @@
   type View = "loading" | "chat";
 
   let view = $state<View>("loading");
-  /** True while the startup warm is in flight: we keep a full-screen
-   *  loading screen up (rather than dropping into a chat that feels
-   *  sluggish because it's competing with the cold load) until the model
-   *  is resident. The chat still mounts behind it, so it's fully ready
-   *  when the screen lifts. */
-  let warming = $state(false);
   let appVersion = $state("");
   let hardware = $state<HardwareProfile | null>(null);
   let activeModel = $state("");
@@ -298,46 +291,32 @@
       // run the install lazily).
       view = "chat";
 
-      // Warm the chat model so the first message doesn't pay the cold-load
-      // wait. On by default; the load runs under the configured throttle
-      // (Settings → Performance). Skipped when the user turned it off, when
-      // the model isn't on disk yet (the download overlay owns that), or
-      // when keep_alive is "0" (warming would just load-then-unload).
-      //
-      // We hold a full-screen loading screen (`warming`) over the chat —
-      // which keeps mounting/initializing behind it — until the warm
-      // settles, so the user lands on a chat that's actually ready instead
-      // of one that feels sluggish while it competes with the cold load.
+      // The chat model is no longer warmed behind a blocking startup screen.
+      // The workspace (Transcribe by default) is up now, and the model loads
+      // lazily on the first chat — the in-chat indicator surfaces that load
+      // inline ("Loading the model…") instead of a full-screen status
+      // screen. Launch feels fast and we never make the user wait on a model
+      // they may not even use this session.
+      startupProgress.done();
+      // Daemon up so the first chat doesn't also pay the server spawn.
+      // Fire-and-forget — the binary may not be installed yet (the chat
+      // surface's DownloadOverlay owns that) and we never block on it.
+      invoke("ollama_ensure_running").catch(() => {});
+      // Optional background pre-warm: only when the user opted in AND is
+      // actually landing in Text mode (warming a chat model while they sit
+      // on Transcribe is exactly the wasted wait this change removes).
+      // Non-blocking; if they send before it's resident the in-chat
+      // "Loading the model…" indicator covers the rest. Still skipped when
+      // the model isn't on disk yet or keep_alive is "0" (warming would just
+      // load-then-unload).
       if (
         config.warm_on_startup !== false &&
+        activeMode === "text" &&
         pendingTextModel &&
         !textModelMissing &&
         config.ollama_keep_alive !== "0"
       ) {
-        warming = true;
-        startupProgress.start("ollama");
-        // Bring the daemon up first so the bar can step from "starting the
-        // server" to "loading the model"; `ollama_warm` re-ensures it, but
-        // that second call is idempotent and returns fast. The `.catch`
-        // before `.then` mirrors the old fire-and-forget: even if the ping
-        // fails (binary not installed yet) we still attempt the warm, which
-        // re-runs ensure_running and surfaces the real error.
-        invoke("ollama_ensure_running")
-          .catch(() => {})
-          .then(() => {
-            startupProgress.start("warm");
-            return invoke("ollama_warm", { model: pendingTextModel });
-          })
-          .catch(() => {})
-          .finally(() => {
-            warming = false;
-            startupProgress.done();
-          });
-      } else {
-        // No warm: the daemon still needs to be up for the first message,
-        // but there's no slow load to track — so the bar is already done.
-        invoke("ollama_ensure_running").catch(() => {});
-        startupProgress.done();
+        invoke("ollama_warm", { model: pendingTextModel }).catch(() => {});
       }
 
       kickUpdateCheck();
@@ -1231,25 +1210,6 @@
        the same modal; the modal self-hides when the prompt queue
        drains. -->
   <PermissionPromptModal />
-
-  {#if warming}
-    <!-- Startup warm: keep a loading screen up until the model is
-         resident. The chat mounts behind this, so it's ready the moment
-         the screen lifts. Same shining word + live CPU/RAM as the in-chat
-         indicator, under the spinner. -->
-    <div class="warming-overlay">
-      <div class="spinner"></div>
-      <LoadingPulse showStats={true} showProgress={true} />
-      {#if ortSetup.checked && !ortSetup.ready && !ortSetup.error}
-        <p class="splash-version">
-          {ortSetup.message ?? "Setting up speech engine…"}
-        </p>
-      {/if}
-      {#if appVersion}
-        <p class="splash-version">v{appVersion}</p>
-      {/if}
-    </div>
-  {/if}
 </div>
 
 <style>
@@ -1449,20 +1409,6 @@
     font-size: 0.7rem;
     color: #555;
     margin-top: -0.5rem;
-  }
-  /* Startup-warm loading screen. Full-screen, opaque, same look as the
-     initial splash (spinner on top, LoadingPulse just beneath). */
-  .warming-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 55;
-    background: #111;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 1rem;
-    color: #888;
   }
   .spinner {
     width: 28px;

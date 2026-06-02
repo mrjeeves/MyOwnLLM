@@ -35,6 +35,10 @@
   import { resolvePeerLlm } from "../mesh-capabilities";
   import { routingPins, setTextPin } from "./routing-pins.svelte";
   import { isTranscriptionMemoryTight } from "../model-lifecycle";
+  import {
+    noteChatModelResident,
+    chatModelLikelyResident,
+  } from "./model-residency";
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
   import { runAgent, type AgentEvent } from "../agent-loop";
   import {
@@ -320,6 +324,11 @@
   const MODEL_LOAD_POPUP_DELAY_MS = 5000;
   let modelLoading = $state(false);
   let modelLoadTimer: ReturnType<typeof setTimeout> | null = null;
+  /** What the load indicator is most likely waiting on, so its comfort text
+   *  can say which: "loading" = a cold model loading into memory; "working"
+   *  = the model is resident and this turn is just taking a while. Set
+   *  per-send from the /api/ps probe in `doSend`. */
+  let modelLoadPhase = $state<"loading" | "working">("loading");
 
   /** Clear the load indicator + its arming timer. Idempotent, so it's
    *  safe to call from every agent event and from cleanup. */
@@ -1089,13 +1098,26 @@
     // firing the request. For the warm case, the remote path, or an
     // unknown ps result, we keep the lightweight 5s reactive timer.
     let coldStart = false;
+    let residencyKnown = false;
     if (!routeViaDevicePubkey) {
       try {
         coldStart = !(await invoke<boolean>("ollama_model_loaded", { model: activeModel }));
+        residencyKnown = true;
       } catch {
         // ps unavailable — fall back to the reactive timer below.
       }
     }
+    // Tell the indicator *what* it's waiting on. A cold model genuinely
+    // loading reads as "Loading the model…"; a warm model that's just slow
+    // reads as the generic "still working" reassurance. On the very first
+    // inference of the session we assume a load even when ps couldn't
+    // confirm it (worst case it's already resident and the line flashes away
+    // on the first token). The remote path loads on the host, so we don't
+    // claim a local model load there.
+    modelLoadPhase =
+      coldStart || (!residencyKnown && !chatModelLikelyResident() && !routeViaDevicePubkey)
+        ? "loading"
+        : "working";
     if (coldStart) {
       modelLoading = true;
       await nextPaint(); // get the indicator on screen before the load freeze
@@ -1117,8 +1139,11 @@
         signal: controller.signal,
         onEvent: (event: AgentEvent) => {
           // Any frame means the model is resident and producing —
-          // tear down the load-wait dialog (idempotent).
+          // tear down the load-wait dialog (idempotent) and remember, for
+          // the rest of the session, that the model has loaded at least
+          // once (so later first-send guesses don't over-assume a load).
           clearModelLoadWait();
+          if (event.kind !== "error") noteChatModelResident();
           switch (event.kind) {
             case "assistant_delta":
             case "thinking_delta": {
@@ -1642,10 +1667,16 @@
           {#if modelLoading}
             <!-- Cold-start (or a long-running call): the model is loading
                  / still working. Replace the typing dots in place (no
-                 jolting modal) with the calmer LoadingPulse — a rotating
-                 reassurance word + live CPU/RAM. Stats are hidden for the
+                 jolting modal) with the calmer LoadingPulse — a shining
+                 reassurance word + live CPU/RAM. On a cold model the word
+                 says "Loading the model…" so the wait reads as a one-time
+                 load rather than a stuck turn; once resident it's the
+                 generic "still working" copy. Stats are hidden for the
                  remote path (the load is on the host's machine). -->
-            <LoadingPulse showStats={!routeViaDevicePubkey} />
+            <LoadingPulse
+              showStats={!routeViaDevicePubkey}
+              loadingModel={modelLoadPhase === "loading"}
+            />
           {:else}
             <span class="dots"><span></span><span></span><span></span></span>
           {/if}
