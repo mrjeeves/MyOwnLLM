@@ -137,12 +137,7 @@ impl TtsBackend for PiperBackend {
             "Loading Piper voice model… ({})",
             ort_setup::status().diagnostic()
         ));
-        if !phonemes::available() {
-            return Err(anyhow!(
-                "Piper needs an espeak-ng phonemizer (set $MYOWNLLM_ESPEAK, bundle the \
-                 sidecar, or install espeak-ng)"
-            ));
-        }
+        phonemes::ensure_ready().context("Piper needs the owned espeak-ng phonemizer")?;
         let model_path = self.artifact_path("model.onnx")?;
         let config_path = self.artifact_path("model.onnx.json")?;
         if !model_path.exists() {

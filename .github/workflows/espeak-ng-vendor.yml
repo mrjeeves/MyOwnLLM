@@ -1,0 +1,98 @@
+# Build espeak-ng (binary + espeak-ng-data) from a pinned source as MyOwnLLM's
+# OWN release assets, so the engine can self-install it (src/espeak_install.rs)
+# without ever touching a system package — the owned-binary policy.
+#
+# Produces, for each target, an archive named exactly as `espeak_install`
+# expects (`espeak-ng-<os>-<arch>-<version>.{tar.gz,zip}`) and attaches it to a
+# `espeak-ng-v<version>` release. `<version>` is read from `.espeak-version`.
+#
+# Run once per espeak-ng bump (manual dispatch). This is the supply side of the
+# owned phonemizer; the engine code is the consumer. NOTE: built blind — give
+# it a validating run and tune the per-OS build/staging if a target is off.
+name: espeak-ng vendor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write # create/upload to the espeak-ng-v* release
+
+jobs:
+  read-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: echo "version=$(tr -d '[:space:]' < .espeak-version)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: read-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,     osname: linux,   arch: x86_64,  kind: tgz }
+          - { os: ubuntu-24.04-arm,  osname: linux,   arch: aarch64, kind: tgz }
+          - { os: macos-14,          osname: macos,   arch: aarch64, kind: tgz }
+          - { os: macos-13,          osname: macos,   arch: x86_64,  kind: tgz }
+          - { os: windows-latest,    osname: windows, arch: x86_64,  kind: zip }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone espeak-ng at the pinned tag
+        run: git clone --depth 1 --branch ${{ needs.read-version.outputs.version }} https://github.com/espeak-ng/espeak-ng espeak-src
+
+      # --- Unix: autotools build into a staging prefix ---
+      - name: Build (unix)
+        if: runner.os != 'Windows'
+        working-directory: espeak-src
+        run: |
+          ./autogen.sh
+          ./configure --prefix="$PWD/_install"
+          make -j
+          make install
+
+      # --- Windows: CMake build ---
+      - name: Build (windows)
+        if: runner.os == 'Windows'
+        working-directory: espeak-src
+        run: |
+          cmake -B build -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/espeak-src/_install" -DUSE_ASYNC=OFF
+          cmake --build build --config Release
+          cmake --install build --config Release
+
+      - name: Stage archive payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          stem="espeak-ng-${{ matrix.osname }}-${{ matrix.arch }}-${{ needs.read-version.outputs.version }}"
+          mkdir -p "stage/$stem"
+          inst="espeak-src/_install"
+          # Binary (espeak-ng[.exe]) — locate it under the install prefix.
+          binsrc="$(find "$inst" -name 'espeak-ng' -o -name 'espeak-ng.exe' | head -n1)"
+          cp "$binsrc" "stage/$stem/"
+          # Data dir (espeak-ng-data) — flat at the archive root.
+          datasrc="$(dirname "$(find "$inst" -type d -name 'espeak-ng-data' | head -n1)")/espeak-ng-data"
+          cp -R "$datasrc" "stage/$stem/espeak-ng-data"
+          echo "STEM=$stem" >> "$GITHUB_ENV"
+
+      - name: Package (tar.gz)
+        if: matrix.kind == 'tgz'
+        shell: bash
+        run: tar -C "stage/$STEM" -czf "$STEM.tar.gz" .
+
+      - name: Package (zip)
+        if: matrix.kind == 'zip'
+        shell: bash
+        run: (cd "stage/$STEM" && 7z a "../../$STEM.zip" .)
+
+      - name: Publish to the espeak-ng-v* release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: espeak-ng-v${{ needs.read-version.outputs.version }}
+          files: |
+            ${{ env.STEM }}.tar.gz
+            ${{ env.STEM }}.zip

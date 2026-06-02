@@ -8,6 +8,7 @@ mod asr;
 mod cli;
 mod conversations;
 mod diarize;
+mod espeak_install;
 mod frame_sink;
 mod hardware;
 mod mesh;

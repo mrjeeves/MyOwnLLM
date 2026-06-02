@@ -1,121 +1,84 @@
-//! Grapheme→phoneme front-end for the TTS backends, via **espeak-ng**.
+//! Grapheme→phoneme front-end for the TTS backends, via the engine's
+//! **owned** espeak-ng.
 //!
 //! Both Kokoro and Piper are trained on espeak-ng IPA phonemes, so this is the
-//! shared front-end: `text → IPA string`. We shell out to an `espeak-ng`
-//! binary rather than link `libespeak-ng` — the binary + its `espeak-ng-data`
-//! bundle the same way the `myownmesh` daemon does (a Tauri sidecar), which
-//! avoids per-platform FFI/link pain and reuses the bundling we already ship.
+//! shared front-end: `text → IPA string`. Per the owned-binary policy the
+//! engine never uses a *system* espeak-ng — it resolves only its own copy and
+//! self-heals (fetches) one if missing, exactly like [`crate::ort_install`]
+//! does for the onnxruntime dylib:
 //!
-//! Discovery order (first hit wins):
-//!   1. `$MYOWNLLM_ESPEAK` — explicit override.
-//!   2. A bundled sidecar next to the running binary
-//!      (`espeak-ng-<triple>` / `espeak-ng`), where `build.rs` drops it.
-//!   3. `espeak-ng`, then `espeak`, on `PATH` — a system install (what a dev
-//!      box or a CI runner that `apt install`ed it has).
+//!   1. `$MYOWNLLM_ESPEAK` — an explicit binary override (dev / tests).
+//!   2. The owned install at `~/.myownllm/espeak/`
+//!      ([`crate::espeak_install`]); fetched on demand if absent or stale.
 //!
-//! If none is found, [`phonemize`] errors; the caller surfaces that and the
-//! consumer degrades to WebSpeech. Nothing here needs the network or a model.
+//! The owned binary is run with `--path <espeak_dir>` so it loads the bundled
+//! `espeak-ng-data` rather than anything system-wide. If neither the override
+//! nor the owned install is reachable (e.g. the vendor release isn't published
+//! yet, offline), [`phonemize`] errors and the consumer degrades to WebSpeech.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-/// The bundled sidecar's base name. `build.rs` writes it next to the binary as
-/// `espeak-ng-<triple>{.exe}` (dev) or `espeak-ng{.exe}` (production bundle),
-/// mirroring the `myownmesh` sidecar slot.
-const SIDECAR_STEM: &str = "espeak-ng";
+use crate::espeak_install;
 
-/// Locate an `espeak-ng` binary, caching the result. `None` if none is found.
-fn espeak_binary() -> Option<&'static PathBuf> {
-    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
-    CACHE.get_or_init(discover_espeak).as_ref()
+/// A resolved phonemizer: the binary, and the directory to hand espeak-ng via
+/// `--path` so it finds its `espeak-ng-data` (the owned install sets this; an
+/// explicit override is trusted to find its own data).
+struct Espeak {
+    bin: PathBuf,
+    data_root: Option<PathBuf>,
 }
 
-fn discover_espeak() -> Option<PathBuf> {
+/// Resolve the owned espeak-ng, fetching it if needed (self-repair). Never
+/// consults the system `PATH`.
+fn resolve() -> Result<Espeak> {
     // 1. Explicit override.
     if let Ok(p) = std::env::var("MYOWNLLM_ESPEAK") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
+        let bin = PathBuf::from(p);
+        if bin.is_file() {
+            return Ok(Espeak {
+                bin,
+                data_root: None,
+            });
         }
     }
-
-    // 2. A sidecar next to the running binary.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let exe_suffix = std::env::consts::EXE_SUFFIX; // "" or ".exe"
-            let triple = option_env!("DAEMON_SIDECAR_TRIPLE").unwrap_or("");
-            let candidates = [
-                dir.join(format!("{SIDECAR_STEM}-{triple}{exe_suffix}")),
-                dir.join(format!("{SIDECAR_STEM}{exe_suffix}")),
-            ];
-            for c in candidates {
-                if !triple.is_empty() && c.is_file() {
-                    return Some(c);
-                }
-                if c.is_file() {
-                    return Some(c);
-                }
-            }
-        }
-    }
-
-    // 3. PATH.
-    for name in ["espeak-ng", "espeak"] {
-        if let Ok(p) = which_on_path(name) {
-            return Some(p);
-        }
-    }
-    None
+    // 2. The owned install — fetch on demand (idempotent; no-op once present).
+    let bin = espeak_install::ensure().context("installing the owned espeak-ng")?;
+    Ok(Espeak {
+        bin,
+        data_root: Some(espeak_install::espeak_dir()?),
+    })
 }
 
-/// Minimal `which`: probe each `PATH` entry for an executable `name`. (We avoid
-/// pulling the `which` crate's behaviour differences into the hot path; the
-/// result is cached anyway.)
-fn which_on_path(name: &str) -> Result<PathBuf> {
-    let exe_suffix = std::env::consts::EXE_SUFFIX;
-    let path = std::env::var_os("PATH").ok_or_else(|| anyhow!("no PATH"))?;
-    for dir in std::env::split_paths(&path) {
-        let cand = dir.join(format!("{name}{exe_suffix}"));
-        if cand.is_file() {
-            return Ok(cand);
-        }
-    }
-    bail!("{name} not found on PATH")
-}
-
-/// `true` if a phonemizer is available — lets a backend's `warm_up` fail fast
-/// with a clear message instead of only discovering it at synth time.
-pub fn available() -> bool {
-    espeak_binary().is_some()
+/// Make sure the owned espeak-ng is installed (fetching if needed). Called from
+/// a backend's `warm_up` (on a blocking thread) so the first reply isn't cold
+/// and a missing phonemizer fails fast with a clear message.
+pub fn ensure_ready() -> Result<()> {
+    resolve().map(|_| ())
 }
 
 /// Convert `text` to an espeak-ng IPA phoneme string for the given espeak voice
 /// (`lang`, e.g. `"en-us"`). Stress and length marks are preserved — the voice
-/// models' phoneme maps include them. Returns the raw IPA the model expects;
-/// the backend splits it into ids.
+/// models' phoneme maps include them.
 pub fn phonemize(text: &str, lang: &str) -> Result<String> {
-    let bin = espeak_binary().ok_or_else(|| {
-        anyhow!(
-            "no espeak-ng phonemizer found (set $MYOWNLLM_ESPEAK, bundle the sidecar, \
-             or install espeak-ng) — text-to-speech needs it"
-        )
-    })?;
+    let espeak = resolve()?;
 
-    // `-q` quiet (no audio), `--ipa` IPA output, `-v <lang>` the voice.
-    let mut child = Command::new(bin)
-        .arg("-q")
-        .arg("--ipa")
-        .arg("-v")
-        .arg(lang)
+    // `-q` quiet (no audio), `--ipa` IPA output, `-v <lang>` the voice,
+    // `--path <dir>` so the owned `espeak-ng-data` is used (no system data).
+    let mut cmd = Command::new(&espeak.bin);
+    cmd.arg("-q").arg("--ipa").arg("-v").arg(lang);
+    if let Some(root) = &espeak.data_root {
+        cmd.arg("--path").arg(root);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("spawning espeak-ng ({})", bin.display()))?;
+        .with_context(|| format!("spawning espeak-ng ({})", espeak.bin.display()))?;
 
     // Feed the text on stdin so we don't have to escape it as an argument.
     child
@@ -129,8 +92,7 @@ pub fn phonemize(text: &str, lang: &str) -> Result<String> {
     if !out.status.success() {
         bail!("espeak-ng exited with {}", out.status);
     }
-    let ipa = String::from_utf8_lossy(&out.stdout);
-    Ok(normalize_ipa(&ipa))
+    Ok(normalize_ipa(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// espeak prints IPA per line with leading/trailing whitespace and newlines
@@ -147,16 +109,5 @@ mod tests {
     #[test]
     fn normalize_collapses_whitespace_and_newlines() {
         assert_eq!(normalize_ipa("  həˈloʊ \n  wɜːld \n"), "həˈloʊ wɜːld");
-    }
-
-    #[test]
-    fn missing_phonemizer_is_a_clear_error() {
-        // With no espeak on this machine and no override, phonemize should
-        // surface a descriptive error rather than panic. (On a box that *has*
-        // espeak-ng this test still passes: a successful Ok is also fine.)
-        if !available() {
-            let err = phonemize("hello", "en-us").unwrap_err().to_string();
-            assert!(err.contains("espeak-ng"), "got: {err}");
-        }
     }
 }
