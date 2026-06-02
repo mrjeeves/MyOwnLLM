@@ -416,7 +416,11 @@ mod tests {
     fn chunk_within_slop_of_tail_end_is_contiguous() {
         // Rounding in the ms<->sample conversions can leave a chunk a hair
         // short of the tail's end; the slop keeps it contiguous.
-        assert!(tail_is_contiguous(10_000, 2_000, 12_000 + CONTIGUITY_SLOP_MS));
+        assert!(tail_is_contiguous(
+            10_000,
+            2_000,
+            12_000 + CONTIGUITY_SLOP_MS
+        ));
         assert!(tail_is_contiguous(10_000, 2_000, 11_950));
     }
 
