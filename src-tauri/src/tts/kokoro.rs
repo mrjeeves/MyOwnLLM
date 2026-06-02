@@ -116,12 +116,7 @@ impl TtsBackend for KokoroBackend {
             "Loading Kokoro voice model… ({})",
             ort_setup::status().diagnostic()
         ));
-        if !phonemes::available() {
-            return Err(anyhow!(
-                "Kokoro needs an espeak-ng phonemizer (set $MYOWNLLM_ESPEAK, bundle the \
-                 sidecar, or install espeak-ng)"
-            ));
-        }
+        phonemes::ensure_ready().context("Kokoro needs the owned espeak-ng phonemizer")?;
         let model_path = self.artifact_path("model.onnx")?;
         let voices_path = self.artifact_path("voices.bin")?;
         let config_path = self.artifact_path("config.json")?;
