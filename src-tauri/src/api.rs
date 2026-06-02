@@ -324,6 +324,7 @@ async fn completions(
 async fn embeddings(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(q): Query<WaitQuery>,
     Json(req): Json<EmbeddingsRequest>,
 ) -> Response {
     if let Err(resp) = check_auth(&state, &headers) {
@@ -334,7 +335,13 @@ async fn embeddings(
         Ok(t) => t,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, "bad_model", e.to_string()),
     };
-    if let Err(resp) = ensure_model_or_503(&state, &resolved, false).await {
+    // Honour `?wait=true` / `X-MyOwnLLM-Wait` like the chat routes do: the
+    // first embeddings call on a cold machine (before the watcher has
+    // pulled the tracked `embed` model) can block on the pull instead of
+    // bouncing the caller with a 503 — so Myo's memory system gets a
+    // vector back on the first try.
+    let wait = q.wait || header_bool(&headers, "x-myownllm-wait");
+    if let Err(resp) = ensure_model_or_503(&state, &resolved, wait).await {
         return resp;
     }
     let mut body = serde_json::to_value(&req).unwrap_or(json!({}));

@@ -1,6 +1,6 @@
 {
   "name": "MyOwnLLM Default",
-  "version": "20",
+  "version": "21",
   "ttl_minutes": 360,
   "default_family": "gemma4",
   "headroom_gb": {
@@ -34,6 +34,14 @@
         { "min_vram_gb": 4, "min_ram_gb": 8, "min_unified_ram_gb": 16, "disk_mb": 115, "runtime": "kokoro", "model": "kokoro-82m",                 "fallback": "piper-en-us-lessac-medium" },
         { "min_vram_gb": 0, "min_ram_gb": 2, "min_unified_ram_gb": 4,  "disk_mb": 63,  "runtime": "piper",  "model": "piper-en-us-lessac-medium", "fallback": "piper-en-us-lessac-low"    },
         { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0,  "disk_mb": 28,  "runtime": "piper",  "model": "piper-en-us-lessac-low",    "fallback": "piper-en-us-lessac-low"    }
+      ]
+    },
+    "embed": {
+      "label": "Embed",
+      "tiers": [
+        { "min_vram_gb": 0, "min_ram_gb": 4, "min_unified_ram_gb": 8, "disk_mb": 622, "model": "embeddinggemma",   "fallback": "nomic-embed-text" },
+        { "min_vram_gb": 0, "min_ram_gb": 2, "min_unified_ram_gb": 4, "disk_mb": 274, "model": "nomic-embed-text", "fallback": "all-minilm"       },
+        { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0, "disk_mb": 46,  "model": "all-minilm",       "fallback": "all-minilm"       }
       ]
     }
   },

@@ -122,7 +122,10 @@ const DEFAULT_CONFIG: Config = {
   kept_models: [],
   mode_overrides: {},
   family_overrides: {},
-  tracked_modes: ["transcribe"],
+  // `embed` is a maintained system capability, not a chat surface: it's
+  // tracked so the watcher keeps a local embedding model pulled + warm for
+  // Myo's memory system (exposed as the `myownllm-embed` virtual ID).
+  tracked_modes: ["transcribe", "embed"],
   // Filled at first load via defaultConversationDir() — needs an async homeDir().
   conversation_dir: "",
   auto_cleanup: { ...DEFAULT_AUTO_CLEANUP },
@@ -260,6 +263,12 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
   // One-shot upgrade: seed tracked_modes from active_mode for legacy configs.
   if (!merged.tracked_modes || merged.tracked_modes.length === 0) {
     merged.tracked_modes = [merged.active_mode];
+  }
+  // `embed` is a maintained system capability backing Myo's memory system,
+  // not a user-chosen chat mode — ensure it's always tracked so a local
+  // embedding model stays pulled + warm even on configs that predate it.
+  if (!merged.tracked_modes.includes("embed")) {
+    merged.tracked_modes = [...merged.tracked_modes, "embed"];
   }
   // Older configs predate active_family; default to the schema's gemma4.
   if (!merged.active_family) {
