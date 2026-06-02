@@ -113,7 +113,11 @@ const DEFAULT_CONFIG: Config = {
   model_cleanup_days: 1,
   ollama_keep_alive: "30m",
   ollama_throttle: "io",
-  warm_on_startup: true,
+  // Off by default: the chat model loads lazily on the first message
+  // (surfaced inline in the chat as "Loading the model…") rather than being
+  // warmed up front behind a startup screen. Opt in to a *background*,
+  // non-blocking pre-warm via Settings → Performance.
+  warm_on_startup: false,
   cleanup_warning_suppressed_families: [],
   kept_models: [],
   mode_overrides: {},

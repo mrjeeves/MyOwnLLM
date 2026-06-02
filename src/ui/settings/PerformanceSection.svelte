@@ -40,16 +40,17 @@
     },
   ];
 
-  /** Preload the chat model at startup so the first message is instant.
-   *  On by default; the load runs under the throttle above. */
-  let warmOnStartup = $state(true);
+  /** Optional background pre-warm of the chat model at startup so the first
+   *  message is instant. Off by default — the model otherwise loads lazily
+   *  on first use, shown inline in the chat. */
+  let warmOnStartup = $state(false);
 
   onMount(async () => {
     try {
       const config = await loadConfig();
       keepAlive = config.ollama_keep_alive ?? "30m";
       throttle = (config.ollama_throttle ?? "io") as Throttle;
-      warmOnStartup = config.warm_on_startup ?? true;
+      warmOnStartup = config.warm_on_startup ?? false;
     } catch (e) {
       error = String(e);
     } finally {
@@ -157,9 +158,11 @@
       <div class="card">
         <div class="card-title">Warm at startup</div>
         <p class="card-meta">
-          Preload the chat model in the background when the app starts, so
-          your first message doesn't wait for it to load. The load runs
-          under the throttle above, so it won't lock up the machine.
+          Off by default — the chat model loads on your first message, shown
+          inline in the chat. Turn this on to pre-load it in the background
+          when you start in Text mode instead, so the first message is
+          instant. It runs under the throttle above and never blocks the app
+          — you land in the workspace right away either way.
         </p>
         <label class="toggle">
           <input
@@ -167,7 +170,7 @@
             checked={warmOnStartup}
             onchange={(e) => patchWarmOnStartup((e.currentTarget as HTMLInputElement).checked)}
           />
-          Warm the chat model at startup
+          Pre-warm the chat model in the background
         </label>
       </div>
 

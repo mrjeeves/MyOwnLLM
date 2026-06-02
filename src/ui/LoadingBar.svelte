@@ -1,9 +1,10 @@
 <script lang="ts">
-  // Determinate startup tracker: a real 0→100% bar driven by the shared
+  // Determinate progress bar: a real 0→100% driven by the shared
   // `startupProgress` store, with a short status line naming whichever step
-  // is currently adding to the percentage. Shared by the initial splash and
-  // the warming overlay's LoadingPulse so both read the same live progress —
-  // the bar picks up where the splash left off instead of restarting.
+  // is currently adding to the percentage. Used by the launch splash, and
+  // surfaced inline (via LoadingPulse) whenever a known, measurable process
+  // is running — so the same honest bar shows up wherever there's real
+  // progress to report.
   import { startupProgress } from "./startup-progress.svelte";
 
   // While a step is in flight the number sits at the last completed

@@ -3,25 +3,30 @@
   // rotates every few seconds with a moving shine, plus an optional quiet
   // live CPU/RAM line as proof of life. Self-contained — it owns its word
   // rotation and (when showStats) its usage poll — so it can be dropped in
-  // both the in-chat cold-start bubble and the startup warming screen.
+  // the in-chat cold-start bubble or any other "hang tight" surface.
+  //
+  // Two layers of fidelity:
+  //   - When a genuinely *measurable* process is running (the launch
+  //     sequence, or a future install/setup that drives `startupProgress`),
+  //     we show the real 0→100% LoadingBar — honest milestone progress.
+  //   - Otherwise there are no honest milestones to show (a model load /
+  //     slow turn is opaque), so we fall back to the shining word.
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import type { LiveSnapshot } from "../types";
   import LoadingBar from "./LoadingBar.svelte";
+  import { startupProgress } from "./startup-progress.svelte";
 
-  // `showProgress` swaps the vague rotating word for the determinate startup
-  // tracker (a real 0→100% bar with a per-step status line) — used by the
-  // startup loading screen. Left off in the in-chat bubble, where there's no
-  // startup to track and the rotating reassurance word is all we want.
+  // `loadingModel` swaps the generic reassurance words for "loading the
+  // model" phrasing: the in-chat indicator passes this on a cold start so
+  // the wait reads as a one-time model load rather than a stuck turn.
   let {
     showStats = true,
-    showProgress = false,
-  }: { showStats?: boolean; showProgress?: boolean } = $props();
+    loadingModel = false,
+  }: { showStats?: boolean; loadingModel?: boolean } = $props();
 
-  // Deliberately ambiguous about *what's* happening: this same indicator
-  // covers both a cold model load and a slow in-progress turn, so phrases
-  // like "Loading the model…" would wrongly suggest a reload mid-chat.
-  // These just reassure that work is underway, whatever the cause.
+  // Generic "work is underway, whatever the cause" phrases — shown once the
+  // model is resident and a turn is just taking a while.
   const WORDS = [
     "Working on it…",
     "Thinking it through…",
@@ -31,6 +36,14 @@
     "Just a moment…",
     "Almost there…",
   ];
+  // Cold-load phrases — clearly about the one-time load into memory, so the
+  // user reads the wait as "the model is coming up" rather than "stuck".
+  const LOADING_WORDS = [
+    "Loading the model…",
+    "Warming up the model…",
+    "Getting the model ready…",
+    "Loading into memory…",
+  ];
   const WORD_MS = 3000;
   const STATS_POLL_MS = 1200;
 
@@ -38,6 +51,15 @@
   let live = $state<LiveSnapshot | null>(null);
   let wordTimer: ReturnType<typeof setInterval> | null = null;
   let statsTimer: ReturnType<typeof setInterval> | null = null;
+
+  // A determinate, known multi-step process is in flight (the launch
+  // sequence, or anything else driving the shared tracker): show the real
+  // bar. Once it's finished there's nothing honest to chart, so we drop back
+  // to the shining word. This is why the load-status bar "lives in both
+  // places" — the splash and, when a known process is running, right here.
+  let determinate = $derived(!startupProgress.finished);
+  let words = $derived(loadingModel ? LOADING_WORDS : WORDS);
+  let displayWord = $derived(words[wordIdx % words.length]);
 
   function fmtGb(bytes: number | null | undefined): string {
     if (bytes == null) return "—";
@@ -53,13 +75,11 @@
   }
 
   onMount(() => {
-    // The determinate bar's status line replaces the rotating word, so only
-    // spin it when the word is actually on screen.
-    if (!showProgress) {
-      wordTimer = setInterval(() => {
-        wordIdx = (wordIdx + 1) % WORDS.length;
-      }, WORD_MS);
-    }
+    // Rotate the reassurance word. Harmless to keep ticking even while the
+    // determinate bar is showing — the word just isn't on screen then.
+    wordTimer = setInterval(() => {
+      wordIdx = wordIdx + 1;
+    }, WORD_MS);
     if (showStats) {
       void refresh(); // prime the CPU delta cache immediately
       statsTimer = setInterval(() => void refresh(), STATS_POLL_MS);
@@ -73,11 +93,11 @@
 </script>
 
 <div class="loading-inline" aria-live="polite">
-  {#if showProgress}
+  {#if determinate}
     <LoadingBar />
   {:else}
-    {#key wordIdx}
-      <span class="loading-word">{WORDS[wordIdx]}</span>
+    {#key displayWord}
+      <span class="loading-word">{displayWord}</span>
     {/key}
   {/if}
   {#if showStats && live}
