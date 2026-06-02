@@ -539,14 +539,17 @@ export const NETWORKS_TOOL: Tool = {
     function: {
       name: "networks",
       description:
-        "Manage and diagnose the user's Cloud Mesh networks. " +
-        "Call this whenever the user asks about their network, mesh, " +
-        "connection, peers, or devices not showing up. " +
-        "Start with action='status' for an overview before taking " +
-        "action. Adding or switching networks may briefly disrupt " +
-        "any in-flight cross-device work — narrate what you're doing " +
-        "before destructive actions and confirm with the user when " +
-        "intent is ambiguous.",
+        "Manage and diagnose the user's Cloud Mesh: device identity, saved " +
+        "networks, connected peers, pending join requests, the accepting " +
+        "policy, the diagnostic log, and the signaling/STUN/TURN servers. " +
+        "Reach for this whenever the user asks about their network, mesh, " +
+        "connection, peers, or devices that aren't showing up. The exact " +
+        "operation is chosen by the 'action' argument (see its enum). Start " +
+        "with action='status' to get the lay of the land before changing " +
+        "anything. Forgetting a network, denying a request, or switching the " +
+        "active network interrupts in-flight cross-device work and can't be " +
+        "undone from here, so pick the action that matches what the user " +
+        "actually asked for.",
       parameters: {
         type: "object",
         properties: {
@@ -690,11 +693,12 @@ export function buildShellTool(host: AgentHostInfo): Tool {
         name: "shell",
         description:
           `Run a shell command on this device (${host.os} ${host.arch}) and ` +
-          `return stdout / stderr / exit code.\n\n` +
+          `get back stdout, stderr, and the exit code. Use it for system ` +
+          `diagnostics, inspecting or configuring the machine, and anything ` +
+          `the other tools don't cover.\n\n` +
           `Shell: ${shellHint}\n\n` +
-          `Each call prompts the user for permission unless they've previously granted ` +
-          `blanket or per-command trust. Output is capped at 256 KiB per stream and ` +
-          `times out after 60 s by default.`,
+          `Output is capped at 256 KiB per stream and the command times out ` +
+          `after 60 s by default.`,
         parameters: {
           type: "object",
           properties: {
@@ -753,11 +757,11 @@ export const SHELL_TOOL: Tool = {
       name: "shell",
       description:
         "Run a shell command on this device and return stdout / stderr / " +
-        "exit code. Uses `sh -c` on Unix and `cmd /C` on Windows so " +
-        "pipes, redirects, and `&&` work as written. Each call prompts " +
-        "the user for permission unless they've previously granted blanket " +
-        "or per-command trust on this device. Output is capped at 256 KiB " +
-        "per stream and timed-out after 60 s by default.",
+        "exit code. Use it for system diagnostics, inspecting or configuring " +
+        "the machine, and anything the other tools don't cover. Uses `sh -c` " +
+        "on Unix and `cmd /C` on Windows so pipes, redirects, and `&&` work " +
+        "as written. Output is capped at 256 KiB per stream and the command " +
+        "times out after 60 s by default.",
       parameters: {
         type: "object",
         properties: {
@@ -789,11 +793,12 @@ export const READ_FILE_TOOL: Tool = {
     function: {
       name: "read_file",
       description:
-        "Read a text file on this device and return its contents. Capped " +
-        "at 1 MiB by default (16 MiB hard ceiling). Non-destructive — " +
-        "doesn't prompt the user. Binary content is returned as UTF-8 " +
-        "lossy approximation; use `shell` with `file`/`xxd` for true " +
-        "binary inspection.",
+        "Read a text file on this device and return its contents. Quick and " +
+        "non-destructive, so use it freely to inspect logs, config, or any " +
+        "text file before deciding what to do next. Returns up to 1 MiB by " +
+        "default (16 MiB hard ceiling). Binary content comes back as a lossy " +
+        "UTF-8 approximation; use `shell` with `file`/`xxd` for true binary " +
+        "inspection.",
       parameters: {
         type: "object",
         properties: {
@@ -828,10 +833,10 @@ export const WRITE_FILE_TOOL: Tool = {
     function: {
       name: "write_file",
       description:
-        "Write text content to a file on this device. Creates parent " +
-        "directories by default. Each call prompts the user for permission " +
-        "unless they've previously granted blanket or per-path trust on " +
-        "this device. Use `append: true` to append rather than overwrite.",
+        "Write text content to a file on this device, creating parent " +
+        "directories by default. Use it to save logs, configs, scripts, or " +
+        "any text artifact the task produces. Set `append: true` to append " +
+        "rather than overwrite.",
       parameters: {
         type: "object",
         properties: {
@@ -907,27 +912,32 @@ export const TOOLS_BY_NAME: Record<string, Tool> = Object.fromEntries(
 );
 
 /** Base system prompt — the framing the model sees regardless of
- *  which tools are enabled for the current send. Includes role +
- *  general style guidance. Per-tool documentation is appended at
- *  send time via `toolSystemPromptSnippet` so deselecting a tool in
- *  the prompt editor drops both the tool from the model's tool array
- *  AND its documentation from the prompt body. */
+ *  which tools are enabled for the current send. Deliberately generic
+ *  and behavior-only: this is a general-purpose agent, so its specific
+ *  capabilities come from the per-tool descriptions, NOT from a baked-in
+ *  role here. Per-tool documentation is appended at send time via the
+ *  tool snippets so deselecting a tool in the prompt editor drops both
+ *  the tool from the model's tool array AND its documentation from the
+ *  prompt body. */
 export const DEFAULT_SYSTEM_PROMPT_BASE: string =
-  "You are MyOwnLLM's built-in IT support assistant. You have hands-on " +
-  "tools for managing the user's Cloud Mesh (\"Networks\") and acting on " +
-  "the host filesystem and shell.\n\n" +
-  "Style:\n" +
-  "- Be direct. Quote tool results back to the user in plain English; don't dump JSON.\n" +
-  "- When you take an action, say what you did and what the result was.\n" +
-  "- If the user just wants information, answer the question and stop — don't " +
-  "fire actions speculatively.\n" +
-  "- If a tool call fails (including permission denials), surface the error " +
-  "message and suggest the next step.\n" +
-  "- Before changing anything destructive (forgetting a network, denying a " +
-  "pending request, switching active network mid-session, writing a file, " +
-  "running a shell command), confirm with the user. They'll see a permission " +
-  "prompt for shell / write_file, but a quick \"I'm about to run X — okay?\" " +
-  "in chat first is better UX than a surprise modal.";
+  "You are MyOwnLLM's built-in assistant: a capable, general-purpose " +
+  "agent. You help by answering questions, thinking through problems, and " +
+  "taking action with your tools when a request calls for it. Not every " +
+  "message needs a tool — but when one fits, use it rather than just " +
+  "describing what you would do.\n\n" +
+  "Be direct, honest, and concise: lead with the answer, write in plain " +
+  "language, and match the length to what was asked. If you're unsure or " +
+  "something is outside your reach, say so plainly — don't invent facts or " +
+  "claim a tool did something it didn't.\n\n" +
+  "With tools:\n" +
+  "- Assume they're available and permitted, and call them directly. The " +
+  "app handles any confirmation the user needs, so don't ask for permission " +
+  "in chat — act, then tell the user what you did and what came of it.\n" +
+  "- Infer the obvious intent; when a minor detail is missing, pick the " +
+  "sensible default instead of stalling, and lean on read-only tools to " +
+  "find what you need rather than guessing.\n" +
+  "- Summarize what a tool returns rather than pasting raw JSON. If a tool " +
+  "errors, say what failed and what you'd try next.";
 
 /** Host environment line. Injected verbatim into the system prompt
  *  at send time so the model knows which shell + path separator it's
@@ -974,9 +984,10 @@ const NETWORKS_TOOL_SNIPPET: string =
   "Network settings & imports:\n" +
   "- Network settings travel as a portable JSON envelope carrying " +
   "`kind: \"myownllm.network-settings\"`. The user can paste one into chat or " +
-  "attach a .json file — when you see this shape, offer to import it via " +
+  "attach a .json file — when they want it applied, import it via " +
   "`action='import_settings'` (pass the parsed object as `settings`, or the " +
-  "raw string as `json`). Confirm the network_id with the user before applying.\n" +
+  "raw string as `json`), using the network_id from the blob unless the user " +
+  "named a different one.\n" +
   "- `action='export_settings'` returns the same envelope for the active (or " +
   "named) network, ready to share to another device.\n" +
   "- `action='set_signaling_servers' / 'set_stun_servers' / 'set_turn_servers'` " +
@@ -985,29 +996,26 @@ const NETWORKS_TOOL_SNIPPET: string =
 
 const READ_FILE_TOOL_SNIPPET: string =
   "## `read_file` tool — read a file from disk\n\n" +
-  "Reads a text file on the user's device and returns its contents. " +
-  "Non-destructive — runs without prompting the user. Use it to inspect " +
-  "logs, config files, or any text artifact before deciding what to do " +
-  "next. Pass an absolute path when possible; relative paths resolve " +
-  "against the agent's working directory which may not match what the " +
-  "user expects.";
+  "Reads a text file on the user's device and returns its contents. It's " +
+  "non-destructive, so read freely — grounding a decision in the actual " +
+  "file beats guessing what it contains. Prefer an absolute path; relative " +
+  "paths resolve against the agent's working directory, which may not be " +
+  "where the user thinks it is.";
 
 const WRITE_FILE_TOOL_SNIPPET: string =
   "## `write_file` tool — create or modify a file\n\n" +
-  "Writes (or appends) text to a file on the user's device. The user is " +
-  "prompted for permission on every call unless they've previously " +
-  "granted blanket trust for the exact path. State your intent in chat " +
-  "before calling — a surprise permission modal is worse UX than a " +
-  "heads-up sentence describing what you're about to write and where.";
+  "Writes or appends text to a file on the user's device, creating parent " +
+  "directories as needed. Use `append: true` to add to a file instead of " +
+  "replacing it. Name the path you wrote in your reply so the user knows " +
+  "where the file landed.";
 
 const SHELL_TOOL_SNIPPET: string =
   "## `shell` tool — run a shell command\n\n" +
-  "Runs a shell command on the user's device. The user is prompted for " +
-  "permission on every call unless they've granted blanket trust for the " +
-  "exact command string. Use the shell family indicated in the host line " +
-  "above (POSIX sh on Unix, Windows cmd on Windows). State your intent " +
-  "in chat before invoking destructive commands — confirmation first " +
-  "beats a surprise modal.";
+  "Runs a shell command on the user's device and returns stdout, stderr, " +
+  "and the exit code. Use the shell family from the host line above (POSIX " +
+  "sh on Unix, Windows cmd on Windows) and quote paths that contain spaces. " +
+  "Prefer a targeted command over a sprawling one so the output stays easy " +
+  "to read back to the user.";
 
 /** Lookup of the per-tool prompt snippet by tool id. Exposed so the
  *  Prompts settings UI can preview the snippet next to each tool's
