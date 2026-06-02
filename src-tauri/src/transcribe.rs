@@ -2764,18 +2764,12 @@ fn run_streaming_loop(
                 .unwrap_or(utt_start_ms)
                 .max(utt_start_ms);
             // Diarize the finalized utterance audio before we drop it.
-            let dia = PerfTracker::time(&mut perf.diarize, || {
-                diarize_speaker(
-                    &mut diarize,
-                    window.samples(),
-                    window.base_ms(),
-                    utt_start_ms,
-                    end_ms,
-                    &cancel,
-                )
+            let turns = PerfTracker::time(&mut perf.diarize, || {
+                run_diarize_turns(&mut diarize, window.samples(), window.base_ms(), &cancel)
             });
-            // Opportunistically keep the best voice clip for this speaker;
-            // on a first capture, stash it live + emit an in-session chip.
+            // Opportunistically keep the best voice clip for the dominant
+            // speaker; on a first capture, stash it live + emit a chip.
+            let dia = dominant_turn(&turns, utt_start_ms, end_ms);
             if let Some(spk) = dia.speaker {
                 if let Some(cand) = clips.consider(
                     spk,
@@ -2787,7 +2781,6 @@ fn run_streaming_loop(
                     emit_live_speaker_chip(sink, event, started, review_key, cand);
                 }
             }
-            let (speaker, overlap) = (dia.speaker, dia.overlap);
             agree.finalize();
             let cs = (!chunk_seconds_sent)
                 .then_some(capture_chunk_seconds)
@@ -2795,17 +2788,18 @@ fn run_streaming_loop(
             if cs.is_some() && !final_tokens.is_empty() {
                 chunk_seconds_sent = true;
             }
-            emit_stream_segment(
+            // One final segment per speaker run, so a speaker change
+            // mid-utterance renders as distinct, labeled lines.
+            emit_diarized_runs(
                 sink,
                 event,
                 started,
                 cur_seg_id,
+                &mut next_seg_id,
                 &final_tokens,
                 window.base_ms(),
                 utt_start_ms,
-                false,
-                speaker,
-                overlap,
+                &turns,
                 rx.len() as u32,
                 cs,
             );
@@ -2840,14 +2834,9 @@ fn run_streaming_loop(
                 .map(|t| window.base_ms() + t.t_ms)
                 .unwrap_or(utt_start_ms)
                 .max(utt_start_ms);
-            let dia = diarize_speaker(
-                &mut diarize,
-                window.samples(),
-                window.base_ms(),
-                utt_start_ms,
-                end_ms,
-                &cancel,
-            );
+            let turns =
+                run_diarize_turns(&mut diarize, window.samples(), window.base_ms(), &cancel);
+            let dia = dominant_turn(&turns, utt_start_ms, end_ms);
             if let Some(spk) = dia.speaker {
                 clips.consider(
                     spk,
@@ -2860,17 +2849,16 @@ fn run_streaming_loop(
             let cs = (!chunk_seconds_sent)
                 .then_some(capture_chunk_seconds)
                 .flatten();
-            emit_stream_segment(
+            emit_diarized_runs(
                 sink,
                 event,
                 started,
                 cur_seg_id,
+                &mut next_seg_id,
                 &final_tokens,
                 window.base_ms(),
                 utt_start_ms,
-                false,
-                dia.speaker,
-                dia.overlap,
+                &turns,
                 rx.len() as u32,
                 cs,
             );
@@ -2917,6 +2905,41 @@ fn emit_stream_segment(
     pending_chunks: u32,
     chunk_seconds: Option<f32>,
 ) {
+    emit_one_segment(
+        sink,
+        event,
+        started,
+        seg_id,
+        tokens,
+        window_base_ms,
+        utt_start_ms,
+        partial,
+        speaker,
+        overlap,
+        pending_chunks,
+        chunk_seconds,
+    );
+}
+
+/// Emit a single transcript segment frame. `seg_start_ms` is the
+/// segment's absolute start (the whole utterance for an interim line, or
+/// one speaker run's start for a diarized final). The end time is the
+/// last token's, floored at the start.
+#[allow(clippy::too_many_arguments)]
+fn emit_one_segment(
+    sink: &Arc<dyn FrameSink>,
+    event: &str,
+    started: std::time::Instant,
+    seg_id: u64,
+    tokens: &[AsrToken],
+    window_base_ms: u64,
+    seg_start_ms: u64,
+    partial: bool,
+    speaker: Option<u32>,
+    overlap: bool,
+    pending_chunks: u32,
+    chunk_seconds: Option<f32>,
+) {
     let text = join_tokens(tokens);
     if text.is_empty() {
         return;
@@ -2924,10 +2947,10 @@ fn emit_stream_segment(
     let end_ms = tokens
         .last()
         .map(|t| window_base_ms + t.t_ms)
-        .unwrap_or(utt_start_ms)
-        .max(utt_start_ms);
+        .unwrap_or(seg_start_ms)
+        .max(seg_start_ms);
     let seg = EmittedSegment {
-        start_ms: utt_start_ms,
+        start_ms: seg_start_ms,
         end_ms,
         text,
         speaker,
@@ -3410,28 +3433,33 @@ struct DiarizeResult {
 }
 
 /// Run the diarizer (if enabled) over a finalized utterance's audio and
-/// return the speaker whose turn most overlaps `[start_ms, end_ms]`, plus
-/// that turn's overlap flag, confidence, and embedding. An empty result
-/// when diarization is off or no turn overlaps — mirrors the max-overlap
-/// assignment `join_segments` uses on the disk path.
-fn diarize_speaker(
+/// return every speaker turn it identified within the window, with
+/// session-relative timestamps. Empty when diarization is off or the
+/// pass errors (logged) — callers degrade to unlabeled segments.
+fn run_diarize_turns(
     diarize: &mut Option<&mut (dyn DiarizeBackend + 'static)>,
     samples: &[f32],
     base_ms: u64,
-    start_ms: u64,
-    end_ms: u64,
     cancel: &AtomicBool,
-) -> DiarizeResult {
+) -> Vec<SpeakerTurn> {
     let Some(d) = diarize.as_deref_mut() else {
-        return DiarizeResult::default();
+        return Vec::new();
     };
-    let turns = match d.process_chunk(samples, base_ms, cancel) {
+    match d.process_chunk(samples, base_ms, cancel) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("streaming diarize failed: {e}");
-            return DiarizeResult::default();
+            Vec::new()
         }
-    };
+    }
+}
+
+/// The turn whose span most overlaps `[start_ms, end_ms]`, as the
+/// utterance's dominant speaker — used for opportunistic voice-clip
+/// capture (which anchors one profile per finalized utterance). Empty
+/// when no turn overlaps. Mirrors the max-overlap assignment
+/// `join_segments` uses on the disk path.
+fn dominant_turn(turns: &[SpeakerTurn], start_ms: u64, end_ms: u64) -> DiarizeResult {
     let mut best: Option<(usize, u64)> = None;
     for (i, t) in turns.iter().enumerate() {
         let lo = start_ms.max(t.start_ms);
@@ -3454,6 +3482,122 @@ fn diarize_speaker(
             }
         }
         None => DiarizeResult::default(),
+    }
+}
+
+/// A contiguous run of finalized tokens sharing one diarized speaker.
+/// `start`/`end` index `tokens`; `start_ms` is the run's absolute start.
+struct SpeakerRun {
+    start: usize,
+    end: usize,
+    speaker: Option<u32>,
+    overlap: bool,
+    start_ms: u64,
+}
+
+/// The diarize turn whose span most overlaps `[start_ms, end_ms]`,
+/// returned as `(speaker, overlap)`. `(None, false)` when nothing
+/// overlaps. A zero-width span is widened to 1 ms so a point-in-time
+/// token still matches the turn it sits inside.
+fn best_turn_for_span(turns: &[SpeakerTurn], start_ms: u64, end_ms: u64) -> (Option<u32>, bool) {
+    let end_ms = end_ms.max(start_ms + 1);
+    let mut best: Option<(&SpeakerTurn, u64)> = None;
+    for t in turns {
+        let lo = start_ms.max(t.start_ms);
+        let hi = end_ms.min(t.end_ms);
+        if hi > lo {
+            let overlap_ms = hi - lo;
+            if best.map(|(_, o)| overlap_ms > o).unwrap_or(true) {
+                best = Some((t, overlap_ms));
+            }
+        }
+    }
+    match best {
+        Some((t, _)) => (Some(t.speaker), t.overlap),
+        None => (None, false),
+    }
+}
+
+/// Partition a finalized utterance's tokens into per-speaker runs by
+/// assigning each token's time span to the diarize turn it overlaps most
+/// and coalescing consecutive same-speaker tokens. With no turns
+/// (diarize off / no overlap) every token lands in one `None` run, which
+/// reproduces the pre-split single-segment behavior.
+fn split_tokens_by_speaker(
+    tokens: &[AsrToken],
+    window_base_ms: u64,
+    utt_start_ms: u64,
+    turns: &[SpeakerTurn],
+) -> Vec<SpeakerRun> {
+    let mut runs: Vec<SpeakerRun> = Vec::new();
+    let mut prev_end_abs = utt_start_ms;
+    for (i, tok) in tokens.iter().enumerate() {
+        // `t_ms` is the token's end time relative to the window; the
+        // span back to the previous token's end is its footprint.
+        let tok_end_abs = (window_base_ms + tok.t_ms).max(prev_end_abs);
+        let tok_start_abs = prev_end_abs.min(tok_end_abs);
+        let (speaker, overlap) = best_turn_for_span(turns, tok_start_abs, tok_end_abs);
+        match runs.last_mut() {
+            Some(r) if r.speaker == speaker => {
+                r.end = i + 1;
+                r.overlap |= overlap;
+            }
+            _ => runs.push(SpeakerRun {
+                start: i,
+                end: i + 1,
+                speaker,
+                overlap,
+                start_ms: tok_start_abs.max(utt_start_ms),
+            }),
+        }
+        prev_end_abs = tok_end_abs;
+    }
+    runs
+}
+
+/// Split a finalized utterance into one final segment per diarized
+/// speaker run and emit each. The first run keeps the utterance's
+/// `first_seg_id` (so it replaces the in-flight interim line); later
+/// runs draw fresh ids from `next_seg_id` and append as new lines.
+/// `chunk_seconds` is attached to the first emitted run only.
+#[allow(clippy::too_many_arguments)]
+fn emit_diarized_runs(
+    sink: &Arc<dyn FrameSink>,
+    event: &str,
+    started: std::time::Instant,
+    first_seg_id: u64,
+    next_seg_id: &mut u64,
+    tokens: &[AsrToken],
+    window_base_ms: u64,
+    utt_start_ms: u64,
+    turns: &[SpeakerTurn],
+    pending_chunks: u32,
+    chunk_seconds: Option<f32>,
+) {
+    let runs = split_tokens_by_speaker(tokens, window_base_ms, utt_start_ms, turns);
+    for (ri, run) in runs.iter().enumerate() {
+        let seg_id = if ri == 0 {
+            first_seg_id
+        } else {
+            let id = *next_seg_id;
+            *next_seg_id += 1;
+            id
+        };
+        let cs = if ri == 0 { chunk_seconds } else { None };
+        emit_one_segment(
+            sink,
+            event,
+            started,
+            seg_id,
+            &tokens[run.start..run.end],
+            window_base_ms,
+            run.start_ms,
+            false,
+            run.speaker,
+            run.overlap,
+            pending_chunks,
+            cs,
+        );
     }
 }
 
@@ -3559,6 +3703,80 @@ mod tests {
     use super::*;
     use crate::frame_sink::CaptureSink;
     use std::collections::VecDeque;
+
+    fn tok(text: &str, t_ms: u64) -> AsrToken {
+        AsrToken {
+            text: text.to_string(),
+            t_ms,
+        }
+    }
+
+    #[test]
+    fn split_no_turns_is_one_unlabeled_run() {
+        let tokens = [tok("a", 500), tok("b", 1000), tok("c", 1500)];
+        let runs = split_tokens_by_speaker(&tokens, 0, 0, &[]);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].start, 0);
+        assert_eq!(runs[0].end, 3);
+        assert_eq!(runs[0].speaker, None);
+    }
+
+    #[test]
+    fn split_single_speaker_is_one_run() {
+        let tokens = [tok("a", 500), tok("b", 1000), tok("c", 1500)];
+        let turns = [turn(0, 2000, 0, false)];
+        let runs = split_tokens_by_speaker(&tokens, 0, 0, &turns);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].speaker, Some(0));
+        assert_eq!((runs[0].start, runs[0].end), (0, 3));
+    }
+
+    #[test]
+    fn split_two_speakers_breaks_at_turn_boundary() {
+        // Tokens end at 500/1000/1500/2000; speaker 0 owns [0,1000],
+        // speaker 1 owns [1000,2000]. Tokens 0,1 fall in speaker 0;
+        // tokens 2,3 in speaker 1.
+        let tokens = [
+            tok("a", 500),
+            tok("b", 1000),
+            tok("c", 1500),
+            tok("d", 2000),
+        ];
+        let turns = [turn(0, 1000, 0, false), turn(1000, 2000, 1, false)];
+        let runs = split_tokens_by_speaker(&tokens, 0, 0, &turns);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].speaker, Some(0));
+        assert_eq!((runs[0].start, runs[0].end), (0, 2));
+        assert_eq!(runs[0].start_ms, 0);
+        assert_eq!(runs[1].speaker, Some(1));
+        assert_eq!((runs[1].start, runs[1].end), (2, 4));
+        assert_eq!(runs[1].start_ms, 1000);
+    }
+
+    #[test]
+    fn split_propagates_overlap_into_run() {
+        let tokens = [tok("a", 500), tok("b", 1000)];
+        let turns = [turn(0, 2000, 0, true)];
+        let runs = split_tokens_by_speaker(&tokens, 0, 0, &turns);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].overlap);
+    }
+
+    #[test]
+    fn split_honors_window_base_offset() {
+        // The window starts at 10_000 ms; turns are session-absolute, so
+        // the boundary must still land correctly. Token "a" ends at abs
+        // 11_000 (all in speaker 2's turn), "b" at abs 12_000 (speaker 5).
+        let tokens = [tok("a", 1000), tok("b", 2000)];
+        let turns = [
+            turn(10_000, 11_000, 2, false),
+            turn(11_000, 12_000, 5, false),
+        ];
+        let runs = split_tokens_by_speaker(&tokens, 10_000, 10_000, &turns);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].speaker, Some(2));
+        assert_eq!(runs[1].speaker, Some(5));
+    }
 
     /// A minimal mono 16-bit PCM WAV of `ms` ms of silence at `sr` Hz — the
     /// shape the mic-capture and warm-up paths feed the transcription route.

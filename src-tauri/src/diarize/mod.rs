@@ -246,6 +246,27 @@ impl DiarizeBackend for PyannoteOrtBackend {
             self.tail_t0_ms += drop_ms;
         }
 
+        // The tail is only valid left-context if the incoming chunk
+        // continues the stream the tail came from. The streaming loop
+        // (run_streaming_loop) calls us once per *finalized utterance*,
+        // resetting its window between utterances, so every call after the
+        // first arrives with a `chunk_t0_ms` far ahead of the buffered tail
+        // — a different utterance at a later wall-clock time. Prepending a
+        // stale tail there anchors `window_t0_ms` to the *previous*
+        // utterance, so the emitted turns carry timestamps that no longer
+        // overlap the current utterance and the caller's max-overlap match
+        // attributes no speaker. Detect that gap and drop the tail; only a
+        // chunk that picks up where the tail ends (within a small slop) gets
+        // to reuse it. (The contiguous file/drain loops likewise skip silent
+        // chunks, so this also drops the tail across a silence gap, where
+        // reusing it would mis-anchor turns the same way.) The persistent
+        // clusterer is untouched, so cross-utterance speaker identity still
+        // carries over.
+        let tail_len_ms = self.tail.len() as u64 * 1000 / 16_000;
+        if !self.tail.is_empty() && !tail_is_contiguous(self.tail_t0_ms, tail_len_ms, chunk_t0_ms) {
+            self.tail.clear();
+        }
+
         let window_t0_ms = if self.tail.is_empty() {
             chunk_t0_ms
         } else {
@@ -313,11 +334,25 @@ impl DiarizeBackend for PyannoteOrtBackend {
             });
         }
 
+        // Per-turn breakdown (speaker@similarity, `*` = overlap) so a
+        // real session's stderr shows where attribution drifts or churns.
+        let summary: Vec<String> = turns
+            .iter()
+            .map(|t| {
+                format!(
+                    "s{}@{:.2}{}",
+                    t.speaker,
+                    t.confidence.unwrap_or(0.0),
+                    if t.overlap { "*" } else { "" }
+                )
+            })
+            .collect();
         eprintln!(
-            "[diarize] chunk t0={}ms emitted_turns={} filtered_short_slices={}",
+            "[diarize] chunk t0={}ms emitted_turns={} filtered_short_slices={} turns=[{}]",
             chunk_t0_ms,
             turns.len(),
-            filtered_short
+            filtered_short,
+            summary.join(" ")
         );
 
         // Stash a 2 s tail for next chunk's context (enough for the
@@ -341,6 +376,27 @@ impl DiarizeBackend for PyannoteOrtBackend {
     }
 }
 
+/// Maximum gap, in ms, between the end of a buffered tail and the start of
+/// the next chunk for the two to still count as one contiguous stream. A
+/// chunk that starts within this slop of the tail's end is reusing real
+/// left-context; anything further ahead is a new utterance (or the far side
+/// of a skipped silence gap) and must not inherit the tail's time anchor.
+const CONTIGUITY_SLOP_MS: u64 = 100;
+
+/// Whether a buffered tail spanning `[tail_t0_ms, tail_t0_ms + tail_len_ms]`
+/// is a contiguous predecessor of a chunk arriving at `chunk_t0_ms` — i.e.
+/// the chunk picks up where the tail ends, within `CONTIGUITY_SLOP_MS`.
+///
+/// `process_chunk` prepends the tail and anchors the whole analysis window
+/// at `tail_t0_ms`, so reusing the tail is only sound when the chunk really
+/// continues it in absolute time. A non-contiguous chunk (the per-utterance
+/// streaming caller after a window reset, or a voiced chunk on the far side
+/// of a skipped silence gap) would otherwise be mis-stamped with the
+/// previous segment's timeline.
+fn tail_is_contiguous(tail_t0_ms: u64, tail_len_ms: u64, chunk_t0_ms: u64) -> bool {
+    chunk_t0_ms >= tail_t0_ms && chunk_t0_ms <= tail_t0_ms + tail_len_ms + CONTIGUITY_SLOP_MS
+}
+
 /// Factory: parse the runtime + composite name and return a backend.
 pub fn make_backend(runtime: &str, composite_name: &str) -> Result<Box<dyn DiarizeBackend>> {
     match runtime {
@@ -354,5 +410,53 @@ pub fn make_backend(runtime: &str, composite_name: &str) -> Result<Box<dyn Diari
         other => Err(anyhow::anyhow!(
             "unsupported diarize runtime: '{other}' (known: pyannote-diarize)"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A 2 s tail anchored at 10_000 ms occupies [10_000, 12_000].
+
+    #[test]
+    fn chunk_resuming_at_tail_end_is_contiguous() {
+        // The contiguous file/drain loop: next chunk starts right where the
+        // tail ends, so the tail is real left-context and may be reused.
+        assert!(tail_is_contiguous(10_000, 2_000, 12_000));
+    }
+
+    #[test]
+    fn chunk_within_slop_of_tail_end_is_contiguous() {
+        // Rounding in the ms<->sample conversions can leave a chunk a hair
+        // short of the tail's end; the slop keeps it contiguous.
+        assert!(tail_is_contiguous(
+            10_000,
+            2_000,
+            12_000 + CONTIGUITY_SLOP_MS
+        ));
+        assert!(tail_is_contiguous(10_000, 2_000, 11_950));
+    }
+
+    #[test]
+    fn chunk_overlapping_tail_is_contiguous() {
+        // A chunk starting inside the tail's span still continues it.
+        assert!(tail_is_contiguous(10_000, 2_000, 11_000));
+    }
+
+    #[test]
+    fn next_utterance_after_a_gap_is_not_contiguous() {
+        // The streaming bug: utterance #2 finalizes seconds later. Its
+        // chunk_t0_ms sits well past the stale tail, so the tail must be
+        // dropped rather than mis-anchoring the new turns.
+        assert!(!tail_is_contiguous(10_000, 2_000, 18_000));
+        // Even a half-second gap past the tail end is non-contiguous.
+        assert!(!tail_is_contiguous(10_000, 2_000, 12_500));
+    }
+
+    #[test]
+    fn chunk_before_tail_start_is_not_contiguous() {
+        // A chunk timestamped before the tail can't be continuing it.
+        assert!(!tail_is_contiguous(10_000, 2_000, 9_000));
     }
 }

@@ -28,6 +28,14 @@
 
 use std::time::Duration;
 
+/// Maximum EMA step applied to a centroid for a deadband (medium-
+/// confidence) match, taken at the join-side edge of the deadband and
+/// scaled linearly down to 0 at the create-side edge. Lets a centroid
+/// keep tracking a speaker's drifting voice instead of freezing on the
+/// first few strong matches, while keeping any single borderline
+/// embedding from dominating the running mean.
+const DEADBAND_MAX_ALPHA: f32 = 0.25;
+
 /// Configuration for the online clusterer.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // `stale_after` is reserved for the cold-start re-label
@@ -219,13 +227,27 @@ impl OnlineClusterer {
             }
         }
 
-        // 2) Deadband match → join nearest, lock the centroid.
-        //    Also taken when `lock_centroid` is set: we never open
-        //    a new cluster from a low-trust embedding.
+        // 2) Deadband match → join nearest. Also taken when
+        //    `lock_centroid` is set: we never open a new cluster from a
+        //    low-trust embedding. A locked (overlap) embedding only
+        //    touches `last_seen`; an unlocked deadband embedding nudges
+        //    the centroid toward it by a bounded EMA step so the speaker
+        //    profile keeps adapting. The step scales from 0 at
+        //    `create_sim` to `DEADBAND_MAX_ALPHA` at `join_sim`, so a
+        //    borderline match barely moves the mean while a near-join
+        //    match moves it appreciably. `count` is left unchanged — a
+        //    deadband match is medium-confidence evidence, not a full
+        //    membership vote.
         if let Some((idx, sim)) = best {
             if sim >= create_sim || lock_centroid {
                 let c = &mut self.centroids[idx];
-                c.last_seen_ms = c.last_seen_ms.max(now_ms);
+                if lock_centroid {
+                    c.last_seen_ms = c.last_seen_ms.max(now_ms);
+                } else {
+                    let span = (join_sim - create_sim).max(1e-6);
+                    let frac = ((sim - create_sim) / span).clamp(0.0, 1.0);
+                    ema_update(c, embedding, now_ms, DEADBAND_MAX_ALPHA * frac);
+                }
                 return (c.id, sim);
             }
         }
@@ -310,6 +332,20 @@ fn update_centroid(c: &mut Centroid, e: &[f32], now_ms: u64) {
     c.last_seen_ms = c.last_seen_ms.max(now_ms);
 }
 
+/// Nudge a centroid's mean toward `e` by `alpha` (0..=1) and renormalize,
+/// without bumping `count`. Used for deadband matches: the direction
+/// adapts but a borderline slice doesn't gain a full membership vote.
+fn ema_update(c: &mut Centroid, e: &[f32], now_ms: u64, alpha: f32) {
+    c.last_seen_ms = c.last_seen_ms.max(now_ms);
+    if alpha <= 0.0 {
+        return;
+    }
+    for (m, &x) in c.mean.iter_mut().zip(e.iter()) {
+        *m = *m * (1.0 - alpha) + x * alpha;
+    }
+    l2_normalize(&mut c.mean);
+}
+
 fn merge_into(dst: &mut Centroid, src_mean: &[f32], src_count: u64, src_last_seen_ms: u64) {
     let total = dst.count as f32 + src_count as f32;
     for (m, &x) in dst.mean.iter_mut().zip(src_mean.iter()) {
@@ -372,11 +408,12 @@ mod tests {
     }
 
     #[test]
-    fn deadband_embedding_joins_nearest_without_updating_centroid() {
+    fn deadband_embedding_joins_nearest_and_nudges_centroid() {
         // join_threshold=0.45 → join_sim=0.55
         // create_threshold=0.60 → create_sim=0.40
-        // An embedding with sim in (0.40, 0.55) must join nearest
-        // *and* leave the centroid mean untouched.
+        // An embedding with sim in (0.40, 0.55) joins nearest, nudges
+        // the centroid toward it by a *bounded* step, and leaves `count`
+        // untouched (medium-confidence evidence, not a full vote).
         let mut c = OnlineClusterer::new(cfg());
         let a = norm(vec![1.0, 0.0, 0.0]);
         c.assign(&a, 100, false);
@@ -389,12 +426,55 @@ mod tests {
         assert!(sim > 0.40 && sim < 0.55, "sim={sim} not in deadband");
         assert_eq!(c.len(), 1, "deadband must not open a new cluster");
         assert_eq!(
-            c.centroids[0].mean, mean_before,
-            "deadband assignment must not move the centroid"
-        );
-        assert_eq!(
             c.centroids[0].count, 1,
             "deadband assignment must not bump the count"
+        );
+        // The mean moved, but only a little: it stays far closer to its
+        // original direction than to the drift embedding.
+        assert_ne!(
+            c.centroids[0].mean, mean_before,
+            "deadband assignment must adapt the centroid"
+        );
+        assert!(
+            dot(&c.centroids[0].mean, &mean_before) > 0.9,
+            "deadband nudge moved the centroid too far"
+        );
+        assert!(
+            dot(&c.centroids[0].mean, &mean_before) > dot(&c.centroids[0].mean, &drift),
+            "centroid should still favour its original direction"
+        );
+    }
+
+    #[test]
+    fn deadband_step_scales_with_similarity() {
+        // A match near the join edge of the deadband should move the
+        // centroid more than one near the create edge.
+        let a = norm(vec![1.0, 0.0, 0.0]);
+
+        // sim ≈ 0.42 (near create_sim=0.40): cos = 0.42.
+        let near_create = {
+            let y = (1.0f32 - 0.42 * 0.42).sqrt();
+            norm(vec![0.42, y, 0.0])
+        };
+        // sim ≈ 0.53 (near join_sim=0.55): cos = 0.53.
+        let near_join = {
+            let y = (1.0f32 - 0.53 * 0.53).sqrt();
+            norm(vec![0.53, y, 0.0])
+        };
+
+        let mut lo = OnlineClusterer::new(cfg());
+        lo.assign(&a, 100, false);
+        lo.assign(&near_create, 200, false);
+
+        let mut hi = OnlineClusterer::new(cfg());
+        hi.assign(&a, 100, false);
+        hi.assign(&near_join, 200, false);
+
+        let moved_lo = 1.0 - dot(&lo.centroids[0].mean, &a);
+        let moved_hi = 1.0 - dot(&hi.centroids[0].mean, &a);
+        assert!(
+            moved_hi > moved_lo,
+            "near-join nudge ({moved_hi}) should exceed near-create nudge ({moved_lo})"
         );
     }
 
