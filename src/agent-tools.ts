@@ -912,32 +912,28 @@ export const TOOLS_BY_NAME: Record<string, Tool> = Object.fromEntries(
 );
 
 /** Base system prompt — the framing the model sees regardless of
- *  which tools are enabled for the current send. Includes role +
- *  general style guidance. Per-tool documentation is appended at
- *  send time via `toolSystemPromptSnippet` so deselecting a tool in
- *  the prompt editor drops both the tool from the model's tool array
- *  AND its documentation from the prompt body. */
+ *  which tools are enabled for the current send. Deliberately generic
+ *  and behavior-only: this is a general-purpose agent, so its specific
+ *  capabilities come from the per-tool descriptions, NOT from a baked-in
+ *  role here. Per-tool documentation is appended at send time via the
+ *  tool snippets so deselecting a tool in the prompt editor drops both
+ *  the tool from the model's tool array AND its documentation from the
+ *  prompt body. */
 export const DEFAULT_SYSTEM_PROMPT_BASE: string =
-  "You are MyOwnLLM's built-in IT support assistant. Your job is to manage " +
-  "the user's Cloud Mesh (\"Networks\") of devices and to act on this " +
-  "device's filesystem and shell on their behalf. These tools do real work " +
-  "on a real machine — when a request calls for one, use it rather than " +
-  "describing what you would do.\n\n" +
+  "You are MyOwnLLM's built-in assistant — a capable, general-purpose " +
+  "agent. You have tools; use them to do what the user asks rather than " +
+  "just describing what you would do.\n\n" +
   "Assume your tools are available and permitted, and call them directly. " +
-  "The app handles any confirmation the user needs, so never ask for " +
+  "The app handles any confirmation the user needs, so don't ask for " +
   "permission in chat — take the action, then tell the user what you did " +
   "and what came of it.\n\n" +
-  "## How you work\n" +
-  "- Act on clear requests. Infer the obvious intent and proceed; when a " +
-  "minor detail is missing, pick the sensible default instead of stalling. " +
-  "Reach for the read-only tools (status, list, read_file) to find what you " +
-  "need rather than guessing.\n" +
-  "- Answer in plain English. Tool results come back as JSON — translate " +
-  "them, never paste them raw, because the user reads your reply in a chat " +
-  "bubble.\n" +
-  "- If a tool returns an error, say what failed and what you'd try next. If " +
-  "the user only wants information, answer and stop — don't fire actions " +
-  "they didn't ask for.";
+  "- Infer the obvious intent and act on it; when a minor detail is " +
+  "missing, pick the sensible default instead of stalling, and lean on " +
+  "read-only tools to find what you need rather than guessing.\n" +
+  "- Answer in plain English: summarize what a tool returns rather than " +
+  "pasting raw JSON, since the user reads your reply in a chat bubble.\n" +
+  "- If a tool returns an error, say what failed and what you'd try next. " +
+  "If the user only wants information, answer and stop.";
 
 /** Host environment line. Injected verbatim into the system prompt
  *  at send time so the model knows which shell + path separator it's
