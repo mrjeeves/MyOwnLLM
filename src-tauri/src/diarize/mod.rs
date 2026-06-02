@@ -334,11 +334,25 @@ impl DiarizeBackend for PyannoteOrtBackend {
             });
         }
 
+        // Per-turn breakdown (speaker@similarity, `*` = overlap) so a
+        // real session's stderr shows where attribution drifts or churns.
+        let summary: Vec<String> = turns
+            .iter()
+            .map(|t| {
+                format!(
+                    "s{}@{:.2}{}",
+                    t.speaker,
+                    t.confidence.unwrap_or(0.0),
+                    if t.overlap { "*" } else { "" }
+                )
+            })
+            .collect();
         eprintln!(
-            "[diarize] chunk t0={}ms emitted_turns={} filtered_short_slices={}",
+            "[diarize] chunk t0={}ms emitted_turns={} filtered_short_slices={} turns=[{}]",
             chunk_t0_ms,
             turns.len(),
-            filtered_short
+            filtered_short,
+            summary.join(" ")
         );
 
         // Stash a 2 s tail for next chunk's context (enough for the
