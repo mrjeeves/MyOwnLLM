@@ -32,7 +32,7 @@ export interface LiveSnapshot {
   cpu_count: number | null;
 }
 
-export type Mode = "text" | "vision" | "code" | "transcribe" | "diarize";
+export type Mode = "text" | "vision" | "code" | "transcribe" | "diarize" | "embed";
 
 /** Runtimes the resolver knows how to dispatch to.
  *

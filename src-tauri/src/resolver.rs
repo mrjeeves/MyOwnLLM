@@ -27,21 +27,27 @@ use crate::hardware::HardwareProfile;
 
 pub const VIRTUAL_PREFIX: &str = "myownllm-";
 /// Modes the resolver knows how to look up against a manifest. `text`,
-/// `transcribe`, and `speak` are the end-user surfaces; `diarize` is
-/// internal to the transcription pipeline (opt-in via the GUI), not a
-/// public virtual ID.
-pub const KNOWN_MODES: &[&str] = &["text", "transcribe", "diarize", "speak"];
+/// `transcribe`, and `speak` are the end-user surfaces; `embed` is a
+/// background capability (an Ollama embedding model that backs Myo's
+/// memory system); `diarize` is internal to the transcription pipeline
+/// (opt-in via the GUI). Both `embed` and `diarize` are looked up
+/// hardware-aware just like the user surfaces.
+pub const KNOWN_MODES: &[&str] = &["text", "transcribe", "diarize", "speak", "embed"];
 
 /// Virtual model IDs exposed to OpenAI-compatible clients via `/v1/models`,
 /// paired with the mode each one resolves to. Keep this list narrow: bare
 /// `myownllm` is the default chat model, `myownllm-transcribe` is the ASR
 /// surface, `myownllm-speak` is the TTS surface (so Myo can show the
-/// resolved voice tier the way it shows the resolved ASR model). Internal
-/// modes (`diarize`) are not advertised.
+/// resolved voice tier the way it shows the resolved ASR model), and
+/// `myownllm-embed` is the embeddings surface (so Myo's memory system can
+/// POST to `/v1/embeddings` against a stable id and let the device pick
+/// the hardware-appropriate embedding model). Internal modes (`diarize`)
+/// are not advertised.
 pub const PUBLIC_VIRTUAL_IDS: &[(&str, &str)] = &[
     ("myownllm", "text"),
     ("myownllm-transcribe", "transcribe"),
     ("myownllm-speak", "speak"),
+    ("myownllm-embed", "embed"),
 ];
 const DEFAULT_TTL_MIN: f64 = 360.0;
 const FALLBACK_MANIFEST_URL: &str =
@@ -160,6 +166,10 @@ pub fn default_runtime_for(mode: &str) -> &'static str {
         // Top of the speak tier ladder; the lower rungs promote to piper
         // via the per-tier `runtime` override.
         "speak" => "kokoro",
+        // `embed` joins `text` on the Ollama runtime — the embedding tags
+        // (embeddinggemma / nomic-embed-text / all-minilm) are pulled,
+        // tracked, and cleaned up by the same `ollama` machinery as chat
+        // models, so the catch-all is exactly right for it.
         _ => "ollama",
     }
 }
@@ -826,7 +836,7 @@ pub fn default_config_value() -> Value {
         "warm_on_startup": true,
         "kept_models": [],
         "mode_overrides": {},
-        "tracked_modes": ["text"],
+        "tracked_modes": ["text", "embed"],
         "conversation_dir": conv_dir,
         "api": {
             "enabled": true,
@@ -896,6 +906,15 @@ pub fn merge_defaults(mut config: Value) -> Value {
     if needs_seed {
         let active = config["active_mode"].as_str().unwrap_or("text").to_string();
         config["tracked_modes"] = serde_json::json!([active]);
+    }
+    // `embed` is a maintained system capability (it backs Myo's memory
+    // system via the `myownllm-embed` virtual ID), not a user-chosen chat
+    // mode — ensure it's always tracked so a local embedding model stays
+    // pulled even on configs written before `embed` existed.
+    if let Some(modes) = config["tracked_modes"].as_array_mut() {
+        if !modes.iter().any(|m| m.as_str() == Some("embed")) {
+            modes.push(serde_json::json!("embed"));
+        }
     }
     // Fill active_family on legacy configs (predates the families schema).
     if config["active_family"].as_str().unwrap_or("").is_empty() {
@@ -1291,5 +1310,57 @@ mod tests {
         let pi = hw(GpuType::None, None, 4.0);
         let (_, rt) = resolve_full(&m, &pi, "diarize", "f").unwrap();
         assert_eq!(rt, "pyannote-diarize");
+    }
+
+    #[test]
+    fn embed_mode_resolves_on_ollama_runtime_and_walks_tiers() {
+        // The `embed` shared mode is plain Ollama — no per-tier runtime
+        // override — so it resolves to the hardware-appropriate embedding
+        // tag on the `ollama` runtime, exactly like `text`. A 2 GB Pi
+        // catches the bottom rung; a roomy host reaches the top rung.
+        let m = serde_json::json!({
+            "default_family": "f",
+            "headroom_gb": { "none": 2 },
+            "shared_modes": {
+                "embed": {
+                    "tiers": [
+                        { "min_vram_gb": 0, "min_ram_gb": 4, "min_unified_ram_gb": 8, "model": "embeddinggemma",   "fallback": "nomic-embed-text" },
+                        { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0, "model": "all-minilm",       "fallback": "all-minilm"       }
+                    ]
+                }
+            },
+            "families": {
+                "f": { "default_mode": "text", "modes": { "text": { "tiers": [
+                    { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0, "model": "x" }
+                ]}}}
+            }
+        });
+        let pi = hw(GpuType::None, None, 4.0);
+        let (pi_model, pi_rt) = resolve_full(&m, &pi, "embed", "f").unwrap();
+        assert_eq!(pi_model, "all-minilm");
+        assert_eq!(pi_rt, "ollama");
+
+        let big = hw(GpuType::None, None, 16.0);
+        let (big_model, big_rt) = resolve_full(&m, &big, "embed", "f").unwrap();
+        assert_eq!(big_model, "embeddinggemma");
+        assert_eq!(big_rt, "ollama");
+    }
+
+    #[test]
+    fn embed_tags_are_in_recommended_set_for_cleanup_protection() {
+        // The embed tiers must surface from `tags_in_manifest` (they're
+        // Ollama tags) so the cleanup pass treats a pulled embedding model
+        // as recommended rather than evicting it.
+        let m = serde_json::json!({
+            "shared_modes": {
+                "embed": {
+                    "tiers": [
+                        { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0, "model": "all-minilm", "fallback": "all-minilm" }
+                    ]
+                }
+            },
+            "families": {}
+        });
+        assert!(tags_in_manifest(&m).contains(&"all-minilm".to_string()));
     }
 }

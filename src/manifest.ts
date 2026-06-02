@@ -566,16 +566,30 @@ export function resolveModel(
   return resolveModelEx(hardware, manifest, mode, modeOverrides, familyName, familyOverrides).model;
 }
 
-/** All model tags recommended by a manifest across every family/mode/tier. */
+/** All model tags recommended by a manifest across every family/mode/tier.
+ *  Includes `shared_modes` (the canonical transcribe / diarize / speak /
+ *  embed ladders) as well as per-family modes — otherwise an
+ *  Ollama-runtime shared mode like `embed` (whose tags DO show up in
+ *  `ollama list`) would never be marked recommended and the cleanup pass
+ *  would evict the embedding model out from under Myo's memory system.
+ *  The non-Ollama shared modes (transcribe/diarize/speak) contribute tags
+ *  that never appear in `ollama list`, so adding them here is harmless —
+ *  they just become unused keys in the recommended-by map. */
 export function allRecommendedModels(manifest: Manifest): Set<string> {
   const models = new Set<string>();
+  const collect = (modeSpec: ManifestMode) => {
+    for (const tier of modeSpec.tiers) {
+      models.add(tier.model);
+      models.add(tier.fallback);
+    }
+  };
   for (const family of Object.values(manifest.families ?? {})) {
     for (const modeSpec of Object.values(family.modes ?? {})) {
-      for (const tier of modeSpec.tiers) {
-        models.add(tier.model);
-        models.add(tier.fallback);
-      }
+      collect(modeSpec);
     }
+  }
+  for (const modeSpec of Object.values(manifest.shared_modes ?? {})) {
+    collect(modeSpec);
   }
   return models;
 }

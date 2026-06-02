@@ -924,7 +924,7 @@ async fn cmd_preload(args: &[String]) -> Result<()> {
     for m in &modes {
         if !crate::resolver::KNOWN_MODES.contains(&m.as_str()) {
             return Err(anyhow!(
-                "unknown mode '{m}' (expected one of: text, transcribe, diarize, speak)"
+                "unknown mode '{m}' (expected one of: text, transcribe, diarize, speak, embed)"
             ));
         }
     }

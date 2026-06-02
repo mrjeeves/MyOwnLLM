@@ -121,7 +121,7 @@ myownllm serve --no-ollama                           # don't auto-start ollama
 |------|-----------|
 | `POST /v1/chat/completions` | OpenAI chat. Streams when `stream: true`. |
 | `POST /v1/completions`      | Legacy completions. |
-| `POST /v1/embeddings`       | Proxied to Ollama embeddings. |
+| `POST /v1/embeddings`       | Proxied to Ollama embeddings. Use the `myownllm-embed` virtual ID to let the device pick the hardware-appropriate embedding model. |
 | `GET  /v1/models`           | Virtual model IDs + raw pulled tags. |
 | `GET  /healthz`             | 200 if Ollama reachable, else 503. |
 | `POST /v1/myownllm/preload`    | Body `{"modes":[…], "track":bool}`; SSE progress. |
@@ -135,6 +135,7 @@ These resolve at request-time to whatever tag your manifest currently selects fo
 |-----------------------|-----------------------|
 | `myownllm`            | `gemma4:e4b`          |
 | `myownllm-transcribe` | `parakeet:parakeet-tdt-0.6b-v3-int8` |
+| `myownllm-embed`      | `embeddinggemma`      |
 
 Every response includes `X-MyOwnLLM-Resolved-Model` so a client (or a log) can see what tag actually served the request.
 
@@ -405,6 +406,7 @@ myownllm run --profile https://example.com/manifest.json   # one-off manifest UR
 | `text` | General-purpose LLM | Default; served as virtual ID `myownllm` |
 | `transcribe` | Moonshine / Parakeet (per tier) | Activates mic; streams live captions (interim text that firms up as you speak, Silero VAD endpointing, beam search on finalized utterances). Pi 5 → Moonshine (English only); capable hardware → Parakeet TDT 0.6B v3 (25 languages). Served as virtual ID `myownllm-transcribe`. |
 | `diarize`    | pyannote pipeline | Internal sub-feature of transcribe (opt-in via the transcribe pane's "Identify speakers" toggle). Tags each segment with a speaker ID; click the pill to rename. With **Speaker Profiles**, a confirmed voice keeps its name across *future* sessions — confirm the inline chip once and its clip anchors the profile (manage them in the Speakers settings tab). Not exposed as a virtual ID. |
+| `embed`      | EmbeddingGemma / Nomic / all-MiniLM (per tier) | Background capability, not a chat surface: a small Ollama embedding model the device keeps pulled + warm so memory/RAG consumers (notably Myo) can turn text into vectors locally. Tracked by default. Served as virtual ID `myownllm-embed`; POST to `/v1/embeddings`. |
 
 Exit chat: `Ctrl+C` or type `exit`.
 
