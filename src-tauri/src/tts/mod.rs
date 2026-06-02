@@ -79,6 +79,8 @@ pub struct TtsAudio {
 /// implementations are not `Sync` — the headless path holds `&mut self`
 /// for the lifetime of a synthesis call on a blocking worker thread.
 pub trait TtsBackend: Send {
+    #[allow(dead_code)] // Surfaced to the consumer's voice-tier indicator
+                        // (Myo Phase 2); the engine doesn't read it yet.
     fn caps(&self) -> TtsCaps;
 
     /// Load the voice model into memory and prepare per-call state. Slow:
@@ -202,7 +204,12 @@ mod tests {
 
     #[test]
     fn unknown_runtime_is_rejected() {
-        let err = make_backend("flite", "whatever").unwrap_err().to_string();
+        // `Box<dyn TtsBackend>` isn't `Debug`, so `unwrap_err()` (which would
+        // format the Ok value on panic) won't compile — match instead.
+        let err = match make_backend("flite", "whatever") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error for an unknown TTS runtime"),
+        };
         assert!(err.contains("unsupported TTS runtime"));
         assert!(err.contains("kokoro"));
         assert!(err.contains("piper"));
