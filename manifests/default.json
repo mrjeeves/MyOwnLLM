@@ -1,6 +1,6 @@
 {
   "name": "MyOwnLLM Default",
-  "version": "19",
+  "version": "20",
   "ttl_minutes": 360,
   "default_family": "gemma4",
   "headroom_gb": {
@@ -25,6 +25,15 @@
       "tiers": [
         { "min_vram_gb": 0, "min_ram_gb": 6, "min_unified_ram_gb": 12, "disk_mb": 32, "runtime": "pyannote-diarize", "model": "pyannote-seg-3.0+wespeaker-r34", "fallback": "pyannote-seg-3.0+campp-small" },
         { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0,  "disk_mb": 13, "runtime": "pyannote-diarize", "model": "pyannote-seg-3.0+campp-small",  "fallback": "pyannote-seg-3.0+campp-small" }
+      ]
+    },
+    "speak": {
+      "label": "Speak",
+      "output": "audio",
+      "tiers": [
+        { "min_vram_gb": 4, "min_ram_gb": 8, "min_unified_ram_gb": 16, "disk_mb": 115, "runtime": "kokoro", "model": "kokoro-82m",                 "fallback": "piper-en-us-lessac-medium" },
+        { "min_vram_gb": 0, "min_ram_gb": 2, "min_unified_ram_gb": 4,  "disk_mb": 63,  "runtime": "piper",  "model": "piper-en-us-lessac-medium", "fallback": "piper-en-us-lessac-low"    },
+        { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0,  "disk_mb": 28,  "runtime": "piper",  "model": "piper-en-us-lessac-low",    "fallback": "piper-en-us-lessac-low"    }
       ]
     }
   },

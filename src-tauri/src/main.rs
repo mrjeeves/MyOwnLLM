@@ -22,6 +22,7 @@ mod remote_ui;
 mod resolver;
 mod self_update;
 mod transcribe;
+mod tts;
 mod usage;
 mod watcher;
 mod wav;

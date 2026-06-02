@@ -26,17 +26,23 @@ use tokio::time::Duration;
 use crate::hardware::HardwareProfile;
 
 pub const VIRTUAL_PREFIX: &str = "myownllm-";
-/// Modes the resolver knows how to look up against a manifest. `text` and
-/// `transcribe` are the two end-user surfaces; `diarize` is internal to the
-/// transcription pipeline (opt-in via the GUI), not a public virtual ID.
-pub const KNOWN_MODES: &[&str] = &["text", "transcribe", "diarize"];
+/// Modes the resolver knows how to look up against a manifest. `text`,
+/// `transcribe`, and `speak` are the end-user surfaces; `diarize` is
+/// internal to the transcription pipeline (opt-in via the GUI), not a
+/// public virtual ID.
+pub const KNOWN_MODES: &[&str] = &["text", "transcribe", "diarize", "speak"];
 
 /// Virtual model IDs exposed to OpenAI-compatible clients via `/v1/models`,
 /// paired with the mode each one resolves to. Keep this list narrow: bare
 /// `myownllm` is the default chat model, `myownllm-transcribe` is the ASR
-/// surface. Internal modes (`diarize`) are not advertised.
-pub const PUBLIC_VIRTUAL_IDS: &[(&str, &str)] =
-    &[("myownllm", "text"), ("myownllm-transcribe", "transcribe")];
+/// surface, `myownllm-speak` is the TTS surface (so Myo can show the
+/// resolved voice tier the way it shows the resolved ASR model). Internal
+/// modes (`diarize`) are not advertised.
+pub const PUBLIC_VIRTUAL_IDS: &[(&str, &str)] = &[
+    ("myownllm", "text"),
+    ("myownllm-transcribe", "transcribe"),
+    ("myownllm-speak", "speak"),
+];
 const DEFAULT_TTL_MIN: f64 = 360.0;
 const FALLBACK_MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/mrjeeves/MyOwnLLM/main/manifests/default.json";
@@ -151,6 +157,9 @@ pub fn default_runtime_for(mode: &str) -> &'static str {
         // promotes to parakeet via the per-tier `runtime` override.
         "transcribe" => "moonshine",
         "diarize" => "pyannote-diarize",
+        // Top of the speak tier ladder; the lower rungs promote to piper
+        // via the per-tier `runtime` override.
+        "speak" => "kokoro",
         _ => "ollama",
     }
 }
@@ -183,6 +192,8 @@ fn safe_fallback_for(runtime: &str) -> &'static str {
         "parakeet" => "parakeet-tdt-0.6b-v3-int8",
         "pyannote-diarize" => "pyannote-seg-3.0+campp-small",
         "sortformer" => "sortformer-streaming",
+        "kokoro" => "kokoro-82m",
+        "piper" => "piper-en-us-lessac-medium",
         _ => "tinyllama",
     }
 }
@@ -1196,6 +1207,65 @@ mod tests {
         let (mac_model, mac_rt) = resolve_full(&ladder, &mac, "transcribe", "f").unwrap();
         assert_eq!(mac_model, "parakeet-tdt-0.6b-v3-int8");
         assert_eq!(mac_rt, "parakeet");
+    }
+
+    #[test]
+    fn speak_ladder_per_tier_runtime_promotes_capable_hardware() {
+        // Mirror of the transcribe test for the TTS `speak` ladder: Kokoro
+        // on the capable rung, Piper on the lower rungs. A 4 GB Pi lands on
+        // Piper-low; a 32 GB Mac lands on Kokoro — same ladder, different
+        // per-tier `runtime`.
+        let ladder = serde_json::json!({
+            "default_family": "f",
+            "shared_modes": {
+                "speak": {
+                    "tiers": [
+                        { "min_vram_gb": 4, "min_ram_gb": 8, "min_unified_ram_gb": 16, "runtime": "kokoro", "model": "kokoro-82m",                  "fallback": "piper-en-us-lessac-medium" },
+                        { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0,  "runtime": "piper",  "model": "piper-en-us-lessac-low",      "fallback": "piper-en-us-lessac-low"    }
+                    ]
+                }
+            },
+            "families": {
+                "f": { "default_mode": "text", "modes": { "text": { "tiers": [
+                    { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0, "model": "x" }
+                ]}}}
+            }
+        });
+        let pi = hw(GpuType::None, None, 4.0);
+        let mac = hw(GpuType::Apple, Some(32.0), 32.0);
+
+        let (pi_model, pi_rt) = resolve_full(&ladder, &pi, "speak", "f").unwrap();
+        assert_eq!(pi_model, "piper-en-us-lessac-low");
+        assert_eq!(pi_rt, "piper");
+
+        let (mac_model, mac_rt) = resolve_full(&ladder, &mac, "speak", "f").unwrap();
+        assert_eq!(mac_model, "kokoro-82m");
+        assert_eq!(mac_rt, "kokoro");
+    }
+
+    #[test]
+    fn speak_mode_defaults_to_kokoro_runtime() {
+        // Even without a tier-level `runtime` field, the resolver maps the
+        // `speak` mode to the kokoro runtime via `default_runtime_for`.
+        let m = serde_json::json!({
+            "default_family": "f",
+            "shared_modes": {
+                "speak": {
+                    "tiers": [
+                        { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0, "model": "kokoro-82m", "fallback": "kokoro-82m" }
+                    ]
+                }
+            },
+            "families": {
+                "f": { "default_mode": "text", "modes": { "text": { "tiers": [
+                    { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0, "model": "x" }
+                ]}}}
+            }
+        });
+        let pi = hw(GpuType::None, None, 4.0);
+        let (model, rt) = resolve_full(&m, &pi, "speak", "f").unwrap();
+        assert_eq!(model, "kokoro-82m");
+        assert_eq!(rt, "kokoro");
     }
 
     #[test]

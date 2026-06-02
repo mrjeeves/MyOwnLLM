@@ -62,6 +62,7 @@ fn kind_dir(kind: ModelKind) -> Result<PathBuf> {
     let sub = match kind {
         ModelKind::Asr => "asr",
         ModelKind::Diarize => "diarize",
+        ModelKind::Tts => "tts",
     };
     Ok(models_root()?.join(sub))
 }
@@ -96,6 +97,8 @@ pub enum ModelKind {
     Asr,
     /// Speaker diarization (pyannote-segmentation + a speaker embedder).
     Diarize,
+    /// Text-to-speech (Kokoro, Piper, …). The mirror of `Asr`.
+    Tts,
 }
 
 impl ModelKind {
@@ -103,6 +106,7 @@ impl ModelKind {
         match self {
             ModelKind::Asr => "asr",
             ModelKind::Diarize => "diarize",
+            ModelKind::Tts => "tts",
         }
     }
 }
@@ -329,6 +333,79 @@ pub const REGISTRY: &[ModelSpec] = &[
             approx_bytes: 6_500_000,
             min_bytes: 4_500_000,
         }],
+    },
+    // ---- TTS ----------------------------------------------------------
+    // The `speak` ladder mirrors `transcribe`: Kokoro on the capable rung,
+    // Piper (medium → low) on the lower rungs. WebSpeech is Myo's tier-4
+    // fallback and has no model here.
+    //
+    // NOTE: the URLs / sizes below are provisional starting points for the
+    // staged synthesis step (`tts/kokoro.rs`, `tts/piper.rs`) — they are
+    // not exercised until grapheme→phoneme + the ONNX forward land, so
+    // verify each against the live HF repo (and re-pin `approx_bytes` /
+    // `min_bytes`) before that step ships, the same way the ASR entries
+    // were captured against a known-good mirror. `min_bytes` rejects the
+    // HTML error pages HF's LFS layer occasionally serves with a 200.
+
+    // Kokoro-82M (Apache-2.0) via the onnx-community export — the quantized
+    // model graph plus the packed per-voice style-embedding bank. The
+    // capable-hardware voice tier.
+    ModelSpec {
+        name: "kokoro-82m",
+        kind: ModelKind::Tts,
+        artifacts: &[
+            Artifact {
+                filename: "model.onnx",
+                url: "https://huggingface.co/onnx-community/Kokoro-82M-ONNX/resolve/main/onnx/model_quantized.onnx",
+                approx_bytes: 88_000_000,
+                min_bytes: 50_000_000,
+            },
+            Artifact {
+                filename: "voices.bin",
+                url: "https://huggingface.co/onnx-community/Kokoro-82M-ONNX/resolve/main/voices.bin",
+                approx_bytes: 27_000_000,
+                min_bytes: 5_000_000,
+            },
+        ],
+    },
+    // Piper en_US-lessac medium (MIT) via rhasspy/piper-voices — VITS graph
+    // + the voice's config JSON (sample rate, phoneme id map). Mid rung.
+    ModelSpec {
+        name: "piper-en-us-lessac-medium",
+        kind: ModelKind::Tts,
+        artifacts: &[
+            Artifact {
+                filename: "model.onnx",
+                url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx",
+                approx_bytes: 63_000_000,
+                min_bytes: 30_000_000,
+            },
+            Artifact {
+                filename: "model.onnx.json",
+                url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
+                approx_bytes: 12_000,
+                min_bytes: 1_000,
+            },
+        ],
+    },
+    // Piper en_US-lessac low (MIT) — the Pi / low-end voice tier.
+    ModelSpec {
+        name: "piper-en-us-lessac-low",
+        kind: ModelKind::Tts,
+        artifacts: &[
+            Artifact {
+                filename: "model.onnx",
+                url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/low/en_US-lessac-low.onnx",
+                approx_bytes: 28_000_000,
+                min_bytes: 15_000_000,
+            },
+            Artifact {
+                filename: "model.onnx.json",
+                url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/low/en_US-lessac-low.onnx.json",
+                approx_bytes: 12_000,
+                min_bytes: 1_000,
+            },
+        ],
     },
 ];
 

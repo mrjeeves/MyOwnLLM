@@ -78,6 +78,7 @@ pub async fn serve(
         .route("/v1/myownllm/preload", post(api_preload))
         .route("/v1/myownllm/status", get(api_status))
         .route("/v1/audio/transcriptions", post(transcriptions))
+        .route("/v1/audio/speech", post(speech))
         .route("/v1/audio/stream", get(audio_stream_ws))
         .with_state(state.clone());
 
@@ -551,6 +552,153 @@ async fn transcriptions(
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "transcribe_join",
+            e.to_string(),
+        ),
+    }
+}
+
+/// OpenAI-shaped body for `POST /v1/audio/speech`.
+#[derive(Debug, Deserialize)]
+struct SpeechRequest {
+    /// The text to speak.
+    input: String,
+    /// Optional voice id for multi-voice backends (Kokoro). Single-voice
+    /// backends (Piper) ignore it.
+    #[serde(default)]
+    voice: Option<String>,
+    /// `"wav"` (default) for v1. Accepted for OpenAI-shape compatibility;
+    /// only WAV is produced today (whole-utterance), so other values are
+    /// treated as WAV. MP3 / streaming are follow-ups.
+    #[serde(default)]
+    #[allow(dead_code)]
+    response_format: Option<String>,
+    /// Accepted for OpenAI-shape compatibility but advisory only: the
+    /// hardware voice tier (and thus the model) is chosen by the resolver,
+    /// never the client — the same contract as `/v1/audio/transcriptions`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    model: Option<String>,
+}
+
+/// `POST /v1/audio/speech` — text-to-speech over HTTP.
+///
+/// The synthesis mirror of [`transcriptions`]: a headless wrapper over the
+/// in-process TTS pipeline (`crate::tts::synthesize_blocking`) so loopback
+/// callers — notably Myo's live-reply path — get nicer voices picked by
+/// hardware the same way `transcribe` picks its ASR model. The body is
+/// OpenAI-shaped JSON (`{"input": "...", "voice": "...", ...}`); the
+/// response is raw `audio/wav` bytes (whole utterance for v1).
+///
+/// The hardware tier — Kokoro on capable machines, Piper on the lower
+/// rungs — is chosen by `resolver.resolve("speak")`; the client never
+/// picks it. A cold machine may block while the onnxruntime dylib and the
+/// resolved voice model download, so clients should use a generous timeout
+/// (and fall back to WebSpeech on any error, the tier-4 graceful degrade).
+async fn speech(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SpeechRequest>,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+    let text = req.input.trim().to_string();
+    if text.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "empty_input",
+            "request 'input' was empty — provide text to speak",
+        );
+    }
+    eprintln!("[tts-http] speech request: {} chars", text.len());
+
+    // 1. onnxruntime must be loaded before any TTS backend builds a session.
+    //    Idempotent + serialized; the first call may download the runtime
+    //    dylib, so keep it off the async worker (mirrors `transcriptions`).
+    let ort = tokio::task::spawn_blocking(|| {
+        let never = std::sync::atomic::AtomicBool::new(false);
+        crate::ort_setup::ensure_ready(&|stage| eprintln!("[tts-http] ort: {stage}"), &never)
+    })
+    .await;
+    match ort {
+        Ok(s) if s.initialized => {}
+        Ok(s) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ort_unavailable",
+                format!(
+                    "speech engine (onnxruntime) not ready: {}",
+                    s.error.unwrap_or_else(|| "unknown error".into())
+                ),
+            )
+        }
+        Err(e) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "ort_join", e.to_string())
+        }
+    }
+
+    // 2. Resolve this machine's voice model + the runtime that serves it.
+    let (model, runtime) = match crate::resolver::resolve_pair("speak").await {
+        Ok(pair) => pair,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "resolve_failed",
+                format!("could not resolve a speak model: {e}"),
+            )
+        }
+    };
+    eprintln!("[tts-http] resolved speak → runtime={runtime} model={model}");
+
+    // 3. Make sure the voice model is on disk (no-op once installed; first
+    //    call downloads it).
+    match crate::models::fetch_model_quiet(&model, crate::models::ModelKind::Tts).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "model_unavailable",
+                format!("voice model '{model}' could not be installed"),
+            )
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "model_fetch_failed",
+                format!("fetching voice model '{model}': {e}"),
+            )
+        }
+    }
+
+    // 4. Synthesize on a blocking thread (ORT inference), then return the
+    //    audio bytes. Any synthesis failure (including the staged
+    //    "not implemented yet") returns an error the client treats as the
+    //    cue to fall back to WebSpeech — the same tier-4 graceful degrade
+    //    as a 404 from an engine too old to have this route at all.
+    let job_model = model.clone();
+    let job_voice = req.voice.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::tts::synthesize_blocking(&runtime, &job_model, &text, job_voice.as_deref())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(audio)) => {
+            eprintln!(
+                "[tts-http] synthesized {} bytes ({})",
+                audio.wav.len(),
+                audio.mime
+            );
+            ([(axum::http::header::CONTENT_TYPE, audio.mime)], audio.wav).into_response()
+        }
+        Ok(Err(e)) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "synthesize_failed",
+            format!("{e:#}"),
+        ),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "synthesize_join",
             e.to_string(),
         ),
     }
