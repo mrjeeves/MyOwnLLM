@@ -36,6 +36,7 @@
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
   import { loadConfig } from "../config";
   import { pinDownloadedModel, isTranscriptionMemoryTight } from "../model-lifecycle";
+  import { noteChatModelEvicted } from "./model-residency";
   import {
     loadConversation,
     saveConversation,
@@ -442,7 +443,13 @@
     if (!textModel) return;
     try {
       const loaded = await invoke<boolean>("ollama_model_loaded", { model: textModel });
-      if (loaded) await invoke("ollama_unload", { model: textModel });
+      if (loaded) {
+        await invoke("ollama_unload", { model: textModel });
+        // We deliberately evicted the chat model, so the next chat turn will
+        // pay a cold load. Tell the in-chat loader to expect it — it'll show
+        // "Loading the model…" again even if /api/ps can't be reached then.
+        noteChatModelEvicted();
+      }
     } catch (e) {
       console.warn("chat-model unload before transcription failed:", e);
     }

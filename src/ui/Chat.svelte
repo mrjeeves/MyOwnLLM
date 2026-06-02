@@ -1,14 +1,3 @@
-<script module lang="ts">
-  // Session-scoped: flips true once any inference has produced output. Lets
-  // the in-chat loading indicator "assume the model is loading" on the very
-  // first inference of the session even when we couldn't confirm residency
-  // via Ollama's /api/ps — worst case it's already resident and the
-  // "Loading the model…" line flashes away on the first token. Module scope
-  // = shared across every Chat instance for the life of the app session
-  // (survives conversation swaps / remounts).
-  let modelProvenResident = false;
-</script>
-
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { tick, onDestroy, untrack } from "svelte";
@@ -46,6 +35,10 @@
   import { resolvePeerLlm } from "../mesh-capabilities";
   import { routingPins, setTextPin } from "./routing-pins.svelte";
   import { isTranscriptionMemoryTight } from "../model-lifecycle";
+  import {
+    noteChatModelResident,
+    chatModelLikelyResident,
+  } from "./model-residency";
   import { settingsRoute, type CloudMeshSubTab } from "./settings-route.svelte";
   import { runAgent, type AgentEvent } from "../agent-loop";
   import {
@@ -1122,7 +1115,7 @@
     // on the first token). The remote path loads on the host, so we don't
     // claim a local model load there.
     modelLoadPhase =
-      coldStart || (!residencyKnown && !modelProvenResident && !routeViaDevicePubkey)
+      coldStart || (!residencyKnown && !chatModelLikelyResident() && !routeViaDevicePubkey)
         ? "loading"
         : "working";
     if (coldStart) {
@@ -1150,7 +1143,7 @@
           // the rest of the session, that the model has loaded at least
           // once (so later first-send guesses don't over-assume a load).
           clearModelLoadWait();
-          if (event.kind !== "error") modelProvenResident = true;
+          if (event.kind !== "error") noteChatModelResident();
           switch (event.kind) {
             case "assistant_delta":
             case "thinking_delta": {
