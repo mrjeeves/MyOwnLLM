@@ -28,6 +28,7 @@ mod tts;
 mod usage;
 mod watcher;
 mod wav;
+mod web_search;
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -1354,6 +1355,7 @@ fn main() {
             agent_io::agent_read_file,
             agent_io::agent_write_file,
             agent_io::agent_host_info,
+            web_search::agent_web_search,
             // ---- daemon-backed mesh commands (PR migrating off Trystero)
             mesh::daemon_commands::mesh_daemon_status,
             mesh::daemon_commands::mesh_daemon_identity_show,

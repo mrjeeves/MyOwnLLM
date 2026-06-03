@@ -81,20 +81,26 @@ export interface AgentRunArgs {
    *  between turns and propagate cancel into the active stream. */
   signal: AbortSignal;
   /** Soft cap on tool-calling rounds. Each round is one model turn
-   *  plus the tool executions it requested. The default is generous
-   *  for a triage flow (e.g. status → list_peers → reconnect_peer)
-   *  but bounded so a confused model can't burn through unlimited
-   *  rounds. */
+   *  plus the tool executions it requested. Generous so real agent
+   *  chains (search → read → run → check) have room, but bounded so a
+   *  confused model can't loop forever. When the cap is reached the loop
+   *  runs one final turn with NO tools offered, forcing a user-visible
+   *  answer rather than erroring out. */
   maxRounds?: number;
   /** Called for each agent event. The UI uses this to paint deltas,
    *  show tool pills, and finalize messages. */
   onEvent: (event: AgentEvent) => void;
 }
 
-const DEFAULT_MAX_ROUNDS = 8;
+// Matches Myo's MAX_TOOL_ROUNDS. Real agent chains (search → read → run
+// → check) are expected, so the budget is generous; the final-round
+// no-tools pass guarantees the turn still terminates with speech.
+const DEFAULT_MAX_ROUNDS = 16;
 
 /** Run the agent loop. Resolves once the model has produced a turn
- *  with no tool calls, the user cancelled, or `maxRounds` is hit. */
+ *  with no tool calls, the user cancelled, or the round budget is hit —
+ *  in which case a final no-tools turn still yields a user-visible
+ *  answer. */
 export async function runAgent(args: AgentRunArgs): Promise<void> {
   const {
     messages,
@@ -111,18 +117,27 @@ export async function runAgent(args: AgentRunArgs): Promise<void> {
 
   const toolDefs = tools.map((t) => t.definition);
 
-  for (let round = 0; round < maxRounds; round += 1) {
+  // Loop one pass past `maxRounds`: the final pass offers NO tools so the
+  // model is forced to produce a user-visible answer instead of calling
+  // another round of tools. Mirrors Myo's "force a plain answer on the
+  // final round" — the turn always terminates with a reply rather than
+  // erroring on a blown budget.
+  for (let round = 0; round <= maxRounds; round += 1) {
     if (signal.aborted) {
       onEvent({ kind: "done", messages, cancelled: true });
       return;
     }
+
+    const isFinalRound = round === maxRounds;
 
     let turn: { content: string; thinking: string; tool_calls: ToolCall[]; cancelled: boolean };
     const turnStart = Date.now();
     try {
       turn = await runSingleTurn({
         messages,
-        toolDefs,
+        // Offer tools only while rounds remain; the final pass forces a
+        // plain answer by advertising none.
+        toolDefs: isFinalRound ? [] : toolDefs,
         model,
         family,
         mode,
@@ -155,46 +170,36 @@ export async function runAgent(args: AgentRunArgs): Promise<void> {
       onEvent({ kind: "done", messages, cancelled: true });
       return;
     }
-    if (turn.tool_calls.length === 0) {
-      // Natural stop — the model has nothing more to call, this turn
-      // is the user-visible answer.
+    // Natural stop — the model has nothing more to call, this turn is the
+    // user-visible answer. On the final round no tools were offered, so
+    // we always stop here (even if a misbehaving model still emitted a
+    // tool_call) rather than running an unbounded extra round.
+    if (turn.tool_calls.length === 0 || isFinalRound) {
       onEvent({ kind: "done", messages, cancelled: false });
       return;
     }
 
-    // Execute every tool the model asked for, in order. Each appends
-    // a `role: "tool"` message that the next round sees.
+    // Execute the round's tool calls CONCURRENTLY — a round of several
+    // searches / reads runs in parallel and finishes as fast as the
+    // slowest, instead of summing their latencies (mirrors Myo's
+    // JoinSet). Tool side-effects always happen on THIS device. Results
+    // are appended in the model's original call order so the transcript
+    // stays readable; the model pairs them up by `tool_call_id` anyway.
+    if (signal.aborted) {
+      onEvent({ kind: "done", messages, cancelled: true });
+      return;
+    }
     for (const call of turn.tool_calls) {
-      if (signal.aborted) {
-        onEvent({ kind: "done", messages, cancelled: true });
-        return;
-      }
       onEvent({ kind: "tool_call_started", call });
-      const tool = TOOLS_BY_NAME[call.function.name];
-      let content: string;
-      let ok = true;
-      if (!tool) {
-        ok = false;
-        content = JSON.stringify({
-          error: `unknown tool '${call.function.name}' — must be one of: ${Object.keys(TOOLS_BY_NAME).join(", ")}`,
-        });
-      } else {
-        try {
-          content = await tool.handler(call.function.arguments ?? {});
-        } catch (e) {
-          ok = false;
-          content = JSON.stringify({
-            error: String(e instanceof Error ? e.message : e),
-          });
-        }
-      }
-      const result: StoredMessage = {
+    }
+    const settled = await Promise.all(turn.tool_calls.map((call) => runToolCall(call)));
+    for (const { call, ok, content } of settled) {
+      messages.push({
         role: "tool",
         name: call.function.name,
         tool_call_id: call.id,
         content,
-      };
-      messages.push(result);
+      });
       onEvent({
         kind: "tool_call_finished",
         call,
@@ -204,13 +209,40 @@ export async function runAgent(args: AgentRunArgs): Promise<void> {
     }
   }
 
-  // Round budget exhausted. Surface as an error so the UI can show
-  // something rather than silently dropping the loop.
-  onEvent({
-    kind: "error",
-    message: `agent loop hit ${maxRounds}-round cap without converging`,
-  });
+  // Unreachable: the `isFinalRound` branch always returns. Kept as a
+  // defensive terminal so a future refactor can't drop the loop without
+  // emitting a `done`.
   onEvent({ kind: "done", messages, cancelled: false });
+}
+
+/** Dispatch one tool call to its handler, normalizing both the
+ *  unknown-tool case and a thrown handler into a string result the
+ *  model can read and recover from. Pure (no events) so it's safe to
+ *  run many concurrently; the loop emits the start/finish pills around
+ *  it. */
+async function runToolCall(
+  call: ToolCall,
+): Promise<{ call: ToolCall; ok: boolean; content: string }> {
+  const tool = TOOLS_BY_NAME[call.function.name];
+  if (!tool) {
+    return {
+      call,
+      ok: false,
+      content: JSON.stringify({
+        error: `unknown tool '${call.function.name}' — must be one of: ${Object.keys(TOOLS_BY_NAME).join(", ")}`,
+      }),
+    };
+  }
+  try {
+    const content = await tool.handler(call.function.arguments ?? {});
+    return { call, ok: true, content };
+  } catch (e) {
+    return {
+      call,
+      ok: false,
+      content: JSON.stringify({ error: String(e instanceof Error ? e.message : e) }),
+    };
+  }
 }
 
 /** Translate StoredMessage[] into the wire shape Ollama expects.

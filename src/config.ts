@@ -16,6 +16,7 @@ import type {
   TurnServer,
   Prompt,
   PromptToolId,
+  WebSearchConfig,
 } from "./types";
 import { PROMPT_ALL_TOOLS } from "./types";
 
@@ -104,6 +105,13 @@ const DEFAULT_MIC: MicConfig = {
   auto_gain_control: true,
 };
 
+/** Keyless DuckDuckGo out of the box — the `web_search` tool works with
+ *  no signup. Power users can point `backend` at a self-hosted SearXNG
+ *  instance via config.json. */
+const DEFAULT_WEB_SEARCH: WebSearchConfig = {
+  backend: "ddg",
+};
+
 const DEFAULT_CONFIG: Config = {
   active_provider: "MyOwnLLM Default",
   active_family: "gemma4",
@@ -139,6 +147,7 @@ const DEFAULT_CONFIG: Config = {
     diag_quiet: false,
   },
   mic: { ...DEFAULT_MIC },
+  web_search: { ...DEFAULT_WEB_SEARCH },
   providers: [
     {
       name: "MyOwnLLM Default",
@@ -235,6 +244,10 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
     mic: {
       ...DEFAULT_MIC,
       ...((raw as { mic?: Partial<MicConfig> & { whisper_model?: string } }).mic ?? {}),
+    },
+    web_search: {
+      ...DEFAULT_WEB_SEARCH,
+      ...((raw as { web_search?: Partial<WebSearchConfig> }).web_search ?? {}),
     },
     mode_overrides: (raw as { mode_overrides?: Config["mode_overrides"] }).mode_overrides ?? {},
     family_overrides:
@@ -1123,6 +1136,12 @@ function mergeAgentPermissions(
 export function getAgentPermissions(cfg: Config): AgentPermissionsConfig {
   const active = activeNetwork(cfg);
   return active?.agent_permissions ?? freshAgentPermissions();
+}
+
+/** The `web_search` backend config, with the keyless DuckDuckGo
+ *  default filled in for configs that predate the field. */
+export function getWebSearchConfig(cfg: Config): WebSearchConfig {
+  return cfg.web_search ?? { backend: "ddg" };
 }
 
 /** Mutate the active network's permissions and persist. The patcher

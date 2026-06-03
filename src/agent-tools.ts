@@ -21,6 +21,7 @@ import {
   importNetworkSettings,
   isNetworkSettingsExport,
   loadConfig,
+  getWebSearchConfig,
   removeNetwork,
   setActiveNetwork,
   tryParseNetworkSettings,
@@ -645,6 +646,79 @@ export const NETWORKS_TOOL: Tool = {
 };
 
 // ---------------------------------------------------------------------
+// Web search tool
+//
+// Keyless web search, ported from Myo. Read-only — it can't touch the
+// host — so it bypasses the permission gate like `read_file`. The fetch
+// + HTML/JSON parsing happens in Rust (`agent_web_search`) because
+// scraping DuckDuckGo from the WebView would trip CORS; here we just
+// pick the configured backend, call through, and shape the hits into the
+// readable list the model reads back.
+// ---------------------------------------------------------------------
+
+/** One result from `agent_web_search`. Mirrors `web_search::WebHit`. */
+interface WebHit {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
+/** What `agent_web_search` returns. Mirrors `web_search::WebSearchOutcome`. */
+interface WebSearchOutcome {
+  query: string;
+  hits: WebHit[];
+}
+
+export const WEB_SEARCH_TOOL: Tool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "web_search",
+      description:
+        "Search the web and get back a list of results (title, URL, and a " +
+        "snippet). Use it to look up current facts, find pages, or gather " +
+        "sources before answering.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "The search query." },
+          limit: {
+            type: "integer",
+            description: "Max results to return (1-10, default 5).",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  handler: async (args) => {
+    const query = asString(args, "query");
+    const limit = typeof args.limit === "number" ? args.limit : undefined;
+    // The backend (keyless DuckDuckGo by default, or a self-hosted
+    // SearXNG instance) is a global preference, read fresh per call so a
+    // config edit takes effect without a restart.
+    const ws = getWebSearchConfig(await loadConfig());
+    const outcome = await invoke<WebSearchOutcome>("agent_web_search", {
+      query,
+      limit: limit ?? null,
+      backend: ws.backend,
+      searxngUrl: ws.searxng_url ?? null,
+    });
+    const hits = outcome.hits ?? [];
+    if (hits.length === 0) {
+      return `No web results found for "${outcome.query}".`;
+    }
+    // Mirror Myo's plain-text shape — a numbered list reads back far
+    // better for the model than raw JSON.
+    const lines = [`Top ${hits.length} web results for "${outcome.query}":`];
+    hits.forEach((h, i) => {
+      lines.push(`\n${i + 1}. ${h.title || "(untitled)"}\n${h.url}\n${h.snippet}`);
+    });
+    return lines.join("\n");
+  },
+};
+
+// ---------------------------------------------------------------------
 // Shell / file tools
 //
 // `shell` and `write_file` mutate the host, so they route through
@@ -897,7 +971,13 @@ export const WRITE_FILE_TOOL: Tool = {
  *  for system-prompt readability — destructive tools surface later
  *  than the safe `read_file`. */
 export function buildChatTools(host: AgentHostInfo): Tool[] {
-  return [NETWORKS_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL, buildShellTool(host)];
+  return [
+    NETWORKS_TOOL,
+    WEB_SEARCH_TOOL,
+    READ_FILE_TOOL,
+    WRITE_FILE_TOOL,
+    buildShellTool(host),
+  ];
 }
 
 /** Map name → tool. Used by the agent loop's dispatcher (which only
@@ -905,10 +985,9 @@ export function buildChatTools(host: AgentHostInfo): Tool[] {
  *  shell tool here is fine — the description differences live in
  *  what the MODEL sees, not in the handler the loop dispatches to. */
 export const TOOLS_BY_NAME: Record<string, Tool> = Object.fromEntries(
-  [NETWORKS_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL, SHELL_TOOL].map((t) => [
-    t.definition.function.name,
-    t,
-  ]),
+  [NETWORKS_TOOL, WEB_SEARCH_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL, SHELL_TOOL].map(
+    (t) => [t.definition.function.name, t],
+  ),
 );
 
 /** Base system prompt — the framing the model sees regardless of
@@ -994,6 +1073,16 @@ const NETWORKS_TOOL_SNIPPET: string =
   "replace the respective list on a network. Empty array restores defaults " +
   "(Trystero public Nostr relays / Google STUN / no TURN).";
 
+const WEB_SEARCH_TOOL_SNIPPET: string =
+  "## `web_search` tool — search the web\n\n" +
+  "Searches the web and returns a short list of results (title, URL, " +
+  "snippet). It's keyless and read-only, so reach for it whenever a " +
+  "question turns on a current fact, a specific page, or anything outside " +
+  "what you already know — look it up instead of guessing or claiming you " +
+  "can't. Pass a focused `query`; raise `limit` (up to 10) when you want to " +
+  "compare sources. Summarize what you found and name the URLs you drew on " +
+  "so the user can follow up.";
+
 const READ_FILE_TOOL_SNIPPET: string =
   "## `read_file` tool — read a file from disk\n\n" +
   "Reads a text file on the user's device and returns its contents. It's " +
@@ -1023,6 +1112,7 @@ const SHELL_TOOL_SNIPPET: string =
  *  a tool. */
 export const TOOL_PROMPT_SNIPPETS: Record<string, string> = {
   networks: NETWORKS_TOOL_SNIPPET,
+  web_search: WEB_SEARCH_TOOL_SNIPPET,
   read_file: READ_FILE_TOOL_SNIPPET,
   write_file: WRITE_FILE_TOOL_SNIPPET,
   shell: SHELL_TOOL_SNIPPET,
@@ -1080,6 +1170,6 @@ export function buildAgentSystemPrompt(host: AgentHostInfo): string {
   return composeSystemPrompt({
     systemPromptBody: DEFAULT_SYSTEM_PROMPT_BASE,
     host,
-    enabledTools: ["networks", "read_file", "write_file", "shell"],
+    enabledTools: ["networks", "web_search", "read_file", "write_file", "shell"],
   });
 }
