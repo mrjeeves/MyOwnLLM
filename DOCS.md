@@ -18,10 +18,11 @@ Full reference manual for MyOwnLLM. For a one-page overview and quick start, see
   - [Import & Export](#import--export)
   - [Update](#update)
 - [GUI](#gui)
+- [Agent & tools](#agent--tools)
 - [Cloud Mesh](#cloud-mesh)
 - [Provider system](#provider-system)
 - [Manifest format](#manifest-format)
-- [Imports & merged catalogs](#imports--merged-catalogs)
+- [Imports & merged manifests](#imports--merged-manifests)
 - [Auto-update](#auto-update)
 - [Model lifecycle & cleanup](#model-lifecycle--cleanup)
 - [Scriptability](#scriptability)
@@ -683,6 +684,63 @@ status line naming whichever step is currently in flight:
 
 ---
 
+## Agent & tools
+
+The built-in chat is a **tool-calling agent**. When a request calls for it, the model emits one or more tool calls; MyOwnLLM runs them, feeds the results back, and loops until the model answers in plain prose. Not every message needs a tool — but when one fits, the agent acts rather than describing what it would do, then tells you what it did.
+
+**Tools execute on the caller's device, even when inference runs on a remote mesh peer.** The peer just streams the model back over the wire; the side effects (a shell command, a file write, a mesh reconfiguration) happen on the box where you typed the request — that's whose state you're asking the assistant to manage. Your Pi can borrow the workstation's 4090 and still configure the Pi.
+
+### The tools
+
+| Tool | What it does | Gated |
+| --- | --- | --- |
+| `networks` | Inspect and manage the Cloud Mesh — status, saved networks, peers, pending approvals, switching, reconnect, rediscovery, accepting policy, the diagnostic log, and import/export of portable network settings. | — |
+| `web_search` | Keyless web search; returns a short list of `title` / `url` / `snippet` hits. DuckDuckGo by default; optionally a self-hosted SearXNG (see below). | — |
+| `read_file` | Read a text file from disk (UTF-8 lossy, size-capped). | — |
+| `write_file` | Create or append to a file, making parent directories as needed. | ✅ per-network |
+| `shell` | Run a shell command (`sh -c` on Unix, `cmd /C` on Windows) and capture stdout / stderr / exit code, with output and wall-clock caps. | ✅ per-network |
+
+`web_search`, `read_file`, and `networks` are non-destructive and run without a prompt. `shell` and `write_file` mutate the host, so they pass through the permission gate below.
+
+### The agent loop
+
+- **Bounded.** A turn runs up to 16 tool-calling rounds. When the budget is hit, the loop runs one final turn with **no tools offered**, forcing a plain-prose answer — it always terminates with a reply rather than stalling or erroring.
+- **Parallel within a round.** When the model asks for several tools at once (say, three `web_search` calls), they run concurrently and the round finishes as fast as the slowest one; results are recorded in the model's original call order.
+- **Cancellable.** The chat's Stop button aborts the in-flight model turn (local or mesh) and unwinds the loop without starting another round.
+- **Reasoning-aware.** Thinking-model output streams into a collapsible block alongside the visible answer.
+
+### Permissions
+
+`shell` and `write_file` route through a **per-network permission gate** before they run. Each call resolves to one of:
+
+- **Deny** — refuse this call (the model sees the refusal and can adapt).
+- **Allow once** — run just this call.
+- **Always accept this command / path** — add the exact literal to an allow-list so identical future calls skip the prompt.
+- **Accept all** — set the tool's mode to auto-allow every call.
+
+Decisions are scoped to the **active network** (`Config.cloud_mesh.networks[*].agent_permissions`) and, when `auto_gossip` is on, sync to peers on that network via the `permissions/snapshot` channel — last-write-wins per tool by `updated_at`. Switching networks loads a different policy; turning `auto_gossip` off isolates the active network so local edits don't propagate and peer pressure can't mutate your policy. Manage stored rules in **Settings → Permissions**.
+
+### Prompts & per-prompt tools
+
+The system prompt sent to the model is composed at send time from the active **Prompt** (its system body), a live host-environment line, a documentation snippet for each enabled tool, and the prompt's optional user-prompt addition. Each Prompt carries its own **tool selection** — deselect a tool in **Settings → Prompts** and it's dropped from the model's tool array *and* its snippet from the prompt, hiding the capability entirely for that prompt. Prompts gossip per network, last-write-wins by id.
+
+### Web search backend
+
+`web_search` is **keyless out of the box**: it scrapes DuckDuckGo's HTML endpoint, so search works anywhere with no signup or API key. The fetch happens in the Rust backend (the `agent_web_search` command), not the WebView, so it isn't subject to browser CORS.
+
+To route searches through a self-hosted [SearXNG](https://docs.searxng.org/) instance instead — cleaner JSON results when you run one — set the top-level `web_search` block in `~/.myownllm/config.json`:
+
+```json
+"web_search": {
+  "backend": "searxng",
+  "searxng_url": "http://127.0.0.1:8080"
+}
+```
+
+The default is equivalent to `{ "backend": "ddg" }`. The setting is global (not per-network) and is read fresh on each search, so an edit takes effect without a restart.
+
+---
+
 ## Cloud Mesh
 
 **Distributed Intelligence.** Two (or ten) MyOwnLLM instances with the same Network ID find each other, mutually authenticate, and share work peer-to-peer over WebRTC. No MyOwnLLM-operated signaling server, no API key, no cloud round-trip. Every device becomes a window into the same mesh: phone audio in, desktop transcription out, a laptop's idle GPU answering prompts from the tablet on the kitchen counter — each device adds its powers to the whole, picked per-surface from the model selector at the bottom of each pane.
@@ -1295,6 +1353,10 @@ The `manifests/` cache stores one entry per URL. When a manifest reached via an 
     "check_interval_hours": 6,
     "stable_url": null,
     "beta_url": null
+  },
+  "web_search": {                       // backend for the agent's web_search tool
+    "backend": "ddg",                   // "ddg" (keyless DuckDuckGo, default) | "searxng"
+    "searxng_url": null                 // required when backend = "searxng", e.g. "http://127.0.0.1:8080"
   },
   "cloud_mesh": {
     "enabled": false,
