@@ -74,6 +74,7 @@
     onRequestStopChat,
     onRequestSendChat,
     onJumpToTranscribe,
+    onOpenSpeakers,
   } = $props<{
     activeModel: string;
     activeMode: Mode;
@@ -130,6 +131,8 @@
      *  another conversation already owns the chat slot. */
     onRequestSendChat: (send: () => Promise<void>) => void;
     onJumpToTranscribe: () => void;
+    /** Open the Speakers workspace from the TopBar's Speakers bubble. */
+    onOpenSpeakers: () => void;
   }>();
 
   interface Message extends StoredMessage {
@@ -1518,6 +1521,8 @@
     current={activeMode}
     supported={supportedModes}
     onChange={handleModeChange}
+    speakersActive={false}
+    onOpenSpeakers={() => onOpenSpeakers()}
     onOpenSettings={(tab) => (settingsTab = tab)}
     onRequestStopTranscribe={() => onRequestStopTranscribe()}
     onRequestStopChat={() => onRequestStopChat()}

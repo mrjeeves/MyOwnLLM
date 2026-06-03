@@ -6,6 +6,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import Chat from "./Chat.svelte";
   import TranscribeView from "./TranscribeView.svelte";
+  import SpeakersView from "./SpeakersView.svelte";
   import Sidebar from "./Sidebar.svelte";
   import LoadingBar from "./LoadingBar.svelte";
   import { startupProgress } from "./startup-progress.svelte";
@@ -89,6 +90,12 @@
   type View = "loading" | "chat";
 
   let view = $state<View>("loading");
+  /** Speakers workspace toggle. Speakers is a third top-bar bubble
+   *  alongside Text / Transcribe, but it isn't a model `Mode` (no
+   *  resolver tier), so it rides on its own boolean rather than
+   *  `activeMode`. When true it replaces the Chat / Transcribe surface;
+   *  picking a mode bubble or selecting a conversation clears it. */
+  let speakersOpen = $state(false);
   let appVersion = $state("");
   let hardware = $state<HardwareProfile | null>(null);
   let activeModel = $state("");
@@ -599,8 +606,19 @@
     }
   }
 
+  /** Open the Speakers workspace. Refused while a chat streams —
+   *  leaving the Chat surface mid-stream would orphan the in-flight
+   *  generation (the TopBar's Speakers bubble is also disabled then,
+   *  so this is belt-and-suspenders). */
+  function openSpeakers() {
+    if (chatStreamLock) return;
+    speakersOpen = true;
+  }
+
   async function onModeChange(mode: Mode) {
     if (chatStreamLock && mode !== "text") return;
+    // Picking a model-mode bubble always leaves the Speakers workspace.
+    speakersOpen = false;
     activeMode = mode;
     if (!hardware) return;
     const [config, manifest] = await Promise.all([loadConfig(), getActiveManifest()]);
@@ -631,7 +649,10 @@
   const chatStreamLock = $derived(chatSlot.kind === "chat");
 
   function onSelectConversation(id: string) {
-    if (activeConversationId === id && !remoteOpen) return;
+    if (activeConversationId === id && !remoteOpen && !speakersOpen) return;
+    // Selecting a conversation leaves the Speakers workspace and shows
+    // that conversation in its own (text / transcribe) surface.
+    speakersOpen = false;
     if (chatStreamLock && id !== chatSlot.conversationId) return;
     remoteOpen = null;
     remoteOpenError = "";
@@ -659,6 +680,7 @@
     mode?: Mode;
   }) {
     if (chatStreamLock) return;
+    speakersOpen = false;
     activeConversationId = null;
     suppressNextActiveEvent = true;
     setActiveConversationId(null);
@@ -681,6 +703,7 @@
 
   function onNewConversation() {
     if (chatStreamLock) return;
+    speakersOpen = false;
     remoteOpen = null;
     remoteOpenError = "";
     activeConversationId = null;
@@ -1135,7 +1158,16 @@
           <button class="dismiss" onclick={() => (remoteOpenError = "")} aria-label="Dismiss">✕</button>
         </div>
       {/if}
-      {#if activeMode === "transcribe"}
+      {#if speakersOpen}
+        <SpeakersView
+          {activeMode}
+          {supportedModes}
+          onModeChange={onModeChange}
+          onProviderChange={onProviderChange}
+          onRequestStopTranscribe={requestStopTranscribe}
+          onRequestStopChat={requestStopChat}
+        />
+      {:else if activeMode === "transcribe"}
         <TranscribeView
           {activeModel}
           {activeMode}
@@ -1160,6 +1192,7 @@
           onRequestStartRecording={requestStartRecording}
           onRequestActivateTalkingPoints={requestActivateTalkingPoints}
           onRequestRegenerateTalkingPoints={requestRegenerateTalkingPoints}
+          onOpenSpeakers={openSpeakers}
         />
       {:else}
         <Chat
@@ -1184,6 +1217,7 @@
           onRequestStopChat={requestStopChat}
           onRequestSendChat={requestSendChat}
           onJumpToTranscribe={jumpToTranscribe}
+          onOpenSpeakers={openSpeakers}
         />
       {/if}
     </div>

@@ -4,7 +4,6 @@
   import StorageSection from "./settings/StorageSection.svelte";
   import HardwareSection from "./settings/HardwareSection.svelte";
   import PerformanceSection from "./settings/PerformanceSection.svelte";
-  import SpeakersSection from "./settings/SpeakersSection.svelte";
   import UsageSection from "./settings/UsageSection.svelte";
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import CloudMeshSection from "./settings/CloudMeshSection.svelte";
@@ -21,11 +20,15 @@
     | "tools"
     | "hardware"
     | "performance"
-    | "speakers"
     | "storage"
     | "usage"
     | "cloud-mesh"
     | "updates"
+    // "speakers" — moved out of Settings into a top-level main-UI
+    // workspace (the third mode bubble). Kept as a still-accepted
+    // legacy deep-link value, mapped to "families" on entry so a stale
+    // callsite doesn't render an empty tab.
+    | "speakers"
     // Legacy values that still appear in old `initialTab` deep-links
     // from earlier code paths. We map them to current ids on entry so a
     // stale callsite doesn't render an empty tab. "providers" is
@@ -70,7 +73,9 @@
           ? "updates"
           : initialTab === "permissions"
             ? "tools"
-            : initialTab,
+            : initialTab === "speakers"
+              ? "families"
+              : initialTab,
   );
 
   /** When the deep-link target was the legacy "permissions" tab, open
@@ -88,7 +93,7 @@
   let initialShowProviders = $state<boolean>(initialTab === "providers");
 
   const tabs: Array<{
-    id: Exclude<Tab, "permissions" | "providers" | "transcription" | "remote">;
+    id: Exclude<Tab, "speakers" | "permissions" | "providers" | "transcription" | "remote">;
     label: string;
   }> = [
     { id: "families", label: "Family" },
@@ -103,7 +108,6 @@
     { id: "tools", label: "Tools" },
     { id: "hardware", label: "Hardware" },
     { id: "performance", label: "Performance" },
-    { id: "speakers", label: "Speakers" },
     { id: "storage", label: "Storage" },
     { id: "usage", label: "Usage" },
     { id: "updates", label: "Updates" },
@@ -176,8 +180,6 @@
         <HardwareSection setActive={(t) => (active = t)} />
       {:else if active === "performance"}
         <PerformanceSection />
-      {:else if active === "speakers"}
-        <SpeakersSection />
       {:else if active === "usage"}
         <UsageSection />
       {:else if active === "cloud-mesh"}

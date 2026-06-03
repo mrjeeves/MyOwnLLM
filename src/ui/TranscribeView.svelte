@@ -72,6 +72,7 @@
     onRequestStartRecording,
     onRequestActivateTalkingPoints,
     onRequestRegenerateTalkingPoints,
+    onOpenSpeakers,
   } = $props<{
     activeModel: string;
     activeMode: Mode;
@@ -115,6 +116,8 @@
     onRequestRegenerateTalkingPoints: (
       conversationId: string,
     ) => Promise<string | null>;
+    /** Open the Speakers workspace from the TopBar's Speakers bubble. */
+    onOpenSpeakers: () => void;
   }>();
 
   /** Mirror of `models::ModelInfo` in src-tauri. */
@@ -1140,6 +1143,8 @@
     current={activeMode}
     supported={supportedModes}
     onChange={handleModeChange}
+    speakersActive={false}
+    onOpenSpeakers={() => onOpenSpeakers()}
     onOpenSettings={(tab) => (settingsTab = tab)}
     onRequestStopTranscribe={() => onRequestStopTranscribe()}
     onRequestStopChat={() => onRequestStopChat()}
