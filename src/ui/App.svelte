@@ -229,11 +229,11 @@
       startupProgress.start("manifest");
 
       // Background auto-cleanups. Each pass is gated by its toggle in
-      // Settings → Storage so users can opt out per area; defaults are
-      // all on so existing installs see the same disk-tidying behaviour
-      // they did before the cleanup system was centralized. Errors are
-      // swallowed — a cleanup hiccup must never block startup.
-      if (config.auto_cleanup?.models !== false) {
+      // Settings → Storage. Model cleanup is opt-in (default off) and, when
+      // on, only removes provider-retired models; the scratch-data passes
+      // default on. Errors are swallowed — a cleanup hiccup must never block
+      // startup.
+      if (config.auto_cleanup?.models === true) {
         runCleanup().catch(() => {});
       }
       if (config.auto_cleanup?.legacy !== false) {

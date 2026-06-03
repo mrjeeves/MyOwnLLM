@@ -186,7 +186,7 @@
     conversationBytes = convOrphans.reduce((acc, o) => acc + o.size_bytes, 0);
 
     autoCleanup = {
-      models: config.auto_cleanup?.models ?? true,
+      models: config.auto_cleanup?.models ?? false,
       transcribe_buffer: config.auto_cleanup?.transcribe_buffer ?? true,
       legacy: config.auto_cleanup?.legacy ?? true,
       updates: config.auto_cleanup?.updates ?? true,
@@ -366,11 +366,12 @@
     models: {
       title: "Models",
       blurb:
-        "Auto-cleanup removes only Ollama chat models that no active provider still " +
-        "recommends, and only after they’ve gone unused. Models in active use are always " +
-        "kept — your current family, the always-on system models (memory/embeddings, " +
-        "transcription, speaker ID), pinned models, and mode overrides. On-disk speech " +
-        "models are managed from the Models tab.",
+        "Off by default — MyOwnLLM won’t delete models you’ve downloaded on its own; we " +
+        "don’t own every path that might still use them. With this on, it removes only " +
+        "models a provider has explicitly retired in its manifest (backmapping: an old " +
+        "model mapped to its current replacement). Pinned models and mode overrides are " +
+        "always kept, and your downloaded models are never removed just for dropping off " +
+        "the current list. Delete anything yourself any time from the Models tab.",
     },
     transcribe_buffer: {
       title: "Transcription buffer",

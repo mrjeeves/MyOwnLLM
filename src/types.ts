@@ -170,6 +170,14 @@ export interface Manifest {
    * `modes[k]` always wins on collision.
    */
   shared_modes?: Record<string, ManifestMode>;
+  /** Deprecation map: a retired model tag → the current model it maps to.
+   *  Providers author this so cleanup is *provider-controlled*: auto-cleanup
+   *  removes a pulled model only when a provider has listed it here (i.e.
+   *  explicitly superseded it), never just because it dropped off the current
+   *  tier list. It also lets a stored/offline reference to a retired tag be
+   *  forwarded to its replacement. Matching is canonical (`:latest`-
+   *  insensitive). Absent ⇒ no deprecations. */
+  backmap?: Record<string, string>;
   families: Record<string, ManifestFamily>;
 }
 
