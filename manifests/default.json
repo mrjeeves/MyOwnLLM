@@ -1,6 +1,6 @@
 {
   "name": "MyOwnLLM Default",
-  "version": "21",
+  "version": "22",
   "ttl_minutes": 360,
   "default_family": "gemma4",
   "headroom_gb": {
@@ -9,6 +9,7 @@
     "nvidia": 1,
     "amd": 1
   },
+  "max_utilization": 0.5,
   "shared_modes": {
     "transcribe": {
       "label": "Transcribe",

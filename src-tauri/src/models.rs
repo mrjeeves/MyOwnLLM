@@ -348,7 +348,7 @@ pub const REGISTRY: &[ModelSpec] = &[
     // HTML error pages HF's LFS layer occasionally serves with a 200.
 
     // Kokoro-82M (Apache-2.0) via the onnx-community export — the quantized
-    // model graph plus the packed per-voice style-embedding bank. The
+    // model graph plus the default voice's style-embedding bank. The
     // capable-hardware voice tier.
     ModelSpec {
         name: "kokoro-82m",
@@ -360,11 +360,16 @@ pub const REGISTRY: &[ModelSpec] = &[
                 approx_bytes: 88_000_000,
                 min_bytes: 50_000_000,
             },
+            // onnx-community split the old root `voices.bin` pack into a
+            // per-voice `voices/` folder (the root file now 404s). `af` is
+            // Kokoro's default voice; its `[510, 256]` little-endian f32 style
+            // bank is exactly what the loader wants — one row picked by token
+            // length — so we fetch that single voice and save it as voices.bin.
             Artifact {
                 filename: "voices.bin",
-                url: "https://huggingface.co/onnx-community/Kokoro-82M-ONNX/resolve/main/voices.bin",
-                approx_bytes: 27_000_000,
-                min_bytes: 5_000_000,
+                url: "https://huggingface.co/onnx-community/Kokoro-82M-ONNX/resolve/main/voices/af.bin",
+                approx_bytes: 523_264,
+                min_bytes: 400_000,
             },
             // The IPA-symbol → token-id `vocab` lives here; the backend reads
             // it at runtime so tokenization tracks the actual export.

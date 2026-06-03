@@ -272,6 +272,11 @@ pub fn resolve_full(
 
     let unified = is_unified_memory(hw);
     let headroom = headroom_gb(manifest, &hw.gpu_type);
+    // Cap utilization for a family's own LLM modes (see `budget_fraction`): walk
+    // the tiers against a scaled-down view of the pool so the resident chat model
+    // leaves the configured fraction of VRAM/RAM free. Shared modes are unscaled.
+    let from_family = mode_is_family(manifest, family, mode);
+    let budget_hw = scaled_hw(hw, budget_fraction(manifest, from_family));
 
     // Pass 1: VRAM walk on discrete GPU, or unified-pool walk on
     // Apple / no-GPU. This is the path that produces the displayed
@@ -279,7 +284,7 @@ pub fn resolve_full(
     // resolver actually uses to pick a tier; otherwise the UI would
     // promise hardware the GPU can't deliver.
     for tier in tiers {
-        if tier_matches_primary(tier, hw, unified, headroom) {
+        if tier_matches_primary(tier, &budget_hw, unified, headroom) {
             if let Some(model) = tier["model"].as_str() {
                 return Ok((
                     model.to_string(),
@@ -297,7 +302,7 @@ pub fn resolve_full(
     // produces a runnable model on CPU.
     if !unified {
         for tier in tiers {
-            if tier_matches_cpu_fallback(tier, hw, headroom) {
+            if tier_matches_cpu_fallback(tier, &budget_hw, headroom) {
                 if let Some(model) = tier["model"].as_str() {
                     return Ok((
                         model.to_string(),
@@ -358,14 +363,16 @@ pub fn mode_runtime_with_hw(
     if let Some(tiers) = tiers {
         let unified = is_unified_memory(hw);
         let headroom = headroom_gb(manifest, &hw.gpu_type);
+        let from_family = mode_is_family(manifest, family, mode);
+        let budget_hw = scaled_hw(hw, budget_fraction(manifest, from_family));
         for tier in tiers {
-            if tier_matches_primary(tier, hw, unified, headroom) {
+            if tier_matches_primary(tier, &budget_hw, unified, headroom) {
                 return Some(tier_runtime(Some(tier), mode_spec, mode));
             }
         }
         if !unified {
             for tier in tiers {
-                if tier_matches_cpu_fallback(tier, hw, headroom) {
+                if tier_matches_cpu_fallback(tier, &budget_hw, headroom) {
                     return Some(tier_runtime(Some(tier), mode_spec, mode));
                 }
             }
@@ -428,6 +435,52 @@ fn unified_threshold_gb(tier: &Value, headroom: f64) -> f64 {
         return u;
     }
     tier["min_ram_gb"].as_f64().unwrap_or(0.0) + headroom
+}
+
+/// Whether `mode` resolves against a family's own ladder (its LLM modes) rather
+/// than the shared ASR/TTS/embed ladders — the distinction that decides whether
+/// the `max_utilization` budget cap applies.
+fn mode_is_family(manifest: &Value, family: &Map<String, Value>, mode: &str) -> bool {
+    let in_family = family
+        .get("modes")
+        .and_then(|m| m.get(mode))
+        .and_then(|v| v.as_object())
+        .is_some();
+    let in_shared = manifest
+        .get("shared_modes")
+        .and_then(|m| m.get(mode))
+        .and_then(|v| v.as_object())
+        .is_some();
+    in_family || !in_shared
+}
+
+/// Fraction of the VRAM / unified-RAM pool a recommendation may use, from the
+/// manifest's `max_utilization` (default 1.0 — use it all). Applied only to a
+/// family's LLM modes so a "leave half the memory free" policy biases the chat
+/// model down a tier or two without touching the small shared ladders. Values
+/// outside (0, 1] fall back to 1.0.
+fn budget_fraction(manifest: &Value, from_family: bool) -> f64 {
+    if !from_family {
+        return 1.0;
+    }
+    manifest
+        .get("max_utilization")
+        .and_then(|v| v.as_f64())
+        .filter(|f| *f > 0.0 && *f <= 1.0)
+        .unwrap_or(1.0)
+}
+
+/// A copy of `hw` with its VRAM / RAM scaled by `fraction` — the budget the tier
+/// walk matches against when a family caps utilization. `fraction == 1.0` (the
+/// only value the shared ladders ever see) returns the profile unchanged.
+fn scaled_hw(hw: &HardwareProfile, fraction: f64) -> HardwareProfile {
+    if fraction >= 1.0 {
+        return hw.clone();
+    }
+    let mut scaled = hw.clone();
+    scaled.ram_gb *= fraction;
+    scaled.vram_gb = scaled.vram_gb.map(|v| v * fraction);
+    scaled
 }
 
 /// Primary tier-match pass — the one the displayed "Needs ~X GB VRAM"
@@ -605,6 +658,7 @@ fn walk_manifest<'a>(
             "version": raw["version"].clone(),
             "ttl_minutes": raw["ttl_minutes"].clone(),
             "default_family": raw["default_family"].clone(),
+            "max_utilization": raw["max_utilization"].clone(),
             "shared_modes": Value::Object(merged_shared),
             "families": Value::Object(merged_families),
         }))
@@ -972,6 +1026,37 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn max_utilization_halves_the_family_budget() {
+        // Discrete 24 GB GPU: at full utilization it clears the top 24 GB rung…
+        let gpu = hw(GpuType::Nvidia, Some(24.0), 32.0);
+        assert_eq!(
+            resolve_in_manifest(&manifest(), &gpu, "text", "test").unwrap(),
+            "big:31b"
+        );
+        // …but at max_utilization 0.5 only 12 GB counts, so it drops a rung.
+        let mut half = manifest();
+        half["max_utilization"] = serde_json::json!(0.5);
+        assert_eq!(
+            resolve_in_manifest(&half, &gpu, "text", "test").unwrap(),
+            "mid:12b"
+        );
+        // Unified pools halve the same way: a 32 GB Mac drops from the 31b rung
+        // (min_unified 32) to e4b (min_unified 10 ≤ 16; 12b's 18 doesn't fit).
+        let mac = hw(GpuType::Apple, Some(32.0), 32.0);
+        assert_eq!(
+            resolve_in_manifest(&half, &mac, "text", "test").unwrap(),
+            "e4b"
+        );
+        // Out-of-range fractions are ignored (treated as full utilization).
+        let mut bogus = manifest();
+        bogus["max_utilization"] = serde_json::json!(0.0);
+        assert_eq!(
+            resolve_in_manifest(&bogus, &gpu, "text", "test").unwrap(),
+            "big:31b"
+        );
     }
 
     #[test]

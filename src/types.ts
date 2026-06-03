@@ -140,6 +140,11 @@ export interface Manifest {
    *  resolver's compiled-in defaults (apple: 8, none: 4, nvidia/amd: 2)
    *  so older cached manifests automatically inherit sensible numbers. */
   headroom_gb?: HeadroomMap;
+  /** Fraction (0, 1] of the VRAM / unified-RAM pool a recommendation may use
+   *  for a family's own LLM modes — the resolver walks the tiers against this
+   *  share of the pool so the resident chat model leaves the rest free (the
+   *  shared ASR/TTS/embed ladders always use the full pool). Absent ⇒ 1.0. */
+  max_utilization?: number;
   /**
    * Mode blocks every family inherits unless it declares its own.
    * Used today for the canonical whisper transcribe ladder so we don't
