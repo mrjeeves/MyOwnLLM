@@ -90,7 +90,12 @@ const DEFAULT_CLOUD_MESH: CloudMeshConfig = {
 };
 
 const DEFAULT_AUTO_CLEANUP: AutoCleanupConfig = {
-  models: true,
+  // Models stay OFF by default: deleting multi-GB downloads on the user's
+  // behalf is the wrong default, and we don't own every path that might use a
+  // model. When enabled, cleanup only removes provider-retired (backmapped)
+  // models — see runCleanup. The other passes touch our own scratch data, so
+  // they stay on.
+  models: false,
   transcribe_buffer: true,
   legacy: true,
   updates: true,

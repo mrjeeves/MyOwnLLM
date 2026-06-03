@@ -11,7 +11,7 @@
   } from "../../model-lifecycle";
   import { getAllManifests } from "../../providers";
   import { loadConfig } from "../../config";
-  import { resolveModel } from "../../manifest";
+  import { canonicalModelTag, resolveModel } from "../../manifest";
   import { scrollAffordance } from "../scroll-affordance";
   import FamilyDetail from "./FamilyDetail.svelte";
   import type { HardwareProfile, Mode } from "../../types";
@@ -269,7 +269,8 @@
     // Locks are enforced at the row level (no trash button is rendered for
     // active-family or shared-capability tags). Belt + suspenders here in
     // case state slips between render and click.
-    if (activeFamilyTags.has(deleteTarget.name) || capabilityLocks[deleteTarget.name]) return;
+    const cname = canonicalModelTag(deleteTarget.name);
+    if (activeFamilyTags.has(cname) || capabilityLocks[cname]) return;
     deleting = true;
     deleteError = "";
     try {
@@ -378,10 +379,11 @@
       <div class="scroll-affordance-wrap">
       <div class="list scroll-fade" use:scrollAffordance>
         {#each models as m}
-          {@const famLocked = activeFamilyTags.has(m.name)}
-          {@const capLabel = capabilityLocks[m.name]}
+          {@const cname = canonicalModelTag(m.name)}
+          {@const famLocked = activeFamilyTags.has(cname)}
+          {@const capLabel = capabilityLocks[cname]}
           {@const locked = famLocked || !!capLabel}
-          {@const places = tagPlaces[m.name] ?? []}
+          {@const places = tagPlaces[cname] ?? []}
           {@const otherPlaces = places.filter((p) => !(famLocked && p.kind === "family" && p.label === activeFamilyLabel) && !(capLabel && p.kind === "capability" && p.label === capLabel))}
           <div class="model-row" class:unrecommended={!locked && places.length === 0}>
             <div class="model-info">

@@ -3,7 +3,7 @@ import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/core";
 import { loadConfig, saveConfig } from "./config";
 import { getAllManifests } from "./providers";
-import { allRecommendedModels, resolveModel } from "./manifest";
+import { allRecommendedModels, canonicalModelTag, resolveModel } from "./manifest";
 import type { HardwareProfile, ModelStatusCache, OllamaModel, Mode } from "./types";
 
 async function statusCachePath(): Promise<string> {
@@ -39,19 +39,23 @@ export async function recomputeRecommendedSet(): Promise<ModelStatusCache> {
   const now = new Date().toISOString();
   const existing = await readStatusCache();
 
-  // Build map: model tag → list of provider names that recommend it
+  // Build map: canonical model tag → list of provider names that recommend it.
+  // Canonicalised so a tagless pull (`embeddinggemma`, listed by Ollama as
+  // `embeddinggemma:latest`) matches the bare manifest tag instead of looking
+  // unrecommended and getting evicted.
   const recommendedBy = new Map<string, string[]>();
   for (const { provider, manifest } of allManifests) {
     for (const tag of allRecommendedModels(manifest)) {
-      const list = recommendedBy.get(tag) ?? [];
+      const key = canonicalModelTag(tag);
+      const list = recommendedBy.get(key) ?? [];
       list.push(provider.name);
-      recommendedBy.set(tag, list);
+      recommendedBy.set(key, list);
     }
   }
 
   const updated: ModelStatusCache = {};
   for (const model of pulled) {
-    const providers = recommendedBy.get(model.name) ?? [];
+    const providers = recommendedBy.get(canonicalModelTag(model.name)) ?? [];
     const wasRecommended = (existing[model.name]?.recommended_by ?? []).length > 0;
     const isNow = providers.length > 0;
     updated[model.name] = {
@@ -70,83 +74,76 @@ export async function recomputeRecommendedSet(): Promise<ModelStatusCache> {
   return updated;
 }
 
-/** Evict models that are no longer recommended by any provider beyond the cleanup threshold. */
-export async function runCleanup(): Promise<string[]> {
-  const config = await loadConfig();
-  const thresholdMs = config.model_cleanup_days * 24 * 60 * 60 * 1000;
-  const keepSet = new Set(config.kept_models);
+/** Models eligible for cleanup under the backmapping policy. We no longer
+ *  evict a model just because no current tier lists it — silently deleting
+ *  multi-GB downloads the user (or some path we don't own) may still want is
+ *  the wrong default. A model is removable only when an active provider has
+ *  *retired* it in its manifest `backmap` (old tag → current replacement):
+ *  the provider is asserting it's superseded and that references forward to
+ *  the replacement. User pins and mode overrides still protect a model.
+ *  Canonical-matched so a tagless pull (`embeddinggemma:latest`) lines up
+ *  with a bare `backmap` key. */
+async function backmapEvictTargets(): Promise<Array<{ name: string; size: number }>> {
+  const [config, allManifests, pulled] = await Promise.all([
+    loadConfig(),
+    getAllManifests(),
+    invoke<OllamaModel[]>("ollama_list_models").catch(() => [] as OllamaModel[]),
+  ]);
+  // Union of every active provider's retired (backmapped) tags.
+  const retired = new Set<string>();
+  for (const { manifest } of allManifests) {
+    for (const old of Object.keys(manifest.backmap ?? {})) {
+      retired.add(canonicalModelTag(old));
+    }
+  }
+  if (retired.size === 0) return [];
+  const keepSet = new Set(config.kept_models.map(canonicalModelTag));
   const overrideSet = new Set(
-    Object.values(config.mode_overrides).filter((v): v is string => typeof v === "string")
+    Object.values(config.mode_overrides)
+      .filter((v): v is string => typeof v === "string")
+      .map(canonicalModelTag),
   );
+  const targets: Array<{ name: string; size: number }> = [];
+  for (const m of pulled) {
+    const canon = canonicalModelTag(m.name);
+    if (!retired.has(canon)) continue;
+    if (keepSet.has(canon)) continue;
+    if (overrideSet.has(canon)) continue;
+    targets.push({ name: m.name, size: m.size });
+  }
+  return targets;
+}
 
-  const status = await recomputeRecommendedSet();
+async function deleteModels(targets: Array<{ name: string; size: number }>): Promise<string[]> {
   const evicted: string[] = [];
-
-  for (const [tag, info] of Object.entries(status)) {
-    if (info.recommended_by.length > 0) continue; // still recommended
-    if (keepSet.has(tag)) continue;              // user-pinned
-    if (overrideSet.has(tag)) continue;          // user override → implicitly kept
-
-    const age = Date.now() - new Date(info.last_recommended).getTime();
-    if (age >= thresholdMs) {
-      try {
-        await invoke("ollama_delete_model", { name: tag });
-        evicted.push(tag);
-      } catch {
-        // Model may already be gone; ignore.
-      }
+  for (const t of targets) {
+    try {
+      await invoke("ollama_delete_model", { name: t.name });
+      evicted.push(t.name);
+    } catch {
+      // Model may already be gone; ignore.
     }
   }
   return evicted;
 }
 
-/** Read-only mirror of `pruneNow`: returns the tags + sizes the next
- *  prune would evict, without touching disk. Used by the Storage tab's
- *  "Clean now" confirmation popup so users can see exactly which models
- *  will be deleted (and how much disk they'll get back) before
- *  committing. */
-export async function previewPruneTargets(): Promise<Array<{ name: string; size: number }>> {
-  const [config, status, pulled] = await Promise.all([
-    loadConfig(),
-    readStatusCache(),
-    invoke<OllamaModel[]>("ollama_list_models").catch(() => [] as OllamaModel[]),
-  ]);
-  const keepSet = new Set(config.kept_models);
-  const overrideSet = new Set(
-    Object.values(config.mode_overrides).filter((v): v is string => typeof v === "string")
-  );
-  const sizeByName = new Map(pulled.map((m) => [m.name, m.size] as const));
-  const targets: Array<{ name: string; size: number }> = [];
-  for (const [tag, info] of Object.entries(status)) {
-    if (info.recommended_by.length > 0) continue;
-    if (keepSet.has(tag)) continue;
-    if (overrideSet.has(tag)) continue;
-    targets.push({ name: tag, size: sizeByName.get(tag) ?? 0 });
-  }
-  return targets;
+/** Startup auto-clean pass — gated by the Storage → Models toggle, which is
+ *  off by default. When on, removes only provider-retired models per the
+ *  backmapping policy. */
+export async function runCleanup(): Promise<string[]> {
+  return deleteModels(await backmapEvictTargets());
 }
 
-/** Immediately evict all unrecommended, non-kept, non-override models (respects keep/override). */
+/** Read-only mirror of `pruneNow` for the Storage "Clean now" preview, so the
+ *  confirmation popup can show exactly which retired models will be removed
+ *  (and the disk they'll free) before committing. */
+export async function previewPruneTargets(): Promise<Array<{ name: string; size: number }>> {
+  return backmapEvictTargets();
+}
+
+/** Immediately remove every provider-retired model (respects pins/overrides). */
 export async function pruneNow(): Promise<string[]> {
-  const config = await loadConfig();
-  const keepSet = new Set(config.kept_models);
-  const overrideSet = new Set(
-    Object.values(config.mode_overrides).filter((v): v is string => typeof v === "string")
-  );
-
-  const status = await recomputeRecommendedSet();
-  const evicted: string[] = [];
-
-  for (const [tag, info] of Object.entries(status)) {
-    if (info.recommended_by.length > 0) continue;
-    if (keepSet.has(tag)) continue;
-    if (overrideSet.has(tag)) continue;
-    try {
-      await invoke("ollama_delete_model", { name: tag });
-      evicted.push(tag);
-    } catch {}
-  }
-  return evicted;
+  return deleteModels(await backmapEvictTargets());
 }
 
 export async function keepModel(tag: string): Promise<void> {
@@ -281,7 +278,7 @@ export async function lookupModelUsage(
         ) {
           activeTag = resolved;
         }
-        if (resolved === tag) {
+        if (canonicalModelTag(resolved) === canonicalModelTag(tag)) {
           uses.push({
             provider: provider.name,
             familyName,
@@ -293,7 +290,7 @@ export async function lookupModelUsage(
     }
   }
 
-  const isActiveTag = activeTag === tag;
+  const isActiveTag = activeTag !== null && canonicalModelTag(activeTag) === canonicalModelTag(tag);
   return { isActiveTag, activeTag, uses };
 }
 
