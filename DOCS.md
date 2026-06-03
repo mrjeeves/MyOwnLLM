@@ -672,15 +672,15 @@ status line naming whichever step is currently in flight:
 **Settings panel** (click the model pill or the gear):
 - **Family tab** — pick which family inside the active provider MyOwnLLM uses for recommendations. Each family card shows its full tier list with the tier picked for your hardware highlighted, so you can see exactly what's running and why.
 - **Providers tab** — list of saved providers. Click any provider to switch (model and family hot-swap immediately to the new manifest's default family).
-- **Models tab** — every pulled model with its size, recommendation status, and pin/override controls.
+- **Models tab** — every pulled model with its size, recommendation status, and lock (keep) / override controls. Any model can be deleted from here — including the one currently in use or a model backing an always-on feature — after a confirmation warning; it re-downloads on demand.
 - **Storage tab** — per-area auto-cleanup toggles and a "Clean now" button per area (models, transcribe buffer, legacy runtimes, update leftovers, orphaned conversation files). The conversations folder lives here too. At the bottom: a **Danger zone** card with one-click resets — Delete all models, Delete all conversations, Delete all app data and downloads. Each is gated behind a typed challenge phrase and mirrors the matching `myownllm purge` subcommand. All three force-reload the app window after the delete completes — any open chat or in-flight recording goes with it.
 - **Speakers tab** — manage cross-session **Speaker Profiles**. List every known voice, play its anchor clip, rename it, remove a clip, **merge** two profiles that turn out to be the same person, or forget one. Profiles are built during diarized sessions: when a voice is confidently recognised an inline chip offers a one-tap confirm, and an end-of-session review strip lets you name anyone still unconfirmed. A confirmed clip *anchors* the profile (its centroid pins to verified clips, ignoring drift), so each correction makes future auto-attribution more confident. Per-conversation **Keep audio** (in the transcribe pane) records the full session WAV for manual scrubbing instead of just the auto-captured clips.
 
 **Model status panel** (click "⊞ Models"):
 - Every pulled model: size, which providers recommend it, age if unrecommended.
-- Pin icon to keep a model (exempt from cleanup).
+- Lock icon (🔒 / 🔓) to keep a model on disk, exempt from cleanup ("pin" in the code).
 - Per-mode override: pick a specific model from any provider's full tier list.
-- "Clean up" — evicts all unrecommended, non-pinned, non-override models.
+- "Clean up" — evicts all unrecommended, unlocked, non-override models.
 
 ---
 
