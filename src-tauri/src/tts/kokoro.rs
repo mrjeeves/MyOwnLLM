@@ -168,7 +168,9 @@ impl TtsBackend for KokoroBackend {
             self.vocab = parse_vocab(&cfg);
         }
         if self.vocab.is_empty() {
-            return Err(anyhow!("Kokoro has no `vocab` map (bundled config is empty)"));
+            return Err(anyhow!(
+                "Kokoro has no `vocab` map (bundled config is empty)"
+            ));
         }
 
         // Style bank: raw little-endian f32.
@@ -330,7 +332,7 @@ mod tests {
         assert_eq!(v.get("a"), Some(&5));
         assert_eq!(v.get(" "), Some(&16));
         assert_eq!(v.get("b"), None); // non-integer skipped
-        // A missing / non-object `vocab` yields an empty map (→ caller falls back).
+                                      // A missing / non-object `vocab` yields an empty map (→ caller falls back).
         assert!(parse_vocab(&serde_json::json!({})).is_empty());
     }
 

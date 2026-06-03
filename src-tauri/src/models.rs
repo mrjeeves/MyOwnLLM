@@ -492,7 +492,11 @@ async fn fetch_artifact(client: &reqwest::Client, artifact: &Artifact) -> Result
 /// atomically and return its size — the streaming-pull counterpart of the
 /// fallback `fetch_model_quiet` performs. Returns `None` when there's no
 /// bundled copy (or it fails to land), so the caller proceeds to its error path.
-fn write_bundled_fallback(spec: &ModelSpec, artifact: &Artifact, dir: &std::path::Path) -> Option<u64> {
+fn write_bundled_fallback(
+    spec: &ModelSpec,
+    artifact: &Artifact,
+    dir: &std::path::Path,
+) -> Option<u64> {
     let data = bundled_artifact(spec.name, artifact.filename)?;
     if (data.len() as u64) < artifact.min_bytes {
         return None;
@@ -1315,7 +1319,10 @@ mod tests {
     fn payload_snippet_collapses_whitespace_and_marks_truncation() {
         assert_eq!(payload_snippet(b"Entry not found"), "Entry not found");
         // Control chars / newlines collapse to single spaces.
-        assert_eq!(payload_snippet(b"<html>\n  <body>x</body>"), "<html> <body>x</body>");
+        assert_eq!(
+            payload_snippet(b"<html>\n  <body>x</body>"),
+            "<html> <body>x</body>"
+        );
         // Over the cap gets an ellipsis so logs show it was clipped.
         let long = vec![b'a'; 200];
         assert!(payload_snippet(&long).ends_with('…'));
