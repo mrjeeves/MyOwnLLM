@@ -427,6 +427,16 @@ export async function deleteConversation(id: string): Promise<void> {
   }
 }
 
+/** Delete several conversations in one pass — the bulk-select path in the
+ *  sidebar. Best-effort per id (each delegates to `deleteConversation`,
+ *  which swallows its own errors), so one already-gone or locked file
+ *  doesn't abort the rest of the batch. Sequential rather than parallel to
+ *  keep the filesystem churn — and the sidecar cleanup inside each delete —
+ *  predictable. */
+export async function deleteConversations(ids: string[]): Promise<void> {
+  for (const id of ids) await deleteConversation(id);
+}
+
 export async function renameConversation(id: string, title: string): Promise<void> {
   const c = await loadConversation(id);
   if (!c) return;
@@ -458,6 +468,14 @@ export async function moveConversation(id: string, targetFolder: string): Promis
       }
     }
   }
+}
+
+/** Move several conversations into the same target folder — the bulk-select
+ *  drag/menu path in the sidebar. Sequential so renames don't race on the
+ *  shared destination directory; each delegates to `moveConversation`, which
+ *  no-ops on files already living there. */
+export async function moveConversations(ids: string[], targetFolder: string): Promise<void> {
+  for (const id of ids) await moveConversation(id, targetFolder);
 }
 
 /** Create an empty folder at `path` (POSIX, from root). Components are

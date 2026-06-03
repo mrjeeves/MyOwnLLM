@@ -18,8 +18,10 @@
   import {
     listConversations,
     deleteConversation,
+    deleteConversations,
     renameConversation,
     moveConversation,
+    moveConversations,
     createFolder,
     renameFolder,
     deleteFolder,
@@ -708,6 +710,27 @@
     await refreshConversations();
   }
 
+  /** Bulk-select delete: drop every selected conversation, then refresh
+   *  once. If the open conversation is in the batch we fall back to the
+   *  new-chat empty state, same as the single delete. */
+  async function onDeleteConversations(ids: string[]) {
+    await deleteConversations(ids);
+    if (activeConversationId && ids.includes(activeConversationId)) {
+      activeConversationId = null;
+      newChatCounter += 1;
+      suppressNextActiveEvent = true;
+      setActiveConversationId(null);
+    }
+    await refreshConversations();
+  }
+
+  /** Bulk-select move: relocate every selected conversation into `folder`
+   *  (POSIX path, "" for root), then a single refresh for the whole batch. */
+  async function onMoveConversations(ids: string[], folder: string) {
+    await moveConversations(ids, folder);
+    await refreshConversations();
+  }
+
   async function onCreateFolder(path: string) {
     await createFolder(path);
     await refreshConversations();
@@ -1075,7 +1098,9 @@
         onNew={onNewConversation}
         onRename={onRenameConversation}
         onDelete={onDeleteConversation}
+        onDeleteMany={onDeleteConversations}
         onMove={onMoveConversation}
+        onMoveMany={onMoveConversations}
         onMoveFolder={onMoveFolder}
         onCreateFolder={onCreateFolder}
         onRenameFolder={onRenameFolder}
