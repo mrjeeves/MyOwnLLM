@@ -429,6 +429,81 @@ pub fn find(name: &str, kind: ModelKind) -> Option<&'static ModelSpec> {
     REGISTRY.iter().find(|m| m.name == name && m.kind == kind)
 }
 
+/// First ~120 bytes of a payload, lossily as text with control characters
+/// collapsed to spaces — enough to tell a 404 page from an LFS pointer from a
+/// rate-limit notice in one log line, without dumping a whole HTML body.
+fn payload_snippet(bytes: &[u8]) -> String {
+    let n = bytes.len().min(120);
+    let text: String = String::from_utf8_lossy(&bytes[..n])
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if bytes.len() > n {
+        format!("{text}…")
+    } else {
+        text
+    }
+}
+
+/// A compiled-in copy of an artifact, used as a last resort when the network
+/// fetch returns a broken payload. Only Kokoro's `config.json` — the fixed
+/// IPA→id vocab the model ships (a ~2 KB non-LFS file HF occasionally serves
+/// as a tiny error page with a 200 status) — is bundled; the multi-megabyte
+/// LFS artifacts are too large to embed. See
+/// [`crate::tts::kokoro::EMBEDDED_CONFIG_JSON`].
+fn bundled_artifact(spec_name: &str, filename: &str) -> Option<&'static [u8]> {
+    match (spec_name, filename) {
+        ("kokoro-82m", "config.json") => Some(crate::tts::kokoro::EMBEDDED_CONFIG_JSON.as_bytes()),
+        _ => None,
+    }
+}
+
+/// Fetch one artifact into memory, validating the HTTP status and that the
+/// payload meets the artifact's minimum size. The size check catches the
+/// HTML/error pages HuggingFace's LFS layer occasionally serves with a 200;
+/// both error arms include the leading bytes of the body so the cause is
+/// visible in logs instead of a bare byte count.
+async fn fetch_artifact(client: &reqwest::Client, artifact: &Artifact) -> Result<Vec<u8>> {
+    let resp = client.get(artifact.url).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.bytes().await.unwrap_or_default();
+        bail!(
+            "HTTP {status} fetching {} — {}",
+            artifact.url,
+            payload_snippet(&body)
+        );
+    }
+    let bytes = resp.bytes().await?;
+    if (bytes.len() as u64) < artifact.min_bytes {
+        bail!(
+            "{} fetched {} bytes (< min {}) — likely an error page: {}",
+            artifact.filename,
+            bytes.len(),
+            artifact.min_bytes,
+            payload_snippet(&bytes)
+        );
+    }
+    Ok(bytes.to_vec())
+}
+
+/// If we ship a compiled-in copy of this artifact, write it into place
+/// atomically and return its size — the streaming-pull counterpart of the
+/// fallback `fetch_model_quiet` performs. Returns `None` when there's no
+/// bundled copy (or it fails to land), so the caller proceeds to its error path.
+fn write_bundled_fallback(spec: &ModelSpec, artifact: &Artifact, dir: &std::path::Path) -> Option<u64> {
+    let data = bundled_artifact(spec.name, artifact.filename)?;
+    if (data.len() as u64) < artifact.min_bytes {
+        return None;
+    }
+    let final_path = dir.join(artifact.filename);
+    let tmp = dir.join(format!("{}.partial", artifact.filename));
+    std::fs::write(&tmp, data).ok()?;
+    std::fs::rename(&tmp, &final_path).ok()?;
+    Some(data.len() as u64)
+}
+
 /// Fetch a model's artifacts with no UI/progress channel — for optional
 /// companion models (e.g. the Silero VAD upgrade) pulled best-effort in
 /// the background. Atomic per artifact (`.partial` → rename), size-
@@ -457,19 +532,25 @@ pub async fn fetch_model_quiet(name: &str, kind: ModelKind) -> Result<bool> {
             }
             let _ = std::fs::remove_file(&final_path);
         }
-        let resp = client.get(artifact.url).send().await?;
-        if !resp.status().is_success() {
-            bail!("HTTP {} fetching {}", resp.status(), artifact.url);
-        }
-        let bytes = resp.bytes().await?;
-        if (bytes.len() as u64) < artifact.min_bytes {
-            bail!(
-                "{} fetched {} bytes (< min {}) — likely an error page",
-                artifact.filename,
-                bytes.len(),
-                artifact.min_bytes
-            );
-        }
+        // Prefer the live download; on a broken/short payload (or an HTTP
+        // error) fall back to a compiled-in copy when we ship one for this
+        // artifact, so a flaky small-file fetch can't break an otherwise-
+        // present model.
+        let bytes: Vec<u8> = match fetch_artifact(&client, artifact).await {
+            Ok(b) => b,
+            Err(e) => match bundled_artifact(spec.name, artifact.filename) {
+                Some(b) if (b.len() as u64) >= artifact.min_bytes => {
+                    eprintln!(
+                        "[models] {}/{}: network fetch failed ({e}); using bundled fallback ({} bytes)",
+                        spec.name,
+                        artifact.filename,
+                        b.len()
+                    );
+                    b.to_vec()
+                }
+                _ => return Err(e),
+            },
+        };
         let tmp = dir.join(format!("{}.partial", artifact.filename));
         std::fs::write(&tmp, &bytes).with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, &final_path)
@@ -944,6 +1025,34 @@ async fn pull_model_inner(
             r = send_fut => r?,
         };
         if !resp.status().is_success() {
+            // A compiled-in copy (Kokoro's vocab config) stands in for a small
+            // non-LFS file HF served as an error page — same fallback as the
+            // quiet fetch path, so the GUI "Download" button benefits too.
+            if let Some(sz) = write_bundled_fallback(spec, artifact, dir) {
+                eprintln!(
+                    "[models] {}/{}: HTTP {} from {}; using bundled fallback ({sz} bytes)",
+                    spec.name,
+                    artifact.filename,
+                    resp.status(),
+                    artifact.url
+                );
+                emit_progress(
+                    window,
+                    spec,
+                    ModelPullProgress {
+                        name: spec.name.to_string(),
+                        kind: spec.kind.as_str().to_string(),
+                        bytes: sz,
+                        total: sz,
+                        artifact_index: idx,
+                        artifact_count,
+                        done: idx + 1 == artifact_count,
+                        error: None,
+                        cancelled: false,
+                    },
+                );
+                continue;
+            }
             let err = format!("HTTP {} fetching {}", resp.status(), artifact.url);
             emit_progress(
                 window,
@@ -1009,6 +1118,31 @@ async fn pull_model_inner(
 
         if downloaded < artifact.min_bytes {
             let _ = tokio::fs::remove_file(&tmp).await;
+            // Same bundled-copy fallback as the HTTP-error arm: a short payload
+            // for an artifact we ship a canonical copy of (Kokoro's vocab
+            // config) lands the bundled bytes instead of failing the pull.
+            if let Some(sz) = write_bundled_fallback(spec, artifact, dir) {
+                eprintln!(
+                    "[models] {}/{}: only {downloaded} bytes downloaded (< min {}); using bundled fallback ({sz} bytes)",
+                    spec.name, artifact.filename, artifact.min_bytes
+                );
+                emit_progress(
+                    window,
+                    spec,
+                    ModelPullProgress {
+                        name: spec.name.to_string(),
+                        kind: spec.kind.as_str().to_string(),
+                        bytes: sz,
+                        total: sz,
+                        artifact_index: idx,
+                        artifact_count,
+                        done: idx + 1 == artifact_count,
+                        error: None,
+                        cancelled: false,
+                    },
+                );
+                continue;
+            }
             let err = format!(
                 "downloaded {downloaded} bytes for {}/{} (artifact {}), expected ≥{}. \
                  Server may have returned an error page; try again.",
@@ -1175,5 +1309,44 @@ mod tests {
         // relative path collapses but doesn't traverse, and we sit
         // under `models/{kind}/...` so absolute path safety is
         // preserved.
+    }
+
+    #[test]
+    fn payload_snippet_collapses_whitespace_and_marks_truncation() {
+        assert_eq!(payload_snippet(b"Entry not found"), "Entry not found");
+        // Control chars / newlines collapse to single spaces.
+        assert_eq!(payload_snippet(b"<html>\n  <body>x</body>"), "<html> <body>x</body>");
+        // Over the cap gets an ellipsis so logs show it was clipped.
+        let long = vec![b'a'; 200];
+        assert!(payload_snippet(&long).ends_with('…'));
+        assert!(payload_snippet(&long).len() <= 124); // 120 'a' + ellipsis bytes
+    }
+
+    #[test]
+    fn bundled_artifact_only_covers_kokoro_config() {
+        assert!(bundled_artifact("kokoro-82m", "config.json").is_some());
+        // The big LFS artifacts and other models are not bundled.
+        assert!(bundled_artifact("kokoro-82m", "model.onnx").is_none());
+        assert!(bundled_artifact("piper-en-us-lessac-low", "config.json").is_none());
+    }
+
+    /// The bundled Kokoro config must clear the `min_bytes` the registry
+    /// requires for `config.json`, or the fallback would write a file the
+    /// install-check immediately rejects — defeating the whole point.
+    #[test]
+    fn bundled_kokoro_config_satisfies_registered_min_bytes() {
+        let spec = find("kokoro-82m", ModelKind::Tts).expect("kokoro in registry");
+        let cfg_artifact = spec
+            .artifacts
+            .iter()
+            .find(|a| a.filename == "config.json")
+            .expect("kokoro has a config.json artifact");
+        let bundled = bundled_artifact("kokoro-82m", "config.json").unwrap();
+        assert!(
+            (bundled.len() as u64) >= cfg_artifact.min_bytes,
+            "bundled config {} bytes < registered min {}",
+            bundled.len(),
+            cfg_artifact.min_bytes
+        );
     }
 }
