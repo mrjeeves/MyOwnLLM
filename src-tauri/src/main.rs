@@ -18,6 +18,7 @@ mod ort_install;
 mod ort_setup;
 mod preload;
 mod process;
+mod progress;
 mod purge;
 mod remote_ui;
 mod resolver;
