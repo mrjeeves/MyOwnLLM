@@ -102,6 +102,14 @@ export interface ManifestTier {
 export interface ManifestMode {
   label: string;
   input?: "audio";
+  /** Whether a provider can swap this capability's model by editing its
+   *  manifest. Absent ⇒ swappable: the embedding / transcribe / diarize /
+   *  speak ladders are all provider-level defaults — MyOwnLLM's own provider
+   *  ships `embeddinggemma` for every family, a Deepseek/white-label provider
+   *  can ship its own. `false` marks a capability whose runtime is wired to
+   *  one specific model (Silero VAD) — tracked in the manifest, but built
+   *  into the app and not a swap target. */
+  swappable?: boolean;
   /** Default runtime for tiers that don't declare their own. Most modes
    *  leave this blank and let the resolver derive it from the mode
    *  (`text` → `ollama`, `transcribe` → `moonshine`, `diarize` →
