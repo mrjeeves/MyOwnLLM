@@ -605,7 +605,10 @@ export function resolveModel(
   familyName?: string,
   familyOverrides?: Record<string, Partial<Record<Mode, string | null>>>,
 ): string {
-  return resolveModelEx(hardware, manifest, mode, modeOverrides, familyName, familyOverrides).model;
+  const { model } = resolveModelEx(hardware, manifest, mode, modeOverrides, familyName, familyOverrides);
+  // Forward a provider-retired tag (e.g. an override still pointing at an old
+  // model) to its current replacement; a no-op for current tier models.
+  return backmapTag(manifest, model);
 }
 
 /** Canonicalise a model tag for cross-referencing a pulled model against a
@@ -618,6 +621,18 @@ export function resolveModel(
  *  untouched. Must mirror `resolver::canonical_model_tag` on the Rust side. */
 export function canonicalModelTag(tag: string): string {
   return tag.endsWith(":latest") ? tag.slice(0, -":latest".length) : tag;
+}
+
+/** Forward a (possibly retired) model tag to its current replacement via the
+ *  manifest's `backmap`. A no-op when the tag isn't listed, so current tier
+ *  models pass straight through and only stored/override references to a
+ *  retired model are rewritten. Canonical-aware so a stored `foo:latest` still
+ *  matches a bare `foo` key. Single-hop — providers map straight to the
+ *  current tag, not a chain. Mirrors `resolver::backmap_tag` on the Rust side. */
+export function backmapTag(manifest: Manifest, tag: string): string {
+  const map = manifest.backmap;
+  if (!map) return tag;
+  return map[tag] ?? map[canonicalModelTag(tag)] ?? tag;
 }
 
 /** All model tags recommended by a manifest across every family/mode/tier.

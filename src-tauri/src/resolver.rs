@@ -96,29 +96,33 @@ pub async fn resolve_with_hardware(
 
     let active_family = config["active_family"].as_str().unwrap_or("");
 
-    // Per-family override wins over the flat `mode_overrides` so a
-    // user's tier choice for one family doesn't bleed into another.
-    // Mirror of the precedence in `src/manifest.ts::resolveModelEx`.
+    let manifest_url = match profile_url {
+        Some(u) => u.to_string(),
+        None => active_provider_url(&config).unwrap_or_else(|| FALLBACK_MANIFEST_URL.to_string()),
+    };
+    // Loaded up front so overrides forward through `backmap` too. Best-effort:
+    // if it can't load (offline), an override still resolves to its raw tag.
+    let manifest = fetch_or_load_manifest(&manifest_url).await.ok();
+
+    // Per-family override wins over the flat `mode_overrides` so a user's tier
+    // choice for one family doesn't bleed into another. Mirror of the
+    // precedence in `src/manifest.ts::resolveModelEx`. A retired override tag
+    // forwards to its current replacement via the manifest's `backmap`.
     if !active_family.is_empty() {
         if let Some(over) = config["family_overrides"][active_family][mode].as_str() {
             if !over.is_empty() {
-                return Ok(over.to_string());
+                return Ok(forward_retired(manifest.as_ref(), over));
             }
         }
     }
 
     if let Some(over) = config["mode_overrides"][mode].as_str() {
         if !over.is_empty() {
-            return Ok(over.to_string());
+            return Ok(forward_retired(manifest.as_ref(), over));
         }
     }
 
-    let manifest_url = match profile_url {
-        Some(u) => u.to_string(),
-        None => active_provider_url(&config).unwrap_or_else(|| FALLBACK_MANIFEST_URL.to_string()),
-    };
-
-    let manifest = fetch_or_load_manifest(&manifest_url).await?;
+    let manifest = manifest.ok_or_else(|| anyhow!("manifest unavailable for mode {mode}"))?;
     resolve_in_manifest(&manifest, hw, mode, active_family)
 }
 
@@ -151,7 +155,9 @@ pub fn resolve_in_manifest(
     mode: &str,
     active_family: &str,
 ) -> Result<String> {
-    Ok(resolve_full(manifest, hw, mode, active_family)?.0)
+    let model = resolve_full(manifest, hw, mode, active_family)?.0;
+    // Forward a retired tier tag to its current replacement (no-op otherwise).
+    Ok(backmap_tag(manifest, &model))
 }
 
 /// Default runtime for a mode when neither tier nor mode block declares
@@ -518,6 +524,31 @@ fn tier_matches_cpu_fallback(tier: &Value, hw: &HardwareProfile, headroom: f64) 
 /// `canonicalModelTag` on the TS side.
 pub fn canonical_model_tag(tag: &str) -> &str {
     tag.strip_suffix(":latest").unwrap_or(tag)
+}
+
+/// Forward a (possibly retired) model tag to its current replacement via the
+/// manifest's `backmap`. A no-op when the tag isn't listed, so current tier
+/// models pass through and only stored/override references to a retired model
+/// are rewritten. Canonical-aware. Mirrors `backmapTag` on the TS side.
+pub fn backmap_tag(manifest: &Value, tag: &str) -> String {
+    let Some(map) = manifest.get("backmap").and_then(|v| v.as_object()) else {
+        return tag.to_string();
+    };
+    if let Some(v) = map.get(tag).and_then(|v| v.as_str()) {
+        return v.to_string();
+    }
+    if let Some(v) = map.get(canonical_model_tag(tag)).and_then(|v| v.as_str()) {
+        return v.to_string();
+    }
+    tag.to_string()
+}
+
+/// `backmap_tag` for an optional manifest — the override paths resolve before
+/// the manifest is guaranteed loaded (offline ⇒ return the tag unchanged).
+fn forward_retired(manifest: Option<&Value>, tag: &str) -> String {
+    manifest
+        .map(|m| backmap_tag(m, tag))
+        .unwrap_or_else(|| tag.to_string())
 }
 
 /// All Ollama-runtime model tags recommended by a manifest across every
