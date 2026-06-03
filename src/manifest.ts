@@ -15,6 +15,13 @@ import BUNDLED_MANIFEST_JSON from "../manifests/default.json";
 
 const DEFAULT_TTL_MINUTES = 360;
 
+/** URLs already force-refreshed once since this launch. The first resolve of
+ *  each URL bypasses the TTL so a manifest published since last run is picked
+ *  up on launch; every later resolve this session uses the normal cached path.
+ *  Offline-safe — a failed forced fetch still falls back to the cache below.
+ *  Mirrors the Rust launch refresh in `watcher.rs::refresh_manifests_on_launch`. */
+const refreshedThisSession = new Set<string>();
+
 async function cacheDir(): Promise<string> {
   const home = await homeDir();
   return `${home}/.myownllm/cache/manifests`;
@@ -84,7 +91,11 @@ async function fetchOne(url: string): Promise<Manifest> {
   if (url.startsWith("bundled://")) return BUNDLED_MANIFEST_JSON as unknown as Manifest;
 
   const cached = await readCache(url);
-  if (cached) {
+  // The first resolve of this URL since launch forces a network re-fetch so a
+  // change published since last run lands immediately instead of waiting out
+  // the TTL; later resolves this session honour the cached TTL.
+  const forceRefresh = !refreshedThisSession.has(url);
+  if (cached && !forceRefresh) {
     const ttl = cached.manifest.ttl_minutes ?? DEFAULT_TTL_MINUTES;
     // Cache is OK if it's still fresh AND the bundled binary doesn't
     // already know about a newer schema. The version-bump escape hatch
@@ -97,10 +108,13 @@ async function fetchOne(url: string): Promise<Manifest> {
   try {
     const manifest = await fetchManifestRaw(url);
     await writeCache(url, manifest);
+    refreshedThisSession.add(url);
     return manifest;
   } catch {
-    // Network failed — prefer the cache, but if our bundled is newer
-    // than the cache, the bundled manifest is the more accurate source.
+    // Network failed — record the attempt so an offline session doesn't
+    // re-hammer the network on every resolve, then prefer the cache; if our
+    // bundled is newer than the cache, the bundled manifest is more accurate.
+    refreshedThisSession.add(url);
     if (cached && !bundledVersionIsNewer(cached.manifest)) return cached.manifest;
     return BUNDLED_MANIFEST_JSON as unknown as Manifest;
   }

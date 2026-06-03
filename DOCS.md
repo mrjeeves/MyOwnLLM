@@ -37,7 +37,7 @@ Full reference manual for MyOwnLLM. For a one-page overview and quick start, see
 ```
 myownllm serve
   1. Detect GPU (nvidia-smi / rocm-smi / system_profiler) and RAM
-  2. Fetch active provider's manifest (cached against the manifest's own TTL)
+  2. Fetch active provider's manifest (refreshed once on launch, then cached against the manifest's own TTL)
   3. Walk tiers top-to-bottom → pick best model this hardware can run
   4. Auto-install Ollama if missing
   5. Pull the resolved tag if not already on disk (with progress)
@@ -45,7 +45,7 @@ myownllm serve
   7. Listen on 127.0.0.1:1473, expose virtual model IDs
 ```
 
-On every request: re-resolve, hot-swap if upstream changed, return. A 5-minute background watcher keeps tracked modes warm and checks for self-updates so the binary itself stays current with no user intervention. You never interact with Ollama directly; MyOwnLLM manages it as a child process.
+On every request: re-resolve against the cached manifest, hot-swap if the resolved tag changed, return. Manifests are re-fetched once on launch and then on their own TTL (the bundled default provider's is 60 min), so a change you publish reaches installs by their next launch or within the TTL — whichever comes first. A 5-minute background watcher keeps tracked modes warm, picks up manifest changes at the TTL boundary, and checks for self-updates so the binary itself stays current with no user intervention. You never interact with Ollama directly; MyOwnLLM manages it as a child process.
 
 ---
 
@@ -977,6 +977,8 @@ A single manifest can expose multiple families — that's how you ship "use our 
   "version": "12",
   "ttl_minutes": 360,            // how long MyOwnLLM caches THIS file before re-fetching (default: 360).
                                  // Publisher's rate-limit signal — pick what fits your host.
+                                 // Re-fetched once on app launch regardless, so a change is never
+                                 // more than one launch (or one TTL) away from reaching installs.
   "default_family": "gemma4",    // family used until the user picks one
 
   "imports": [                   // optional: URLs to other manifests whose families are merged in.

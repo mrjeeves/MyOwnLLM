@@ -1,9 +1,11 @@
 //! Background reconciler for tracked modes.
 //!
-//! Periodically (currently every 5 minutes) re-fetches each provider's manifest at its
-//! TTL boundary, compares the resolved tag for every tracked mode against the previous
-//! tick, pulls any new tags, and invokes the model-status recompute so the eviction
-//! clock starts on tags that just became unrecommended.
+//! Forces a one-shot manifest refresh on launch (so a change published since
+//! last run is visible immediately, not after the TTL), then periodically
+//! (currently every 5 minutes) re-fetches each provider's manifest at its TTL
+//! boundary, compares the resolved tag for every tracked mode against the
+//! previous tick, pulls any new tags, and invokes the model-status recompute
+//! so the eviction clock starts on tags that just became unrecommended.
 //!
 //! Process safety: a single advisory file lock at `~/.myownllm/watcher.lock` prevents two
 //! processes (e.g. GUI + a separate `myownllm serve`) from both ticking. First wins.
@@ -36,6 +38,11 @@ pub fn spawn_background() -> bool {
     }
 
     tokio::spawn(async move {
+        // Launch refresh: pull each saved provider's manifest once up front,
+        // bypassing the TTL, so a change published since last run lands this
+        // session instead of after the TTL. Offline-safe — falls back to the
+        // cached copy. Then settle into the periodic reconcile cadence.
+        refresh_manifests_on_launch().await;
         loop {
             if let Err(e) = tick().await {
                 eprintln!("watcher: tick error: {e}");
@@ -44,6 +51,21 @@ pub fn spawn_background() -> bool {
         }
     });
     true
+}
+
+/// Force a one-shot manifest re-fetch for every saved provider at launch.
+/// Bypasses the TTL so a freshly published change (a new `max_utilization`
+/// cap, a retiered ladder) is visible this session; offline-safe via
+/// `refresh_manifest`'s cache fallback. Runs once before the periodic loop.
+async fn refresh_manifests_on_launch() {
+    let Ok(cfg) = crate::resolver::load_config_value() else {
+        return;
+    };
+    for url in crate::resolver::all_provider_urls(&cfg) {
+        if let Err(e) = crate::resolver::refresh_manifest(&url).await {
+            eprintln!("watcher: launch manifest refresh failed for {url}: {e}");
+        }
+    }
 }
 
 async fn tick() -> Result<()> {

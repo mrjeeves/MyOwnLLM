@@ -644,19 +644,32 @@ pub async fn translate_virtual(requested: &str) -> Result<String> {
 
 pub async fn fetch_or_load_manifest(url: &str) -> Result<Value> {
     let mut visited: HashSet<String> = HashSet::new();
-    walk_manifest(url, &mut visited).await
+    walk_manifest(url, &mut visited, false).await
+}
+
+/// Like `fetch_or_load_manifest`, but bypasses the TTL freshness check and
+/// re-fetches `url` (and its imports) from the network. On a network failure
+/// it falls back to the cached copy (then bundled) just like the normal path,
+/// so a forced refresh while offline still resolves. Used by the launch-time
+/// refresh so a manifest change published since last run (e.g. a new
+/// `max_utilization` cap) reaches the install on next start instead of waiting
+/// out the TTL.
+pub async fn refresh_manifest(url: &str) -> Result<Value> {
+    let mut visited: HashSet<String> = HashSet::new();
+    walk_manifest(url, &mut visited, true).await
 }
 
 fn walk_manifest<'a>(
     url: &'a str,
     visited: &'a mut HashSet<String>,
+    force: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
     Box::pin(async move {
         if !visited.insert(url.to_string()) {
             return Ok(empty_manifest());
         }
 
-        let raw = fetch_one_manifest(url).await?;
+        let raw = fetch_one_manifest(url, force).await?;
         let mut merged_families: Map<String, Value> = Map::new();
         let mut merged_shared: Map<String, Value> = Map::new();
 
@@ -665,7 +678,7 @@ fn walk_manifest<'a>(
                 let Some(imp_url) = imp.as_str() else {
                     continue;
                 };
-                let imported = match walk_manifest(imp_url, visited).await {
+                let imported = match walk_manifest(imp_url, visited, force).await {
                     Ok(v) => v,
                     Err(_) => continue, // Import failure is non-fatal; merge the rest.
                 };
@@ -740,18 +753,24 @@ fn bundled_is_newer(cached_manifest: &Value) -> bool {
 }
 
 /// Fetch a single manifest URL, honouring its own ttl_minutes. No import recursion.
-async fn fetch_one_manifest(url: &str) -> Result<Value> {
-    if let Some(cached) = read_manifest_cache(url) {
-        let ttl_min = cached["manifest"]["ttl_minutes"]
-            .as_f64()
-            .unwrap_or(DEFAULT_TTL_MIN);
-        let fetched_at = cached["fetched_at"].as_str().unwrap_or("");
-        // Cache is OK if fresh AND the bundled binary doesn't already
-        // know about a newer schema. The version-bump escape hatch
-        // keeps `just dev` rebuilds from reading a stale cached
-        // manifest until TTL.
-        if !is_stale(fetched_at, ttl_min) && !bundled_is_newer(&cached["manifest"]) {
-            return Ok(cached["manifest"].clone());
+async fn fetch_one_manifest(url: &str, force: bool) -> Result<Value> {
+    // `force` (launch-time refresh) skips the freshness short-circuit and goes
+    // straight to the network so a change published since last run is picked up
+    // immediately. The failure path below still falls back to the cache, so a
+    // forced refresh while offline is safe.
+    if !force {
+        if let Some(cached) = read_manifest_cache(url) {
+            let ttl_min = cached["manifest"]["ttl_minutes"]
+                .as_f64()
+                .unwrap_or(DEFAULT_TTL_MIN);
+            let fetched_at = cached["fetched_at"].as_str().unwrap_or("");
+            // Cache is OK if fresh AND the bundled binary doesn't already
+            // know about a newer schema. The version-bump escape hatch
+            // keeps `just dev` rebuilds from reading a stale cached
+            // manifest until TTL.
+            if !is_stale(fetched_at, ttl_min) && !bundled_is_newer(&cached["manifest"]) {
+                return Ok(cached["manifest"].clone());
+            }
         }
     }
 
@@ -915,6 +934,20 @@ pub fn active_provider_url(config: &Value) -> Option<String> {
         .get("url")?
         .as_str()
         .map(str::to_string)
+}
+
+/// Every saved provider URL, active or not. The launch refresh walks all of
+/// them so a manifest change is picked up regardless of which provider is
+/// currently active.
+pub fn all_provider_urls(config: &Value) -> Vec<String> {
+    config["providers"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("url").and_then(|u| u.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn default_config_value() -> Value {
