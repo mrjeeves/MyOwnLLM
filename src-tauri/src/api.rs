@@ -77,6 +77,7 @@ pub async fn serve(
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/myownllm/preload", post(api_preload))
         .route("/v1/myownllm/status", get(api_status))
+        .route("/v1/myownllm/progress", get(api_progress))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/v1/audio/speech", post(speech))
         .route("/v1/audio/stream", get(audio_stream_ws))
@@ -274,7 +275,7 @@ async fn chat_completions(
     };
 
     let wait = q.wait || header_bool(&headers, "x-myownllm-wait");
-    if let Err(resp) = ensure_model_or_503(&state, &resolved, wait).await {
+    if let Err(resp) = ensure_model_or_503(&state, &resolved, "chat", wait).await {
         return resp;
     }
 
@@ -306,7 +307,7 @@ async fn completions(
         Err(e) => return error_response(StatusCode::BAD_REQUEST, "bad_model", e.to_string()),
     };
     let wait = q.wait || header_bool(&headers, "x-myownllm-wait");
-    if let Err(resp) = ensure_model_or_503(&state, &resolved, wait).await {
+    if let Err(resp) = ensure_model_or_503(&state, &resolved, "chat", wait).await {
         return resp;
     }
     let mut body = serde_json::to_value(&req).unwrap_or(json!({}));
@@ -341,7 +342,7 @@ async fn embeddings(
     // bouncing the caller with a 503 — so Myo's memory system gets a
     // vector back on the first try.
     let wait = q.wait || header_bool(&headers, "x-myownllm-wait");
-    if let Err(resp) = ensure_model_or_503(&state, &resolved, wait).await {
+    if let Err(resp) = ensure_model_or_503(&state, &resolved, "embed", wait).await {
         return resp;
     }
     let mut body = serde_json::to_value(&req).unwrap_or(json!({}));
@@ -423,6 +424,16 @@ async fn api_status(State(_state): State<AppState>) -> impl IntoResponse {
         "ollama": ollama_up,
         "tracked": tracked,
     }))
+}
+
+/// `GET /v1/myownllm/progress` — a snapshot of every model currently being
+/// acquired (downloaded / loaded) on behalf of a blocking force-load. A
+/// loopback consumer (Myo) polls this while a `X-MyOwnLLM-Wait` chat/embed
+/// call — or a `speak`/`transcribe` request — is parked, so it can draw a real
+/// progress bar with a live percentage and status text instead of staring at a
+/// hung connection. Unauthenticated like `/status`: read-only, loopback-scoped.
+async fn api_progress() -> impl IntoResponse {
+    Json(json!({ "active": crate::progress::snapshot() }))
 }
 
 // ---------------------------------------------------------------------------
@@ -875,12 +886,13 @@ fn pcm_i16le_to_f32(bytes: &[u8]) -> Vec<f32> {
 async fn ensure_model_or_503(
     state: &AppState,
     tag: &str,
+    kind: &str,
     wait: bool,
 ) -> std::result::Result<(), Response> {
     if crate::ollama::has_model(tag).await.unwrap_or(false) {
         return Ok(());
     }
-    let rx = ensure_pull_started(state, tag);
+    let rx = ensure_pull_started(state, tag, kind);
     if !wait {
         let snap = rx.borrow().clone();
         let mut resp = (
@@ -937,10 +949,36 @@ async fn ensure_model_or_503(
         }
     }
     drop(rx_stream);
+    // The model was just pulled, so it isn't resident yet — the proxied call
+    // pays a cold load. Surface that as an indeterminate "loading" phase the
+    // consumer can show; it's cleared in the background once Ollama reports
+    // the tag loaded.
+    report_loading_until_resident(tag, kind);
     Ok(())
 }
 
-fn ensure_pull_started(state: &AppState, tag: &str) -> watch::Receiver<PullStatus> {
+/// After a fresh pull the model isn't resident, and the cold load Ollama does
+/// on the first inference has no progress stream. Park an indeterminate
+/// "loading" row in the progress registry so the consumer's bar can switch
+/// from "downloading X%" to a "loading into memory" caption, and clear it in
+/// the background once `/api/ps` shows the tag resident (capped so a tag that
+/// never loads can't pin the row forever).
+fn report_loading_until_resident(tag: &str, kind: &str) {
+    let key = format!("ollama:{tag}");
+    crate::progress::report_loading(&key, tag, kind, "Loading model into memory…".into());
+    let tag = tag.to_string();
+    tokio::spawn(async move {
+        for _ in 0..240 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if crate::ollama::is_model_loaded(&tag).await {
+                break;
+            }
+        }
+        crate::progress::finish(&key);
+    });
+}
+
+fn ensure_pull_started(state: &AppState, tag: &str, kind: &str) -> watch::Receiver<PullStatus> {
     if let Some(existing) = state.pull_status.get(tag) {
         return existing.value().clone();
     }
@@ -952,9 +990,29 @@ fn ensure_pull_started(state: &AppState, tag: &str) -> watch::Receiver<PullStatu
     state.pull_status.insert(tag.to_string(), rx.clone());
 
     let tag_owned = tag.to_string();
+    let kind_owned = kind.to_string();
+    let prog_key = format!("ollama:{tag}");
     let map = state.pull_status.clone();
     tokio::spawn(async move {
+        crate::progress::report_download(
+            &prog_key,
+            &tag_owned,
+            &kind_owned,
+            None,
+            0,
+            0,
+            "starting".into(),
+        );
         let res = crate::ollama::pull_with(&tag_owned, |evt| {
+            crate::progress::report_download(
+                &prog_key,
+                &tag_owned,
+                &kind_owned,
+                evt.percent,
+                evt.completed,
+                evt.total,
+                evt.render(),
+            );
             let _ = tx.send(PullStatus {
                 done: false,
                 error: None,
@@ -963,21 +1021,30 @@ fn ensure_pull_started(state: &AppState, tag: &str) -> watch::Receiver<PullStatu
         })
         .await;
         let final_status = match res {
-            Ok(crate::ollama::PullOutcome::Completed) => PullStatus {
-                done: true,
-                error: None,
-                last_line: "complete".into(),
-            },
-            Ok(crate::ollama::PullOutcome::Cancelled) => PullStatus {
-                done: true,
-                error: Some("cancelled".into()),
-                last_line: "cancelled".into(),
-            },
-            Err(e) => PullStatus {
-                done: true,
-                error: Some(e.to_string()),
-                last_line: format!("error: {e}"),
-            },
+            Ok(crate::ollama::PullOutcome::Completed) => {
+                crate::progress::finish(&prog_key);
+                PullStatus {
+                    done: true,
+                    error: None,
+                    last_line: "complete".into(),
+                }
+            }
+            Ok(crate::ollama::PullOutcome::Cancelled) => {
+                crate::progress::finish(&prog_key);
+                PullStatus {
+                    done: true,
+                    error: Some("cancelled".into()),
+                    last_line: "cancelled".into(),
+                }
+            }
+            Err(e) => {
+                crate::progress::mark_error(&prog_key, &tag_owned, &kind_owned, e.to_string());
+                PullStatus {
+                    done: true,
+                    error: Some(e.to_string()),
+                    last_line: format!("error: {e}"),
+                }
+            }
         };
         let _ = tx.send(final_status);
         // Leave entry in map briefly so concurrent readers see `done`; reap after a bit.
