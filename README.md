@@ -39,7 +39,7 @@ MyOwnLLM is a **local-first AI you install once and run everywhere** — a deskt
 | 🎙️ **Live diarized transcription** | Real-time streaming captions in 25 languages, with speaker IDs that stay stable across the whole session — and carry into future ones. |
 | 🗣️ **Text-to-speech** | On-device TTS (Kokoro / Piper) with a self-installing espeak-ng phonemizer and a `POST /v1/audio/speech` endpoint. |
 | 🔌 **Three wire formats, one server** | OpenAI, Ollama, and Anthropic on `:1473`. Cursor, Continue, Aider, Cline, Zed, and Open WebUI all just work. |
-| 🧠 **Hardware-aware models** | Manifest-driven tier selection from a Raspberry Pi 4 (2 GB) to a 4090. Gemma 4 and Qwen 3.6 edge builds included. |
+| 🧠 **Hardware-aware models** | Manifest-driven tier selection from a Raspberry Pi 4 (2 GB) to a 5090. Gemma 4 and Qwen 3.6 edge builds included. |
 | 🔄 **Self-updating** | Stages on launch, applies on next start. Last-good manifest cached for offline runs. |
 | 🔒 **Local-first & private** | Everything runs on your own hardware. Self-host a relay for an air-gapped LAN. |
 
@@ -88,7 +88,7 @@ The built-in chat is a tool-calling agent. It reaches for a tool whenever a requ
 | `write_file` | Create or append to a file. | ✅ per-network |
 | `shell` | Run a shell command and capture stdout / stderr / exit code. | ✅ per-network |
 
-- **Tools run on the caller's box even when inference is on a remote peer** — your Pi can borrow the workstation's 4090 and still configure the Pi.
+- **Tools run on the caller's box even when inference is on a remote peer** — your Pi can borrow the workstation's 5090 and still configure the Pi.
 - **`shell` and `write_file` route through a per-network permission gate** — Deny / Allow once / Always for this command-or-path / Always for the tool. Decisions persist per network and gossip to peers when `auto_gossip` is on. `web_search` and `read_file` are read-only and ungated.
 - **The loop runs a round's tool calls in parallel** and is bounded (16 rounds); when the budget is hit it forces a final, tool-free answer instead of stalling.
 - Per-prompt tool selection lives in **Settings → Prompts** — deselect a tool to hide it from the model entirely for that prompt.
