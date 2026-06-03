@@ -10,6 +10,7 @@
     resumeTalkingPoints,
     stopTalkingPoints,
   } from "./chat-slot.svelte";
+  import { meshClient } from "../mesh-daemon.svelte";
 
   let {
     current,
@@ -20,6 +21,8 @@
     onRequestStopChat,
     speakersActive = false,
     onOpenSpeakers,
+    networksActive = false,
+    onOpenNetworks,
   } = $props<{
     current: Mode;
     supported: Set<Mode>;
@@ -36,7 +39,25 @@
      *  it rides alongside the mode bubbles as its own button rather
      *  than going through `onChange`. */
     onOpenSpeakers: () => void;
+    /** True while the Networks workspace (the mesh node graph) is on
+     *  screen. Same role as `speakersActive`: it lights the Networks
+     *  bubble and de-highlights the model-mode bubbles. */
+    networksActive?: boolean;
+    /** Open the Networks workspace. Like Speakers, Networks isn't a
+     *  model `Mode` — the graph is its own first-class surface, so it
+     *  rides alongside the mode bubbles rather than through `onChange`. */
+    onOpenNetworks: () => void;
   }>();
+
+  /** Pulse a dot on the Networks bubble when a peer is waiting on the
+   *  local user — a fresh request, or "they approved, confirm here".
+   *  Both sit in `pending_approval` until the user acts. Sourced
+   *  straight off the mesh client so the signal shows from every view
+   *  without threading a prop through each surface — getting a new
+   *  device approved stays a one-glance task from anywhere. */
+  const networksAttention = $derived(
+    meshClient.peers.some((p) => p.status === "pending_approval"),
+  );
 
   // Same mode set the redesigned bar surfaces. Trimmed to text +
   // transcribe; vision/code aren't surfaced in the GUI yet.
@@ -141,7 +162,7 @@
       {@const slotActive = slotStatus !== "idle"}
       {@const lockedOut = chatRunning && m.id !== current}
       {@const btnDisabled = !ok || lockedOut}
-      {@const isActive = m.id === current && !speakersActive}
+      {@const isActive = m.id === current && !speakersActive && !networksActive}
       <div
         class="slot"
         class:active={isActive}
@@ -272,6 +293,40 @@
         <span class="mode-label">Speakers</span>
       </button>
     </div>
+
+    <!-- Networks workspace. Like Speakers, not a model `Mode`: it opens
+         the mesh node graph as a first-class surface. Locked while a
+         chat streams (leaving the Chat surface mid-stream orphans the
+         generation, same as the mode bubbles). The attention dot pulses
+         when a peer is waiting on the user to approve it. -->
+    <div class="slot" class:active={networksActive} class:locked={chatRunning}>
+      <button
+        class="mode-btn networks-btn"
+        class:active={networksActive}
+        disabled={chatRunning}
+        title={chatRunning
+          ? "Stop the chat to switch modes."
+          : "Your mesh — see devices, approve connections"}
+        onclick={() => !chatRunning && onOpenNetworks()}
+      >
+        <svg class="mode-glyph" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+          <circle cx="12" cy="5" r="2.4" fill="currentColor" />
+          <circle cx="5" cy="18" r="2.4" fill="currentColor" />
+          <circle cx="19" cy="18" r="2.4" fill="currentColor" />
+          <path
+            d="M12 7.2 6.4 16M12 7.2 17.6 16M6.8 18h10.4"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+          />
+        </svg>
+        <span class="mode-label">Networks</span>
+        {#if networksAttention && !networksActive}
+          <span class="attn-dot" aria-label="A device is waiting for approval"></span>
+        {/if}
+      </button>
+    </div>
   </div>
 
   <div class="spacer"></div>
@@ -380,6 +435,25 @@
     cursor: not-allowed;
   }
   .mode-label { line-height: 1; }
+  .mode-glyph { flex-shrink: 0; opacity: .85; }
+  .networks-btn { position: relative; }
+  .networks-btn.active .mode-glyph { opacity: 1; }
+  /* Pending-approval pulse on the Networks bubble — mirrors the graph's
+     node badge so the "a device needs you" signal reads the same from
+     the top bar as it does on the canvas. */
+  .attn-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #a78bfa;
+    box-shadow: 0 0 6px rgba(167, 139, 250, .85);
+    animation: attn-pulse 1.5s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+  @keyframes attn-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: .5; transform: scale(.8); }
+  }
 
   .status-row {
     display: inline-flex;

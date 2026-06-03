@@ -27,6 +27,7 @@
     onProviderChange,
     onRequestStopTranscribe,
     onRequestStopChat,
+    onOpenNetworks,
   } = $props<{
     activeMode: Mode;
     supportedModes: Set<Mode>;
@@ -34,6 +35,8 @@
     onProviderChange: () => void;
     onRequestStopTranscribe: () => void;
     onRequestStopChat: () => void;
+    /** Open the Networks workspace from the TopBar's Networks bubble. */
+    onOpenNetworks: () => void;
   }>();
 
   let settingsTab = $state<SettingsTab | null>(null);
@@ -67,6 +70,8 @@
     onChange={handleModeChange}
     speakersActive={true}
     onOpenSpeakers={() => {}}
+    networksActive={false}
+    onOpenNetworks={() => onOpenNetworks()}
     onOpenSettings={(tab) => (settingsTab = tab)}
     onRequestStopTranscribe={() => onRequestStopTranscribe()}
     onRequestStopChat={() => onRequestStopChat()}
