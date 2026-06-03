@@ -11,7 +11,7 @@
   } from "../../model-lifecycle";
   import { getAllManifests } from "../../providers";
   import { loadConfig } from "../../config";
-  import { resolveModel, modeFor } from "../../manifest";
+  import { resolveModel } from "../../manifest";
   import { scrollAffordance } from "../scroll-affordance";
   import FamilyDetail from "./FamilyDetail.svelte";
   import type { HardwareProfile, Mode } from "../../types";
@@ -34,19 +34,29 @@
   /** Active family — used as the seed for the Model Overrides tab so it
    *  always renders the family the user is actually chatting in. */
   let activeFamily = $state<string>("");
-  /** Every model tag listed in any tier (model or fallback) of the active
-   *  family inside the active provider. These are the rows we lock from
-   *  deletion: switching modes within the active family stays cheap because
-   *  the user can't accidentally delete a tag they'd need on the next mode
-   *  swap. Switching families (CLI or Family tab) recomputes this set. */
+  /** Every chat-model tag (text/vision/code, model or fallback) of the
+   *  active family. These rows are locked from deletion: switching modes
+   *  within the active family stays cheap because the user can't
+   *  accidentally delete a tag they'd need on the next mode swap. Switching
+   *  families (CLI or Family tab) recomputes this set. */
   let activeFamilyTags = $state<Set<string>>(new Set());
   /** The active family's display label, surfaced in the row badge so users
    *  can read "active · Gemma 4" instead of decoding their config. */
   let activeFamilyLabel = $state<string>("");
-  /** Per-tag list of every (provider, family) pair that lists the tag in
-   *  any tier — so a row in family `qwen3` reads "in Qwen 3 family" rather
-   *  than the old "in N providers" which lost the family signal entirely. */
-  let tagFamilies = $state<Record<string, Array<{ provider: string; familyName: string; familyLabel: string }>>>({});
+  /** Tag → the always-on shared capability whose current pick it is
+   *  (Transcribe / Diarize / Embed / Voice activity). These models back
+   *  features the user can toggle on at any time and belong to no chat
+   *  family, so the per-family lock never catches them — yet deleting the
+   *  embedding model out from under Myo's memory, or the VAD model the live
+   *  endpointer wants, is exactly the footgun this list prevents. Locked
+   *  like the active family; the badge shows the capability name. */
+  let capabilityLocks = $state<Record<string, string>>({});
+  /** Per-tag list of every place that recommends it, for the soft "in …"
+   *  badge on rows that aren't locked. `kind` drives the wording: a chat
+   *  family reads "in Qwen 3.6 family", a shared capability reads "in
+   *  Speak". Replaces the old per-provider map, which lost the signal of
+   *  *which* capability/family wanted the tag. */
+  let tagPlaces = $state<Record<string, Array<{ label: string; kind: "family" | "capability" }>>>({});
 
   let deleteTarget = $state<{
     name: string;
@@ -95,99 +105,134 @@
     return tag.includes("+") ? tag.split("+").filter(Boolean) : [tag];
   }
 
-  /** Walk every saved provider's manifest and bucket every tag into:
-   *  (a) the active-family lock set, and
-   *  (b) the per-tag family map for row badges. One pass over O(providers
-   *  × families × modes × tiers) — cheap enough to redo on every reload. */
+  /** Walk every saved provider's manifest and bucket each tag into:
+   *  (a) the active-family lock set (chat tiers of the family the user is
+   *      in — text/vision/code), (b) the capability-lock map (the resolver's
+   *      live pick for each always-on shared capability), and (c) the
+   *      per-tag "recommended places" map for the soft badge.
+   *
+   *  Chat families and shared capabilities are kept distinct on purpose:
+   *  transcribe / diarize / speak / embed / vad are family-agnostic, so a
+   *  downloaded embedding or VAD model is attributed to its capability
+   *  ("Embed", "Voice activity") rather than to whichever family happens to
+   *  inherit the shared block — and it lands locked, not "unrecommended".
+   *  One pass over O(providers × families/modes × tiers). */
   async function computeFamilyMembership() {
     try {
       const [allManifests, config] = await Promise.all([getAllManifests(), loadConfig()]);
-      const lockSet = new Set<string>();
-      const map: Record<string, Array<{ provider: string; familyName: string; familyLabel: string }>> = {};
+      const familyLock = new Set<string>();
+      const capLock: Record<string, string> = {};
+      const places: Record<string, Array<{ label: string; kind: "family" | "capability" }>> = {};
       let activeLabel = "";
 
-      // Walk every (provider, family, mode) triple via `modeFor` so
-      // shared_modes — most notably the manifest-wide transcribe and
-      // diarize ladders — contributes its tiers to both the lock set and
-      // the tagFamilies map. Without this, whisper / pyannote tags
-      // inherited from shared_modes show as "unrecommended" in the list
-      // even though every family that supports transcribe would re-pull
-      // them on demand.
-      const ALL_MODES: Mode[] = ["text", "vision", "code", "transcribe", "diarize"];
+      const addPlace = (tag: string, label: string, kind: "family" | "capability") => {
+        const list = places[tag] ?? (places[tag] = []);
+        if (!list.some((p) => p.label === label && p.kind === kind)) list.push({ label, kind });
+      };
+
+      // (a)/(c) Chat families. Only text/vision/code live on a family —
+      // transcribe/diarize/speak/embed/vad are shared capabilities handled
+      // below. Attribute every tier tag to the family's label; lock the
+      // active family's tags so a mode swap within it can't delete a tag
+      // it would immediately re-pull.
+      const FAMILY_MODES: Mode[] = ["text", "vision", "code"];
       for (const { provider, manifest } of allManifests) {
         for (const [familyName, family] of Object.entries(manifest.families ?? {})) {
           const isActiveFam =
             provider.name === config.active_provider && familyName === config.active_family;
           if (isActiveFam) activeLabel = family.label;
-
-          for (const mode of ALL_MODES) {
-            const modeSpec = modeFor(manifest, family, mode);
+          for (const mode of FAMILY_MODES) {
+            const modeSpec = family.modes?.[mode];
             if (!modeSpec) continue;
             for (const tier of modeSpec.tiers) {
               for (const tag of [tier.model, tier.fallback]) {
-                if (!tag) continue;
-                // Diarize tiers use composite tags joined with `+`
-                // (e.g. `pyannote-seg-3.0+wespeaker-r34`). Each
-                // component pulls down as its own ONNX file under
-                // `~/.myownllm/models/diarize/` and shows up as a
-                // separate row in the Models list. Register every
-                // component — not just the composite — so the
-                // individual rows pick up the family-membership badge
-                // instead of reading as unrecommended.
                 for (const part of expandComposite(tag)) {
-                  if (isActiveFam) lockSet.add(part);
-                  const list = map[part] ?? [];
-                  if (!list.find((e) => e.provider === provider.name && e.familyName === familyName)) {
-                    list.push({ provider: provider.name, familyName, familyLabel: family.label });
-                  }
-                  map[part] = list;
+                  if (isActiveFam) familyLock.add(part);
+                  addPlace(part, family.label, "family");
                 }
               }
             }
           }
         }
       }
-      // Mode overrides can point at a tag outside the active family. Whichever
-      // tag the resolver picks for the active mode is the "live" model and
-      // also belongs in the lock set, even if it doesn't appear in any tier
-      // of the active family. Transcribe and diarize are locked
-      // unconditionally as well (regardless of which mode the user is
-      // currently in) — the picked whisper / pyannote models are one
-      // toggle away from being needed and they don't appear in the ollama
-      // family tiers, so the activeMode probe alone misses them on every
-      // text/code/vision session. We resolve directly against the active
-      // manifest rather than via lookupModelUsage so picks from
-      // `shared_modes` (which most LLM families inherit rather than
-      // redeclare) are captured.
-      if (hardware) {
-        const activeEntry = allManifests.find(
-          (e) => e.provider.name === config.active_provider,
-        );
-        if (activeEntry) {
-          for (const mode of [activeMode, "transcribe" as Mode, "diarize" as Mode]) {
-            try {
-              const tag = resolveModel(
-                hardware,
-                activeEntry.manifest,
-                mode,
-                config.mode_overrides,
-                config.active_family,
-                config.family_overrides,
-              );
-              // Diarize resolves to a composite ("seg+embedder") —
-              // expand so each on-disk component is locked, not just
-              // the joined string nobody else has on disk.
-              for (const part of expandComposite(tag)) {
-                lockSet.add(part);
-              }
-            } catch {}
+
+      // (c) Shared capabilities. Every tier tag (across providers) is a
+      // recommended alternate for that capability, so the embedding / VAD /
+      // TTS models read "in Embed" / "in Voice activity" instead of
+      // "unrecommended". Diarize tiers ship composite tags — expand so each
+      // on-disk component gets its own badge.
+      for (const { manifest } of allManifests) {
+        for (const modeSpec of Object.values(manifest.shared_modes ?? {})) {
+          const label = modeSpec.label ?? "Shared";
+          for (const tier of modeSpec.tiers) {
+            for (const tag of [tier.model, tier.fallback]) {
+              for (const part of expandComposite(tag)) addPlace(part, label, "capability");
+            }
           }
         }
       }
 
-      activeFamilyTags = lockSet;
+      // (b) Lock the live pick of each always-on capability. Transcription,
+      // speaker diarization, the memory system's embeddings, and the live
+      // VAD endpointer are all one toggle away regardless of the chat
+      // family/mode, and their models appear in no family ladder — so the
+      // per-family lock never catches them. Resolve against the active
+      // provider's manifest (every family inherits the same shared ladders).
+      const activeEntry =
+        allManifests.find((e) => e.provider.name === config.active_provider) ?? allManifests[0];
+      if (hardware && activeEntry) {
+        const shared = activeEntry.manifest.shared_modes ?? {};
+        // Hardware ladders → lock the current rung. (transcribe / diarize /
+        // embed are all real Modes the resolver understands.)
+        for (const mode of ["transcribe", "diarize", "embed"] as Mode[]) {
+          if (!shared[mode]) continue;
+          const label = shared[mode].label ?? mode;
+          try {
+            const tag = resolveModel(
+              hardware,
+              activeEntry.manifest,
+              mode,
+              config.mode_overrides,
+              config.active_family,
+              config.family_overrides,
+            );
+            // Diarize resolves to a composite ("seg+embedder") — expand so
+            // each on-disk component is locked, not the joined string.
+            for (const part of expandComposite(tag)) capLock[part] = label;
+          } catch {}
+        }
+        // A mode_override can point the active chat mode at a tag outside
+        // the family's own tiers; that live pick belongs to the family.
+        if (FAMILY_MODES.includes(activeMode)) {
+          try {
+            const tag = resolveModel(
+              hardware,
+              activeEntry.manifest,
+              activeMode,
+              config.mode_overrides,
+              config.active_family,
+              config.family_overrides,
+            );
+            for (const part of expandComposite(tag)) familyLock.add(part);
+          } catch {}
+        }
+        // VAD ships a single always-on model with no hardware ladder to
+        // resolve — lock every tag the `vad` block names.
+        const vadSpec = shared["vad"];
+        if (vadSpec) {
+          const label = vadSpec.label ?? "Voice activity";
+          for (const tier of vadSpec.tiers) {
+            for (const tag of [tier.model, tier.fallback]) {
+              if (tag) capLock[tag] = label;
+            }
+          }
+        }
+      }
+
+      activeFamilyTags = familyLock;
       activeFamilyLabel = activeLabel;
-      tagFamilies = map;
+      capabilityLocks = capLock;
+      tagPlaces = places;
     } catch {
       // Non-fatal: the rows will fall back to the unrecommended badge.
     }
@@ -221,9 +266,10 @@
 
   async function confirmDelete() {
     if (!deleteTarget || deleting) return;
-    // Active-family lock is enforced at the row level (no trash button is
-    // rendered for those tags). Belt + suspenders here in case state slips.
-    if (activeFamilyTags.has(deleteTarget.name)) return;
+    // Locks are enforced at the row level (no trash button is rendered for
+    // active-family or shared-capability tags). Belt + suspenders here in
+    // case state slips between render and click.
+    if (activeFamilyTags.has(deleteTarget.name) || capabilityLocks[deleteTarget.name]) return;
     deleting = true;
     deleteError = "";
     try {
@@ -308,6 +354,13 @@
   function sizeLabel(bytes: number): string {
     return (bytes / 1024 / 1024 / 1024).toFixed(1) + " GB";
   }
+
+  /** Render a recommended-place for the soft badge: a chat family keeps its
+   *  "family" suffix ("Qwen 3.6 family"); a shared capability reads as just
+   *  its label ("Speak", "Voice activity"). */
+  function placeLabel(p: { label: string; kind: "family" | "capability" }): string {
+    return p.kind === "family" ? `${p.label} family` : p.label;
+  }
 </script>
 
 <div class="section">
@@ -325,10 +378,12 @@
       <div class="scroll-affordance-wrap">
       <div class="list scroll-fade" use:scrollAffordance>
         {#each models as m}
-          {@const inActive = activeFamilyTags.has(m.name)}
-          {@const fams = tagFamilies[m.name] ?? []}
-          {@const otherFams = fams.filter((f) => !(inActive && f.familyLabel === activeFamilyLabel))}
-          <div class="model-row" class:unrecommended={!inActive && fams.length === 0}>
+          {@const famLocked = activeFamilyTags.has(m.name)}
+          {@const capLabel = capabilityLocks[m.name]}
+          {@const locked = famLocked || !!capLabel}
+          {@const places = tagPlaces[m.name] ?? []}
+          {@const otherPlaces = places.filter((p) => !(famLocked && p.kind === "family" && p.label === activeFamilyLabel) && !(capLabel && p.kind === "capability" && p.label === capLabel))}
+          <div class="model-row" class:unrecommended={!locked && places.length === 0}>
             <div class="model-info">
               <div class="name-row">
                 <span class="name">{m.name}</span>
@@ -339,20 +394,24 @@
               <span class="size">{sizeLabel(m.size)}</span>
             </div>
             <div class="model-meta">
-              {#if inActive}
+              {#if famLocked}
                 <span class="rec-badge primary" title="Locked — part of the active family">
                   ✓ active · {activeFamilyLabel} family
                 </span>
-              {:else if fams.length === 1}
-                <span class="rec-badge soft">in {fams[0].familyLabel} family</span>
-              {:else if fams.length > 1}
-                <span class="rec-badge soft">in {fams.length} families</span>
+              {:else if capLabel}
+                <span class="rec-badge primary" title="Locked — backs the {capLabel} feature">
+                  ✓ {capLabel}
+                </span>
+              {:else if places.length === 1}
+                <span class="rec-badge soft">in {placeLabel(places[0])}</span>
+              {:else if places.length > 1}
+                <span class="rec-badge soft">in {places.length} places</span>
               {:else}
                 <span class="unrec-badge">unrecommended · {ageLabel(m.last_recommended)}</span>
               {/if}
-              {#if inActive && otherFams.length > 0}
+              {#if locked && otherPlaces.length > 0}
                 <span class="rec-meta">
-                  also in {otherFams.length === 1 ? `${otherFams[0].familyLabel} family` : `${otherFams.length} other families`}
+                  also in {otherPlaces.length === 1 ? placeLabel(otherPlaces[0]) : `${otherPlaces.length} other places`}
                 </span>
               {/if}
             </div>
@@ -364,10 +423,12 @@
             >
               {m.kept ? "📌" : "📍"}
             </button>
-            {#if inActive}
+            {#if locked}
               <span
                 class="trash-btn locked"
-                title="Active family ({activeFamilyLabel}) — switch family to delete"
+                title={famLocked
+                  ? `Active family (${activeFamilyLabel}) — switch family to delete`
+                  : `${capLabel} model — required by the app, can't delete`}
                 aria-hidden="true"
               >🔒</span>
             {:else}
