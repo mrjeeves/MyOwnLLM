@@ -342,13 +342,18 @@ export function resolveModelEx(
 
   const unified = isUnifiedMemory(hardware);
   const headroom = headroomGb(manifest, hardware.gpu_type);
+  // Cap utilization for a family's own LLM modes (mirror of resolve_full): walk
+  // the tiers against a scaled-down view of the pool so the chat model leaves
+  // the configured fraction of VRAM/RAM free. Shared modes stay unscaled.
+  const fromFamily = modeIsFamily(manifest, family, mode);
+  const budgetHw = scaledHw(hardware, budgetFraction(manifest, fromFamily));
 
   // Pass 1: walk for a VRAM-fitting tier (discrete GPU) or unified-pool
   // tier (Apple / no-GPU). This is the path that produces the displayed
   // "Needs ~X GB VRAM" recommendation, so we want it to actually pick
   // tiers the GPU can host.
   for (const tier of tierSpec.tiers) {
-    if (tierMatchesPrimary(tier, hardware, unified, headroom)) {
+    if (tierMatchesPrimary(tier, budgetHw, unified, headroom)) {
       return {
         model: tier.model,
         runtime: tierRuntime(tier, exactSpec, mode),
@@ -366,7 +371,7 @@ export function resolveModelEx(
   // smallest rung" case still produces a runnable model.
   if (!unified) {
     for (const tier of tierSpec.tiers) {
-      if (tierMatchesCpuFallback(tier, hardware, headroom)) {
+      if (tierMatchesCpuFallback(tier, budgetHw, headroom)) {
         return {
           model: tier.model,
           runtime: tierRuntime(tier, exactSpec, mode),
@@ -407,11 +412,14 @@ export function resolveBudget(
 
   const unified = isUnifiedMemory(hardware);
   const reserved = headroomGb(manifest, hardware.gpu_type);
+  // Match the same capped budget resolveModelEx walks (shared modes unscaled).
+  const fromFamily = modeIsFamily(manifest, family, mode);
+  const budgetHw = scaledHw(hardware, budgetFraction(manifest, fromFamily));
   const vramGb = hardware.vram_gb ?? null;
   const ramGb = hardware.ram_gb;
   const availableGb = unified
-    ? Math.max(0, ramGb - reserved)
-    : Math.max(0, (vramGb ?? 0) - reserved);
+    ? Math.max(0, budgetHw.ram_gb - reserved)
+    : Math.max(0, (budgetHw.vram_gb ?? 0) - reserved);
 
   const empty: MemoryBudget = {
     unified,
@@ -428,7 +436,7 @@ export function resolveBudget(
   // VRAM / unified pool pass — same loop as resolveModelEx so the two
   // can never disagree on which tier "fits".
   for (const tier of tierSpec.tiers) {
-    if (tierMatchesPrimary(tier, hardware, unified, reserved)) {
+    if (tierMatchesPrimary(tier, budgetHw, unified, reserved)) {
       return {
         ...empty,
         pickedTier: tier,
@@ -440,7 +448,7 @@ export function resolveBudget(
   }
   if (!unified) {
     for (const tier of tierSpec.tiers) {
-      if (tierMatchesCpuFallback(tier, hardware, reserved)) {
+      if (tierMatchesCpuFallback(tier, budgetHw, reserved)) {
         return {
           ...empty,
           pickedTier: tier,
@@ -517,6 +525,40 @@ function unifiedThresholdGb(tier: ManifestTier, headroom: number): number {
     return tier.min_unified_ram_gb;
   }
   return (tier.min_ram_gb ?? 0) + headroom;
+}
+
+/** Whether `mode` resolves against a family's own ladder (its LLM modes)
+ *  rather than the shared ASR/TTS/embed ladders — the distinction that decides
+ *  whether the `max_utilization` budget cap applies. Mirror of `mode_is_family`
+ *  in `resolver.rs`. */
+function modeIsFamily(
+  manifest: Manifest,
+  family: ManifestFamily | undefined,
+  mode: Mode,
+): boolean {
+  const inFamily = !!family?.modes?.[mode];
+  const inShared = !!manifest.shared_modes?.[mode];
+  return inFamily || !inShared;
+}
+
+/** Fraction of the VRAM / unified-RAM pool a recommendation may use, from the
+ *  manifest's `max_utilization` (default 1.0). Applied only to a family's LLM
+ *  modes. Mirror of `budget_fraction` in `resolver.rs`. */
+function budgetFraction(manifest: Manifest, fromFamily: boolean): number {
+  if (!fromFamily) return 1;
+  const f = manifest.max_utilization;
+  return typeof f === "number" && f > 0 && f <= 1 ? f : 1;
+}
+
+/** `hw` with its VRAM / RAM scaled by `fraction` — the budget the tier walk
+ *  matches against when a family caps utilization. Mirror of `scaled_hw`. */
+function scaledHw(hw: HardwareProfile, fraction: number): HardwareProfile {
+  if (fraction >= 1) return hw;
+  return {
+    ...hw,
+    ram_gb: hw.ram_gb * fraction,
+    vram_gb: hw.vram_gb == null ? hw.vram_gb : hw.vram_gb * fraction,
+  };
 }
 
 /** Primary tier-match pass — the one the displayed "Needs ~X GB VRAM"

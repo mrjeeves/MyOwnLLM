@@ -9,6 +9,7 @@
     "nvidia": 1,
     "amd": 1
   },
+  "max_utilization": 0.5,
   "shared_modes": {
     "transcribe": {
       "label": "Transcribe",
@@ -48,13 +49,16 @@
   "families": {
     "gemma4": {
       "label": "Gemma 4",
-      "description": "Google's general-purpose chat models, pinned to the compact e2b build on every machine — small and fast, so spoken replies come back with the lowest latency even on a big GPU. e2b tool-calls natively; the bigger Gemma 4 tags stay reachable by explicit request.",
+      "description": "Google's general-purpose chat models. A safe default — handles writing, summarising, and everyday questions well.",
       "default_mode": "text",
       "modes": {
         "text": {
           "label": "Text",
           "tiers": [
-            { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0, "disk_mb": 5600, "model": "gemma4:e2b", "fallback": "gemma4:e2b" }
+            { "min_vram_gb": 24, "min_ram_gb": 24, "min_unified_ram_gb": 32, "disk_mb": 19000, "model": "gemma4:31b", "fallback": "gemma4:26b" },
+            { "min_vram_gb": 18, "min_ram_gb": 18, "min_unified_ram_gb": 24, "disk_mb": 17000, "model": "gemma4:26b", "fallback": "gemma4:e4b" },
+            { "min_vram_gb": 6,  "min_ram_gb": 8,  "min_unified_ram_gb": 12, "disk_mb": 7500,  "model": "gemma4:e4b", "fallback": "gemma4:e2b" },
+            { "min_vram_gb": 0,  "min_ram_gb": 0,  "min_unified_ram_gb": 8,  "disk_mb": 5600,  "model": "gemma4:e2b", "fallback": "gemma4:e2b" }
           ]
         }
       }
