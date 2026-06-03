@@ -91,8 +91,10 @@ fn recompute_status_from_disk() -> Result<()> {
             let manifest = &v["manifest"];
             let provider_name = manifest["name"].as_str().unwrap_or("?").to_string();
             for tag in crate::resolver::tags_in_manifest(manifest) {
+                // Canonicalise so a tagless pull (`embeddinggemma`, listed by
+                // Ollama as `embeddinggemma:latest`) matches the bare tag.
                 recommended_by
-                    .entry(tag)
+                    .entry(crate::resolver::canonical_model_tag(&tag).to_string())
                     .or_default()
                     .push(provider_name.clone());
             }
@@ -108,7 +110,9 @@ fn recompute_status_from_disk() -> Result<()> {
 
     let mut updated = Map::new();
     for m in pulled {
-        let providers = recommended_by.remove(&m).unwrap_or_default();
+        let providers = recommended_by
+            .remove(crate::resolver::canonical_model_tag(&m))
+            .unwrap_or_default();
         let was_recommended = prev
             .get(&m)
             .and_then(|v| v["recommended_by"].as_array())

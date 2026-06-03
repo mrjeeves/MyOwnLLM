@@ -3,7 +3,7 @@ import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/core";
 import { loadConfig, saveConfig } from "./config";
 import { getAllManifests } from "./providers";
-import { allRecommendedModels, resolveModel } from "./manifest";
+import { allRecommendedModels, canonicalModelTag, resolveModel } from "./manifest";
 import type { HardwareProfile, ModelStatusCache, OllamaModel, Mode } from "./types";
 
 async function statusCachePath(): Promise<string> {
@@ -39,19 +39,23 @@ export async function recomputeRecommendedSet(): Promise<ModelStatusCache> {
   const now = new Date().toISOString();
   const existing = await readStatusCache();
 
-  // Build map: model tag → list of provider names that recommend it
+  // Build map: canonical model tag → list of provider names that recommend it.
+  // Canonicalised so a tagless pull (`embeddinggemma`, listed by Ollama as
+  // `embeddinggemma:latest`) matches the bare manifest tag instead of looking
+  // unrecommended and getting evicted.
   const recommendedBy = new Map<string, string[]>();
   for (const { provider, manifest } of allManifests) {
     for (const tag of allRecommendedModels(manifest)) {
-      const list = recommendedBy.get(tag) ?? [];
+      const key = canonicalModelTag(tag);
+      const list = recommendedBy.get(key) ?? [];
       list.push(provider.name);
-      recommendedBy.set(tag, list);
+      recommendedBy.set(key, list);
     }
   }
 
   const updated: ModelStatusCache = {};
   for (const model of pulled) {
-    const providers = recommendedBy.get(model.name) ?? [];
+    const providers = recommendedBy.get(canonicalModelTag(model.name)) ?? [];
     const wasRecommended = (existing[model.name]?.recommended_by ?? []).length > 0;
     const isNow = providers.length > 0;
     updated[model.name] = {
@@ -281,7 +285,7 @@ export async function lookupModelUsage(
         ) {
           activeTag = resolved;
         }
-        if (resolved === tag) {
+        if (canonicalModelTag(resolved) === canonicalModelTag(tag)) {
           uses.push({
             provider: provider.name,
             familyName,
@@ -293,7 +297,7 @@ export async function lookupModelUsage(
     }
   }
 
-  const isActiveTag = activeTag === tag;
+  const isActiveTag = activeTag !== null && canonicalModelTag(activeTag) === canonicalModelTag(tag);
   return { isActiveTag, activeTag, uses };
 }
 

@@ -9,6 +9,7 @@
     modeFor,
     defaultRuntimeFor,
     tierRuntime,
+    canonicalModelTag,
   } from "../../manifest";
   import { loadConfig, saveConfig, invalidateConfigCache } from "../../config";
   import { pinDownloadedModel } from "../../model-lifecycle";
@@ -189,8 +190,11 @@
       hardware = hw;
       cleanupEnabled = config.auto_cleanup?.models !== false;
       suppressedFamilies = [...(config.cleanup_warning_suppressed_families ?? [])];
+      // Key by canonical tag so a tagless Ollama pull (listed as
+      // `embeddinggemma:latest`) matches the bare manifest tag the tier
+      // installed-checks use — otherwise the embedding reads "not installed".
       const sizes: Record<string, number> = {};
-      for (const p of pulled) sizes[p.name] = p.size;
+      for (const p of pulled) sizes[canonicalModelTag(p.name)] = p.size;
       pulledSizes = sizes;
       const lsizes: Record<string, number> = {};
       for (const m of [...asr, ...diarize]) {

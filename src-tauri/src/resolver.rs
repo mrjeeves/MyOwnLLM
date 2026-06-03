@@ -510,6 +510,16 @@ fn tier_matches_cpu_fallback(tier: &Value, hw: &HardwareProfile, headroom: f64) 
     cpu_budget >= min_ram
 }
 
+/// Canonicalise a model tag before matching a pulled model against a manifest
+/// tag. Ollama lists a *tagless* pull (`ollama pull embeddinggemma`) as
+/// `embeddinggemma:latest`, while manifests carry the bare name; stripping a
+/// trailing `:latest` lets the two line up so the embedding model isn't marked
+/// unrecommended and cleaned out from under Myo's memory. Mirrors
+/// `canonicalModelTag` on the TS side.
+pub fn canonical_model_tag(tag: &str) -> &str {
+    tag.strip_suffix(":latest").unwrap_or(tag)
+}
+
 /// All Ollama-runtime model tags recommended by a manifest across every
 /// family/mode/tier. Skips tiers whose `runtime` is anything other than
 /// `ollama` (ASR / diarize tiers live under `~/.myownllm/asr/` and
