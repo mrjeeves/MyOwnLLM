@@ -779,6 +779,46 @@
     return !family.modes[mode] && !!m.shared_modes?.[mode];
   }
 
+  /** The model a shared capability is actually running: the highest tier
+   *  already on disk, or the top recommended tier if nothing's downloaded
+   *  yet. Resolver-free (just checks what's installed) so it works for every
+   *  shared mode — including `speak` / `vad`, which aren't chat `Mode`s — and
+   *  handles diarize's composite `seg+embedder` tags by requiring every
+   *  component present. */
+  function sharedModelFor(spec: ManifestMode): { tag: string; installed: boolean } {
+    for (const tier of spec.tiers) {
+      const parts = tier.model.includes("+") ? tier.model.split("+").filter(Boolean) : [tier.model];
+      if (parts.length > 0 && parts.every((p) => !!pulledSizes[p] || !!localSizes[p])) {
+        return { tag: tier.model, installed: true };
+      }
+    }
+    return { tag: spec.tiers[0]?.model ?? "—", installed: false };
+  }
+
+  /** Every capability the manifest shares across families — embeddings,
+   *  transcription, speaker ID, voice activity, speech. Surfaced read-only in
+   *  the detail footer so the system models that back *every* family show up
+   *  and read as recommended, without being mistaken for this family's own
+   *  (switchable) chat tiers. They're picked by hardware and intentionally
+   *  global — switching family never changes them — so they're managed from
+   *  the Models tab, not here. */
+  function sharedCapabilities(
+    m: Manifest,
+  ): Array<{ key: string; label: string; tag: string; installed: boolean; swappable: boolean }> {
+    return Object.entries(m.shared_modes ?? {}).map(([key, spec]) => {
+      const picked = sharedModelFor(spec);
+      return {
+        key,
+        label: spec.label || key,
+        tag: picked.tag,
+        installed: picked.installed,
+        // Provider-level defaults are swappable via the manifest; a capability
+        // is only "built-in" when its runtime is wired to one model (Silero VAD).
+        swappable: spec.swappable !== false,
+      };
+    });
+  }
+
   function pickFamily(name: string): { name: string; family: ManifestFamily } | null {
     if (!manifest) return null;
     const fam = manifest.families?.[name];
@@ -799,6 +839,7 @@
     {:else}
       {@const isActive = picked.name === activeFamily}
       {@const modes = modesIn(manifest, picked.family)}
+      {@const sharedCaps = sharedCapabilities(manifest)}
       <div class="detail-head">
         {#if showBack}
           <button class="back" onclick={() => onBack?.()} aria-label="Back to families">
@@ -1053,6 +1094,38 @@
               </div>
             </div>
           {/each}
+        {/if}
+
+        {#if sharedCaps.length > 0}
+          <div class="shared-models">
+            <div class="shared-models-head">
+              <span class="shared-models-title">System models</span>
+              <span class="shared-models-note">your active provider · shared across its families</span>
+            </div>
+            <p class="shared-models-blurb">
+              Set by your active provider’s manifest and shared across all its families, so
+              switching family never changes them — a different or white-label provider can ship
+              its own (a custom embedding model, say). Auto-picked for your hardware; manage
+              downloads in the Models tab.
+            </p>
+            <ul class="shared-models-list">
+              {#each sharedCaps as cap (cap.key)}
+                <li class="shared-cap">
+                  <span class="cap-label">{cap.label}</span>
+                  <span class="cap-tag">{cap.tag}</span>
+                  {#if !cap.swappable}
+                    <span
+                      class="cap-fixed"
+                      title="Built into the app — its runtime only works with this exact model, so it can’t be swapped from a manifest (unlike the embedding or transcription models)."
+                    >built-in</span>
+                  {/if}
+                  <span class="cap-badge" class:installed={cap.installed}>
+                    {cap.installed ? "✓ recommended · installed" : "recommended"}
+                  </span>
+                </li>
+              {/each}
+            </ul>
+          </div>
         {/if}
       </div>
       <div class="scroll-more-hint" aria-hidden="true">
@@ -1579,5 +1652,56 @@
 
   .loading, .empty, .empty-note {
     color: #555; font-size: .82rem; text-align: center; padding: 1rem;
+  }
+
+  /* Read-only summary of the manifest's shared system models, pinned to the
+     bottom of every family's detail so they read as recommended without
+     looking like switchable per-family tiers. */
+  .shared-models {
+    border: 1px dashed #1e1e26;
+    background: #0d0d12;
+    border-radius: 7px;
+    padding: .55rem .85rem .65rem;
+    margin-top: .5rem;
+    flex-shrink: 0;
+  }
+  .shared-models-head {
+    display: flex; align-items: baseline; gap: .5rem;
+    margin-bottom: .3rem;
+  }
+  .shared-models-title {
+    font-size: .72rem; color: #888;
+    text-transform: uppercase; letter-spacing: .05em;
+  }
+  .shared-models-note { font-size: .68rem; color: #555; }
+  .shared-models-blurb {
+    font-size: .72rem; color: #777; line-height: 1.5;
+    margin-bottom: .5rem;
+  }
+  .shared-models-list {
+    list-style: none; display: flex; flex-direction: column; gap: .25rem;
+  }
+  .shared-cap {
+    display: flex; align-items: center; gap: .5rem;
+    flex-wrap: wrap;
+  }
+  .cap-label {
+    font-size: .76rem; color: #bbb; min-width: 6.5rem;
+  }
+  .cap-tag {
+    font-size: .72rem; color: #ccc; font-family: monospace;
+    background: #15151c; border: 1px solid #25252f;
+    padding: 0 .35rem; border-radius: 4px;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .cap-badge {
+    font-size: .68rem; color: #777; margin-left: auto;
+  }
+  .cap-badge.installed { color: #6a6; }
+  .cap-fixed {
+    font-size: .62rem; color: #d4a64a;
+    background: #1f1812; border: 1px solid #4a3a1a;
+    padding: 0 .35rem; border-radius: 4px;
+    cursor: help;
   }
 </style>

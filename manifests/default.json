@@ -1,6 +1,6 @@
 {
   "name": "MyOwnLLM Default",
-  "version": "23",
+  "version": "24",
   "ttl_minutes": 360,
   "default_family": "gemma4",
   "headroom_gb": {
@@ -49,6 +49,7 @@
       "label": "Voice activity",
       "input": "audio",
       "runtime": "silero-vad",
+      "swappable": false,
       "tiers": [
         { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0, "disk_mb": 2, "model": "silero-vad-v5", "fallback": "silero-vad-v5" }
       ]

@@ -366,9 +366,11 @@
     models: {
       title: "Models",
       blurb:
-        "Auto-cleanup removes Ollama models the active provider no longer recommends, " +
-        "after they’ve been unused for the configured threshold. Pinned models and " +
-        "mode overrides are always kept.",
+        "Auto-cleanup removes only Ollama chat models that no active provider still " +
+        "recommends, and only after they’ve gone unused. Models in active use are always " +
+        "kept — your current family, the always-on system models (memory/embeddings, " +
+        "transcription, speaker ID), pinned models, and mode overrides. On-disk speech " +
+        "models are managed from the Models tab.",
     },
     transcribe_buffer: {
       title: "Transcription buffer",
