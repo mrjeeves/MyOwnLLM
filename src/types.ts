@@ -426,13 +426,22 @@ export interface AgentPermissionsConfig {
  *  registry in `agent-tools.ts` — turning one off in the Prompt
  *  drops it from the model's `tools` array for that send, hiding
  *  the function entirely so the model can't call it. */
-export type PromptToolId = "networks" | "read_file" | "write_file" | "shell";
+export type PromptToolId =
+  | "networks"
+  | "web_search"
+  | "read_file"
+  | "write_file"
+  | "shell";
 
 /** Every available tool, surfaced as a fixed list so the Prompts
  *  editor can render check-marks in a stable order without round-
- *  tripping the agent-tools registry. */
+ *  tripping the agent-tools registry. Read-only / information tools
+ *  (networks, web_search, read_file) lead; host-mutating ones
+ *  (write_file, shell) trail — the same safe-first ordering the system
+ *  prompt advertises them in. */
 export const PROMPT_ALL_TOOLS: PromptToolId[] = [
   "networks",
+  "web_search",
   "read_file",
   "write_file",
   "shell",
@@ -490,6 +499,20 @@ export interface Prompt {
   updated_at: number;
 }
 
+/** How the `web_search` tool reaches the web. Keyless by default
+ *  (DuckDuckGo's HTML endpoint) so search works out of the box with no
+ *  signup; point it at a self-hosted SearXNG instance for a JSON-clean
+ *  alternative. Mirrors Myo's `WebSearchConfig`. */
+export interface WebSearchConfig {
+  /** "ddg" = DuckDuckGo's keyless HTML endpoint (default, works
+   *  anywhere). "searxng" = a SearXNG instance's JSON search API at
+   *  `searxng_url`. */
+  backend: "ddg" | "searxng";
+  /** Base URL of the SearXNG instance (e.g. "http://127.0.0.1:8080").
+   *  Required when `backend` is "searxng"; ignored otherwise. */
+  searxng_url?: string;
+}
+
 export interface Config {
   active_provider: string;
   active_family: string;
@@ -542,6 +565,9 @@ export interface Config {
   remote_ui: RemoteUiConfig;
   cloud_mesh: CloudMeshConfig;
   mic: MicConfig;
+  /** Backend the agent's `web_search` tool uses. Defaults to keyless
+   *  DuckDuckGo so search works with no setup. */
+  web_search: WebSearchConfig;
   providers: Provider[];
   /** Legacy field: pre-multi-network installs stored a single
    *  `agent_permissions` blob shared across every (then-singular)

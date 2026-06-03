@@ -41,6 +41,7 @@
 
   const TOOL_LABELS: Record<PromptToolId, string> = {
     networks: "Networks",
+    web_search: "Web search",
     read_file: "Read file",
     write_file: "Write file",
     shell: "Shell",
