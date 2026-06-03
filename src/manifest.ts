@@ -608,6 +608,18 @@ export function resolveModel(
   return resolveModelEx(hardware, manifest, mode, modeOverrides, familyName, familyOverrides).model;
 }
 
+/** Canonicalise a model tag for cross-referencing a pulled model against a
+ *  manifest tag. Ollama stores a *tagless* pull (`ollama pull embeddinggemma`)
+ *  as `embeddinggemma:latest`, but manifests reference the bare name — so the
+ *  two never match by string equality, and the embedding model (the one common
+ *  tagless pull) reads as "unrecommended" everywhere and gets cleaned out from
+ *  under Myo's memory system after the grace period. Stripping a trailing
+ *  `:latest` makes both sides line up. Explicit tags (`gemma4:e2b`) are left
+ *  untouched. Must mirror `resolver::canonical_model_tag` on the Rust side. */
+export function canonicalModelTag(tag: string): string {
+  return tag.endsWith(":latest") ? tag.slice(0, -":latest".length) : tag;
+}
+
 /** All model tags recommended by a manifest across every family/mode/tier.
  *  Includes `shared_modes` (the canonical transcribe / diarize / speak /
  *  embed ladders) as well as per-family modes — otherwise an
