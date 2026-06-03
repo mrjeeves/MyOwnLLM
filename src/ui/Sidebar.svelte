@@ -537,7 +537,9 @@
     onNew,
     onRename,
     onDelete,
+    onDeleteMany,
     onMove,
+    onMoveMany,
     onMoveFolder,
     onCreateFolder,
     onRenameFolder,
@@ -572,8 +574,15 @@
     onNew: () => void;
     onRename: (id: string, title: string) => void;
     onDelete: (id: string) => void;
+    /** Bulk delete — every selected conversation in one batch (single
+     *  refresh on the App side). Optional: falls back to looping `onDelete`
+     *  if a host doesn't wire it. */
+    onDeleteMany?: (ids: string[]) => void;
     /** Move a conversation file into the given folder path (POSIX, "" for root). */
     onMove: (id: string, folder: string) => void;
+    /** Bulk move — every selected conversation into one folder. Optional:
+     *  falls back to looping `onMove`. */
+    onMoveMany?: (ids: string[], folder: string) => void;
     /** Move/rename a folder into a new parent. `newPath` is the full POSIX
      *  path (parent + "/" + name; just `name` for root). */
     onMoveFolder: (oldPath: string, newPath: string) => void;
@@ -623,7 +632,10 @@
      *  network list). Right-click here pops Add / Import options
      *  that aren't scoped to a specific network — the user wanted
      *  these next to the section divider, not buried in Settings. */
-    | { kind: "networks-header" };
+    | { kind: "networks-header" }
+    /** Bulk "Move to…" picker for the current multi-selection. Opened from
+     *  the selection action bar; lists root + every folder. */
+    | { kind: "bulk-move" };
   let menu = $state<{ target: MenuTarget; x: number; y: number } | null>(null);
   let editingId = $state<string | null>(null);
   let editingFolder = $state<string | null>(null);
@@ -950,6 +962,295 @@
   }
 
   // ---------------------------------------------------------------------
+  // Multi-select. The conversation list grows fast ("conversation
+  // explosions"), so the sidebar supports batch selection for bulk move
+  // and delete. Two entry points, by design:
+  //
+  //   - The Select button in the head toggles an explicit select mode:
+  //     rows grow a checkbox, a click toggles instead of opening, and a
+  //     bulk-action bar appears under the head.
+  //   - Keyboard + modifier gestures work without first arming the mode:
+  //     Ctrl/Cmd-click toggles a row, Shift-click selects a contiguous
+  //     range, ↑/↓ move focus, Space toggles, Shift+↑/↓ extend, and
+  //     Ctrl/Cmd+A selects all. Any of these flips select mode on.
+  //
+  // Selection lives in `selectedIds`; range gestures anchor on the last
+  // row toggled without Shift. Both the range walk and arrow navigation
+  // run over `visibleOrder` — the rows in the exact top-to-bottom order
+  // they render — so a Shift-range mirrors what the user sees rather than
+  // storage order, and collapsed-folder children (which aren't on screen)
+  // can't be swept up by accident.
+  // ---------------------------------------------------------------------
+
+  let selectMode = $state(false);
+  let selectedIds = $state<Set<string>>(new Set());
+  /** Anchor for Shift-range selection: the last row toggled without Shift. */
+  let selectionAnchor = $state<string | null>(null);
+
+  const selectedCount = $derived(selectedIds.size);
+
+  /** Conversation ids in render order: root time-bands first, then folders
+   *  depth-first, skipping the children of any collapsed folder. */
+  const visibleOrder = $derived.by<string[]>(() => {
+    const out: string[] = [];
+    for (const group of groupByBand(tree.items)) {
+      for (const r of group.rows) out.push(r.id);
+    }
+    const walk = (node: Node) => {
+      // The folder header is always visible, but it isn't a selectable
+      // conversation. Its items/children only render when expanded.
+      if (collapsed.has(node.path)) return;
+      for (const c of node.items) out.push(c.id);
+      for (const child of node.children) walk(child);
+    };
+    for (const child of tree.children) walk(child);
+    return out;
+  });
+
+  /** All folder paths (sorted) for the bulk "Move to…" menu — folders the
+   *  user created plus any referenced by an item's path, mirroring the
+   *  tree's own materialisation rule. */
+  const allFolderPaths = $derived.by<string[]>(() => {
+    const set = new Set<string>();
+    for (const f of folders) set.add(f.path);
+    for (const it of items) if (it.path) set.add(it.path);
+    return [...set].sort();
+  });
+
+  /** Every on-screen row already selected? Drives the head-bar toggle's
+   *  All ↔ None label so one button both selects and clears. */
+  const allVisibleSelected = $derived(
+    visibleOrder.length > 0 && visibleOrder.every((id) => selectedIds.has(id)),
+  );
+
+  /** Prune ids that no longer exist whenever the item list changes — a
+   *  delete, a folder collapse that hides a selected row, or a remote sync
+   *  moving something out from under us. Keeps the count and the bulk
+   *  actions honest. */
+  $effect(() => {
+    const live = new Set(items.map((c: ConversationMeta) => c.id));
+    let stale = false;
+    for (const id of selectedIds) {
+      if (!live.has(id)) {
+        stale = true;
+        break;
+      }
+    }
+    if (!stale) return;
+    const next = new Set<string>();
+    for (const id of selectedIds) if (live.has(id)) next.add(id);
+    selectedIds = next;
+    if (selectionAnchor && !live.has(selectionAnchor)) selectionAnchor = null;
+  });
+
+  function toggleSelected(id: string) {
+    const next = new Set(selectedIds);
+    next.has(id) ? next.delete(id) : next.add(id);
+    selectedIds = next;
+  }
+
+  /** Select the contiguous range between two ids over `visibleOrder`.
+   *  `replace` clears the prior selection (plain Shift-click); otherwise
+   *  the range is unioned in (Ctrl+Shift-click). Falls back to a single
+   *  toggle if either endpoint isn't currently on screen. */
+  function selectRange(fromId: string, toId: string, replace: boolean) {
+    const order = visibleOrder;
+    const i = order.indexOf(fromId);
+    const j = order.indexOf(toId);
+    if (i === -1 || j === -1) {
+      toggleSelected(toId);
+      return;
+    }
+    const [lo, hi] = i <= j ? [i, j] : [j, i];
+    const next = replace ? new Set<string>() : new Set(selectedIds);
+    for (let k = lo; k <= hi; k++) next.add(order[k]);
+    selectedIds = next;
+  }
+
+  function selectAll() {
+    if (visibleOrder.length === 0) return;
+    selectedIds = new Set(visibleOrder);
+    selectMode = true;
+  }
+
+  /** Bar-button select-all that doubles as clear-all once everything's
+   *  picked. (Ctrl/Cmd+A always *selects* — only this toggles, since the
+   *  button label tells the user which way it'll go.) */
+  function toggleSelectAll() {
+    if (allVisibleSelected) selectedIds = new Set();
+    else if (visibleOrder.length > 0) selectedIds = new Set(visibleOrder);
+    selectMode = true;
+  }
+
+  function exitSelectMode() {
+    selectMode = false;
+    selectedIds = new Set();
+    selectionAnchor = null;
+    closeMenu();
+  }
+
+  function toggleSelectMode() {
+    if (selectMode) exitSelectMode();
+    else selectMode = true;
+  }
+
+  /** Click on a conversation row. A plain click opens it; in select mode or
+   *  with a modifier it becomes a selection gesture (and arms select mode). */
+  function handleRowClick(e: MouseEvent, id: string) {
+    if (suppressNextClick) {
+      suppressNextClick = false;
+      return;
+    }
+    const additive = e.metaKey || e.ctrlKey;
+    const range = e.shiftKey;
+    if (selectMode || additive || range) {
+      if (range && selectionAnchor) {
+        selectRange(selectionAnchor, id, !additive);
+      } else {
+        toggleSelected(id);
+        selectionAnchor = id;
+      }
+      selectMode = true;
+      return;
+    }
+    onSelect(id);
+  }
+
+  /** Move DOM focus (and scroll) to a row by id — drives arrow navigation. */
+  function focusRow(id: string) {
+    requestAnimationFrame(() => {
+      const sel =
+        typeof CSS !== "undefined" && CSS.escape ? CSS.escape(id) : id;
+      const el = document.querySelector<HTMLElement>(`[data-row-id="${sel}"]`);
+      el?.focus();
+      el?.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  /** Extend a Shift+Arrow selection. Anchors on the current row if no anchor
+   *  is set yet, then selects the contiguous block anchor→newFocus — the
+   *  same contract as Shift-click, so the two gestures stay consistent. */
+  function extendSelectionTo(currentId: string, newFocusId: string) {
+    if (!selectionAnchor) selectionAnchor = currentId;
+    selectMode = true;
+    selectRange(selectionAnchor, newFocusId, true);
+  }
+
+  /** Keyboard handler for a conversation row (focused via Tab or arrows). */
+  function onRowKey(e: KeyboardEvent, id: string) {
+    const order = visibleOrder;
+    const idx = order.indexOf(id);
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      e.stopPropagation();
+      const nextId = order[Math.min(idx + 1, order.length - 1)] ?? id;
+      if (e.shiftKey) extendSelectionTo(id, nextId);
+      focusRow(nextId);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      e.stopPropagation();
+      const prevId = order[Math.max(idx - 1, 0)] ?? id;
+      if (e.shiftKey) extendSelectionTo(id, prevId);
+      focusRow(prevId);
+    } else if (e.key === " ") {
+      // Space toggles selection (and arms select mode); Enter still opens.
+      e.preventDefault();
+      e.stopPropagation();
+      toggleSelected(id);
+      selectionAnchor = id;
+      selectMode = true;
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (selectMode) {
+        toggleSelected(id);
+        selectionAnchor = id;
+      } else {
+        onSelect(id);
+      }
+    } else if ((e.key === "a" || e.key === "A") && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      e.stopPropagation();
+      selectAll();
+    } else if (e.key === "Escape" && selectMode) {
+      e.preventDefault();
+      e.stopPropagation();
+      exitSelectMode();
+    }
+  }
+
+  /** Sidebar-wide keyboard fallback so Escape / Ctrl+A still work when focus
+   *  sits on a bar button rather than a row. Ignores events from text inputs
+   *  so it never hijacks a rename / new-folder field. */
+  function onSidebarKey(e: KeyboardEvent) {
+    if (!selectMode) return;
+    const t = e.target as HTMLElement | null;
+    if (t && t.closest("input, textarea")) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      exitSelectMode();
+    } else if ((e.key === "a" || e.key === "A") && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      selectAll();
+    }
+  }
+
+  /** Bind the sidebar-wide key fallback imperatively (Svelte action, like
+   *  `autofocus` below) so we keep the listener scoped to the sidebar
+   *  subtree without hanging an interaction handler off the <aside>
+   *  landmark — which would trip the a11y lint. */
+  function sidebarKeys(node: HTMLElement) {
+    node.addEventListener("keydown", onSidebarKey);
+    return {
+      destroy() {
+        node.removeEventListener("keydown", onSidebarKey);
+      },
+    };
+  }
+
+  // ---- bulk actions ----------------------------------------------------
+
+  function deleteMany(ids: string[]) {
+    if (onDeleteMany) onDeleteMany(ids);
+    else for (const id of ids) onDelete(id);
+  }
+
+  function moveMany(ids: string[], folder: string) {
+    if (onMoveMany) onMoveMany(ids, folder);
+    else for (const id of ids) onMove(id, folder);
+  }
+
+  function bulkDelete() {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    closeMenu();
+    const label =
+      ids.length === 1 ? `this ${itemNoun}` : `${ids.length} ${itemNoun}s`;
+    deletePrompt = {
+      title: `Delete ${label}?`,
+      body: "This can't be undone.",
+      proceed: () => {
+        deleteMany(ids);
+        exitSelectMode();
+      },
+    };
+  }
+
+  function openBulkMoveMenu(e: MouseEvent) {
+    if (selectedCount === 0) return;
+    const { x, y } = menuAnchor(e, 220, 300);
+    menu = { target: { kind: "bulk-move" }, x, y };
+  }
+
+  function bulkMove(folder: string) {
+    const ids = [...selectedIds];
+    closeMenu();
+    if (ids.length === 0) return;
+    moveMany(ids, folder);
+    exitSelectMode();
+  }
+
+  // ---------------------------------------------------------------------
   // Drag-drop. Custom pointer-based implementation: the HTML5 DnD API
   // doesn't fire reliably under WebKitGTK (Tauri's Linux webview), and we
   // want OS-style affordances anyway — a ghost that follows the cursor,
@@ -1006,6 +1307,17 @@
   /** Visible drop highlight target. Folder rows and the list root key off
    *  this to paint their hover state. */
   const dragOverPath = $derived(drag && drag.active ? drag.overPath : null);
+
+  /** True while dragging a conversation that's part of a multi-selection —
+   *  the whole batch travels together. Drives the ghost's "N conversations"
+   *  label, the dimming of every selected row, and the batched drop. */
+  const multiDrag = $derived(
+    !!drag &&
+      drag.active &&
+      drag.src.kind === "item" &&
+      selectedIds.has(drag.src.id) &&
+      selectedIds.size > 1,
+  );
 
   function srcLabel(src: DragSrc): string {
     return src.label || (src.kind === "folder" ? "Folder" : "Untitled");
@@ -1185,6 +1497,17 @@
     if (target === null) return;
     if (drag.src.kind === "item") {
       const id = drag.src.id;
+      // Multi-drag: the grabbed row is part of the selection, so move the
+      // whole batch (skipping any already sitting in the target folder).
+      if (multiDrag) {
+        const ids = [...selectedIds].filter((sid) => {
+          const it = items.find((c: ConversationMeta) => c.id === sid);
+          return it && it.path !== target;
+        });
+        if (ids.length > 0) moveMany(ids, target);
+        exitSelectMode();
+        return;
+      }
       const item = items.find((c: ConversationMeta) => c.id === id);
       if (!item) return;
       if (item.path === target) return;
@@ -1206,14 +1529,6 @@
     writeStringSet(COLLAPSED_FOLDERS_KEY, collapsed);
   }
 
-  function handleRowClick(id: string) {
-    if (suppressNextClick) {
-      suppressNextClick = false;
-      return;
-    }
-    onSelect(id);
-  }
-
   function handleFolderClick(path: string) {
     if (suppressNextClick) {
       suppressNextClick = false;
@@ -1228,9 +1543,15 @@
     if (kind === "folder" && drag.src.kind === "folder") return drag.src.path === key;
     return false;
   }
+
+  /** A conversation row should read as "lifting off" while dragged — either
+   *  it's the grabbed row, or it's a selected member of a multi-drag batch. */
+  function isRowDragging(id: string): boolean {
+    return isDragSource("item", id) || (multiDrag && selectedIds.has(id));
+  }
 </script>
 
-<aside class="sidebar" class:open aria-hidden={!open}>
+<aside class="sidebar" class:open aria-hidden={!open} use:sidebarKeys>
   <div class="head">
     <button class="new" onclick={onNew} title={newLabel}>
       <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
@@ -1254,12 +1575,73 @@
         />
       </svg>
     </button>
+    <!-- Multi-select toggle. Flips the list into batch-selection mode
+         (checkboxes + bulk-action bar). Keyboard / modifier gestures arm
+         the same mode without this button, but it's the discoverable
+         entry point for "select a bunch of these at once." Disabled when
+         there's nothing to select. -->
+    <button
+      class="select-btn"
+      class:on={selectMode}
+      onclick={toggleSelectMode}
+      disabled={items.length === 0}
+      title={selectMode ? "Exit selection" : `Select multiple ${itemNoun}s`}
+      aria-label={selectMode ? "Exit selection" : "Select multiple"}
+      aria-pressed={selectMode}
+    >
+      <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+        <path
+          fill="currentColor"
+          d="M3 5h9v2H3V5zm0 6h9v2H3v-2zm0 6h6v2H3v-2zm17.3-9.3l1.4 1.4-6 6-3.4-3.4 1.4-1.4 2 2 4.6-4.6z"
+        />
+      </svg>
+    </button>
     <button class="collapse" onclick={onClose} title="Hide sidebar" aria-label="Hide sidebar">
       <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
         <path fill="currentColor" d="M14.7 6.3a1 1 0 0 1 0 1.4L10.4 12l4.3 4.3a1 1 0 1 1-1.4 1.4l-5-5a1 1 0 0 1 0-1.4l5-5a1 1 0 0 1 1.4 0z" />
       </svg>
     </button>
   </div>
+
+  {#if selectMode}
+    <!-- Bulk-action bar. Appears under the head whenever select mode is
+         armed; the count + actions operate on `selectedIds`. Move opens a
+         folder picker (root + every folder); Delete routes through the
+         shared confirm modal. Done / Escape exit. -->
+    <div class="select-bar">
+      <span class="select-count">
+        {selectedCount} selected
+      </span>
+      <div class="select-actions">
+        <button
+          onclick={toggleSelectAll}
+          title={allVisibleSelected
+            ? "Clear selection"
+            : `Select all ${itemNoun}s (Ctrl/Cmd+A)`}
+        >
+          {allVisibleSelected ? "None" : "All"}
+        </button>
+        <button
+          disabled={selectedCount === 0}
+          onclick={openBulkMoveMenu}
+          title="Move selected into a folder"
+        >
+          Move
+        </button>
+        <button
+          class="danger"
+          disabled={selectedCount === 0}
+          onclick={bulkDelete}
+          title="Delete selected"
+        >
+          Delete
+        </button>
+        <button onclick={exitSelectMode} title="Exit selection (Esc)">
+          Done
+        </button>
+      </div>
+    </div>
+  {/if}
 
   <div
     class="list"
@@ -1702,25 +2084,36 @@
 {/snippet}
 
 {#snippet row(c: ConversationMeta, depth: number)}
+  {@const isSelected = selectMode && selectedIds.has(c.id)}
   <div
     class="row"
     class:active={c.id === activeId}
-    class:dragging={isDragSource("item", c.id)}
+    class:selected={isSelected}
+    class:dragging={isRowDragging(c.id)}
     style="--depth: {depth};"
     role="button"
     tabindex="0"
     data-drop-path={c.path}
-    onclick={() => handleRowClick(c.id)}
-    onkeydown={(e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        onSelect(c.id);
-      }
-    }}
+    data-row-id={c.id}
+    aria-pressed={selectMode ? isSelected : undefined}
+    onclick={(e) => handleRowClick(e, c.id)}
+    onkeydown={(e) => onRowKey(e, c.id)}
     oncontextmenu={(e) => openItemMenu(e, c.id)}
     onpointerdown={(e) => startItemDrag(e, c)}
     title={c.title}
   >
+    {#if selectMode}
+      <span class="checkbox" class:checked={isSelected} aria-hidden="true">
+        {#if isSelected}
+          <svg viewBox="0 0 24 24" width="10" height="10">
+            <path
+              fill="currentColor"
+              d="M9 16.2l-3.5-3.5L4 14.2l5 5 11-11-1.5-1.5z"
+            />
+          </svg>
+        {/if}
+      </span>
+    {/if}
     {#if c.mode === "transcribe"}
       <svg
         class="mode-icon"
@@ -1898,6 +2291,37 @@
       >
         Forget
       </button>
+    {:else if menu.target.kind === "bulk-move"}
+      <!-- Bulk move-target picker for the current selection. Root plus
+           every folder; clicking relocates the whole batch and exits
+           select mode. -->
+      <div class="menu-section-label">
+        Move {selectedCount} {selectedCount === 1 ? itemNoun : `${itemNoun}s`} to…
+      </div>
+      <button class="move-target" onclick={() => bulkMove("")}>
+        <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+          <path
+            fill="currentColor"
+            d="M10 4l2 2h6a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h6z"
+          />
+        </svg>
+        <span>Root</span>
+      </button>
+      {#if allFolderPaths.length === 0}
+        <div class="menu-empty">No folders yet.</div>
+      {:else}
+        {#each allFolderPaths as p (p)}
+          <button class="move-target" onclick={() => bulkMove(p)} title={p}>
+            <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M10 4l2 2h6a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h6z"
+              />
+            </svg>
+            <span class="move-target-name">{p}</span>
+          </button>
+        {/each}
+      {/if}
     {:else}
       <!-- networks-header: the actions that aren't scoped to a
            specific saved network (Add / Import). Surfaced on
@@ -2154,7 +2578,12 @@
         />
       </svg>
     {/if}
-    <span class="drag-ghost-label">{srcLabel(drag.src)}</span>
+    <span class="drag-ghost-label">
+      {multiDrag ? `${selectedCount} ${itemNoun}s` : srcLabel(drag.src)}
+    </span>
+    {#if multiDrag}
+      <span class="drag-ghost-count" aria-hidden="true">{selectedCount}</span>
+    {/if}
   </div>
 {/if}
 
@@ -2201,6 +2630,7 @@
   }
   .new:hover { border-color: #3a3a55; color: #fff; background: #131320; }
   .folder-btn,
+  .select-btn,
   .collapse {
     background: none;
     border: none;
@@ -2212,7 +2642,59 @@
     align-items: center;
   }
   .folder-btn:hover,
+  .select-btn:hover,
   .collapse:hover { background: #1a1a1a; color: #ccc; }
+  /* Select toggle: lit accent while select mode is armed so the head
+     button and the bar below read as the same "you're selecting" state. */
+  .select-btn.on { color: #b9b9ee; background: #1a1a2e; }
+  .select-btn.on:hover { background: #20203a; color: #d8d8ff; }
+  .select-btn:disabled { opacity: .35; cursor: default; }
+  .select-btn:disabled:hover { background: none; color: #666; }
+
+  /* Bulk-action bar — sits between the head and the list while select
+     mode is on. Mirrors the head's density; actions disable when the
+     selection is empty so the bar reads as "armed but nothing picked." */
+  .select-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: .4rem;
+    padding: .35rem .5rem;
+    border-bottom: 1px solid #161616;
+    background: #0e0e16;
+  }
+  .select-count {
+    font-size: .74rem;
+    color: #b9b9ee;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .select-actions {
+    display: flex;
+    gap: .25rem;
+  }
+  .select-actions button {
+    background: none;
+    border: 1px solid #2a2a3a;
+    color: #ccc;
+    font: inherit;
+    font-size: .72rem;
+    padding: .2rem .45rem;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background .12s, border-color .12s, color .12s;
+  }
+  .select-actions button:hover:not(:disabled) {
+    background: #1a1a2a;
+    border-color: #3a3a55;
+    color: #fff;
+  }
+  .select-actions button:disabled { opacity: .4; cursor: default; }
+  .select-actions button.danger { color: #ff8b8b; border-color: #3a2424; }
+  .select-actions button.danger:hover:not(:disabled) {
+    background: #2a1818;
+    border-color: #5a2c2c;
+  }
   .list {
     flex: 1;
     overflow-y: auto;
@@ -2654,6 +3136,36 @@
   }
   .row:hover { background: #161616; color: #e8e8e8; }
   .row.active { background: #1c1c2e; color: #fff; }
+  /* Selected rows in multi-select. A left accent + brighter ground reads
+     distinctly from the single .active highlight, so an open-and-selected
+     row still parses. */
+  .row.selected {
+    background: #181830;
+    color: #eaeaff;
+    box-shadow: inset 2px 0 0 0 #6e6ef7;
+  }
+  .row.selected:hover { background: #20203a; }
+  .row.selected.active { background: #242444; }
+  /* Checkbox affordance shown only while select mode is armed. Purely
+     visual — the whole row is the hit target — so it doesn't fight the
+     drag handler for pointerdowns. */
+  .checkbox {
+    width: 15px;
+    height: 15px;
+    border-radius: 4px;
+    border: 1.5px solid #44445a;
+    background: #0e0e16;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    line-height: 0;
+  }
+  .checkbox.checked {
+    background: #6e6ef7;
+    border-color: #6e6ef7;
+  }
   .mode-icon {
     color: #6e6ef7;
     flex-shrink: 0;
@@ -2712,6 +3224,25 @@
   .menu button:hover { background: #1f1f33; }
   .menu button.danger { color: #ff8b8b; }
   .menu button.danger:hover { background: #2a1818; }
+  /* Folder rows in the bulk move-target menu: folder icon + name, name
+     ellipsised so deep paths don't blow the menu width. */
+  .menu button.move-target {
+    display: flex;
+    align-items: center;
+    gap: .4rem;
+  }
+  .menu button.move-target svg { color: #d4a64a; flex-shrink: 0; }
+  .move-target-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .menu-empty {
+    font-size: .72rem;
+    color: #666;
+    font-style: italic;
+    padding: .3rem .6rem;
+  }
   .menu-divider {
     height: 1px;
     background: #2a2a3a;
@@ -2873,6 +3404,22 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* Count badge on the ghost when dragging a multi-selection — the
+     "you're carrying N" cue, like a file manager's drag stack. */
+  .drag-ghost-count {
+    flex-shrink: 0;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 8px;
+    background: #6e6ef7;
+    color: #fff;
+    font-size: .68rem;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 
   .delete-prompt-scrim {
