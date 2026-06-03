@@ -34,7 +34,7 @@ void freshAgentPermissions; // imported only to keep barrel-style co-locations e
 /** Construct a new Prompt with sane defaults: built-in system
  *  prompt body, all tools selected, empty user prompt. Used by the
  *  Settings Prompts editor's "Add new" button. */
-export function freshPrompt(name = "Untitled prompt"): Prompt {
+export function freshPrompt(name = "Untitled persona"): Prompt {
   return {
     id: newPromptId(),
     name,
@@ -144,7 +144,7 @@ class AgentPromptsState {
    *  prompts live inside networks. */
   async create(prompt?: Partial<Prompt>): Promise<Prompt> {
     const next: Prompt = {
-      ...freshPrompt(prompt?.name ?? "Untitled prompt"),
+      ...freshPrompt(prompt?.name ?? "Untitled persona"),
       ...(prompt ?? {}),
       updated_at: Date.now(),
     };

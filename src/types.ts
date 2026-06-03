@@ -457,19 +457,88 @@ export type PromptToolId =
   | "write_file"
   | "shell";
 
-/** Every available tool, surfaced as a fixed list so the Prompts
- *  editor can render check-marks in a stable order without round-
- *  tripping the agent-tools registry. Read-only / information tools
- *  (networks, web_search, read_file) lead; host-mutating ones
- *  (write_file, shell) trail — the same safe-first ordering the system
- *  prompt advertises them in. */
-export const PROMPT_ALL_TOOLS: PromptToolId[] = [
-  "networks",
-  "web_search",
-  "read_file",
-  "write_file",
-  "shell",
+/** One row in the tool catalog: the metadata the settings UI renders
+ *  for a tool, independent of any one screen. Keeps the Tools list
+ *  (Settings → Tools), the Permissions sub-tab, and the Personas
+ *  editor agreeing on names + descriptions rather than each hard-coding
+ *  its own copy. */
+export interface ToolCatalogEntry {
+  id: PromptToolId;
+  /** Human-readable name shown in every tool list. */
+  label: string;
+  /** One-line description of what the tool does. */
+  description: string;
+  /** True for host-mutating tools (`write_file`, `shell`) that route
+   *  through the agent-permission gate — so the UI can show a
+   *  "permission-gated" affordance and point at the Permissions tab.
+   *  False for read-only / informational tools that bypass the gate. */
+  gated: boolean;
+}
+
+/** Canonical catalog of every agent tool, in the safe-first order the
+ *  system prompt advertises them in (read-only / informational tools
+ *  lead; host-mutating ones trail). Single source of truth for tool
+ *  metadata across the settings screens. */
+export const TOOL_CATALOG: ToolCatalogEntry[] = [
+  {
+    id: "networks",
+    label: "Networks",
+    description:
+      "Inspect and manage your Cloud Mesh — peers, saved networks, the accepting policy, and signaling / STUN / TURN servers.",
+    gated: false,
+  },
+  {
+    id: "web_search",
+    label: "Web search",
+    description: "Search the web for current facts and sources. Keyless and read-only.",
+    gated: false,
+  },
+  {
+    id: "read_file",
+    label: "Read file",
+    description: "Read a text file from this device. Read-only, so it never modifies anything.",
+    gated: false,
+  },
+  {
+    id: "write_file",
+    label: "Write file",
+    description: "Create or modify files on this device.",
+    gated: true,
+  },
+  {
+    id: "shell",
+    label: "Shell",
+    description: "Run shell commands on this device.",
+    gated: true,
+  },
 ];
+
+/** Every available tool, surfaced as a fixed list so the Personas
+ *  editor can render check-marks in a stable order without round-
+ *  tripping the agent-tools registry. Derived from `TOOL_CATALOG` so
+ *  the order + membership stay in lockstep with the catalog. */
+export const PROMPT_ALL_TOOLS: PromptToolId[] = TOOL_CATALOG.map((t) => t.id);
+
+/** Program-level (global, per-installation) tool enablement — the
+ *  OUTER layer of tool control, edited in Settings → Tools. Each
+ *  tool the chat agent can call has a master on/off switch here. A
+ *  tool switched off is removed from every chat send on this device
+ *  (it drops from the model's tool array AND from the system-prompt
+ *  tool snippets), regardless of whether a persona has it selected.
+ *  Per-persona tool selection (the `Prompt.tools` list) is the INNER
+ *  layer: it can only narrow what a globally-enabled tool exposes,
+ *  never re-enable a globally-disabled one.
+ *
+ *  Unlike agent permissions and personas (which are per-network and
+ *  gossip to peers), this is a local program preference: not
+ *  network-scoped and not shared with peers. */
+export interface ToolsConfig {
+  /** Per-tool master enable, keyed by tool id. `false` removes the
+   *  tool from every chat send on this device. A MISSING key means
+   *  enabled (the default) so a tool added in a later version is on
+   *  until the user turns it off. */
+  enabled: Partial<Record<PromptToolId, boolean>>;
+}
 
 /** One named prompt the user has authored. The TextBar's "System
  *  prompt" dropdown picks one of these to apply on the next send.
@@ -592,6 +661,12 @@ export interface Config {
   /** Backend the agent's `web_search` tool uses. Defaults to keyless
    *  DuckDuckGo so search works with no setup. */
   web_search: WebSearchConfig;
+  /** Program-level (global) per-tool enablement, managed in
+   *  Settings → Tools. The outer on/off layer for every agent tool;
+   *  a tool disabled here is unavailable to every persona and chat
+   *  send on this device. Optional for backwards compat — absent /
+   *  missing tools default to enabled. */
+  tools?: ToolsConfig;
   providers: Provider[];
   /** Legacy field: pre-multi-network installs stored a single
    *  `agent_permissions` blob shared across every (then-singular)

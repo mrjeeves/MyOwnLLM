@@ -17,6 +17,7 @@ import type {
   Prompt,
   PromptToolId,
   WebSearchConfig,
+  ToolsConfig,
 } from "./types";
 import { PROMPT_ALL_TOOLS } from "./types";
 
@@ -117,6 +118,13 @@ const DEFAULT_WEB_SEARCH: WebSearchConfig = {
   backend: "ddg",
 };
 
+/** Program-level tool enablement default: empty map = every tool
+ *  enabled (a missing key reads as enabled). New installs and configs
+ *  predating the field both land here. */
+const DEFAULT_TOOLS: ToolsConfig = {
+  enabled: {},
+};
+
 const DEFAULT_CONFIG: Config = {
   active_provider: "MyOwnLLM Default",
   active_family: "gemma4",
@@ -153,6 +161,7 @@ const DEFAULT_CONFIG: Config = {
   },
   mic: { ...DEFAULT_MIC },
   web_search: { ...DEFAULT_WEB_SEARCH },
+  tools: { enabled: { ...DEFAULT_TOOLS.enabled } },
   providers: [
     {
       name: "MyOwnLLM Default",
@@ -254,6 +263,7 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
       ...DEFAULT_WEB_SEARCH,
       ...((raw as { web_search?: Partial<WebSearchConfig> }).web_search ?? {}),
     },
+    tools: coerceToolsConfig((raw as { tools?: unknown }).tools),
     mode_overrides: (raw as { mode_overrides?: Config["mode_overrides"] }).mode_overrides ?? {},
     family_overrides:
       (raw as { family_overrides?: Config["family_overrides"] }).family_overrides ?? {},
@@ -1147,6 +1157,58 @@ export function getAgentPermissions(cfg: Config): AgentPermissionsConfig {
  *  default filled in for configs that predate the field. */
 export function getWebSearchConfig(cfg: Config): WebSearchConfig {
   return cfg.web_search ?? { backend: "ddg" };
+}
+
+// ---- tools (program-level enablement) ------------------------------------
+
+/** Fresh program-level tools config: empty map, so every tool reads
+ *  as enabled (missing key = enabled). */
+export function freshToolsConfig(): ToolsConfig {
+  return { enabled: { ...DEFAULT_TOOLS.enabled } };
+}
+
+/** Coerce a possibly-hand-edited / legacy `tools` blob into a strict
+ *  `ToolsConfig`. Only recognised tool ids with boolean values survive;
+ *  anything else is dropped (and so reads as the enabled default). */
+function coerceToolsConfig(raw: unknown): ToolsConfig {
+  if (!raw || typeof raw !== "object") return freshToolsConfig();
+  const rawEnabled = (raw as { enabled?: unknown }).enabled;
+  const enabled: Partial<Record<PromptToolId, boolean>> = {};
+  if (rawEnabled && typeof rawEnabled === "object") {
+    for (const tool of PROMPT_ALL_TOOLS) {
+      const v = (rawEnabled as Record<string, unknown>)[tool];
+      if (typeof v === "boolean") enabled[tool] = v;
+    }
+  }
+  return { enabled };
+}
+
+/** Read the program-level tools config with defaults filled in. */
+export function getToolsConfig(cfg: Config): ToolsConfig {
+  return coerceToolsConfig(cfg.tools);
+}
+
+/** Whether a single tool is enabled at the program level. A missing
+ *  entry reads as enabled so upgrades never silently disable a tool. */
+export function getToolEnabled(cfg: Config, tool: PromptToolId): boolean {
+  return getToolsConfig(cfg).enabled[tool] ?? true;
+}
+
+/** The program-level-enabled tools, in canonical catalog order. */
+export function getEnabledTools(cfg: Config): PromptToolId[] {
+  const tc = getToolsConfig(cfg);
+  return PROMPT_ALL_TOOLS.filter((t) => tc.enabled[t] ?? true);
+}
+
+/** Mutate the program-level tools config and persist. The patcher
+ *  receives the current (defaults-filled) config and returns the next
+ *  one. Global preference — no network scoping, no gossip. */
+export async function updateToolsConfig(
+  patcher: (current: ToolsConfig) => ToolsConfig,
+): Promise<Config> {
+  const cfg = await loadConfig();
+  const next = patcher(getToolsConfig(cfg));
+  return await updateConfig({ tools: next });
 }
 
 /** Mutate the active network's permissions and persist. The patcher

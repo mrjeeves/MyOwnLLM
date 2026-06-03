@@ -12,6 +12,10 @@ export type SettingsTab =
   | "storage"
   | "hardware"
   | "cloud-mesh"
+  | "tools"
+  // Legacy deep-link target. The Permissions tab is now a sub-section
+  // of the Tools area; `SettingsPanel` maps this to `"tools"` with the
+  // Permissions sub-tab pre-opened so older callsites still land on it.
   | "permissions"
   | "prompts"
   | "transcription"

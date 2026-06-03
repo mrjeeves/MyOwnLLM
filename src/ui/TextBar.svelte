@@ -126,13 +126,13 @@
   <div class="spacer"></div>
 
   {#if onPromptChange && thinkingAvailable}
-    <!-- System-prompt picker. Lists every named prompt the user
-         has authored across any saved network; "Default" sends
-         the built-in baseline. Selecting a prompt authored on a
+    <!-- Persona picker. Lists every named persona the user has
+         authored across any saved network; "Default" sends the
+         built-in baseline. Selecting a persona authored on a
          different network propagates it onto the active network
          on the next send via `agentPrompts.propagateToActive`. -->
-    <label class="prompt-picker" title="System prompt selector — pick a named prompt to apply on the next send.">
-      <span class="prompt-label">Prompt</span>
+    <label class="prompt-picker" title="Persona selector — pick a saved persona to apply on the next send.">
+      <span class="prompt-label">Persona</span>
       <select
         value={activePromptId ?? ""}
         onchange={(e) => {
@@ -143,7 +143,7 @@
       >
         <option value="">Default</option>
         {#each promptsAvailable as p (p.id)}
-          <option value={p.id}>{p.name || "Untitled prompt"}</option>
+          <option value={p.id}>{p.name || "Untitled persona"}</option>
         {/each}
       </select>
     </label>
