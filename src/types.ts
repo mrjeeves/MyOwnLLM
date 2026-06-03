@@ -48,13 +48,21 @@ export type Mode = "text" | "vision" | "code" | "transcribe" | "diarize" | "embe
  *                          tier on capable GPUs. Schema accepts the value
  *                          but no model ships yet (upstream ONNX export
  *                          has a known issue in late 2025).
+ *  - `silero-vad`        — Silero VAD v5, the neural endpointer on the live
+ *                          ASR path. The generic resolver never dispatches
+ *                          it (transcribe.rs loads the file directly); the
+ *                          manifest lists it under the `vad` shared mode so
+ *                          it's tracked / recommended / locked like any
+ *                          other model. The non-`ollama` value is what keeps
+ *                          it off the Ollama pull + cleanup machinery.
  */
 export type ModelRuntime =
   | "ollama"
   | "moonshine"
   | "parakeet"
   | "pyannote-diarize"
-  | "sortformer";
+  | "sortformer"
+  | "silero-vad";
 
 export interface ManifestTier {
   /** Discrete-GPU path: matches when `vram_gb >= min_vram_gb`. Includes

@@ -1,6 +1,6 @@
 {
   "name": "MyOwnLLM Default",
-  "version": "22",
+  "version": "23",
   "ttl_minutes": 360,
   "default_family": "gemma4",
   "headroom_gb": {
@@ -43,6 +43,14 @@
         { "min_vram_gb": 0, "min_ram_gb": 4, "min_unified_ram_gb": 8, "disk_mb": 622, "model": "embeddinggemma",   "fallback": "nomic-embed-text" },
         { "min_vram_gb": 0, "min_ram_gb": 2, "min_unified_ram_gb": 4, "disk_mb": 274, "model": "nomic-embed-text", "fallback": "all-minilm"       },
         { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0, "disk_mb": 46,  "model": "all-minilm",       "fallback": "all-minilm"       }
+      ]
+    },
+    "vad": {
+      "label": "Voice activity",
+      "input": "audio",
+      "runtime": "silero-vad",
+      "tiers": [
+        { "min_vram_gb": 0, "min_ram_gb": 0, "min_unified_ram_gb": 0, "disk_mb": 2, "model": "silero-vad-v5", "fallback": "silero-vad-v5" }
       ]
     }
   },
