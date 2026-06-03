@@ -38,6 +38,20 @@ const MAX_TOKENS: usize = 510;
 /// espeak voice Kokoro's English voices are phonemized with.
 const ESPEAK_VOICE: &str = "en-us";
 
+/// The canonical Kokoro-82M `config.json`, compiled into the binary as a
+/// last-resort fallback for the `vocab` (IPA symbol → token id) map.
+///
+/// The `vocab` is fixed by the model's input-embedding table — identical
+/// across every Kokoro-82M v1.0 export (`n_token: 178`, 114 mapped symbols
+/// with deliberately non-contiguous ids) — so a bundled copy can stand in
+/// for the downloaded file whenever HuggingFace serves a broken payload for
+/// the small non-LFS `config.json` (it occasionally returns a tiny error
+/// page with a 200 status). The voice still degrades to WebSpeech only when
+/// the *model graph* itself is missing — never because this 2 KB vocab
+/// failed to download. Tracked as a real artifact in `models::REGISTRY`, so
+/// the live download is still preferred when it succeeds.
+pub const EMBEDDED_CONFIG_JSON: &str = include_str!("../../assets/kokoro-config.json");
+
 pub struct KokoroBackend {
     model_name: String,
     session: Option<Session>,
@@ -124,22 +138,38 @@ impl TtsBackend for KokoroBackend {
             return Err(anyhow!("Kokoro model missing: {}", model_path.display()));
         }
 
-        // Vocab (IPA symbol → id) from config.json — drives tokenization.
-        let raw = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("reading {}", config_path.display()))?;
-        let cfg: serde_json::Value = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", config_path.display()))?;
-        if let Some(map) = cfg["vocab"].as_object() {
-            for (sym, id) in map {
-                if let Some(id) = id.as_i64() {
-                    self.vocab.insert(sym.clone(), id);
+        // Vocab (IPA symbol → id) drives tokenization. Prefer the downloaded
+        // config.json; if it's missing, unparseable, or carries no `vocab` (HF
+        // sometimes serves a broken payload for this small non-LFS file), fall
+        // back to the compiled-in canonical copy so a present model graph never
+        // degrades to WebSpeech over a 2 KB vocab.
+        self.vocab = match std::fs::read_to_string(&config_path) {
+            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(cfg) => parse_vocab(&cfg),
+                Err(e) => {
+                    eprintln!(
+                        "[kokoro] {} did not parse ({e}); using bundled vocab",
+                        config_path.display()
+                    );
+                    HashMap::new()
                 }
+            },
+            Err(e) => {
+                eprintln!(
+                    "[kokoro] {} unreadable ({e}); using bundled vocab",
+                    config_path.display()
+                );
+                HashMap::new()
             }
+        };
+        if self.vocab.is_empty() {
+            let cfg: serde_json::Value = serde_json::from_str(EMBEDDED_CONFIG_JSON)
+                .context("parsing bundled Kokoro config")?;
+            self.vocab = parse_vocab(&cfg);
         }
         if self.vocab.is_empty() {
             return Err(anyhow!(
-                "Kokoro config {} has no `vocab` map",
-                config_path.display()
+                "Kokoro has no `vocab` map (bundled config is empty)"
             ));
         }
 
@@ -219,6 +249,22 @@ impl TtsBackend for KokoroBackend {
     }
 }
 
+/// Build the IPA-symbol → token-id map from a parsed Kokoro `config.json`'s
+/// `vocab` object. Non-integer values and a missing/non-object `vocab` yield
+/// an empty map, which the caller treats as the cue to fall back to the
+/// bundled config.
+fn parse_vocab(cfg: &serde_json::Value) -> HashMap<String, i64> {
+    let mut vocab = HashMap::new();
+    if let Some(map) = cfg["vocab"].as_object() {
+        for (sym, id) in map {
+            if let Some(id) = id.as_i64() {
+                vocab.insert(sym.clone(), id);
+            }
+        }
+    }
+    vocab
+}
+
 /// Quantise a `[-1, 1]` float waveform to signed 16-bit PCM.
 fn f32_to_i16(samples: &[f32]) -> Vec<i16> {
     samples
@@ -277,5 +323,35 @@ mod tests {
         let mut b = backend();
         b.voices = vec![0.0; STYLE_DIM + 1]; // not a multiple of STYLE_DIM
         assert!(b.style_row(0).is_err());
+    }
+
+    #[test]
+    fn parse_vocab_reads_ints_and_skips_garbage() {
+        let cfg = serde_json::json!({ "vocab": { "a": 5, "b": "nope", " ": 16 } });
+        let v = parse_vocab(&cfg);
+        assert_eq!(v.get("a"), Some(&5));
+        assert_eq!(v.get(" "), Some(&16));
+        assert_eq!(v.get("b"), None); // non-integer skipped
+                                      // A missing / non-object `vocab` yields an empty map (→ caller falls back).
+        assert!(parse_vocab(&serde_json::json!({})).is_empty());
+    }
+
+    /// The compiled-in fallback must parse and carry the canonical Kokoro v1.0
+    /// vocab — the safety net the voice relies on when HF serves a broken
+    /// config.json. A few signature mappings pin it to the real model so a
+    /// future bad edit to the bundled asset fails the build, not a user's ears.
+    #[test]
+    fn embedded_config_carries_canonical_vocab() {
+        let cfg: serde_json::Value =
+            serde_json::from_str(EMBEDDED_CONFIG_JSON).expect("bundled config parses");
+        let v = parse_vocab(&cfg);
+        assert_eq!(v.len(), 114, "Kokoro v1.0 maps 114 symbols");
+        // Signature ids — punctuation, space, stress mark, length mark, and the
+        // distinctive trailing `ᵻ` — fixed by the model's embedding table.
+        assert_eq!(v.get(";"), Some(&1));
+        assert_eq!(v.get(" "), Some(&16));
+        assert_eq!(v.get("ˈ"), Some(&156));
+        assert_eq!(v.get("ː"), Some(&158));
+        assert_eq!(v.get("ᵻ"), Some(&177));
     }
 }
