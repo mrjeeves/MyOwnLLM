@@ -49,6 +49,7 @@
     type AgentHostInfo,
   } from "../agent-tools";
   import { agentPrompts } from "../agent-prompts.svelte";
+  import { agentToolsConfig } from "../agent-tools-config.svelte";
   import { PROMPT_ALL_TOOLS, type PromptToolId } from "../types";
 
   let {
@@ -73,6 +74,7 @@
     onRequestStopChat,
     onRequestSendChat,
     onJumpToTranscribe,
+    onOpenSpeakers,
   } = $props<{
     activeModel: string;
     activeMode: Mode;
@@ -129,6 +131,8 @@
      *  another conversation already owns the chat slot. */
     onRequestSendChat: (send: () => Promise<void>) => void;
     onJumpToTranscribe: () => void;
+    /** Open the Speakers workspace from the TopBar's Speakers bubble. */
+    onOpenSpeakers: () => void;
   }>();
 
   interface Message extends StoredMessage {
@@ -1013,9 +1017,19 @@
     // role + capabilities first, then the user's task-shaped
     // framing — once at the start of the conversation, not
     // prepended to every turn.
-    const enabledTools: PromptToolId[] = activePrompt
+    // The persona's selected tools (or all tools when no persona is
+    // active), then narrowed by the program-level on/off switches from
+    // Settings → Tools. A tool disabled there is unavailable to every
+    // persona on this device, so it drops from both the system-prompt
+    // tool snippets (via `composeSystemPrompt` below) and the model's
+    // tool array (via `enabledToolSet` further down).
+    await agentToolsConfig.ensureLoaded();
+    const personaTools: PromptToolId[] = activePrompt
       ? (activePrompt.tools as PromptToolId[])
       : [...PROMPT_ALL_TOOLS];
+    const enabledTools: PromptToolId[] = personaTools.filter((t) =>
+      agentToolsConfig.isEnabled(t),
+    );
     const systemBody = activePrompt
       ? activePrompt.system_prompt
       : DEFAULT_SYSTEM_PROMPT_BASE;
@@ -1507,6 +1521,8 @@
     current={activeMode}
     supported={supportedModes}
     onChange={handleModeChange}
+    speakersActive={false}
+    onOpenSpeakers={() => onOpenSpeakers()}
     onOpenSettings={(tab) => (settingsTab = tab)}
     onRequestStopTranscribe={() => onRequestStopTranscribe()}
     onRequestStopChat={() => onRequestStopChat()}

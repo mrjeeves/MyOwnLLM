@@ -1,13 +1,15 @@
 <script lang="ts">
-  /** Settings → Prompts tab.
+  /** Settings → Personas tab.
    *
-   *  Authoring surface for the per-network prompt library. The
-   *  list on the left shows every prompt on the currently-active
-   *  network; the editor on the right edits the selected entry.
-   *  Like agent permissions, prompts gossip to peers on the active
-   *  network only — changes you make here propagate to every
-   *  device sharing that network, but stay invisible to peers on
-   *  other saved networks.
+   *  Authoring surface for the per-network persona library (a
+   *  "persona" is a named, reusable prompt: a system prompt body, a
+   *  tool selection, and a user-prompt addition). The list on the
+   *  left shows every persona on the currently-active network; the
+   *  editor on the right edits the selected entry. Like agent
+   *  permissions, personas gossip to peers on the active network
+   *  only — changes you make here propagate to every device sharing
+   *  that network, but stay invisible to peers on other saved
+   *  networks.
    *
    *  The form mirrors the Prompt shape: a name, a system prompt
    *  body (collapsed by default — the built-in default is
@@ -19,6 +21,7 @@
 
   import { onMount } from "svelte";
   import { agentPrompts, type Prompt } from "../../agent-prompts.svelte";
+  import { agentToolsConfig } from "../../agent-tools-config.svelte";
   import {
     DEFAULT_SYSTEM_PROMPT_BASE,
     TOOL_PROMPT_SNIPPETS,
@@ -61,6 +64,20 @@
     selectedId ? prompts.find((p) => p.id === selectedId) ?? null : null,
   );
 
+  // Live program-level tool enablement (Settings → Tools). A persona
+  // can select a tool that's globally switched off; the model won't
+  // see it on a send until it's re-enabled there, so the editor flags
+  // the mismatch rather than silently keeping a dead selection.
+  const toolsConfig = $derived(agentToolsConfig.current);
+  function toolGloballyEnabled(tool: PromptToolId): boolean {
+    return toolsConfig.enabled[tool] ?? true;
+  }
+  /** How many of a persona's selected tools are currently disabled at
+   *  the program level. Drives the summary chip + warning note. */
+  function disabledSelectedCount(tools: readonly PromptToolId[]): number {
+    return tools.filter((t) => !toolGloballyEnabled(t)).length;
+  }
+
   async function refreshActiveLabel(): Promise<void> {
     try {
       const cfg = await loadConfig();
@@ -86,7 +103,7 @@
   async function addPrompt(): Promise<void> {
     error = "";
     try {
-      const p = await agentPrompts.create({ name: "Untitled prompt" });
+      const p = await agentPrompts.create({ name: "Untitled persona" });
       selectedId = p.id;
       systemPromptOpen = false;
       toolsOpen = false;
@@ -122,7 +139,7 @@
   }
 
   async function deletePrompt(id: string): Promise<void> {
-    if (!confirm("Delete this prompt? Other devices on the network will still have their copy until you delete it there too.")) {
+    if (!confirm("Delete this persona? Other devices on the network will still have their copy until you delete it there too.")) {
       return;
     }
     error = "";
@@ -142,6 +159,7 @@
     void (async () => {
       try {
         await agentPrompts.ensureLoaded();
+        await agentToolsConfig.ensureLoaded();
         await refreshActiveLabel();
         if (!selectedId && agentPrompts.current.length > 0) {
           selectedId = agentPrompts.current[0].id;
@@ -157,22 +175,22 @@
 
 <div class="section">
   <header class="head">
-    <h3>Prompts</h3>
+    <h3>Personas</h3>
     <p class="hint">
-      Author reusable prompts for the chat agent. Each prompt holds a
+      Author reusable personas for the chat agent. Each persona holds a
       system prompt body, a set of tools the model is allowed to call,
       and an optional user-prompt prefix injected before your typed
-      message. When auto-gossip is on for the active network, prompts
-      sync to peers on it; using a prompt on a different active network
+      message. When auto-gossip is on for the active network, personas
+      sync to peers on it; using a persona on a different active network
       copies it there too so it begins propagating on the new network.
       {#if activeNetworkAbsent}
-        <strong class="warn">No active network — activate one in Networks to create prompts.</strong>
+        <strong class="warn">No active network — activate one in Networks to create personas.</strong>
       {:else if activeNetworkLabel}
         <span class="net-chip">on <code>{activeNetworkLabel}</code></span>
         {#if activeNetworkGossip}
-          <span class="gossip-chip on" title="Prompts edited here sync to peers on this network and theirs sync back. Toggle in Networks → Status.">auto-gossip on</span>
+          <span class="gossip-chip on" title="Personas edited here sync to peers on this network and theirs sync back. Toggle in Networks → Status.">auto-gossip on</span>
         {:else}
-          <span class="gossip-chip off" title="Auto-gossip is off for this network — prompts edited here stay on this device, and inbound peer snapshots are ignored. Toggle in Networks → Status.">isolated · no peer sync</span>
+          <span class="gossip-chip off" title="Auto-gossip is off for this network — personas edited here stay on this device, and inbound peer snapshots are ignored. Toggle in Networks → Status.">isolated · no peer sync</span>
         {/if}
       {/if}
     </p>
@@ -190,16 +208,16 @@
           class="add-btn"
           onclick={addPrompt}
           disabled={activeNetworkAbsent}
-          title={activeNetworkAbsent ? "Activate a network first" : "Add a new prompt"}
+          title={activeNetworkAbsent ? "Activate a network first" : "Add a new persona"}
         >
           + Add new
         </button>
         {#if prompts.length === 0}
           <div class="empty">
             {#if activeNetworkAbsent}
-              No active network — prompts live on a network.
+              No active network — personas live on a network.
             {:else}
-              No prompts yet. Add one to get started.
+              No personas yet. Add one to get started.
             {/if}
           </div>
         {:else}
@@ -215,8 +233,16 @@
                     toolsOpen = false;
                   }}
                 >
-                  <span class="prompt-name">{p.name || "Untitled prompt"}</span>
-                  <span class="prompt-meta">{p.tools.length} tools</span>
+                  <span class="prompt-name">{p.name || "Untitled persona"}</span>
+                  <span class="prompt-meta">
+                    {p.tools.length} tools
+                    {#if disabledSelectedCount(p.tools) > 0}
+                      <span
+                        class="list-warn-dot"
+                        title="{disabledSelectedCount(p.tools)} selected tool(s) are turned off in Settings → Tools"
+                      ></span>
+                    {/if}
+                  </span>
                 </button>
               </li>
             {/each}
@@ -275,6 +301,14 @@
               <summary>
                 <span>Tools</span>
                 <span class="muted">— {toolsSummary(sel.tools)}</span>
+                {#if disabledSelectedCount(sel.tools) > 0}
+                  <span
+                    class="warn-chip"
+                    title="Some selected tools are turned off in Settings → Tools and won't be available until re-enabled."
+                  >
+                    {disabledSelectedCount(sel.tools)} off globally
+                  </span>
+                {/if}
               </summary>
               <div class="collapse-body">
                 <p class="muted small">
@@ -283,10 +317,22 @@
                   system prompt below the tool list so the model
                   knows when to use it.
                 </p>
+                {#if disabledSelectedCount(sel.tools) > 0}
+                  <p class="global-warn">
+                    {disabledSelectedCount(sel.tools)}
+                    {disabledSelectedCount(sel.tools) === 1
+                      ? "selected tool is"
+                      : "selected tools are"}
+                    turned off in <strong>Settings → Tools</strong>. This persona
+                    keeps the selection, but the model won't see the tool until
+                    it's re-enabled there.
+                  </p>
+                {/if}
                 <div class="tools">
                   {#each PROMPT_ALL_TOOLS as tool (tool)}
                     {@const checked = sel.tools.includes(tool)}
-                    <div class="tool-row" class:checked>
+                    {@const globallyOff = !toolGloballyEnabled(tool)}
+                    <div class="tool-row" class:checked class:globally-off={checked && globallyOff}>
                       <label class="tool-head">
                         <input
                           type="checkbox"
@@ -294,6 +340,14 @@
                           onchange={() => toggleTool(sel.id, tool)}
                         />
                         <span class="tool-name">{TOOL_LABELS[tool]}</span>
+                        {#if globallyOff}
+                          <span
+                            class="off-badge"
+                            title="Disabled in Settings → Tools. Re-enable it there to make it available; this persona's selection is kept either way."
+                          >
+                            off globally
+                          </span>
+                        {/if}
                       </label>
                       {#if checked}
                         <pre class="tool-snippet">{TOOL_PROMPT_SNIPPETS[tool] ?? ""}</pre>
@@ -308,7 +362,7 @@
           <div class="field">
             <label for="prompt-user">User prompt</label>
             <p class="muted small">
-              Your personal system-level instructions for this prompt.
+              Your personal system-level instructions for this persona.
               Appended to the system message after the tool snippets,
               once at the start of the conversation — not prepended to
               every typed message. This is the recommended place to
@@ -330,17 +384,17 @@
 
           <div class="actions">
             <button class="danger" onclick={() => deletePrompt(sel.id)}>
-              Delete prompt
+              Delete persona
             </button>
           </div>
         {:else}
           <div class="placeholder">
             {#if prompts.length === 0 && !activeNetworkAbsent}
-              Click <strong>+ Add new</strong> to create your first prompt.
+              Click <strong>+ Add new</strong> to create your first persona.
             {:else if activeNetworkAbsent}
-              Activate a network in Networks to author prompts.
+              Activate a network in Networks to author personas.
             {:else}
-              Select a prompt from the list, or click <strong>+ Add new</strong>.
+              Select a persona from the list, or click <strong>+ Add new</strong>.
             {/if}
           </div>
         {/if}
@@ -489,6 +543,19 @@
   .prompt-meta {
     font-size: 0.7rem;
     color: #666;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+  /* Amber dot on a persona whose selected tools include one that's
+     globally disabled — surfaces the mismatch without expanding it. */
+  .list-warn-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #f0b070;
+    box-shadow: 0 0 5px rgba(240, 176, 112, 0.7);
+    flex-shrink: 0;
   }
   .empty {
     color: #666;
@@ -628,6 +695,42 @@
   .tool-row.checked {
     border-color: #2a2a55;
     background: #14142a;
+  }
+  /* A selected tool that's switched off at the program level — amber
+     so it reads as "configured but inert" rather than an error. */
+  .tool-row.globally-off {
+    border-color: #3a2a14;
+    background: #221a10;
+  }
+  .off-badge {
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #d4ad7a;
+    background: #2a1f12;
+    border: 1px solid #3a2a14;
+    border-radius: 4px;
+    padding: 0.03rem 0.32rem;
+    margin-left: 0.4rem;
+  }
+  .warn-chip {
+    margin-left: 0.4rem;
+    padding: 0.05rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.68rem;
+    background: #221a10;
+    color: #f0b070;
+    border: 1px solid #3a2f10;
+  }
+  .global-warn {
+    margin: 0;
+    background: #221a10;
+    color: #f0b070;
+    font-size: 0.74rem;
+    padding: 0.4rem 0.55rem;
+    border-radius: 4px;
+    border: 1px solid #3a2f10;
+    line-height: 1.5;
   }
   .tool-head {
     display: flex;

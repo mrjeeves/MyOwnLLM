@@ -18,6 +18,8 @@
     onOpenSettings,
     onRequestStopTranscribe,
     onRequestStopChat,
+    speakersActive = false,
+    onOpenSpeakers,
   } = $props<{
     current: Mode;
     supported: Set<Mode>;
@@ -25,6 +27,15 @@
     onOpenSettings: (tab: SettingsTab) => void;
     onRequestStopTranscribe: () => void;
     onRequestStopChat: () => void;
+    /** True while the Speakers workspace is the one on screen. Drives
+     *  which bubble reads as "active": the model-mode bubbles
+     *  (Text / Transcribe) de-highlight here even though `current`
+     *  still points at the underlying model mode. */
+    speakersActive?: boolean;
+    /** Open the Speakers workspace. Speakers isn't a model `Mode`, so
+     *  it rides alongside the mode bubbles as its own button rather
+     *  than going through `onChange`. */
+    onOpenSpeakers: () => void;
   }>();
 
   // Same mode set the redesigned bar surfaces. Trimmed to text +
@@ -130,9 +141,10 @@
       {@const slotActive = slotStatus !== "idle"}
       {@const lockedOut = chatRunning && m.id !== current}
       {@const btnDisabled = !ok || lockedOut}
+      {@const isActive = m.id === current && !speakersActive}
       <div
         class="slot"
-        class:active={m.id === current}
+        class:active={isActive}
         class:running={slotStatus === "running"}
         class:paused={slotStatus === "paused"}
         class:drain={slotStatus === "drain" || slotStatus === "upload"}
@@ -141,7 +153,7 @@
       >
         <button
           class="mode-btn"
-          class:active={m.id === current}
+          class:active={isActive}
           class:unsupported={!ok}
           disabled={btnDisabled}
           title={!ok
@@ -243,6 +255,23 @@
         {/if}
       </div>
     {/each}
+
+    <!-- Speakers workspace. Not a model `Mode` (no resolver tier, no
+         running slot state), so it rides here as its own bubble rather
+         than in the `modes` loop. Locked while a chat streams, same as
+         the mode bubbles, because leaving the Chat surface mid-stream
+         would orphan the in-flight generation. -->
+    <div class="slot" class:active={speakersActive} class:locked={chatRunning}>
+      <button
+        class="mode-btn"
+        class:active={speakersActive}
+        disabled={chatRunning}
+        title={chatRunning ? "Stop the chat to switch modes." : "Manage speaker profiles"}
+        onclick={() => !chatRunning && onOpenSpeakers()}
+      >
+        <span class="mode-label">Speakers</span>
+      </button>
+    </div>
   </div>
 
   <div class="spacer"></div>

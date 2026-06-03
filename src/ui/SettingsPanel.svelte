@@ -4,11 +4,10 @@
   import StorageSection from "./settings/StorageSection.svelte";
   import HardwareSection from "./settings/HardwareSection.svelte";
   import PerformanceSection from "./settings/PerformanceSection.svelte";
-  import SpeakersSection from "./settings/SpeakersSection.svelte";
   import UsageSection from "./settings/UsageSection.svelte";
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import CloudMeshSection from "./settings/CloudMeshSection.svelte";
-  import PermissionsSection from "./settings/PermissionsSection.svelte";
+  import ToolsSection, { type ToolsSubTab } from "./settings/ToolsSection.svelte";
   import PromptsSection from "./settings/PromptsSection.svelte";
   import { updateUi } from "../update-state.svelte";
   import { settingsAttention } from "../settings-attention.svelte";
@@ -18,20 +17,27 @@
     | "families"
     | "models"
     | "prompts"
-    | "permissions"
+    | "tools"
     | "hardware"
     | "performance"
-    | "speakers"
     | "storage"
     | "usage"
     | "cloud-mesh"
     | "updates"
+    // "speakers" — moved out of Settings into a top-level main-UI
+    // workspace (the third mode bubble). Kept as a still-accepted
+    // legacy deep-link value, mapped to "families" on entry so a stale
+    // callsite doesn't render an empty tab.
+    | "speakers"
     // Legacy values that still appear in old `initialTab` deep-links
     // from earlier code paths. We map them to current ids on entry so a
     // stale callsite doesn't render an empty tab. "providers" is
     // mapped to "updates" with `showProviders` set — the providers
     // screen now lives as a sub-page of Updates rather than its own
-    // top-level tab.
+    // top-level tab. "permissions" maps to "tools" with the
+    // Permissions sub-tab pre-opened — it's now a sub-section of the
+    // Tools area rather than its own top-level tab.
+    | "permissions"
     | "providers"
     | "transcription"
     | "remote";
@@ -65,7 +71,19 @@
         ? "cloud-mesh"
         : initialTab === "providers"
           ? "updates"
-          : initialTab,
+          : initialTab === "permissions"
+            ? "tools"
+            : initialTab === "speakers"
+              ? "families"
+              : initialTab,
+  );
+
+  /** When the deep-link target was the legacy "permissions" tab, open
+   *  the Tools area straight onto its Permissions sub-tab so the
+   *  callsite lands exactly where it used to. */
+  // svelte-ignore state_referenced_locally
+  let initialToolsSubTab = $state<ToolsSubTab | null>(
+    initialTab === "permissions" ? "permissions" : null,
   );
 
   /** Drives the embedded providers sub-page inside Updates. Seeded
@@ -74,19 +92,22 @@
   // svelte-ignore state_referenced_locally
   let initialShowProviders = $state<boolean>(initialTab === "providers");
 
-  const tabs: Array<{ id: Exclude<Tab, "providers" | "transcription" | "remote">; label: string }> = [
+  const tabs: Array<{
+    id: Exclude<Tab, "speakers" | "permissions" | "providers" | "transcription" | "remote">;
+    label: string;
+  }> = [
     { id: "families", label: "Family" },
     { id: "models", label: "Models" },
-    // Networks sits above Prompts + Permissions because both of
-    // those scopes live INSIDE a network (per-network prompt list,
-    // per-network permission policy) — surfacing the network
-    // picker first keeps the hierarchy legible.
+    // Networks sits above Personas because that scope lives INSIDE a
+    // network (per-network persona list) — surfacing the network
+    // picker first keeps the hierarchy legible. Tools follows: it's a
+    // program-level (global) area, and its Permissions sub-tab is the
+    // per-network policy that used to be its own top-level tab.
     { id: "cloud-mesh", label: "Networks" },
-    { id: "prompts", label: "Prompts" },
-    { id: "permissions", label: "Permissions" },
+    { id: "prompts", label: "Personas" },
+    { id: "tools", label: "Tools" },
     { id: "hardware", label: "Hardware" },
     { id: "performance", label: "Performance" },
-    { id: "speakers", label: "Speakers" },
     { id: "storage", label: "Storage" },
     { id: "usage", label: "Usage" },
     { id: "updates", label: "Updates" },
@@ -159,16 +180,14 @@
         <HardwareSection setActive={(t) => (active = t)} />
       {:else if active === "performance"}
         <PerformanceSection />
-      {:else if active === "speakers"}
-        <SpeakersSection />
       {:else if active === "usage"}
         <UsageSection />
       {:else if active === "cloud-mesh"}
         <CloudMeshSection initialSubTab={initialMeshSubTab} />
       {:else if active === "prompts"}
         <PromptsSection />
-      {:else if active === "permissions"}
-        <PermissionsSection />
+      {:else if active === "tools"}
+        <ToolsSection initialSubTab={initialToolsSubTab} />
       {:else if active === "updates"}
         <UpdatesSection {onChanged} {initialShowProviders} />
       {/if}
