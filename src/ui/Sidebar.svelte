@@ -14,6 +14,7 @@
   } from "../config";
   import AddNetworkModal from "./settings/AddNetworkModal.svelte";
   import { settingsRoute } from "./settings-route.svelte";
+  import { updateUi } from "../update-state.svelte";
   import type { CatalogEntry } from "../mesh-protocol";
   import { FEATURES, peerSupportsFeature } from "../mesh-protocol";
   import {
@@ -49,6 +50,38 @@
       localStorage.setItem(key, JSON.stringify([...value]));
     } catch {
       // Best-effort: in-memory state still works without persistence.
+    }
+  }
+
+  /** Persisted expanded width (px) for the resizable sidebar. The
+   *  open/collapsed flag itself is persisted by App; this is just the
+   *  drag-to-resize width, clamped on read so a corrupted value can't
+   *  wedge the panel off-screen or shrink it to nothing. */
+  const SIDEBAR_WIDTH_KEY = "myownllm.sidebarWidth";
+  const SIDEBAR_MIN_WIDTH = 200;
+  const SIDEBAR_MAX_WIDTH = 480;
+  const SIDEBAR_DEFAULT_WIDTH = 260;
+
+  function readSidebarWidth(): number {
+    try {
+      const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+      if (raw) {
+        const n = parseInt(raw, 10);
+        if (Number.isFinite(n)) {
+          return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, n));
+        }
+      }
+    } catch {
+      // localStorage unavailable — fall back to the default width.
+    }
+    return SIDEBAR_DEFAULT_WIDTH;
+  }
+
+  function writeSidebarWidth(px: number): void {
+    try {
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(px)));
+    } catch {
+      // Best-effort.
     }
   }
 
@@ -597,6 +630,58 @@
     mode === "transcribe" ? "No sessions yet." : "No conversations yet.",
   );
   const itemNoun = $derived(mode === "transcribe" ? "session" : "conversation");
+
+  // ---- collapse / resize chrome ----------------------------------------
+  //
+  // The sidebar has two shapes: an expanded panel (resizable, width
+  // persisted) and a collapsed icon rail. App owns the open/collapsed flag
+  // (and persists it); the width + drag-to-resize live here.
+
+  let sidebarWidth = $state(readSidebarWidth());
+  let resizing = $state(false);
+
+  /** Drag the right edge to resize. Width is clamped live and persisted
+   *  once on release so we don't hammer localStorage mid-drag. Uses
+   *  window-level listeners (same approach as the conversation drag-drop
+   *  below) so the drag keeps tracking even if the pointer outruns the
+   *  thin handle. */
+  function startResize(e: PointerEvent) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    resizing = true;
+    const startX = e.clientX;
+    const startW = sidebarWidth;
+    const onMove = (ev: PointerEvent) => {
+      sidebarWidth = Math.min(
+        SIDEBAR_MAX_WIDTH,
+        Math.max(SIDEBAR_MIN_WIDTH, startW + (ev.clientX - startX)),
+      );
+    };
+    const onUp = () => {
+      resizing = false;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      writeSidebarWidth(sidebarWidth);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  /** Sidebar hamburger → Settings, mirroring the top bar's old hamburger
+   *  (updates tab when a release is staged, else the families tab). */
+  function openSettings() {
+    settingsRoute.open(updateUi.available ? "updates" : "families");
+  }
+
+  /** Conversations flattened to a most-recent-first list for the collapsed
+   *  rail — one generic icon each, title on hover. Folders are dropped; the
+   *  rail is a quick-switcher, not the full tree. */
+  let railItems = $derived(
+    [...items].sort((a: ConversationMeta, b: ConversationMeta) =>
+      (a.updated_at ?? "") < (b.updated_at ?? "") ? 1 : -1,
+    ),
+  );
 
   /** Right-click menu state. Anchored to the viewport (fixed positioning),
    *  so the bounding sidebar's overflow can't clip the menu. */
@@ -1551,8 +1636,28 @@
   }
 </script>
 
-<aside class="sidebar" class:open aria-hidden={!open} use:sidebarKeys>
+<aside
+  class="sidebar"
+  class:open
+  class:resizing
+  use:sidebarKeys
+  style={open ? `width:${sidebarWidth}px` : ""}
+>
+  {#if open}
   <div class="head">
+    <button
+      class="hamburger"
+      onclick={openSettings}
+      title="Settings"
+      aria-label="Open settings"
+    >
+      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <path
+          fill="currentColor"
+          d="M3 6h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2z"
+        />
+      </svg>
+    </button>
     <button class="new" onclick={onNew} title={newLabel}>
       <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
         <path
@@ -1891,6 +1996,99 @@
       </div>
     {/if}
   </div>
+  <!-- Drag the right edge to resize; the width persists across launches. -->
+  <button
+    class="resize-handle"
+    type="button"
+    aria-label="Resize sidebar"
+    title="Drag to resize"
+    onpointerdown={startResize}
+  ></button>
+  {:else}
+    <!-- Collapsed icon rail: hamburger + new chat at the top, then a
+         generic icon per conversation (title on hover), then the networks
+         glyph with a generic icon per saved network beneath it. The
+         mid-screen edge button (App) re-expands the sidebar. -->
+    <nav class="rail" aria-label="Conversations (collapsed)">
+      <button
+        class="rail-btn"
+        onclick={openSettings}
+        title="Settings"
+        aria-label="Open settings"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path
+            fill="currentColor"
+            d="M3 6h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2z"
+          />
+        </svg>
+      </button>
+      <button
+        class="rail-btn rail-new"
+        onclick={onNew}
+        title={newLabel}
+        aria-label={newLabel}
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path
+            fill="currentColor"
+            d="M12 5a1 1 0 0 1 1 1v5h5a1 1 0 1 1 0 2h-5v5a1 1 0 1 1-2 0v-5H6a1 1 0 1 1 0-2h5V6a1 1 0 0 1 1-1z"
+          />
+        </svg>
+      </button>
+      <div class="rail-sep" aria-hidden="true"></div>
+      <div class="rail-scroll">
+        {#each railItems as c (c.id)}
+          <button
+            class="rail-item"
+            class:active={c.id === activeId}
+            onclick={() => onSelect(c.id)}
+            title={c.title || "Untitled"}
+            aria-label={c.title || "Untitled"}
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"
+              />
+            </svg>
+          </button>
+        {/each}
+        <div class="rail-net-header" title="Networks">
+          <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+            <circle cx="12" cy="5" r="2.4" fill="currentColor" />
+            <circle cx="5" cy="18" r="2.4" fill="currentColor" />
+            <circle cx="19" cy="18" r="2.4" fill="currentColor" />
+            <path
+              d="M12 7.2 6.4 16M12 7.2 17.6 16M6.8 18h10.4"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+            />
+          </svg>
+          {#if pendingApprovalCount > 0}
+            <span class="rail-attn" title={pendingApprovalReason}></span>
+          {/if}
+        </div>
+        {#each savedNetworks as net (net.id)}
+          <button
+            class="rail-item rail-net"
+            class:active={net.id === activeNetworkId}
+            onclick={() => switchToNetwork(net.id)}
+            title={net.id === activeNetworkId
+              ? `${net.network_id} (active)`
+              : `${net.network_id} — switch`}
+            aria-label={net.network_id}
+          >
+            <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+              <circle cx="12" cy="12" r="5.5" fill="currentColor" />
+            </svg>
+          </button>
+        {/each}
+      </div>
+    </nav>
+  {/if}
 </aside>
 
 {#snippet remoteFolder(node: RemoteNode, peer: (typeof peerGroups)[number])}
@@ -2591,22 +2789,144 @@
   .sidebar {
     width: 260px;
     flex-shrink: 0;
+    position: relative;
     background: #0b0b0b;
     border-right: 1px solid #1a1a1a;
     display: flex;
     flex-direction: column;
     height: 100%;
     overflow: hidden;
-    transition: margin-left .18s ease, width .18s ease;
+    transition: width .18s ease;
     /* Sidebar text isn't user content — clicks and right-clicks should
      * never start a selection. Inputs below opt back in. */
     user-select: none;
     -webkit-user-select: none;
   }
+  /* Collapsed: a narrow icon rail rather than fully hidden. Width comes
+     from the shared --rail-width var (set on App's .layout) so the
+     mid-screen reopen tab lines up with the rail's edge. */
   .sidebar:not(.open) {
-    margin-left: -260px;
-    width: 260px;
+    width: var(--rail-width, 52px);
   }
+  /* No width animation while actively dragging the resize handle — the
+     transition would make the edge lag behind the pointer. */
+  .sidebar.resizing { transition: none; }
+
+  /* Drag-to-resize handle on the inner right edge (expanded only). Thin
+     and transparent until hover; sits above the list so it stays grabbable. */
+  .resize-handle {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 5px;
+    height: 100%;
+    padding: 0;
+    border: none;
+    background: transparent;
+    cursor: col-resize;
+    z-index: 20;
+    touch-action: none;
+  }
+  .resize-handle:hover,
+  .sidebar.resizing .resize-handle {
+    background: #6e6ef7;
+    opacity: .5;
+  }
+
+  /* ---- collapsed icon rail ------------------------------------------- */
+  .rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: .25rem;
+    height: 100%;
+    width: 100%;
+    padding: .45rem .25rem .5rem;
+  }
+  .rail-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 38px;
+    flex-shrink: 0;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: #888;
+    cursor: pointer;
+    transition: background .12s, color .12s, border-color .12s;
+  }
+  .rail-btn:hover { background: #161620; color: #ccc; }
+  .rail-new { border-color: #2a2a2a; color: #ccc; }
+  .rail-new:hover { border-color: #3a3a55; color: #fff; background: #131320; }
+  .rail-sep {
+    width: 24px;
+    height: 1px;
+    background: #1c1c1c;
+    margin: .2rem 0;
+    flex-shrink: 0;
+  }
+  .rail-scroll {
+    flex: 1;
+    width: 100%;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: .12rem;
+    scrollbar-width: thin;
+  }
+  .rail-scroll::-webkit-scrollbar { width: 6px; }
+  .rail-item {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 34px;
+    flex-shrink: 0;
+    background: none;
+    border: none;
+    border-radius: 8px;
+    color: #6f6f6f;
+    cursor: pointer;
+    transition: background .12s, color .12s;
+  }
+  .rail-item:hover { background: #161620; color: #ccc; }
+  .rail-item.active { background: #1a1a2e; color: #b9b9ee; }
+  .rail-net-header {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 30px;
+    margin-top: .4rem;
+    color: #6a7a99;
+    flex-shrink: 0;
+  }
+  .rail-net-header::before {
+    content: "";
+    position: absolute;
+    top: -.35rem;
+    left: 7px;
+    right: 7px;
+    height: 1px;
+    background: #1c1c1c;
+  }
+  .rail-attn {
+    position: absolute;
+    top: 1px;
+    right: 3px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #f59e0b;
+    box-shadow: 0 0 5px rgba(245, 158, 11, .7);
+  }
+  .rail-net.active { color: #6cc77f; background: #122212; }
   .head {
     display: flex;
     align-items: center;
@@ -2629,6 +2949,20 @@
     transition: border-color .12s, color .12s, background .12s;
   }
   .new:hover { border-color: #3a3a55; color: #fff; background: #131320; }
+  /* Sidebar hamburger — relocated here from the top bar. Opens Settings;
+     sits top-left of the head, lining up with the rail's top icon. */
+  .hamburger {
+    background: none;
+    border: none;
+    color: #666;
+    cursor: pointer;
+    padding: .25rem .35rem;
+    border-radius: 5px;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+  }
+  .hamburger:hover { background: #1a1a1a; color: #ccc; }
   .folder-btn,
   .select-btn,
   .collapse {

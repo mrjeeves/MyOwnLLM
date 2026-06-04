@@ -139,8 +139,30 @@
   let error = $state("");
 
   // Sidebar state. We keep the conversation list at App scope so a fresh
-  // conversation created by Chat shows up across remounts.
-  let sidebarOpen = $state(true);
+  // conversation created by Chat shows up across remounts. The open /
+  // collapsed flag persists across launches (the Sidebar persists its own
+  // resizable width), using the same lightweight localStorage pattern the
+  // Sidebar already uses for its folder-collapse state.
+  const SIDEBAR_OPEN_KEY = "myownllm.sidebarOpen";
+  function readSidebarOpen(): boolean {
+    try {
+      const raw = localStorage.getItem(SIDEBAR_OPEN_KEY);
+      if (raw === "0") return false;
+      if (raw === "1") return true;
+    } catch {
+      // localStorage unavailable — default to open.
+    }
+    return true;
+  }
+  function setSidebarOpen(open: boolean): void {
+    sidebarOpen = open;
+    try {
+      localStorage.setItem(SIDEBAR_OPEN_KEY, open ? "1" : "0");
+    } catch {
+      // Best-effort: the toggle still holds for this session.
+    }
+  }
+  let sidebarOpen = $state(readSidebarOpen());
   let conversations = $state<ConversationMeta[]>([]);
   let folders = $state<FolderMeta[]>([]);
   let activeConversationId = $state<string | null>(null);
@@ -1215,15 +1237,15 @@
         onCreateFolder={onCreateFolder}
         onRenameFolder={onRenameFolder}
         onDeleteFolder={onDeleteFolder}
-        onClose={() => (sidebarOpen = false)}
+        onClose={() => setSidebarOpen(false)}
       />
       {#if !sidebarOpen}
-        <!-- Reopen handle: the sidebar's own collapse button slides off
-             with it, and the hamburger now opens Settings, so this edge
-             tab is the only way back to a hidden sidebar. -->
+        <!-- Mid-screen reopen tab — the expand control we're keeping. Sits
+             at the collapsed rail's right edge; clicking it expands the
+             sidebar back to the full panel. -->
         <button
           class="sidebar-reopen"
-          onclick={() => (sidebarOpen = true)}
+          onclick={() => setSidebarOpen(true)}
           title="Show conversations"
           aria-label="Show conversations"
         >
@@ -1494,10 +1516,13 @@
     display: flex;
     min-height: 0;
     position: relative;
+    /* Width of the collapsed sidebar rail. Shared with the Sidebar (which
+       inherits it) so the reopen tab below lines up with the rail's edge. */
+    --rail-width: 52px;
   }
   .sidebar-reopen {
     position: absolute;
-    left: 0;
+    left: var(--rail-width, 52px);
     top: 50%;
     transform: translateY(-50%);
     z-index: 30;

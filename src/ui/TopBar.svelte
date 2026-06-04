@@ -138,22 +138,8 @@
 </script>
 
 <div class="top-bar">
-  <!-- Opens Settings, same as the cog at the far right. Slated to grow
-       into a full app menu later; for now it's a second Settings entry. -->
-  <button
-    class="hamburger"
-    onclick={openSettings}
-    title="Settings"
-    aria-label="Settings"
-  >
-    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
-      <path
-        fill="currentColor"
-        d="M3 6h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2z"
-      />
-    </svg>
-  </button>
-
+  <!-- The hamburger now lives in the sidebar. Settings is still one click
+       away here via the cog at the far right. -->
   <div class="modes">
     {#each modes as m}
       {@const ok = supported.has(m.id)}
@@ -358,17 +344,6 @@
     background: #0d0d0d;
     gap: .5rem;
   }
-  .hamburger {
-    background: none;
-    border: none;
-    color: #777;
-    cursor: pointer;
-    padding: .25rem .35rem;
-    border-radius: 5px;
-    display: flex;
-    align-items: center;
-  }
-  .hamburger:hover { background: #1a1a1a; color: #ccc; }
   .spacer { flex: 1; }
   .settings-btn {
     position: relative;
