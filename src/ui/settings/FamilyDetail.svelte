@@ -174,13 +174,14 @@
   async function load() {
     loading = true;
     try {
-      const [m, config, hw, pulled, asr, diarize] = await Promise.all([
+      const [m, config, hw, pulled, asr, diarize, tts] = await Promise.all([
         getActiveManifest(),
         loadConfig(),
         invoke<HardwareProfile>("detect_hardware"),
         invoke<OllamaModel[]>("ollama_list_models").catch(() => [] as OllamaModel[]),
         invoke<ModelInfo[]>("asr_models_list").catch(() => [] as ModelInfo[]),
         invoke<ModelInfo[]>("diarize_models_list").catch(() => [] as ModelInfo[]),
+        invoke<ModelInfo[]>("tts_models_list").catch(() => [] as ModelInfo[]),
       ]);
       manifest = m;
       activeFamily = config.active_family;
@@ -197,7 +198,7 @@
       for (const p of pulled) sizes[canonicalModelTag(p.name)] = p.size;
       pulledSizes = sizes;
       const lsizes: Record<string, number> = {};
-      for (const m of [...asr, ...diarize]) {
+      for (const m of [...asr, ...diarize, ...tts]) {
         if (m.installed && m.installed_size_bytes != null) {
           lsizes[m.name] = m.installed_size_bytes;
         }

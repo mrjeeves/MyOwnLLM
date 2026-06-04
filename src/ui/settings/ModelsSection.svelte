@@ -286,6 +286,8 @@
         await invoke("asr_model_remove", { name: deleteTarget.name });
       } else if (deleteTarget.runtime === "diarize") {
         await invoke("diarize_model_remove", { name: deleteTarget.name });
+      } else if (deleteTarget.runtime === "tts") {
+        await invoke("tts_model_remove", { name: deleteTarget.name });
       } else {
         await invoke("ollama_delete_model", { name: deleteTarget.name });
       }
