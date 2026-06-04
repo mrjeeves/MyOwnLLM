@@ -28,10 +28,15 @@ use tauri::{PhysicalPosition, PhysicalSize, WebviewWindow, WindowEvent};
 
 /// Saved geometry. Sizes are physical pixels (u32); positions are physical
 /// pixels and can be negative (i32) — a secondary monitor to the left of the
-/// primary lives at negative x. `width`/`height`/`x`/`y` always describe the
-/// *normal* (un-maximized, windowed) geometry so that un-maximizing or
-/// leaving fullscreen returns to a sensible frame; `maximized`/`fullscreen`
-/// ride alongside as flags re-applied on top.
+/// primary lives at negative x. `width`/`height` are the **inner (client)**
+/// size and `x`/`y` the **outer** top-left, matching the setters used to
+/// restore them (`set_size` resizes the client area; `set_position` moves the
+/// outer frame). Capturing the *outer* size here instead would inflate the
+/// window by one title-bar height on every launch, because `set_size` would
+/// then treat that decoration-inclusive value as the client size and the OS
+/// would add the chrome back on top. All values describe the *normal*
+/// (un-maximized, windowed) frame; `maximized`/`fullscreen` ride alongside as
+/// flags re-applied on top.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowState {
     pub width: u32,
@@ -98,8 +103,13 @@ fn snapshot() -> Option<WindowState> {
 
 /// Read the live windowed geometry from the OS. Returns `None` only if the
 /// platform can't report size/position (it always can in practice).
+///
+/// Size is the **inner (client)** size and position the **outer** top-left,
+/// so the values round-trip cleanly through `set_size` (client) +
+/// `set_position` (outer). Using `outer_size` here would grow the window by
+/// the title-bar height on every relaunch on Windows (see `WindowState`).
 fn read_normal_geometry(window: &WebviewWindow) -> Option<WindowState> {
-    let size = window.outer_size().ok()?;
+    let size = window.inner_size().ok()?;
     let pos = window.outer_position().ok()?;
     Some(WindowState {
         width: size.width,
