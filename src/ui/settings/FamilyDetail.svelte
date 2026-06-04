@@ -929,7 +929,7 @@
                   {@const delErr = deleteError[tier.model]}
                   {@const smart = smartnessLabel(tierIdx, modeSpec.tiers.length)}
                   {@const memHint = memoryHint(tier)}
-                  {@const canDelete = downloadable && sz.installed && !recommended && !current}
+                  {@const canDelete = downloadable && sz.installed}
                   <div
                     class="tier"
                     class:current

@@ -63,6 +63,9 @@
     size: number;
     kept: boolean;
     runtime: string;
+    /** Non-null when the row backs an always-on feature or the active family
+     *  — used to warn (not block) before deleting an app-required model. */
+    requiredBy: string | null;
   } | null>(null);
   let deleteUsage = $state<ModelUsage | null>(null);
   let deleteUsageLoading = $state(false);
@@ -244,13 +247,14 @@
     await reload();
   }
 
-  async function startDelete(model: ModelMeta) {
+  async function startDelete(model: ModelMeta, requiredBy: string | null = null) {
     if (!hardware) return;
     deleteTarget = {
       name: model.name,
       size: model.size,
       kept: model.kept,
       runtime: model.runtime,
+      requiredBy,
     };
     deleteUsage = null;
     deleteError = "";
@@ -266,11 +270,6 @@
 
   async function confirmDelete() {
     if (!deleteTarget || deleting) return;
-    // Locks are enforced at the row level (no trash button is rendered for
-    // active-family or shared-capability tags). Belt + suspenders here in
-    // case state slips between render and click.
-    const cname = canonicalModelTag(deleteTarget.name);
-    if (activeFamilyTags.has(cname) || capabilityLocks[cname]) return;
     deleting = true;
     deleteError = "";
     try {
@@ -286,13 +285,7 @@
       if (deleteTarget.runtime === "asr") {
         await invoke("asr_model_remove", { name: deleteTarget.name });
       } else if (deleteTarget.runtime === "diarize") {
-        // No `diarize_model_remove` Tauri command yet — diarize
-        // models are pulled and removed alongside the transcribe
-        // toggle. Surface a clear error so the user knows where to
-        // manage them.
-        throw new Error(
-          "Diarize models are managed via the Transcribe pane's 'Identify speakers' toggle.",
-        );
+        await invoke("diarize_model_remove", { name: deleteTarget.name });
       } else {
         await invoke("ollama_delete_model", { name: deleteTarget.name });
       }
@@ -397,11 +390,11 @@
             </div>
             <div class="model-meta">
               {#if famLocked}
-                <span class="rec-badge primary" title="Locked — part of the active family">
+                <span class="rec-badge primary" title="In use by the active family">
                   ✓ active · {activeFamilyLabel} family
                 </span>
               {:else if capLabel}
-                <span class="rec-badge primary" title="Locked — backs the {capLabel} feature">
+                <span class="rec-badge primary" title="Backs the {capLabel} feature">
                   ✓ {capLabel}
                 </span>
               {:else if places.length === 1}
@@ -421,28 +414,21 @@
               class="pin-btn"
               class:pinned={m.kept}
               onclick={() => toggleKeep(m.name, m.kept)}
-              title={m.kept ? "Unpin" : "Pin (never clean up)"}
+              title={m.kept
+                ? "Locked — kept on disk, won't be auto-cleaned. Click to unlock."
+                : "Unlocked — click to lock (keep on disk, never auto-clean)."}
+              aria-label={m.kept ? `Unlock ${m.name}` : `Lock ${m.name}`}
             >
-              {m.kept ? "📌" : "📍"}
+              {m.kept ? "🔒" : "🔓"}
             </button>
-            {#if locked}
-              <span
-                class="trash-btn locked"
-                title={famLocked
-                  ? `Active family (${activeFamilyLabel}) — switch family to delete`
-                  : `${capLabel} model — required by the app, can't delete`}
-                aria-hidden="true"
-              >🔒</span>
-            {:else}
-              <button
-                class="trash-btn"
-                onclick={() => startDelete(m)}
-                title="Delete this model"
-                aria-label="Delete {m.name}"
-              >
-                🗑
-              </button>
-            {/if}
+            <button
+              class="trash-btn"
+              onclick={() => startDelete(m, locked ? (capLabel || activeFamilyLabel) : null)}
+              title="Delete this model"
+              aria-label="Delete {m.name}"
+            >
+              🗑
+            </button>
           </div>
         {/each}
       </div>
@@ -484,9 +470,9 @@
       {#if deleteUsageLoading}
         <p class="confirm-info">Checking where this model is used…</p>
       {:else if deleteUsage?.isActiveTag}
-        <p class="confirm-error">
-          <strong>This is the model currently in use.</strong>
-          Switch family or mode first, then delete.
+        <p class="confirm-warn-lead">
+          <strong>⚠ This is the model currently in use.</strong>
+          Deleting it now interrupts it until it re-downloads on next use.
         </p>
       {:else if otherUses(deleteUsage).length > 0}
         <p class="confirm-warn-lead">
@@ -508,8 +494,15 @@
         </p>
       {/if}
 
+      {#if deleteTarget.requiredBy}
+        <p class="confirm-info">
+          Backs <strong>{deleteTarget.requiredBy}</strong> — the app re-downloads
+          it automatically when it's needed again.
+        </p>
+      {/if}
+
       {#if deleteTarget.kept}
-        <p class="confirm-info">This model is pinned. Deleting will unpin it.</p>
+        <p class="confirm-info">This model is locked (kept). Deleting will unlock it.</p>
       {/if}
 
       {#if deleteError}
@@ -519,7 +512,7 @@
         <button class="cancel" disabled={deleting} onclick={closeDelete}>Cancel</button>
         <button
           class="delete"
-          disabled={deleting || deleteUsageLoading || deleteUsage?.isActiveTag}
+          disabled={deleting || deleteUsageLoading}
           onclick={confirmDelete}
         >
           {deleting ? "Deleting…" : "Delete"}
@@ -622,10 +615,6 @@
   .confirm-uses li { font-size: .8rem; color: #f0d9a0; }
   .confirm-uses li strong { color: #ffd166; font-weight: 700; }
   .confirm-uses .use-meta { color: #a89070; font-weight: 400; margin-left: .15rem; }
-  .trash-btn.locked {
-    cursor: default;
-    opacity: .35;
-  }
   .confirm-error {
     font-size: .75rem; color: #f88; background: #2a1a1a;
     padding: .4rem .6rem; border-radius: 5px; margin-bottom: .75rem;

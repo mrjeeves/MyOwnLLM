@@ -716,6 +716,14 @@ fn asr_model_remove(name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn diarize_model_remove(name: String) -> Result<(), String> {
+    match models::find(&name, models::ModelKind::Diarize) {
+        Some(spec) => models::remove(spec).map_err(|e| e.to_string()),
+        None => Err(format!("unknown diarize model: {name}")),
+    }
+}
+
+#[tauri::command]
 fn diarize_models_list() -> Vec<models::ModelInfo> {
     models::list(models::ModelKind::Diarize)
 }
@@ -1332,6 +1340,7 @@ fn main() {
             asr_model_pull,
             asr_model_pull_cancel,
             asr_model_remove,
+            diarize_model_remove,
             diarize_models_list,
             diarize_model_pull,
             diarize_model_pull_cancel,

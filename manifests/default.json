@@ -1,7 +1,7 @@
 {
   "name": "MyOwnLLM Default",
-  "version": "24",
-  "ttl_minutes": 360,
+  "version": "25",
+  "ttl_minutes": 60,
   "default_family": "gemma4",
   "headroom_gb": {
     "apple": 5,
