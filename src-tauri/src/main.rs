@@ -1514,6 +1514,7 @@ fn main() {
             mesh::daemon_commands::mesh_daemon_networks_list,
             mesh::daemon_commands::mesh_daemon_network_add,
             mesh::daemon_commands::mesh_daemon_network_remove,
+            mesh::daemon_commands::mesh_daemon_network_update,
             mesh::daemon_commands::mesh_daemon_topology_set,
             mesh::daemon_commands::mesh_daemon_peers_list,
             mesh::daemon_commands::mesh_daemon_roster_list,

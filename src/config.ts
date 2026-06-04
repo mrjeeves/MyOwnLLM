@@ -788,6 +788,34 @@ export async function daemonAddNetwork(net: NetworkConfig): Promise<void> {
   }
 }
 
+/** Push a saved network's current config to the daemon for a network
+ *  it has ALREADY joined, so edits to STUN / TURN / signaling actually
+ *  reach the running engine. `daemonAddNetwork` is a no-op on an
+ *  existing network (the daemon rejects duplicate joins), so without
+ *  this an install that joined a network on a previous launch keeps
+ *  whatever transport config it started with forever — the "I added a
+ *  TURN server but the daemon still says 'no TURN configured'" bug.
+ *
+ *  The daemon hot-applies non-transport fields and only tears down /
+ *  rebuilds the connection when the transport config (signaling / STUN
+ *  / TURN / network_id) actually differs, so pushing an unchanged
+ *  config is cheap and non-disruptive. Best-effort: a daemon that
+ *  hasn't joined this network yet (racing a just-issued add) or an
+ *  older daemon without the update op reports an "unknown network"
+ *  error which we swallow — the next add/reconcile converges. */
+export async function daemonUpdateNetwork(net: NetworkConfig): Promise<void> {
+  const config = networkConfigToDaemonShape(net);
+  try {
+    await invoke("mesh_daemon_network_update", { config });
+  } catch (e) {
+    const msg = String(e);
+    if (msg.includes("unknown network") || msg.includes("network_add first")) {
+      return;
+    }
+    throw e;
+  }
+}
+
 /** Tell the daemon to leave a network. Accepts either the config id
  *  or the wire-level network_id — the daemon's registry indexes by
  *  both. Idempotent: unknown ids are silently swallowed since the
@@ -834,9 +862,17 @@ export async function syncActiveNetworkToDaemon(
       await daemonRemoveNetwork(nid);
     }
   }
-  // Add active if not already joined.
-  if (active && !joined.includes(active.network_id)) {
-    await daemonAddNetwork(active);
+  if (active) {
+    if (joined.includes(active.network_id)) {
+      // Already joined — push the current transport config so STUN /
+      // TURN / signaling edits reach the running engine. NetworkAdd
+      // no-ops on an existing network, so this is the only path that
+      // propagates a config change to a network the daemon joined on a
+      // previous launch. No-op (no teardown) when nothing changed.
+      await daemonUpdateNetwork(active);
+    } else {
+      await daemonAddNetwork(active);
+    }
   }
   return active;
 }
