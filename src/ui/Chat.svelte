@@ -75,6 +75,7 @@
     onRequestSendChat,
     onJumpToTranscribe,
     onOpenSpeakers,
+    onOpenNetworks,
   } = $props<{
     activeModel: string;
     activeMode: Mode;
@@ -133,6 +134,8 @@
     onJumpToTranscribe: () => void;
     /** Open the Speakers workspace from the TopBar's Speakers bubble. */
     onOpenSpeakers: () => void;
+    /** Open the Networks workspace from the TopBar's Networks bubble. */
+    onOpenNetworks: () => void;
   }>();
 
   interface Message extends StoredMessage {
@@ -1523,6 +1526,8 @@
     onChange={handleModeChange}
     speakersActive={false}
     onOpenSpeakers={() => onOpenSpeakers()}
+    networksActive={false}
+    onOpenNetworks={() => onOpenNetworks()}
     onOpenSettings={(tab) => (settingsTab = tab)}
     onRequestStopTranscribe={() => onRequestStopTranscribe()}
     onRequestStopChat={() => onRequestStopChat()}

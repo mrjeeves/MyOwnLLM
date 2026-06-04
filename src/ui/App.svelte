@@ -7,6 +7,7 @@
   import Chat from "./Chat.svelte";
   import TranscribeView from "./TranscribeView.svelte";
   import SpeakersView from "./SpeakersView.svelte";
+  import NetworksView from "./NetworksView.svelte";
   import Sidebar from "./Sidebar.svelte";
   import LoadingBar from "./LoadingBar.svelte";
   import { startupProgress } from "./startup-progress.svelte";
@@ -33,6 +34,7 @@
     type FolderMeta,
   } from "../conversations";
   import { updateUi } from "../update-state.svelte";
+  import { settingsAttention } from "../settings-attention.svelte";
   import { meshClient } from "../mesh-daemon.svelte";
   import {
     transcribeUi,
@@ -96,6 +98,12 @@
    *  `activeMode`. When true it replaces the Chat / Transcribe surface;
    *  picking a mode bubble or selecting a conversation clears it. */
   let speakersOpen = $state(false);
+  /** Networks workspace toggle. Like `speakersOpen`, Networks is a
+   *  top-bar bubble that isn't a model `Mode` (no resolver tier), so it
+   *  rides on its own boolean. When true it replaces the Chat /
+   *  Transcribe / Speakers surface with the mesh node graph; picking a
+   *  mode bubble or selecting a conversation clears it. */
+  let networksOpen = $state(false);
   let appVersion = $state("");
   let hardware = $state<HardwareProfile | null>(null);
   let activeModel = $state("");
@@ -612,13 +620,26 @@
    *  so this is belt-and-suspenders). */
   function openSpeakers() {
     if (chatStreamLock) return;
+    networksOpen = false;
     speakersOpen = true;
+  }
+
+  /** Open the Networks workspace (mesh node graph). Refused while a
+   *  chat streams, same as Speakers — leaving the Chat surface
+   *  mid-stream would orphan the in-flight generation (the TopBar's
+   *  Networks bubble is disabled then too, so this is belt-and-braces). */
+  function openNetworks() {
+    if (chatStreamLock) return;
+    speakersOpen = false;
+    networksOpen = true;
   }
 
   async function onModeChange(mode: Mode) {
     if (chatStreamLock && mode !== "text") return;
-    // Picking a model-mode bubble always leaves the Speakers workspace.
+    // Picking a model-mode bubble always leaves the Speakers / Networks
+    // workspaces.
     speakersOpen = false;
+    networksOpen = false;
     activeMode = mode;
     if (!hardware) return;
     const [config, manifest] = await Promise.all([loadConfig(), getActiveManifest()]);
@@ -648,11 +669,38 @@
    *  no-ops until the stream releases the slot. */
   const chatStreamLock = $derived(chatSlot.kind === "chat");
 
+  /** Mesh approvals waiting on the user — a fresh request, or a peer
+   *  that approved us first and now needs our confirm. Both land in
+   *  `pending_approval` (the daemon only leaves that status while we
+   *  haven't sent our approve yet), so it's the single actionable set;
+   *  a peer we already approved and are waiting on sits in
+   *  `pending_remote` and is deliberately excluded — nothing for the
+   *  user to do there. Surfaced app-wide as a Settings-attention flag
+   *  so the top-bar cog (and the Networks settings tab) light up from
+   *  any view, not just while the Networks workspace is open. The
+   *  Networks mode bubble shows its own dot from the same source. This
+   *  is the one mesh signal worth interrupting for: a new device can't
+   *  finish joining until the user acts. */
+  const meshPendingCount = $derived(
+    meshClient.peers.filter((p) => p.status === "pending_approval").length,
+  );
+  $effect(() => {
+    settingsAttention.set(
+      "cloud-mesh",
+      meshPendingCount > 0
+        ? {
+            reason: `${meshPendingCount} device${meshPendingCount > 1 ? "s" : ""} waiting for approval`,
+          }
+        : null,
+    );
+  });
+
   function onSelectConversation(id: string) {
-    if (activeConversationId === id && !remoteOpen && !speakersOpen) return;
-    // Selecting a conversation leaves the Speakers workspace and shows
-    // that conversation in its own (text / transcribe) surface.
+    if (activeConversationId === id && !remoteOpen && !speakersOpen && !networksOpen) return;
+    // Selecting a conversation leaves the Speakers / Networks workspace
+    // and shows that conversation in its own (text / transcribe) surface.
     speakersOpen = false;
+    networksOpen = false;
     if (chatStreamLock && id !== chatSlot.conversationId) return;
     remoteOpen = null;
     remoteOpenError = "";
@@ -681,6 +729,7 @@
   }) {
     if (chatStreamLock) return;
     speakersOpen = false;
+    networksOpen = false;
     activeConversationId = null;
     suppressNextActiveEvent = true;
     setActiveConversationId(null);
@@ -704,6 +753,7 @@
   function onNewConversation() {
     if (chatStreamLock) return;
     speakersOpen = false;
+    networksOpen = false;
     remoteOpen = null;
     remoteOpenError = "";
     activeConversationId = null;
@@ -1158,7 +1208,17 @@
           <button class="dismiss" onclick={() => (remoteOpenError = "")} aria-label="Dismiss">✕</button>
         </div>
       {/if}
-      {#if speakersOpen}
+      {#if networksOpen}
+        <NetworksView
+          {activeMode}
+          {supportedModes}
+          onModeChange={onModeChange}
+          onProviderChange={onProviderChange}
+          onRequestStopTranscribe={requestStopTranscribe}
+          onRequestStopChat={requestStopChat}
+          onOpenSpeakers={openSpeakers}
+        />
+      {:else if speakersOpen}
         <SpeakersView
           {activeMode}
           {supportedModes}
@@ -1166,6 +1226,7 @@
           onProviderChange={onProviderChange}
           onRequestStopTranscribe={requestStopTranscribe}
           onRequestStopChat={requestStopChat}
+          onOpenNetworks={openNetworks}
         />
       {:else if activeMode === "transcribe"}
         <TranscribeView
@@ -1193,6 +1254,7 @@
           onRequestActivateTalkingPoints={requestActivateTalkingPoints}
           onRequestRegenerateTalkingPoints={requestRegenerateTalkingPoints}
           onOpenSpeakers={openSpeakers}
+          onOpenNetworks={openNetworks}
         />
       {:else}
         <Chat
@@ -1218,6 +1280,7 @@
           onRequestSendChat={requestSendChat}
           onJumpToTranscribe={jumpToTranscribe}
           onOpenSpeakers={openSpeakers}
+          onOpenNetworks={openNetworks}
         />
       {/if}
     </div>
