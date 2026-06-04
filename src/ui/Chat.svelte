@@ -654,6 +654,66 @@
     return map;
   });
 
+  /** Flatten the message list into render items so consecutive tool-call
+   *  turns collapse into one group instead of stacking as separate boxes.
+   *  Tool activity is the model working under the hood — it renders as its
+   *  own compact strip (see `.tool-group`), never as a chat bubble.
+   *
+   *  Walk rules:
+   *   - user, or an assistant turn with something to show (text / thinking
+   *     / image / a live stream) → a `bubble` item.
+   *   - a run of pure tool-call assistant turns (nothing to show) folds
+   *     into a single `tools` item, preserving call order.
+   *   - `tool` results and `system` rows never stand alone (results surface
+   *     inside the group via `toolResultsById`; the system prompt is hidden).
+   */
+  type TranscriptItem =
+    | { kind: "bubble"; key: string; msg: Message; index: number }
+    | { kind: "tools"; key: string; calls: ToolCall[] };
+
+  const transcript = $derived.by((): TranscriptItem[] => {
+    const items: TranscriptItem[] = [];
+    let group: ToolCall[] | null = null;
+    const flush = () => {
+      if (group && group.length > 0) {
+        items.push({ kind: "tools", key: `tools-${group[0].id}`, calls: group });
+      }
+      group = null;
+    };
+    messages.forEach((msg, index) => {
+      // Results live inside their group; the IT-onboarding system prompt is
+      // never shown. Neither renders as a standalone row.
+      if (msg.role === "system" || msg.role === "tool") return;
+      if (msg.role === "assistant") {
+        const shows =
+          !!msg.content ||
+          !!msg.thinking ||
+          (msg.images?.length ?? 0) > 0 ||
+          !!msg.streaming;
+        const calls = msg.tool_calls ?? [];
+        if (shows) {
+          // A visible turn breaks the run: emit any pending group, then the
+          // bubble, then seed a fresh group from this turn's own calls.
+          flush();
+          items.push({ kind: "bubble", key: `msg-${index}`, msg, index });
+          if (calls.length > 0) group = [...calls];
+        } else if (calls.length > 0) {
+          (group ??= []).push(...calls);
+        } else {
+          // Degenerate empty assistant turn — surface it rather than letting
+          // it vanish silently.
+          flush();
+          items.push({ kind: "bubble", key: `msg-${index}`, msg, index });
+        }
+        return;
+      }
+      flush();
+      items.push({ kind: "bubble", key: `msg-${index}`, msg, index });
+    });
+    flush();
+    return items;
+  });
+
   /** Persist the current message list under `activeConversation`, creating
    *  the record on first save. Keeps disk in sync with whatever the user
    *  sees, including thinking blocks.
@@ -1712,14 +1772,64 @@
         {/if}
       </div>
     {/if}
-    {#each messages as msg, i (i)}
-      {#if msg.role === "system"}
-        <!-- IT-onboarding system prompt; hidden from the transcript so the user
-             sees only the conversation they care about. -->
-      {:else if msg.role === "tool"}
-        <!-- Tool results render inline under the assistant call pill above;
-             no standalone bubble in the transcript. -->
+    {#each transcript as item (item.key)}
+      {#if item.kind === "tools"}
+        {@const calls = item.calls}
+        {@const anyRunning = calls.some((c) => inFlightToolCallIds.has(c.id))}
+        {@const settledCount = calls.reduce((n, c) => n + (toolResultsById.has(c.id) ? 1 : 0), 0)}
+        {@const failed = !anyRunning && settledCount < calls.length}
+        <!-- Tool activity is the model working under the hood — consecutive
+             calls collapse into one group the user can expand to audit.
+             Deliberately a flat strip, not a chat bubble. -->
+        <div class="tool-track">
+          <details class="tool-group" class:running={anyRunning} class:failed>
+            <summary class="tool-group-summary">
+              <span class="tool-group-status" aria-hidden="true"
+                >{#if anyRunning}⋯{:else if failed}⚠{:else}✓{/if}</span>
+              <span class="tool-group-label"
+                >{anyRunning ? "Running" : "Ran"}
+                {calls.length === 1 ? "1 tool" : `${calls.length} tools`}{anyRunning ? "…" : ""}</span>
+              <span class="tool-group-names">
+                {#each calls as c, ci (c.id)}
+                  {#if ci > 0}<span class="tool-sep" aria-hidden="true">·</span>{/if}
+                  <span class="tool-chip">{c.function.name}</span>
+                {/each}
+              </span>
+              <span class="tool-group-chevron" aria-hidden="true">▸</span>
+            </summary>
+            <div class="tool-group-body">
+              {#each calls as call (call.id)}
+                {@const running = inFlightToolCallIds.has(call.id)}
+                {@const result = toolResultsById.get(call.id)}
+                <details class="tool-call" class:running>
+                  <summary>
+                    <span class="tool-icon" aria-hidden="true"
+                      >{#if running}⋯{:else if result}✓{:else}⚠{/if}</span>
+                    <span class="tool-name">{call.function.name}</span>
+                    <span class="tool-action">{formatArgsSummary(call.function.arguments)}</span>
+                  </summary>
+                  <div class="tool-detail">
+                    <div class="tool-field">
+                      <span class="tool-field-label">arguments</span>
+                      <pre>{formatJson(call.function.arguments)}</pre>
+                    </div>
+                    {#if result}
+                      <div class="tool-field">
+                        <span class="tool-field-label">result</span>
+                        <pre>{formatToolResult(result.content)}</pre>
+                      </div>
+                    {:else if running}
+                      <div class="tool-pending">running…</div>
+                    {/if}
+                  </div>
+                </details>
+              {/each}
+            </div>
+          </details>
+        </div>
       {:else}
+        {@const msg = item.msg}
+        {@const i = item.index}
         <div class="message {msg.role}">
           <div class="bubble">
             {#if msg.images && msg.images.length > 0}
@@ -1759,39 +1869,8 @@
               {:else}
                 <span class="content">{msg.content}</span>
               {/if}
-            {:else if msg.streaming && !msg.thinking && (!msg.tool_calls || msg.tool_calls.length === 0)}
+            {:else if msg.streaming && !msg.thinking}
               <span class="dots"><span></span><span></span><span></span></span>
-            {/if}
-            {#if msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0}
-              <div class="tool-calls">
-                {#each msg.tool_calls as call (call.id)}
-                  {@const running = inFlightToolCallIds.has(call.id)}
-                  {@const result = toolResultsById.get(call.id)}
-                  <details class="tool-call" class:running>
-                    <summary>
-                      <span class="tool-icon" aria-hidden="true">
-                        {#if running}⋯{:else if result}✓{:else}⚠{/if}
-                      </span>
-                      <span class="tool-name">{call.function.name}</span>
-                      <span class="tool-action">{formatArgsSummary(call.function.arguments)}</span>
-                    </summary>
-                    <div class="tool-detail">
-                      <div class="tool-field">
-                        <span class="tool-field-label">arguments</span>
-                        <pre>{formatJson(call.function.arguments)}</pre>
-                      </div>
-                      {#if result}
-                        <div class="tool-field">
-                          <span class="tool-field-label">result</span>
-                          <pre>{formatToolResult(result.content)}</pre>
-                        </div>
-                      {:else if running}
-                        <div class="tool-pending">running…</div>
-                      {/if}
-                    </div>
-                  </details>
-                {/each}
-              </div>
             {/if}
           </div>
           {#if msg.role === "assistant" && !msg.streaming && msg.content}
@@ -2381,66 +2460,118 @@
   .dots span:nth-child(2) { animation-delay: .2s; }
   .dots span:nth-child(3) { animation-delay: .4s; }
   @keyframes blink { 0%,80%,100% { opacity: .3; } 40% { opacity: 1; } }
-  /* Tool-call pills surface what the IT-onboarded model is doing under
-     the hood — calling `networks` with action=status, switching the active
-     network, etc. Collapsed by default to keep the transcript readable;
-     the user expands one when they want to audit args / result. */
-  .tool-calls {
+  /* Tool activity = the model working under the hood. It renders as a
+     compact, flat strip — deliberately NOT a chat bubble — in the
+     assistant's column. Consecutive calls fold into one `.tool-group`
+     that stays collapsed to keep the transcript readable; the user
+     expands the group, then an individual call, to audit args / result.
+     A left rail (not a rounded box) marks it as a side-channel of the
+     conversation rather than a message in it. */
+  .tool-track {
+    align-self: flex-start;
+    max-width: 72%;
+  }
+  .tool-group {
+    font-size: .78rem;
+    border-left: 2px solid #2e2e38;
+  }
+  .tool-group.running { border-left-color: #4a4a78; }
+  .tool-group.failed { border-left-color: #6a3a3a; }
+  .tool-group-summary {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    padding: .3rem .4rem .3rem .7rem;
+    cursor: pointer;
+    color: #9a9a9a;
+    list-style: none;
+    user-select: none;
+    border-radius: 0 6px 6px 0;
+  }
+  .tool-group-summary::-webkit-details-marker { display: none; }
+  .tool-group-summary:hover { background: rgba(255, 255, 255, .025); color: #c4c4c4; }
+  .tool-group-status {
+    flex: none;
+    width: 1em;
+    text-align: center;
+    color: #7d7d7d;
+  }
+  .tool-group.running .tool-group-status { color: #b9b9ee; animation: blink 1.4s infinite; }
+  .tool-group.failed .tool-group-status { color: #d98a8a; }
+  .tool-group-label { flex: none; color: #b6b6b6; }
+  /* Tool-name preview: the collapsed group still says what ran. Wraps to
+     a second line on a narrow pane rather than truncating mid-name. */
+  .tool-group-names {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: .15rem .35rem;
+  }
+  .tool-chip { font-family: monospace; color: #8a8ad8; white-space: nowrap; }
+  .tool-sep { color: #555; }
+  .tool-group-chevron {
+    flex: none;
+    color: #5e5e5e;
+    font-size: .7rem;
+    transition: transform .15s ease;
+  }
+  .tool-group[open] .tool-group-chevron { transform: rotate(90deg); }
+  .tool-group-body {
     display: flex;
     flex-direction: column;
-    gap: .3rem;
-    margin-top: .55rem;
+    gap: .1rem;
+    padding: .1rem 0 .35rem .55rem;
   }
-  .tool-call {
-    background: #181818;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
-    font-size: .75rem;
-  }
-  .tool-call.running {
-    background: #1c1c24;
-    border-color: #3a3a55;
-  }
+  /* Each call is a flat, expandable row inside the open group — no boxed
+     pill, so the group reads as one unit rather than a stack of bubbles. */
+  .tool-call { font-size: .75rem; border-radius: 5px; }
   .tool-call summary {
     display: flex;
     align-items: center;
     gap: .45rem;
-    padding: .35rem .6rem;
+    padding: .28rem .45rem;
     cursor: pointer;
-    color: #aaa;
+    color: #9a9a9a;
     list-style: none;
     user-select: none;
+    border-radius: 5px;
   }
+  .tool-call summary:hover { background: rgba(255, 255, 255, .025); }
   .tool-call summary::-webkit-details-marker { display: none; }
   .tool-call summary::before {
     content: "▸";
-    color: #666;
-    font-size: .7rem;
+    flex: none;
     width: .8em;
+    color: #5e5e5e;
+    font-size: .65rem;
+    transition: transform .15s ease;
   }
-  .tool-call[open] summary::before { content: "▾"; }
+  .tool-call[open] summary::before { transform: rotate(90deg); }
   .tool-icon {
+    flex: none;
     display: inline-block;
     width: 1em;
     text-align: center;
-    color: #888;
+    color: #7d7d7d;
   }
   .tool-call.running .tool-icon { color: #b9b9ee; animation: blink 1.4s infinite; }
-  .tool-name {
-    font-family: monospace;
-    color: #6e6ef7;
-  }
+  .tool-name { flex: none; font-family: monospace; color: #8a8ad8; }
   .tool-action {
-    color: #888;
+    min-width: 0;
+    color: #818181;
     font-family: monospace;
     font-size: .72rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .tool-detail {
-    padding: .2rem .65rem .55rem .65rem;
+    padding: .1rem .45rem .35rem 1.3rem;
     display: flex;
     flex-direction: column;
-    gap: .45rem;
-    border-top: 1px solid #2a2a2a;
+    gap: .4rem;
   }
   .tool-field {
     display: flex;
