@@ -599,34 +599,54 @@ async fn tts_speak(text: String, voice: Option<String>) -> Result<String, String
     .await
     .map_err(|e| format!("onnxruntime init join error: {e}"))?;
     if !ort.initialized {
-        return Err(format!(
+        let msg = format!(
             "speech engine (onnxruntime) not ready: {}",
             ort.error.unwrap_or_else(|| "unknown error".into())
-        ));
+        );
+        eprintln!("[tts-speak] {msg}");
+        return Err(msg);
     }
 
     // 2. Resolve this machine's voice model + the runtime that serves it.
-    let (model, runtime) = resolver::resolve_pair("speak")
-        .await
-        .map_err(|e| format!("could not resolve a speak model: {e}"))?;
+    let (model, runtime) = resolver::resolve_pair("speak").await.map_err(|e| {
+        let msg = format!("could not resolve a speak model: {e}");
+        eprintln!("[tts-speak] {msg}");
+        msg
+    })?;
     eprintln!("[tts-speak] resolved speak → runtime={runtime} model={model}");
 
     // 3. Make sure the voice model is on disk (no-op once installed; first
     //    call downloads it).
     match models::fetch_model_quiet(&model, models::ModelKind::Tts).await {
         Ok(true) => {}
-        Ok(false) => return Err(format!("voice model '{model}' could not be installed")),
-        Err(e) => return Err(format!("fetching voice model '{model}': {e}")),
+        Ok(false) => {
+            let msg = format!("voice model '{model}' could not be installed");
+            eprintln!("[tts-speak] {msg}");
+            return Err(msg);
+        }
+        Err(e) => {
+            let msg = format!("fetching voice model '{model}': {e}");
+            eprintln!("[tts-speak] {msg}");
+            return Err(msg);
+        }
     }
 
     // 4. Synthesize on a blocking thread (ORT inference), then base64 the WAV
-    //    so the webview can wrap it in a data: URL and play it.
+    //    so the webview can wrap it in a data: URL and play it. Log the full
+    //    error chain to stderr on failure — the synthesis path is where the
+    //    owned espeak-ng install / phonemizer / ONNX forward can fail, and the
+    //    reason (e.g. a missing vendor release) belongs in the engine log, not
+    //    just the webview console the caller writes it to.
     let audio = tokio::task::spawn_blocking(move || {
         tts::synthesize_blocking(&runtime, &model, &text, voice.as_deref())
     })
     .await
     .map_err(|e| format!("synthesis join error: {e}"))?
-    .map_err(|e| format!("{e:#}"))?;
+    .map_err(|e| {
+        let msg = format!("{e:#}");
+        eprintln!("[tts-speak] synthesis failed: {msg}");
+        msg
+    })?;
 
     eprintln!(
         "[tts-speak] synthesized {} bytes ({})",

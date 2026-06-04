@@ -1547,6 +1547,10 @@
   /** Index whose last Speak attempt failed, for the transient "Failed"
    *  label (no voice model / espeak, non-Tauri host, synth error). */
   let speakErrorIdx = $state<number | null>(null);
+  /** The failure reason for `speakErrorIdx`, surfaced in the button's
+   *  tooltip so the actual error (e.g. "espeak-ng vendor release not
+   *  published") is visible without opening the webview console. */
+  let speakErrorMsg = $state<string>("");
   let speakErrorTimer: ReturnType<typeof setTimeout> | null = null;
   /** Bumped on every Speak/Stop action so a synthesis that resolves after
    *  the user moved on (stopped it, or hit Speak on another reply) is
@@ -1563,13 +1567,17 @@
     return (el.textContent ?? "").replace(/\s+/g, " ").trim();
   }
 
-  function flagSpeakError(idx: number) {
+  function flagSpeakError(idx: number, msg: string) {
     speakErrorIdx = idx;
+    speakErrorMsg = msg;
     if (speakErrorTimer) clearTimeout(speakErrorTimer);
     speakErrorTimer = setTimeout(() => {
-      if (speakErrorIdx === idx) speakErrorIdx = null;
+      if (speakErrorIdx === idx) {
+        speakErrorIdx = null;
+        speakErrorMsg = "";
+      }
       speakErrorTimer = null;
-    }, 2200);
+    }, 5000);
   }
 
   /** Speak (or stop) the assistant reply at `idx`. The active message's
@@ -1604,7 +1612,7 @@
       console.error("[tts] synthesis failed:", e);
       if (speakToken === token) {
         speakingIdx = null;
-        flagSpeakError(idx);
+        flagSpeakError(idx, String(e));
       }
       return;
     }
@@ -1622,7 +1630,7 @@
       console.error("[tts] playback failed:", e);
       if (speakToken === token) {
         speakingIdx = null;
-        flagSpeakError(idx);
+        flagSpeakError(idx, String(e));
       }
     }
   }
@@ -1801,9 +1809,11 @@
                 class="bubble-action"
                 class:speaking={speakingIdx === i}
                 onclick={() => speakMessage(i, msg.content)}
-                title={speakingIdx === i && speakPhase === "playing"
-                  ? "Stop playback"
-                  : "Read this reply aloud"}
+                title={speakErrorIdx === i
+                  ? speakErrorMsg
+                  : speakingIdx === i && speakPhase === "playing"
+                    ? "Stop playback"
+                    : "Read this reply aloud"}
                 aria-pressed={speakingIdx === i}
               >
                 {speakLabel(i)}
