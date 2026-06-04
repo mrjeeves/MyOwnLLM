@@ -26,14 +26,24 @@
     DEFAULT_SYSTEM_PROMPT_BASE,
     TOOL_PROMPT_SNIPPETS,
   } from "../../agent-tools";
-  import { PROMPT_ALL_TOOLS, type PromptToolId } from "../../types";
-  import { loadConfig } from "../../config";
+  import {
+    PROMPT_ALL_TOOLS,
+    VOICE_INTEGRATIONS,
+    type PromptToolId,
+    type VoiceConfig,
+  } from "../../types";
+  import { loadConfig, getVoiceConfig } from "../../config";
+  import VoiceControls from "./VoiceControls.svelte";
 
   let loading = $state(true);
   let error = $state("");
   let selectedId = $state<string | null>(null);
   let systemPromptOpen = $state(false);
   let toolsOpen = $state(false);
+  let voiceOpen = $state(false);
+  /** The global default voice, shown when a persona inherits it and used
+   *  to seed a fresh per-persona override. Loaded on mount. */
+  let globalVoice = $state<VoiceConfig>({ engine: "auto", voice_id: "", rate: 1, pitch: 1 });
   let activeNetworkLabel = $state<string>("");
   let activeNetworkAbsent = $state(false);
   // Mirror of the active network's `auto_gossip` flag for the header
@@ -107,6 +117,7 @@
       selectedId = p.id;
       systemPromptOpen = false;
       toolsOpen = false;
+      voiceOpen = false;
     } catch (e) {
       error = String(e instanceof Error ? e.message : e);
     }
@@ -155,12 +166,31 @@
     await updateField(id, "system_prompt", DEFAULT_SYSTEM_PROMPT_BASE);
   }
 
+  /** Human label for a voice engine id, for the "inherits the default"
+   *  note. */
+  function voiceEngineLabel(engine: VoiceConfig["engine"]): string {
+    return VOICE_INTEGRATIONS.find((i) => i.id === engine)?.label ?? engine;
+  }
+
+  /** Turn a per-persona voice override on (seeded from the current global
+   *  default) or off (back to inheriting the global default). */
+  async function toggleVoiceOverride(id: string, on: boolean): Promise<void> {
+    await updateField(id, "voice", on ? { ...globalVoice } : undefined);
+  }
+
+  /** Persist an edit to the selected persona's voice override. */
+  async function setPersonaVoice(id: string, next: VoiceConfig): Promise<void> {
+    await updateField(id, "voice", next);
+  }
+
   onMount(() => {
     void (async () => {
       try {
         await agentPrompts.ensureLoaded();
         await agentToolsConfig.ensureLoaded();
         await refreshActiveLabel();
+        const cfg = await loadConfig();
+        globalVoice = getVoiceConfig(cfg);
         if (!selectedId && agentPrompts.current.length > 0) {
           selectedId = agentPrompts.current[0].id;
         }
@@ -231,6 +261,7 @@
                     selectedId = p.id;
                     systemPromptOpen = false;
                     toolsOpen = false;
+                    voiceOpen = false;
                   }}
                 >
                   <span class="prompt-name">{p.name || "Untitled persona"}</span>
@@ -380,6 +411,51 @@
                   (e.currentTarget as HTMLTextAreaElement).value,
                 )}
             ></textarea>
+          </div>
+
+          <div class="field">
+            <details class="collapse" bind:open={voiceOpen}>
+              <summary>
+                <span>Voice</span>
+                {#if sel.voice}
+                  <span class="muted">— custom · {voiceEngineLabel(sel.voice.engine)}</span>
+                {:else}
+                  <span class="muted">— default · {voiceEngineLabel(globalVoice.engine)}</span>
+                {/if}
+              </summary>
+              <div class="collapse-body">
+                <p class="muted small">
+                  Override the global default voice (Settings → Voices) for
+                  spoken replies while this persona is active. Leave it off to
+                  follow the default.
+                </p>
+                <label class="voice-toggle">
+                  <input
+                    type="checkbox"
+                    checked={!!sel.voice}
+                    onchange={(e) =>
+                      toggleVoiceOverride(
+                        sel.id,
+                        (e.currentTarget as HTMLInputElement).checked,
+                      )}
+                  />
+                  Use a custom voice for this persona
+                </label>
+                {#if sel.voice}
+                  {@const pv = sel.voice}
+                  <VoiceControls
+                    value={pv}
+                    onChange={(next) => setPersonaVoice(sel.id, next)}
+                    idPrefix={`persona-voice-${sel.id}`}
+                  />
+                {:else}
+                  <p class="muted small inherit-note">
+                    Inheriting the global default:
+                    <strong>{voiceEngineLabel(globalVoice.engine)}</strong>.
+                  </p>
+                {/if}
+              </div>
+            </details>
           </div>
 
           <div class="actions">
@@ -759,6 +835,24 @@
     overflow-x: auto;
     white-space: pre-wrap;
     word-break: break-word;
+  }
+  .voice-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.82rem;
+    color: #ccc;
+    cursor: pointer;
+  }
+  .voice-toggle input[type="checkbox"] {
+    accent-color: #6e6ef7;
+  }
+  .inherit-note {
+    color: #888;
+  }
+  .inherit-note strong {
+    color: #cdeaff;
+    font-weight: 600;
   }
   .actions {
     display: flex;

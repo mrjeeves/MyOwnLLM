@@ -588,9 +588,116 @@ export interface Prompt {
    *  agent's tool / shell conventions baked into the default
    *  system prompt. */
   user_prompt: string;
+  /** Optional per-persona voice override. When present it fully
+   *  replaces the global `Config.voice` default for spoken replies
+   *  while this persona is active (the Speak button + any
+   *  `/v1/audio/speech` call made on its behalf). Absent = use the
+   *  global default. Edited in the Personas tab's "Voice" section
+   *  and gossiped with the rest of the persona. */
+  voice?: VoiceConfig;
   /** Unix-ms timestamp of the last local edit. LWW merge key. */
   updated_at: number;
 }
+
+/** A text-to-speech integration ("engine"). The Voices settings tab
+ *  lets the user pick which one drives spoken replies and a persona
+ *  can override it.
+ *
+ *  - `"auto"` — defer to the hardware resolver: Kokoro on capable
+ *    machines, Piper on lighter ones. The historical behavior and
+ *    the default.
+ *  - `"kokoro"` / `"piper"` — force a specific on-device engine
+ *    regardless of the resolved tier (downloads the model on first
+ *    use if it isn't already present).
+ *  - `"webspeech"` — route synthesis through the browser / OS
+ *    SpeechSynthesis voices. No download, many languages, and the
+ *    documented graceful-degrade fallback when an on-device engine
+ *    can't run. */
+export type VoiceEngine = "auto" | "kokoro" | "piper" | "webspeech";
+
+/** Voice + delivery settings shared by the Speak button and the
+ *  `/v1/audio/speech` route. The global copy lives on `Config.voice`;
+ *  a persona overrides it via `Prompt.voice`. */
+export interface VoiceConfig {
+  /** Which integration synthesizes spoken replies. */
+  engine: VoiceEngine;
+  /** Engine-specific voice id. For WebSpeech this is a
+   *  `SpeechSynthesisVoice.voiceURI`; the on-device engines are
+   *  single-voice today and ignore it (kept so the field is
+   *  forward-compatible with a Kokoro voice bank). Empty = the
+   *  engine's default voice. */
+  voice_id: string;
+  /** Speaking rate. 1.0 = natural. WebSpeech maps it to
+   *  `utterance.rate`, Kokoro to the model's `speed` input, Piper to
+   *  the inverse of its `length_scale`. Clamped to [0.5, 2.0]. */
+  rate: number;
+  /** Pitch multiplier. 1.0 = natural. WebSpeech only — the on-device
+   *  engines have no pitch control and ignore it. Clamped to [0, 2]. */
+  pitch: number;
+}
+
+/** One row in the voice-integration catalog: the metadata the Voices
+ *  settings tab renders for each engine, so the UI and the persona
+ *  override agree on labels / capabilities without hard-coding them
+ *  in each component. */
+export interface VoiceIntegration {
+  id: VoiceEngine;
+  /** Human-readable name shown in the engine picker. */
+  label: string;
+  /** One-line description of what the integration is + its trade-offs. */
+  description: string;
+  /** True when the integration exposes a selectable voice list in the
+   *  UI (WebSpeech enumerates the OS voices). The on-device engines are
+   *  single-voice today, so their card hides the voice dropdown. */
+  multiVoice: boolean;
+  /** True when the integration honours the pitch control (WebSpeech
+   *  only). */
+  pitch: boolean;
+  /** True when synthesis runs on this device (vs. the browser / OS). */
+  onDevice: boolean;
+}
+
+/** Canonical catalog of the voice integrations, in the order the
+ *  Voices tab lists them. Single source of truth for engine metadata
+ *  across the Voices tab and the Personas "Voice" section. */
+export const VOICE_INTEGRATIONS: VoiceIntegration[] = [
+  {
+    id: "auto",
+    label: "Automatic (on-device)",
+    description:
+      "Let MyOwnLLM pick the best on-device voice for this machine — Kokoro on capable hardware, Piper on lighter devices. The default.",
+    multiVoice: false,
+    pitch: false,
+    onDevice: true,
+  },
+  {
+    id: "kokoro",
+    label: "Kokoro · on-device",
+    description:
+      "Expressive 82M-parameter neural voice. Best on capable hardware; downloads ~90 MB the first time it speaks.",
+    multiVoice: false,
+    pitch: false,
+    onDevice: true,
+  },
+  {
+    id: "piper",
+    label: "Piper · on-device",
+    description:
+      "Fast, lightweight neural voice that runs anywhere — down to a Raspberry Pi. Downloads ~60 MB the first time it speaks.",
+    multiVoice: false,
+    pitch: false,
+    onDevice: true,
+  },
+  {
+    id: "webspeech",
+    label: "System voices",
+    description:
+      "The voices built into your operating system, via the browser's Speech Synthesis API. No download, many languages, and the fallback used when an on-device engine can't run.",
+    multiVoice: true,
+    pitch: true,
+    onDevice: false,
+  },
+];
 
 /** How the `web_search` tool reaches the web. Keyless by default
  *  (DuckDuckGo's HTML endpoint) so search works out of the box with no
@@ -661,6 +768,12 @@ export interface Config {
   /** Backend the agent's `web_search` tool uses. Defaults to keyless
    *  DuckDuckGo so search works with no setup. */
   web_search: WebSearchConfig;
+  /** Default voice for spoken replies (the Speak button + loopback
+   *  `/v1/audio/speech` callers), managed in Settings → Voices. A
+   *  persona can override it via `Prompt.voice`. Optional for
+   *  backwards compat — absent configs default to automatic on-device
+   *  synthesis via `mergeDefaults`. */
+  voice: VoiceConfig;
   /** Program-level (global) per-tool enablement, managed in
    *  Settings → Tools. The outer on/off layer for every agent tool;
    *  a tool disabled here is unavailable to every persona and chat

@@ -37,7 +37,7 @@ MyOwnLLM is a **local-first AI you install once and run everywhere** — a deskt
 | 🤖 **Self-managing agent** | A tool-calling chat with five tools — including keyless `web_search` — that runs shell commands, reads and writes files, and configures the mesh for you. |
 | 🕸️ **Cloud Mesh** | Your devices find each other and share inference peer-to-peer over WebRTC. No broker, no account, no API key. |
 | 🎙️ **Live diarized transcription** | Real-time streaming captions in 25 languages, with speaker IDs that stay stable across the whole session — and carry into future ones. |
-| 🗣️ **Text-to-speech** | On-device TTS (Kokoro / Piper) with a self-installing espeak-ng phonemizer and a `POST /v1/audio/speech` endpoint. |
+| 🗣️ **Text-to-speech** | On-device TTS (Kokoro / Piper) with a self-installing espeak-ng phonemizer and a `POST /v1/audio/speech` endpoint. Pick a default voice across engines (incl. your OS's system voices) in **Settings → Voices**, or override it per **persona**. |
 | 🔌 **Three wire formats, one server** | OpenAI, Ollama, and Anthropic on `:1473`. Cursor, Continue, Aider, Cline, Zed, and Open WebUI all just work. |
 | 🧠 **Hardware-aware models** | Manifest-driven tier selection from a Raspberry Pi 4 (2 GB) to a 5090. Gemma 4 and Qwen 3.6 edge builds included. |
 | 🔄 **Self-updating** | Stages on launch, applies on next start. Last-good manifest cached for offline runs. |

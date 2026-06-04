@@ -18,6 +18,8 @@ import type {
   PromptToolId,
   WebSearchConfig,
   ToolsConfig,
+  VoiceConfig,
+  VoiceEngine,
 } from "./types";
 import { PROMPT_ALL_TOOLS } from "./types";
 
@@ -125,6 +127,42 @@ const DEFAULT_TOOLS: ToolsConfig = {
   enabled: {},
 };
 
+/** Default voice for spoken replies: automatic on-device synthesis
+ *  (Kokoro/Piper picked by hardware) at a natural rate — the historical
+ *  Speak-button behavior. Configs predating the Voices tab land here. */
+export const DEFAULT_VOICE: VoiceConfig = {
+  engine: "auto",
+  voice_id: "",
+  rate: 1.0,
+  pitch: 1.0,
+};
+
+const VOICE_ENGINES: readonly VoiceEngine[] = ["auto", "kokoro", "piper", "webspeech"];
+
+/** Clamp a possibly-garbage numeric field into range, falling back to
+ *  `dflt` when it isn't a finite number. */
+function clampNum(v: unknown, min: number, max: number, dflt: number): number {
+  if (typeof v !== "number" || !Number.isFinite(v)) return dflt;
+  return Math.min(max, Math.max(min, v));
+}
+
+/** Coerce a possibly-hand-edited / partial voice blob into a strict
+ *  `VoiceConfig`, filling missing or invalid fields from `fallback`.
+ *  Used for both the global `Config.voice` and a persona's optional
+ *  `Prompt.voice` override (where `fallback` is the global default). */
+export function coerceVoiceConfig(raw: unknown, fallback: VoiceConfig): VoiceConfig {
+  if (!raw || typeof raw !== "object") return { ...fallback };
+  const o = raw as Partial<VoiceConfig>;
+  return {
+    engine: VOICE_ENGINES.includes(o.engine as VoiceEngine)
+      ? (o.engine as VoiceEngine)
+      : fallback.engine,
+    voice_id: typeof o.voice_id === "string" ? o.voice_id : fallback.voice_id,
+    rate: clampNum(o.rate, 0.5, 2.0, fallback.rate),
+    pitch: clampNum(o.pitch, 0, 2, fallback.pitch),
+  };
+}
+
 const DEFAULT_CONFIG: Config = {
   active_provider: "MyOwnLLM Default",
   active_family: "gemma4",
@@ -161,6 +199,7 @@ const DEFAULT_CONFIG: Config = {
   },
   mic: { ...DEFAULT_MIC },
   web_search: { ...DEFAULT_WEB_SEARCH },
+  voice: { ...DEFAULT_VOICE },
   tools: { enabled: { ...DEFAULT_TOOLS.enabled } },
   providers: [
     {
@@ -263,6 +302,7 @@ function mergeDefaults(raw: Record<string, unknown>): Config {
       ...DEFAULT_WEB_SEARCH,
       ...((raw as { web_search?: Partial<WebSearchConfig> }).web_search ?? {}),
     },
+    voice: coerceVoiceConfig((raw as { voice?: unknown }).voice, DEFAULT_VOICE),
     tools: coerceToolsConfig((raw as { tools?: unknown }).tools),
     mode_overrides: (raw as { mode_overrides?: Config["mode_overrides"] }).mode_overrides ?? {},
     family_overrides:
@@ -1211,6 +1251,36 @@ export async function updateToolsConfig(
   return await updateConfig({ tools: next });
 }
 
+// ---- voice ---------------------------------------------------------------
+
+/** Read the global default voice config with defaults filled in.
+ *  A config predating the Voices tab reads as automatic on-device
+ *  synthesis. */
+export function getVoiceConfig(cfg: Config): VoiceConfig {
+  return coerceVoiceConfig(cfg.voice, DEFAULT_VOICE);
+}
+
+/** Mutate the global default voice config and persist. The patcher
+ *  receives the current (defaults-filled) config and returns the next.
+ *  Global preference — no network scoping, no gossip (it's local to
+ *  this device, like the program-level tools config). */
+export async function updateVoiceConfig(
+  patcher: (current: VoiceConfig) => VoiceConfig,
+): Promise<Config> {
+  const cfg = await loadConfig();
+  const next = coerceVoiceConfig(patcher(getVoiceConfig(cfg)), DEFAULT_VOICE);
+  return await updateConfig({ voice: next });
+}
+
+/** Resolve the voice that should drive a spoken reply: a persona's
+ *  override when it has one, otherwise the global default. `persona`
+ *  is the active `Prompt` (or null for the built-in baseline). */
+export function resolveVoiceConfig(cfg: Config, persona?: Prompt | null): VoiceConfig {
+  const base = getVoiceConfig(cfg);
+  if (persona?.voice) return coerceVoiceConfig(persona.voice, base);
+  return base;
+}
+
 /** Mutate the active network's permissions and persist. The patcher
  *  returns the updated record; callers are responsible for bumping
  *  `updated_at` on tools they're actually changing (the gossip layer
@@ -1261,7 +1331,23 @@ function coercePrompt(raw: unknown): Prompt | null {
     typeof obj.updated_at === "number" && Number.isFinite(obj.updated_at)
       ? Math.max(0, Math.floor(obj.updated_at))
       : 0;
-  return { id, name, system_prompt, tools, user_prompt, updated_at };
+  // Optional per-persona voice override. Only carried when the blob
+  // actually has one — absent means "use the global default", which is
+  // distinct from an explicit override that happens to equal the
+  // default.
+  const voice =
+    obj.voice && typeof obj.voice === "object"
+      ? coerceVoiceConfig(obj.voice, DEFAULT_VOICE)
+      : undefined;
+  return {
+    id,
+    name,
+    system_prompt,
+    tools,
+    user_prompt,
+    updated_at,
+    ...(voice ? { voice } : {}),
+  };
 }
 
 /** Mint a fresh `id` for a new prompt. Prefixed so a stray id

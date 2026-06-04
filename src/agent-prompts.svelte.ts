@@ -119,6 +119,7 @@ class AgentPromptsState {
           tools: [...remote.tools],
           user_prompt: remote.user_prompt,
           updated_at: remote.updated_at,
+          ...(remote.voice ? { voice: { ...remote.voice } } : {}),
         });
         changed = true;
       }
@@ -194,11 +195,49 @@ class AgentPromptsState {
       system_prompt: source.system_prompt,
       tools: [...source.tools],
       user_prompt: source.user_prompt,
+      ...(source.voice ? { voice: { ...source.voice } } : {}),
       // Stamp fresh so peers on the new network treat this as the
       // authoritative copy.
       updated_at: Date.now(),
     };
     await this.persistList((cur) => [...cur, clone]);
+  }
+
+  /** Ensure a persona referenced by a conversation that arrived from a
+   *  peer (a Move, Pull, or remote-session open) is present in the local
+   *  library, so the conversation's persona — its system prompt, tool
+   *  selection, and voice — is usable on this device rather than a
+   *  dangling `active_prompt_id`. Lands it on the active network (the
+   *  same scope the gossip layer uses) so it then syncs like any other
+   *  persona; `persistList` broadcasts the update, gated by the network's
+   *  `auto_gossip` flag.
+   *
+   *  Last-write-wins: only writes when the persona is absent locally or
+   *  the incoming copy is newer, so re-opening a remote conversation
+   *  never clobbers a fresher local edit. No-op when there's no active
+   *  network to land it on. */
+  async ensureLocalPersona(persona: Prompt): Promise<void> {
+    if (!persona?.id) return;
+    await this.ensureLoaded();
+    const cfg = await loadConfig();
+    const activeId = cfg.cloud_mesh.active_network_id;
+    if (!activeId) return;
+    const active = cfg.cloud_mesh.networks.find((n) => n.id === activeId);
+    if (!active) return;
+    const existing = (active.prompts ?? []).find((p) => p.id === persona.id);
+    if (existing && existing.updated_at >= persona.updated_at) return;
+    const landed: Prompt = {
+      id: persona.id,
+      name: persona.name,
+      system_prompt: persona.system_prompt,
+      tools: [...persona.tools],
+      user_prompt: persona.user_prompt,
+      ...(persona.voice ? { voice: { ...persona.voice } } : {}),
+      // Preserve the incoming timestamp so LWW stays consistent across
+      // the mesh; fall back to now for a hand-rolled persona missing one.
+      updated_at: persona.updated_at || Date.now(),
+    };
+    await this.persistList((cur) => [...cur.filter((p) => p.id !== landed.id), landed]);
   }
 
   /** Internal: apply a patcher to the active network's prompts,

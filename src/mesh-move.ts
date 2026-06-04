@@ -36,7 +36,26 @@ import {
   loadConversation,
   saveConversation,
 } from "./conversations";
+import { agentPrompts } from "./agent-prompts.svelte";
+import type { Prompt } from "./types";
 import type { RpcInboundCall } from "./mesh-daemon.svelte";
+
+/** Resolve the persona a conversation uses so it can ride along with a
+ *  transfer. A conversation only records its persona by id
+ *  (`active_prompt_id`); the persona itself lives in the per-network
+ *  gossiped library, so a conversation moved/pulled/opened from a peer
+ *  would otherwise reference a persona the receiving device may not have.
+ *  Carrying it lets the receiver make it locally available via
+ *  `agentPrompts.ensureLocalPersona`. Returns null when the conversation
+ *  has no persona or it can't be resolved locally. */
+async function personaForConversation(
+  conversation: Conversation,
+): Promise<Prompt | null> {
+  const id = conversation.active_prompt_id;
+  if (!id) return null;
+  await agentPrompts.ensureLoaded();
+  return agentPrompts.resolve(id);
+}
 
 // ----------------------------------------------------------------------
 // Caller side
@@ -57,7 +76,11 @@ interface MoveClient {
   }>;
 }
 
-/** Read a conversation from a peer's local disk. Doesn't delete. */
+/** Read a conversation from a peer's local disk. Doesn't delete. The host
+ *  returns the conversation's persona alongside it (resolved from its
+ *  `active_prompt_id`); we land it in the local library so the
+ *  conversation's system prompt, tools, and voice are usable here whether
+ *  it's being pulled or just viewed remotely. */
 export async function fetchRemoteSession(
   client: MoveClient,
   target_peer_id: string,
@@ -65,9 +88,12 @@ export async function fetchRemoteSession(
 ): Promise<Conversation> {
   const resp = (await client.callRpc(target_peer_id, "session_fetch", {
     guid,
-  })) as { conversation?: Conversation; error?: string };
+  })) as { conversation?: Conversation; persona?: Prompt; error?: string };
   if (resp?.error) throw new Error(resp.error);
   if (!resp?.conversation) throw new Error("host returned no conversation");
+  if (resp.persona) {
+    await agentPrompts.ensureLocalPersona(resp.persona).catch(() => undefined);
+  }
   return resp.conversation;
 }
 
@@ -107,10 +133,14 @@ export async function moveConversation(
   } catch {
     // ignore — root is the safe default
   }
+  // Carry the persona so the receiver can make it locally available —
+  // the conversation only records it by id.
+  const persona = await personaForConversation(conversation);
   const resp = (await client.callRpc(target_peer_id, "move_take", {
     guid,
     conversation,
     source_folder,
+    persona,
   })) as { ok?: boolean; error?: string };
   if (!resp?.ok || resp?.error) {
     throw new Error(resp?.error ?? "peer refused move");
@@ -234,7 +264,10 @@ async function handleSessionFetch(
       );
       return;
     }
-    await client.respondRpc(call.request_id, { conversation }, null);
+    // Resolve + ship the conversation's persona so the caller can make it
+    // locally available (its system prompt, tools, and voice).
+    const persona = await personaForConversation(conversation);
+    await client.respondRpc(call.request_id, { conversation, persona }, null);
   } catch (e) {
     await client.respondRpc(call.request_id, { error: String(e) }, null);
   }
@@ -261,10 +294,11 @@ async function handleMoveTake(
   client: HandlerClient,
   call: RpcInboundCall,
 ): Promise<void> {
-  const { guid, conversation, source_folder } = (call.payload as {
+  const { guid, conversation, source_folder, persona } = (call.payload as {
     guid?: string;
     conversation?: Conversation;
     source_folder?: string;
+    persona?: Prompt;
   }) ?? {};
   if (!guid || !conversation) {
     await client.respondRpc(call.request_id, null, "missing guid/conversation");
@@ -272,6 +306,11 @@ async function handleMoveTake(
   }
   try {
     await saveConversation(conversation, source_folder ?? "");
+    // Take ownership of the conversation's persona too, so its settings
+    // (system prompt, tools, voice) are available on this device.
+    if (persona) {
+      await agentPrompts.ensureLocalPersona(persona).catch(() => undefined);
+    }
     await client.respondRpc(call.request_id, { ok: true, guid }, null);
   } catch (e) {
     await client.respondRpc(call.request_id, { ok: false, error: String(e) }, null);

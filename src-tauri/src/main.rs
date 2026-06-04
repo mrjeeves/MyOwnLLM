@@ -583,7 +583,12 @@ fn speaker_review_dismiss(stream_id: String) -> Result<(), String> {
 /// machine may block while the runtime dylib and the voice model download —
 /// the caller shows a "Speaking…" state and surfaces any error string.
 #[tauri::command]
-async fn tts_speak(text: String, voice: Option<String>) -> Result<String, String> {
+async fn tts_speak(
+    text: String,
+    voice: Option<String>,
+    engine: Option<String>,
+    rate: Option<f32>,
+) -> Result<String, String> {
     let text = text.trim().to_string();
     if text.is_empty() {
         return Err("nothing to speak — the reply was empty".to_string());
@@ -608,13 +613,21 @@ async fn tts_speak(text: String, voice: Option<String>) -> Result<String, String
         return Err(msg);
     }
 
-    // 2. Resolve this machine's voice model + the runtime that serves it.
-    let (model, runtime) = resolver::resolve_pair("speak").await.map_err(|e| {
-        let msg = format!("could not resolve a speak model: {e}");
-        eprintln!("[tts-speak] {msg}");
-        msg
-    })?;
-    eprintln!("[tts-speak] resolved speak → runtime={runtime} model={model}");
+    // 2. Resolve the voice model + the runtime that serves it. An explicit
+    //    `engine` (from the Voices settings / a persona's Voice override)
+    //    forces a specific on-device backend; otherwise the resolver picks
+    //    the hardware tier — the historical Speak-button path. WebSpeech is
+    //    handled entirely in the webview and never reaches this command.
+    let (model, runtime) = match engine.as_deref() {
+        Some("kokoro") => ("kokoro-82m".to_string(), "kokoro".to_string()),
+        Some("piper") => ("piper-en-us-lessac-medium".to_string(), "piper".to_string()),
+        _ => resolver::resolve_pair("speak").await.map_err(|e| {
+            let msg = format!("could not resolve a speak model: {e}");
+            eprintln!("[tts-speak] {msg}");
+            msg
+        })?,
+    };
+    eprintln!("[tts-speak] resolved speak → runtime={runtime} model={model} (engine={engine:?})");
 
     // 3. Make sure the voice model is on disk (no-op once installed; first
     //    call downloads it).
@@ -638,8 +651,9 @@ async fn tts_speak(text: String, voice: Option<String>) -> Result<String, String
     //    owned espeak-ng install / phonemizer / ONNX forward can fail, and the
     //    reason (e.g. a missing vendor release) belongs in the engine log, not
     //    just the webview console the caller writes it to.
+    let speed = rate.unwrap_or(1.0);
     let audio = tokio::task::spawn_blocking(move || {
-        tts::synthesize_blocking(&runtime, &model, &text, voice.as_deref())
+        tts::synthesize_blocking(&runtime, &model, &text, voice.as_deref(), speed)
     })
     .await
     .map_err(|e| format!("synthesis join error: {e}"))?

@@ -238,6 +238,10 @@ export async function publishPromptsSnapshot(
       tools: [...p.tools],
       user_prompt: p.user_prompt,
       updated_at: p.updated_at,
+      // Carry the optional per-persona voice override so it survives a
+      // gossip round-trip; only included when the persona actually has
+      // one (absent = peer keeps "use the global default").
+      ...(p.voice ? { voice: { ...p.voice } } : {}),
     })),
     ts: Date.now(),
   } as PromptsSnapshot);

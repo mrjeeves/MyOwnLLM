@@ -590,6 +590,11 @@ struct SpeechRequest {
     #[serde(default)]
     #[allow(dead_code)]
     response_format: Option<String>,
+    /// Speaking-rate multiplier (OpenAI's `speed`; 1.0 = natural, higher =
+    /// faster). The backends clamp it to the window the Voices settings
+    /// expose. Optional — absent means natural rate.
+    #[serde(default)]
+    speed: Option<f32>,
     /// Accepted for OpenAI-shape compatibility but advisory only: the
     /// hardware voice tier (and thus the model) is chosen by the resolver,
     /// never the client — the same contract as `/v1/audio/transcriptions`.
@@ -695,8 +700,9 @@ async fn speech(
     //    as a 404 from an engine too old to have this route at all.
     let job_model = model.clone();
     let job_voice = req.voice.clone();
+    let speed = req.speed.unwrap_or(1.0);
     let result = tokio::task::spawn_blocking(move || {
-        crate::tts::synthesize_blocking(&runtime, &job_model, &text, job_voice.as_deref())
+        crate::tts::synthesize_blocking(&runtime, &job_model, &text, job_voice.as_deref(), speed)
     })
     .await;
 

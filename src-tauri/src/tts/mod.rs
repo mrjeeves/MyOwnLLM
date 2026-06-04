@@ -95,8 +95,12 @@ pub trait TtsBackend: Send {
 
     /// Render `text` to one whole-utterance [`TtsAudio`]. `voice` is an
     /// optional voice id for multi-voice backends (Kokoro); single-voice
-    /// backends ignore it. Must be called after [`warm_up`](TtsBackend::warm_up).
-    fn synthesize(&mut self, text: &str, voice: Option<&str>) -> Result<TtsAudio>;
+    /// backends ignore it. `speed` is the speaking-rate multiplier (1.0 =
+    /// natural, higher = faster) the Voices settings expose — Kokoro feeds
+    /// it to the model's `speed` input, Piper maps it onto the inverse of
+    /// its `length_scale`. Must be called after
+    /// [`warm_up`](TtsBackend::warm_up).
+    fn synthesize(&mut self, text: &str, voice: Option<&str>, speed: f32) -> Result<TtsAudio>;
 }
 
 /// Factory: given a `(runtime, model_name)` pair from `resolver.resolve("speak")`,
@@ -124,6 +128,7 @@ pub fn synthesize_blocking(
     model_name: &str,
     text: &str,
     voice: Option<&str>,
+    speed: f32,
 ) -> Result<TtsAudio> {
     if !models::find(model_name, ModelKind::Tts)
         .map(models::is_installed)
@@ -137,7 +142,7 @@ pub fn synthesize_blocking(
     let mut backend = make_backend(runtime, model_name)?;
     let cancel = AtomicBool::new(false);
     backend.warm_up(&|_stage| {}, &cancel)?;
-    backend.synthesize(text, voice)
+    backend.synthesize(text, voice, speed)
 }
 
 /// Wrap mono 16-bit PCM in a minimal 44-byte canonical WAV header. The
