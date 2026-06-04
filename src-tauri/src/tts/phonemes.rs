@@ -17,7 +17,7 @@
 //! errors and the consumer degrades to WebSpeech.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -74,12 +74,17 @@ pub fn phonemize(text: &str, lang: &str) -> Result<String> {
     let mut cmd = Command::new(&espeak.bin);
     cmd.arg("-q").arg("--ipa").arg("-v").arg(lang);
     if let Some(root) = &espeak.data_root {
-        cmd.arg("--path").arg(root);
+        // Strip the Windows `\\?\` verbatim prefix: Tauri's `resource_dir()`
+        // hands back verbatim paths, and espeak-ng (a C program) can't open
+        // its data from one — it exits 1. Harmless on non-Windows.
+        cmd.arg("--path").arg(strip_verbatim(root));
     }
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Capture stderr (don't discard it) so a non-zero exit surfaces the
+        // actual espeak-ng diagnostic instead of a bare "exited with 1".
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning espeak-ng ({})", espeak.bin.display()))?;
 
@@ -93,9 +98,29 @@ pub fn phonemize(text: &str, lang: &str) -> Result<String> {
 
     let out = child.wait_with_output().context("waiting on espeak-ng")?;
     if !out.status.success() {
-        bail!("espeak-ng exited with {}", out.status);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            bail!("espeak-ng exited with {}", out.status);
+        }
+        bail!("espeak-ng exited with {} — {}", out.status, detail);
     }
     Ok(normalize_ipa(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Strip the Windows `\\?\` verbatim (extended-length) prefix from a path so
+/// it can be passed to a plain Win32 C program like espeak-ng. `\\?\C:\x`
+/// becomes `C:\x` and `\\?\UNC\server\share` becomes `\\server\share`. A
+/// no-op for normal paths (and everything on non-Windows).
+fn strip_verbatim(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        p.to_path_buf()
+    }
 }
 
 /// espeak prints IPA per line with leading/trailing whitespace and newlines
@@ -112,5 +137,26 @@ mod tests {
     #[test]
     fn normalize_collapses_whitespace_and_newlines() {
         assert_eq!(normalize_ipa("  həˈloʊ \n  wɜːld \n"), "həˈloʊ wɜːld");
+    }
+
+    #[test]
+    fn strip_verbatim_unwraps_windows_extended_paths() {
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\x\espeak")),
+            PathBuf::from(r"C:\x\espeak")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\UNC\srv\share\d")),
+            PathBuf::from(r"\\srv\share\d")
+        );
+        // Normal paths pass through untouched (covers every non-Windows host).
+        assert_eq!(
+            strip_verbatim(Path::new("/usr/share")),
+            PathBuf::from("/usr/share")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"C:\plain")),
+            PathBuf::from(r"C:\plain")
+        );
     }
 }
