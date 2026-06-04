@@ -667,6 +667,11 @@ interface WebHit {
 interface WebSearchOutcome {
   query: string;
   hits: WebHit[];
+  /** Which backend answered: "ddg" or "searxng". */
+  backend: string;
+  /** Why a result is empty/abnormal (throttling, a genuine no-match, or
+   *  markup drift), or null when hits came back normally. */
+  diagnostic: string | null;
 }
 
 export const WEB_SEARCH_TOOL: Tool = {
@@ -706,7 +711,12 @@ export const WEB_SEARCH_TOOL: Tool = {
     });
     const hits = outcome.hits ?? [];
     if (hits.length === 0) {
-      return `No web results found for "${outcome.query}".`;
+      // An empty result with no reason reads as "broken." Surface the backend
+      // queried plus the diagnostic the Rust side built from the source's
+      // actual response (throttling, a genuine no-match, or markup drift) so
+      // the model can explain rather than just shrug.
+      const why = outcome.diagnostic ? ` ${outcome.diagnostic}` : "";
+      return `No web results for "${outcome.query}" (via ${outcome.backend}).${why}`;
     }
     // Mirror Myo's plain-text shape — a numbered list reads back far
     // better for the model than raw JSON.
