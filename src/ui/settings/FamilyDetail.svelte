@@ -545,6 +545,16 @@
           applyAsrEvent(model, e.payload);
         });
         await invoke("asr_model_pull", { name: model });
+      } else if (runtime === "kokoro" || runtime === "piper") {
+        // Voice models stream on the `tts` channel; the backend's
+        // ModelPullProgress frame is identical to the ASR one, so the same
+        // applyAsrEvent handler drives the progress bar.
+        const chan = `myownllm://model-pull/tts/${channelSafe(model)}`;
+        console.debug("[FamilyDetail] subscribing to", chan);
+        progressUnlisten[model] = await listen<ModelPullEvent>(chan, (e) => {
+          applyAsrEvent(model, e.payload);
+        });
+        await invoke("tts_model_pull", { name: model });
       } else {
         throw new Error(`Downloads for runtime "${runtime}" are managed elsewhere.`);
       }
@@ -589,6 +599,8 @@
     try {
       if (d.runtime === "ollama") {
         await invoke("ollama_pull_cancel", { model });
+      } else if (d.runtime === "kokoro" || d.runtime === "piper") {
+        await invoke("tts_model_pull_cancel", { name: model });
       } else {
         await invoke("asr_model_pull_cancel", { name: model });
       }
@@ -638,6 +650,8 @@
         await invoke("ollama_delete_model", { name: c.model });
       } else if (c.runtime === "moonshine" || c.runtime === "parakeet") {
         await invoke("asr_model_remove", { name: c.model });
+      } else if (c.runtime === "kokoro" || c.runtime === "piper") {
+        await invoke("tts_model_remove", { name: c.model });
       } else {
         throw new Error(`Delete for runtime "${c.runtime}" is managed elsewhere.`);
       }
@@ -722,7 +736,14 @@
     const tier = modeSpec.tiers.find((t) => t.model === toModel);
     if (!tier) return;
     const rt = runtimeOfTier(modeSpec, mode, tier);
-    if (rt !== "ollama" && rt !== "moonshine" && rt !== "parakeet") return;
+    if (
+      rt !== "ollama" &&
+      rt !== "moonshine" &&
+      rt !== "parakeet" &&
+      rt !== "kokoro" &&
+      rt !== "piper"
+    )
+      return;
     if (tierInstalled(rt, toModel)) return;
     if (downloads[toModel]) return;
     downloadTier(rt, toModel, {
@@ -776,7 +797,11 @@
   }
 
   function modesIn(m: Manifest, family: ManifestFamily): Mode[] {
-    const order: Mode[] = ["text", "vision", "code", "transcribe"];
+    // `transcribe` and `speak` are shared (audio in / out) capabilities, but
+    // their model is interchangeable per family, so they get the same
+    // switchable tier ladder as the chat modes rather than a read-only
+    // System-models row. `diarize` / `embed` / `vad` stay read-only below.
+    const order: Mode[] = ["text", "vision", "code", "transcribe", "speak"];
     return order.filter((mode) => !!modeFor(m, family, mode));
   }
 
@@ -800,28 +825,36 @@
     return { tag: spec.tiers[0]?.model ?? "—", installed: false };
   }
 
-  /** Every capability the manifest shares across families — embeddings,
-   *  transcription, speaker ID, voice activity, speech. Surfaced read-only in
-   *  the detail footer so the system models that back *every* family show up
-   *  and read as recommended, without being mistaken for this family's own
-   *  (switchable) chat tiers. They're picked by hardware and intentionally
-   *  global — switching family never changes them — so they're managed from
-   *  the Models tab, not here. */
+  /** The manifest's shared capabilities that AREN'T already drawn as a
+   *  switchable tier ladder above — i.e. speaker ID, voice activity, and
+   *  embeddings (transcribe / speak are interchangeable per family, so they
+   *  render as ladders, not here). Surfaced read-only in the detail footer so
+   *  the system models that back *every* family show up and read as
+   *  recommended, without being mistaken for this family's own switchable
+   *  tiers. They're picked by hardware and intentionally global — switching
+   *  family never changes them — so they're managed from the Models tab. */
   function sharedCapabilities(
     m: Manifest,
+    renderedModes: Mode[],
   ): Array<{ key: string; label: string; tag: string; installed: boolean; swappable: boolean }> {
-    return Object.entries(m.shared_modes ?? {}).map(([key, spec]) => {
-      const picked = sharedModelFor(spec);
-      return {
-        key,
-        label: spec.label || key,
-        tag: picked.tag,
-        installed: picked.installed,
-        // Provider-level defaults are swappable via the manifest; a capability
-        // is only "built-in" when its runtime is wired to one model (Silero VAD).
-        swappable: spec.swappable !== false,
-      };
-    });
+    // Skip any shared mode already drawn as a switchable tier ladder above
+    // (transcribe / speak) — listing it again here as a read-only "System
+    // model" would double up the same capability and read as a contradiction
+    // ("recommended, can't change" next to a Switch button for the same thing).
+    return Object.entries(m.shared_modes ?? {})
+      .filter(([key]) => !renderedModes.includes(key as Mode))
+      .map(([key, spec]) => {
+        const picked = sharedModelFor(spec);
+        return {
+          key,
+          label: spec.label || key,
+          tag: picked.tag,
+          installed: picked.installed,
+          // Provider-level defaults are swappable via the manifest; a capability
+          // is only "built-in" when its runtime is wired to one model (Silero VAD).
+          swappable: spec.swappable !== false,
+        };
+      });
   }
 
   function pickFamily(name: string): { name: string; family: ManifestFamily } | null {
@@ -844,7 +877,7 @@
     {:else}
       {@const isActive = picked.name === activeFamily}
       {@const modes = modesIn(manifest, picked.family)}
-      {@const sharedCaps = sharedCapabilities(manifest)}
+      {@const sharedCaps = sharedCapabilities(manifest, modes)}
       <div class="detail-head">
         {#if showBack}
           <button class="back" onclick={() => onBack?.()} aria-label="Back to families">
@@ -922,7 +955,7 @@
                   {@const switched = current && overridden}
                   {@const tierRt = runtimeOfTier(modeSpec, modeName, tier)}
                   {@const sz = tierSize(modeSpec, modeName, tier)}
-                  {@const downloadable = tierRt === "ollama" || tierRt === "moonshine" || tierRt === "parakeet"}
+                  {@const downloadable = tierRt === "ollama" || tierRt === "moonshine" || tierRt === "parakeet" || tierRt === "kokoro" || tierRt === "piper"}
                   {@const dl = downloads[tier.model]}
                   {@const isDownloading = !!dl}
                   {@const isDeleting = deleting.has(tier.model)}

@@ -76,7 +76,18 @@ pub async fn resolve_pair(mode: &str) -> Result<(String, String)> {
                 Some(url) => fetch_or_load_manifest(&url)
                     .await
                     .ok()
-                    .and_then(|m| mode_runtime(&m, mode, &family))
+                    // Prefer the runtime of the tier whose `model` matches the
+                    // resolved tag: `resolve` may have returned a user override
+                    // that crosses a runtime boundary (e.g. a `speak` switch
+                    // from the kokoro tier down to a piper tier), and the
+                    // hardware tier-walk in `mode_runtime` would otherwise hand
+                    // back the runtime of the *hardware* pick — mismatching the
+                    // overridden model at synthesis time. Fall back to the
+                    // hardware walk for a custom tag not in any tier.
+                    .and_then(|m| {
+                        runtime_for_model(&m, mode, &family, &model)
+                            .or_else(|| mode_runtime(&m, mode, &family))
+                    })
                     .unwrap_or_else(|| default_runtime_for(mode).to_string()),
                 None => default_runtime_for(mode).to_string(),
             }
@@ -329,6 +340,41 @@ pub fn resolve_full(
         last_model.to_string(),
         tier_runtime(Some(last), exact_spec, mode),
     ))
+}
+
+/// Runtime of the tier in `mode` whose `model` field equals `model`, if any.
+/// Unlike [`mode_runtime`] (which walks the hardware tier ladder), this keys
+/// off the already-resolved tag — so a user override that crosses a runtime
+/// boundary (a `speak` switch from the kokoro tier to a piper tier, say) is
+/// served by the *correct* backend instead of whichever runtime the hardware
+/// pick happens to use. Returns `None` when the tag matches no tier (a custom
+/// override), letting the caller fall back to the hardware walk.
+fn runtime_for_model(
+    manifest: &Value,
+    mode: &str,
+    active_family: &str,
+    model: &str,
+) -> Option<String> {
+    let (_, family) = pick_family(manifest, active_family)?;
+    let mode_spec = family
+        .get("modes")
+        .and_then(|m| m.get(mode))
+        .and_then(|v| v.as_object())
+        .or_else(|| {
+            manifest
+                .get("shared_modes")
+                .and_then(|m| m.get(mode))
+                .and_then(|v| v.as_object())
+        });
+    let tiers = mode_spec
+        .and_then(|s| s.get("tiers"))
+        .and_then(|t| t.as_array())?;
+    for tier in tiers {
+        if tier.get("model").and_then(|v| v.as_str()) == Some(model) {
+            return Some(tier_runtime(Some(tier), mode_spec, mode));
+        }
+    }
+    None
 }
 
 /// Look up the effective runtime for `mode` under the active family,

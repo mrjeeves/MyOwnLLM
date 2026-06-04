@@ -806,6 +806,26 @@ fn tts_model_remove(name: String) -> Result<(), String> {
     }
 }
 
+/// Pull a voice (TTS) model's artifacts ahead of first use. Mirrors
+/// `asr_model_pull`: progress streams on `myownllm://model-pull/tts/{name}`.
+/// Lets the Family detail screen Download / Switch a `speak` tier the same
+/// way it does for chat and transcribe tiers, instead of waiting for the
+/// lazy fetch inside `tts_speak`.
+#[tauri::command]
+async fn tts_model_pull(name: String, window: tauri::WebviewWindow) -> Result<(), String> {
+    models::pull_model(name, models::ModelKind::Tts, window)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Signal an in-flight `tts_model_pull` to abort. The pull resolves as
+/// cancelled (Ok(())) and emits a final frame with `cancelled: true`.
+#[tauri::command]
+async fn tts_model_pull_cancel(name: String) {
+    models::cancel_pull(models::ModelKind::Tts, &name).await;
+}
+
 #[tauri::command]
 async fn asr_model_pull(name: String, window: tauri::WebviewWindow) -> Result<(), String> {
     models::pull_model(name, models::ModelKind::Asr, window)
@@ -1457,6 +1477,8 @@ fn main() {
             asr_model_remove,
             tts_models_list,
             tts_model_remove,
+            tts_model_pull,
+            tts_model_pull_cancel,
             diarize_model_remove,
             diarize_models_list,
             diarize_model_pull,
