@@ -1238,6 +1238,7 @@
         onRenameFolder={onRenameFolder}
         onDeleteFolder={onDeleteFolder}
         onClose={() => setSidebarOpen(false)}
+        onOpen={() => setSidebarOpen(true)}
       />
       {#if !sidebarOpen}
         <!-- Mid-screen reopen tab — the expand control we're keeping. Sits

@@ -578,6 +578,7 @@
     onRenameFolder,
     onDeleteFolder,
     onClose,
+    onOpen,
   } = $props<{
     open: boolean;
     items: ConversationMeta[];
@@ -623,6 +624,9 @@
     onRenameFolder: (oldPath: string, newPath: string) => void;
     onDeleteFolder: (path: string) => void;
     onClose: () => void;
+    /** Expand the rail back to the full panel — wired to the rail's expand
+     *  chevron. The mid-screen edge tab in App does the same thing. */
+    onOpen: () => void;
   }>();
 
   const newLabel = $derived(mode === "transcribe" ? "New session" : "New chat");
@@ -674,14 +678,27 @@
     settingsRoute.open(updateUi.available ? "updates" : "families");
   }
 
-  /** Conversations flattened to a most-recent-first list for the collapsed
-   *  rail — one generic icon each, title on hover. Folders are dropped; the
-   *  rail is a quick-switcher, not the full tree. */
-  let railItems = $derived(
-    [...items].sort((a: ConversationMeta, b: ConversationMeta) =>
-      (a.updated_at ?? "") < (b.updated_at ?? "") ? 1 : -1,
-    ),
-  );
+  /** Instant, gliding tooltips for the collapsed rail. Native `title`
+   *  tooltips wait out a hover delay before showing — sliding down the
+   *  rail then feels like "move, wait, move, wait." Instead we drive a
+   *  single floating label that snaps in on the first hover and slides
+   *  between rows as the pointer travels, so it reads as one continuous
+   *  label gliding alongside the icons. Cleared when the pointer leaves
+   *  the rail. */
+  let railTip = $state<{ text: string; x: number; y: number } | null>(null);
+  let railEl = $state<HTMLElement | null>(null);
+
+  function showRailTip(e: MouseEvent, text: string) {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    // Pin x to the rail's right edge so the label column stays put and
+    // only y changes as the pointer slides down the icons.
+    const x = (railEl?.getBoundingClientRect().right ?? r.right) + 8;
+    railTip = { text, x, y: r.top + r.height / 2 };
+  }
+
+  function hideRailTip() {
+    railTip = null;
+  }
 
   /** Right-click menu state. Anchored to the viewport (fixed positioning),
    *  so the bounding sidebar's overflow can't clip the menu. */
@@ -2009,24 +2026,49 @@
          generic icon per conversation (title on hover), then the networks
          glyph with a generic icon per saved network beneath it. The
          mid-screen edge button (App) re-expands the sidebar. -->
-    <nav class="rail" aria-label="Conversations (collapsed)">
-      <button
-        class="rail-btn"
-        onclick={openSettings}
-        title="Settings"
-        aria-label="Open settings"
-      >
-        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-          <path
-            fill="currentColor"
-            d="M3 6h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2z"
-          />
-        </svg>
-      </button>
+    <nav
+      class="rail"
+      aria-label="Conversations (collapsed)"
+      bind:this={railEl}
+      onmouseleave={hideRailTip}
+    >
+      <!-- Top row: a compact hamburger (Settings) with the minimize
+           chevron flipped into an expand chevron sitting to its right.
+           The mid-screen edge tab (App) still expands too. -->
+      <div class="rail-top">
+        <button
+          class="rail-btn rail-ham"
+          onclick={openSettings}
+          onmouseenter={(e) => showRailTip(e, "Settings")}
+          aria-label="Open settings"
+        >
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M3 6h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2z"
+            />
+          </svg>
+        </button>
+        <button
+          class="rail-btn rail-expand"
+          onclick={onOpen}
+          onmouseenter={(e) => showRailTip(e, "Expand sidebar")}
+          aria-label="Expand sidebar"
+        >
+          <!-- Same chevron as the head's collapse button, mirrored (CSS)
+               so it points outward = expand. -->
+          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M14.7 6.3a1 1 0 0 1 0 1.4L10.4 12l4.3 4.3a1 1 0 1 1-1.4 1.4l-5-5a1 1 0 0 1 0-1.4l5-5a1 1 0 0 1 1.4 0z"
+            />
+          </svg>
+        </button>
+      </div>
       <button
         class="rail-btn rail-new"
         onclick={onNew}
-        title={newLabel}
+        onmouseenter={(e) => showRailTip(e, newLabel)}
         aria-label={newLabel}
       >
         <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
@@ -2038,47 +2080,39 @@
       </button>
       <div class="rail-sep" aria-hidden="true"></div>
       <div class="rail-scroll">
-        {#each railItems as c (c.id)}
-          <button
-            class="rail-item"
-            class:active={c.id === activeId}
-            onclick={() => onSelect(c.id)}
-            title={c.title || "Untitled"}
-            aria-label={c.title || "Untitled"}
-          >
-            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        {@render railTree(tree, 0)}
+        <button
+          class="rail-net-header"
+          onclick={openMeshStatusSettings}
+          onmouseenter={(e) =>
+            showRailTip(e, pendingApprovalCount > 0 ? pendingApprovalReason : "Networks")}
+          aria-label="Networks settings"
+        >
+          <span class="rail-net-glyph">
+            <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+              <circle cx="12" cy="5" r="2.4" fill="currentColor" />
+              <circle cx="5" cy="18" r="2.4" fill="currentColor" />
+              <circle cx="19" cy="18" r="2.4" fill="currentColor" />
               <path
-                fill="currentColor"
-                d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"
+                d="M12 7.2 6.4 16M12 7.2 17.6 16M6.8 18h10.4"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
               />
             </svg>
-          </button>
-        {/each}
-        <div class="rail-net-header" title="Networks">
-          <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
-            <circle cx="12" cy="5" r="2.4" fill="currentColor" />
-            <circle cx="5" cy="18" r="2.4" fill="currentColor" />
-            <circle cx="19" cy="18" r="2.4" fill="currentColor" />
-            <path
-              d="M12 7.2 6.4 16M12 7.2 17.6 16M6.8 18h10.4"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-            />
-          </svg>
-          {#if pendingApprovalCount > 0}
-            <span class="rail-attn" title={pendingApprovalReason}></span>
-          {/if}
-        </div>
+            {#if pendingApprovalCount > 0}
+              <span class="rail-attn"></span>
+            {/if}
+          </span>
+        </button>
         {#each savedNetworks as net (net.id)}
           <button
             class="rail-item rail-net"
             class:active={net.id === activeNetworkId}
             onclick={() => switchToNetwork(net.id)}
-            title={net.id === activeNetworkId
-              ? `${net.network_id} (active)`
-              : `${net.network_id} — switch`}
+            onmouseenter={(e) =>
+              showRailTip(e, net.id === activeNetworkId ? `${net.network_id} (active)` : net.network_id)}
             aria-label={net.network_id}
           >
             <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
@@ -2090,6 +2124,62 @@
     </nav>
   {/if}
 </aside>
+
+{#if !open && railTip}
+  <!-- Instant rail tooltip: mounts on first hover so it appears at once,
+       then glides between rows (CSS transition on top/left) — it reads as
+       one label sliding down the icons rather than a per-icon hover delay. -->
+  <div
+    class="rail-tip"
+    style="left:{railTip.x}px; top:{railTip.y}px"
+    aria-hidden="true"
+  >
+    {railTip.text}
+  </div>
+{/if}
+
+{#snippet railTree(node: Node, depth: number)}
+  {#each node.items as c (c.id)}
+    <button
+      class="rail-item"
+      class:active={c.id === activeId}
+      style="--rail-depth: {Math.min(depth, 3)};"
+      onclick={() => onSelect(c.id)}
+      onmouseenter={(e) => showRailTip(e, c.title || "Untitled")}
+      aria-label={c.title || "Untitled"}
+    >
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <path
+          fill="currentColor"
+          d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"
+        />
+      </svg>
+    </button>
+  {/each}
+  {#each node.children as child (child.path)}
+    {@const isCol = collapsed.has(child.path)}
+    <button
+      class="rail-folder"
+      class:open={!isCol}
+      style="--rail-depth: {Math.min(depth, 3)};"
+      onclick={() => toggleCollapsed(child.path)}
+      onmouseenter={(e) => showRailTip(e, child.name)}
+      aria-label={`Folder: ${child.name}`}
+      aria-expanded={!isCol}
+    >
+      <span class="rail-caret" aria-hidden="true">{isCol ? "▸" : "▾"}</span>
+      <svg class="rail-folder-icon" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+        <path
+          fill="currentColor"
+          d="M10 4l2 2h6a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h6z"
+        />
+      </svg>
+    </button>
+    {#if !isCol}
+      {@render railTree(child, depth + 1)}
+    {/if}
+  {/each}
+{/snippet}
 
 {#snippet remoteFolder(node: RemoteNode, peer: (typeof peerGroups)[number])}
   {@const key = `${peer.device_pubkey}:${node.path}`}
@@ -2860,6 +2950,26 @@
   .rail-btn:hover { background: #161620; color: #ccc; }
   .rail-new { border-color: #2a2a2a; color: #ccc; }
   .rail-new:hover { border-color: #3a3a55; color: #fff; background: #131320; }
+  /* Top row of the rail: a compact hamburger + the flipped expand chevron,
+     side by side and smaller than the prominent New-chat button below. */
+  .rail-top {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    width: 100%;
+  }
+  .rail-ham,
+  .rail-expand {
+    width: 20px;
+    height: 30px;
+    border-color: transparent;
+    color: #888;
+  }
+  .rail-expand svg {
+    /* Mirror the head's collapse chevron so it points outward = expand. */
+    transform: scaleX(-1);
+  }
   .rail-sep {
     width: 24px;
     height: 1px;
@@ -2875,7 +2985,7 @@
     overflow-x: hidden;
     display: flex;
     flex-direction: column;
-    align-items: center;
+    align-items: stretch;
     gap: .12rem;
     scrollbar-width: thin;
   }
@@ -2884,9 +2994,9 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 38px;
-    height: 34px;
+    height: 32px;
     flex-shrink: 0;
+    margin-left: calc(var(--rail-depth, 0) * 6px);
     background: none;
     border: none;
     border-radius: 8px;
@@ -2896,30 +3006,70 @@
   }
   .rail-item:hover { background: #161620; color: #ccc; }
   .rail-item.active { background: #1a1a2e; color: #b9b9ee; }
+  /* Folder row in the rail: a chevron + folder glyph toggling the same
+     `collapsed` set the expanded tree uses. Its conversations render
+     indented (depth → left margin) beneath it when expanded. */
+  .rail-folder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    height: 30px;
+    flex-shrink: 0;
+    margin-left: calc(var(--rail-depth, 0) * 6px);
+    background: none;
+    border: none;
+    border-radius: 8px;
+    color: #8a8a8a;
+    cursor: pointer;
+    transition: background .12s, color .12s;
+  }
+  .rail-folder:hover { background: #161620; color: #ccc; }
+  .rail-folder.open { color: #aeaec4; }
+  .rail-caret {
+    font-size: 9px;
+    line-height: 1;
+    width: 8px;
+    text-align: center;
+    color: #777;
+    flex-shrink: 0;
+  }
+  .rail-folder:hover .rail-caret { color: #bbb; }
   .rail-net-header {
     position: relative;
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 38px;
+    width: 100%;
     height: 30px;
     margin-top: .4rem;
+    padding: 0;
+    background: none;
+    border: none;
     color: #6a7a99;
+    cursor: pointer;
     flex-shrink: 0;
+    transition: color .12s;
   }
+  .rail-net-header:hover { color: #93a6c8; }
   .rail-net-header::before {
     content: "";
     position: absolute;
     top: -.35rem;
-    left: 7px;
-    right: 7px;
+    left: 10px;
+    right: 10px;
     height: 1px;
     background: #1c1c1c;
   }
+  .rail-net-glyph {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+  }
   .rail-attn {
     position: absolute;
-    top: 1px;
-    right: 3px;
+    top: -3px;
+    right: -5px;
     width: 6px;
     height: 6px;
     border-radius: 50%;
@@ -2927,6 +3077,30 @@
     box-shadow: 0 0 5px rgba(245, 158, 11, .7);
   }
   .rail-net.active { color: #6cc77f; background: #122212; }
+
+  /* Instant gliding tooltip for the collapsed rail (replaces native
+     `title`, which only shows after a hover delay). Mounts on first hover
+     so it appears at once, then transitions top/left as the pointer slides
+     between rows — like one label sliding down the icons. */
+  .rail-tip {
+    position: fixed;
+    z-index: 80;
+    transform: translateY(-50%);
+    max-width: 280px;
+    padding: .32rem .55rem;
+    border-radius: 6px;
+    background: #1e1e26;
+    border: 1px solid #34343f;
+    color: #e8e8e8;
+    font-size: .76rem;
+    line-height: 1.15;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, .5);
+    transition: top .11s ease, left .11s ease;
+  }
   .head {
     display: flex;
     align-items: center;
