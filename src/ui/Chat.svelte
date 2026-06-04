@@ -31,6 +31,7 @@
   } from "./dictation.svelte";
   import { stickToBottom } from "./stick-to-bottom";
   import { renderMarkdown } from "./markdown";
+  import { playWavBase64, stopClip } from "./audio-clip";
   import { meshClient } from "../mesh-daemon.svelte";
   import { resolvePeerLlm } from "../mesh-capabilities";
   import { routingPins, setTextPin } from "./routing-pins.svelte";
@@ -1406,6 +1407,8 @@
 
   onDestroy(() => {
     if (isDictating()) void stopDictation();
+    // Don't let a Speak clip keep playing after the chat unmounts.
+    stopClip();
     // Drop any in-flight composer resize so its window listener + body style
     // overrides don't outlive the component.
     window.removeEventListener("pointermove", onComposerResizeMove);
@@ -1530,6 +1533,105 @@
       if (copiedIdx === idx) copiedIdx = null;
       copiedTimer = null;
     }, 1400);
+  }
+
+  /** Index of the assistant bubble currently being spoken — covers both
+   *  the synthesis wait and live playback. Only one clip plays app-wide
+   *  (audio-clip enforces this), so a single index + sub-phase is enough
+   *  to drive every Speak button's label. */
+  let speakingIdx = $state<number | null>(null);
+  /** Sub-phase for `speakingIdx`: "loading" while the backend synthesizes
+   *  (cold machines fetch the runtime + voice model here), "playing" once
+   *  audio is rolling. */
+  let speakPhase = $state<"loading" | "playing">("loading");
+  /** Index whose last Speak attempt failed, for the transient "Failed"
+   *  label (no voice model / espeak, non-Tauri host, synth error). */
+  let speakErrorIdx = $state<number | null>(null);
+  let speakErrorTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Bumped on every Speak/Stop action so a synthesis that resolves after
+   *  the user moved on (stopped it, or hit Speak on another reply) is
+   *  dropped instead of playing over the top. */
+  let speakToken = 0;
+
+  /** Strip markdown to the plain prose a voice should read: run the chat
+   *  renderer (already XSS-neutralised) and take the rendered text, so
+   *  headings/lists/links collapse to their words and code fences to their
+   *  contents — the model never tries to pronounce `**` or backticks. */
+  function speakableText(md: string): string {
+    const el = document.createElement("div");
+    el.innerHTML = renderMarkdown(md);
+    return (el.textContent ?? "").replace(/\s+/g, " ").trim();
+  }
+
+  function flagSpeakError(idx: number) {
+    speakErrorIdx = idx;
+    if (speakErrorTimer) clearTimeout(speakErrorTimer);
+    speakErrorTimer = setTimeout(() => {
+      if (speakErrorIdx === idx) speakErrorIdx = null;
+      speakErrorTimer = null;
+    }, 2200);
+  }
+
+  /** Speak (or stop) the assistant reply at `idx`. The active message's
+   *  button doubles as Stop; clicking any other Speak button supersedes
+   *  the current clip. Synthesis runs on the backend `tts_speak` command
+   *  (this machine's resolved Kokoro/Piper voice tier) and the returned
+   *  base64 WAV plays in the webview — the same path the Speakers tab uses
+   *  for clip previews. Lets us exercise the real TTS pipeline from chat. */
+  async function speakMessage(idx: number, raw: string) {
+    // The active button is a Stop toggle.
+    if (speakingIdx === idx) {
+      stopClip();
+      speakToken++;
+      speakingIdx = null;
+      return;
+    }
+
+    const text = speakableText(raw);
+    if (!text) return;
+
+    // Supersede any in-flight / playing clip and claim the loading state.
+    stopClip();
+    const token = ++speakToken;
+    speakingIdx = idx;
+    speakPhase = "loading";
+    if (speakErrorIdx === idx) speakErrorIdx = null;
+
+    let b64: string;
+    try {
+      b64 = await invoke<string>("tts_speak", { text });
+    } catch (e) {
+      console.error("[tts] synthesis failed:", e);
+      if (speakToken === token) {
+        speakingIdx = null;
+        flagSpeakError(idx);
+      }
+      return;
+    }
+    // A newer Speak/Stop ran while we were synthesizing — drop this clip.
+    if (speakToken !== token) return;
+
+    try {
+      const audio = await playWavBase64(b64);
+      speakPhase = "playing";
+      // Reset the button back to "Speak" when playback finishes on its own.
+      audio.addEventListener("ended", () => {
+        if (speakToken === token && speakingIdx === idx) speakingIdx = null;
+      });
+    } catch (e) {
+      console.error("[tts] playback failed:", e);
+      if (speakToken === token) {
+        speakingIdx = null;
+        flagSpeakError(idx);
+      }
+    }
+  }
+
+  /** Label for a message's Speak button given the live state. */
+  function speakLabel(idx: number): string {
+    if (speakErrorIdx === idx) return "Failed";
+    if (speakingIdx === idx) return speakPhase === "loading" ? "Synthesizing…" : "Stop";
+    return "Speak";
   }
 
   /** Human-friendly duration label for the bubble footer. Sub-second
@@ -1693,6 +1795,18 @@
                 title="Copy original markdown"
               >
                 {copiedIdx === i ? "Copied" : "Copy"}
+              </button>
+              <button
+                type="button"
+                class="bubble-action"
+                class:speaking={speakingIdx === i}
+                onclick={() => speakMessage(i, msg.content)}
+                title={speakingIdx === i && speakPhase === "playing"
+                  ? "Stop playback"
+                  : "Read this reply aloud"}
+                aria-pressed={speakingIdx === i}
+              >
+                {speakLabel(i)}
               </button>
               {#if msg.duration_ms != null}
                 <span class="bubble-timing" title="Time to generate this reply">
@@ -2189,6 +2303,12 @@
   button.bubble-action:hover:not(:disabled) {
     color: #ddd;
     background: none;
+  }
+  /* Speak button while a clip is loading/playing: the brand accent reads
+     as "active, click again to stop" without an extra icon. */
+  button.bubble-action.speaking,
+  button.bubble-action.speaking:hover:not(:disabled) {
+    color: #9a9aff;
   }
   .bubble-timing {
     font-family: monospace;
