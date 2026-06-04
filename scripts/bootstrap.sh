@@ -44,24 +44,26 @@ install_linux_deps() {
       # but missing on ubuntu-24.04-arm and Raspberry Pi OS. cmake +
       # libasound2-dev are needed by the local-transcription stack —
       # whisper-rs builds whisper.cpp from source via cmake, and cpal
-      # links against ALSA on Linux.
+      # links against ALSA on Linux. espeak-ng is the TTS (Speak)
+      # phonemizer the debug-only dev resolver falls back to when the
+      # bundled static build wasn't staged (src/tts/phonemes.rs).
       sudo apt-get install -y --no-install-recommends \
         libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
         librsvg2-dev libssl-dev xdg-utils curl wget file build-essential \
-        pkg-config cmake libasound2-dev
+        pkg-config cmake libasound2-dev espeak-ng
       ;;
     fedora|rhel|centos)
       log "Installing Tauri build deps (dnf)…"
       sudo dnf install -y \
         webkit2gtk4.1-devel gtk3-devel libappindicator-gtk3-devel \
         librsvg2-devel openssl-devel curl wget file gcc gcc-c++ make \
-        pkgconf-pkg-config cmake alsa-lib-devel
+        pkgconf-pkg-config cmake alsa-lib-devel espeak-ng
       ;;
     arch|manjaro)
       log "Installing Tauri build deps (pacman)…"
       sudo pacman -S --needed --noconfirm \
         webkit2gtk-4.1 gtk3 libayatana-appindicator librsvg openssl curl \
-        wget file base-devel cmake alsa-lib
+        wget file base-devel cmake alsa-lib espeak-ng
       ;;
     *)
       warn "Unrecognised Linux distro (${ID:-?}). Install Tauri deps manually:"
@@ -169,6 +171,14 @@ install_macos_deps() {
   else
     log "Installing onnxruntime via brew…"
     brew install onnxruntime
+  fi
+  # espeak-ng is the TTS (Speak) phonemizer. A release bundles its own pinned,
+  # static copy (build.rs::bundle_espeak, which needs autotools); for dev the
+  # debug-only resolver in src/tts/phonemes.rs falls back to this system one, so
+  # `just dev` can speak without the slow from-source build.
+  if ! have espeak-ng; then
+    log "Installing espeak-ng (TTS phonemizer for dev)…"
+    brew install espeak-ng
   fi
 }
 
