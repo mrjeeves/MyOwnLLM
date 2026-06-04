@@ -14,6 +14,7 @@
   } from "../config";
   import AddNetworkModal from "./settings/AddNetworkModal.svelte";
   import { settingsRoute } from "./settings-route.svelte";
+  import { updateUi } from "../update-state.svelte";
   import type { CatalogEntry } from "../mesh-protocol";
   import { FEATURES, peerSupportsFeature } from "../mesh-protocol";
   import {
@@ -49,6 +50,38 @@
       localStorage.setItem(key, JSON.stringify([...value]));
     } catch {
       // Best-effort: in-memory state still works without persistence.
+    }
+  }
+
+  /** Persisted expanded width (px) for the resizable sidebar. The
+   *  open/collapsed flag itself is persisted by App; this is just the
+   *  drag-to-resize width, clamped on read so a corrupted value can't
+   *  wedge the panel off-screen or shrink it to nothing. */
+  const SIDEBAR_WIDTH_KEY = "myownllm.sidebarWidth";
+  const SIDEBAR_MIN_WIDTH = 200;
+  const SIDEBAR_MAX_WIDTH = 480;
+  const SIDEBAR_DEFAULT_WIDTH = 260;
+
+  function readSidebarWidth(): number {
+    try {
+      const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+      if (raw) {
+        const n = parseInt(raw, 10);
+        if (Number.isFinite(n)) {
+          return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, n));
+        }
+      }
+    } catch {
+      // localStorage unavailable — fall back to the default width.
+    }
+    return SIDEBAR_DEFAULT_WIDTH;
+  }
+
+  function writeSidebarWidth(px: number): void {
+    try {
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(px)));
+    } catch {
+      // Best-effort.
     }
   }
 
@@ -545,6 +578,7 @@
     onRenameFolder,
     onDeleteFolder,
     onClose,
+    onOpen,
   } = $props<{
     open: boolean;
     items: ConversationMeta[];
@@ -590,6 +624,9 @@
     onRenameFolder: (oldPath: string, newPath: string) => void;
     onDeleteFolder: (path: string) => void;
     onClose: () => void;
+    /** Expand the rail back to the full panel — wired to the rail's expand
+     *  chevron. The mid-screen edge tab in App does the same thing. */
+    onOpen: () => void;
   }>();
 
   const newLabel = $derived(mode === "transcribe" ? "New session" : "New chat");
@@ -597,6 +634,71 @@
     mode === "transcribe" ? "No sessions yet." : "No conversations yet.",
   );
   const itemNoun = $derived(mode === "transcribe" ? "session" : "conversation");
+
+  // ---- collapse / resize chrome ----------------------------------------
+  //
+  // The sidebar has two shapes: an expanded panel (resizable, width
+  // persisted) and a collapsed icon rail. App owns the open/collapsed flag
+  // (and persists it); the width + drag-to-resize live here.
+
+  let sidebarWidth = $state(readSidebarWidth());
+  let resizing = $state(false);
+
+  /** Drag the right edge to resize. Width is clamped live and persisted
+   *  once on release so we don't hammer localStorage mid-drag. Uses
+   *  window-level listeners (same approach as the conversation drag-drop
+   *  below) so the drag keeps tracking even if the pointer outruns the
+   *  thin handle. */
+  function startResize(e: PointerEvent) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    resizing = true;
+    const startX = e.clientX;
+    const startW = sidebarWidth;
+    const onMove = (ev: PointerEvent) => {
+      sidebarWidth = Math.min(
+        SIDEBAR_MAX_WIDTH,
+        Math.max(SIDEBAR_MIN_WIDTH, startW + (ev.clientX - startX)),
+      );
+    };
+    const onUp = () => {
+      resizing = false;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      writeSidebarWidth(sidebarWidth);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  /** Sidebar hamburger → Settings, mirroring the top bar's old hamburger
+   *  (updates tab when a release is staged, else the families tab). */
+  function openSettings() {
+    settingsRoute.open(updateUi.available ? "updates" : "families");
+  }
+
+  /** Instant, gliding tooltips for the collapsed rail. Native `title`
+   *  tooltips wait out a hover delay before showing — sliding down the
+   *  rail then feels like "move, wait, move, wait." Instead we drive a
+   *  single floating label that snaps in on the first hover and slides
+   *  between rows as the pointer travels, so it reads as one continuous
+   *  label gliding alongside the icons. Cleared when the pointer leaves
+   *  the rail. */
+  let railTip = $state<{ text: string; x: number; y: number } | null>(null);
+  let railEl = $state<HTMLElement | null>(null);
+
+  function showRailTip(e: MouseEvent, text: string) {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    // Pin x to the rail's right edge so the label column stays put and
+    // only y changes as the pointer slides down the icons.
+    const x = (railEl?.getBoundingClientRect().right ?? r.right) + 8;
+    railTip = { text, x, y: r.top + r.height / 2 };
+  }
+
+  function hideRailTip() {
+    railTip = null;
+  }
 
   /** Right-click menu state. Anchored to the viewport (fixed positioning),
    *  so the bounding sidebar's overflow can't clip the menu. */
@@ -1551,8 +1653,28 @@
   }
 </script>
 
-<aside class="sidebar" class:open aria-hidden={!open} use:sidebarKeys>
+<aside
+  class="sidebar"
+  class:open
+  class:resizing
+  use:sidebarKeys
+  style={open ? `width:${sidebarWidth}px` : ""}
+>
+  {#if open}
   <div class="head">
+    <button
+      class="hamburger"
+      onclick={openSettings}
+      title="Settings"
+      aria-label="Open settings"
+    >
+      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <path
+          fill="currentColor"
+          d="M3 6h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2z"
+        />
+      </svg>
+    </button>
     <button class="new" onclick={onNew} title={newLabel}>
       <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
         <path
@@ -1891,7 +2013,173 @@
       </div>
     {/if}
   </div>
+  <!-- Drag the right edge to resize; the width persists across launches. -->
+  <button
+    class="resize-handle"
+    type="button"
+    aria-label="Resize sidebar"
+    title="Drag to resize"
+    onpointerdown={startResize}
+  ></button>
+  {:else}
+    <!-- Collapsed icon rail: hamburger + new chat at the top, then a
+         generic icon per conversation (title on hover), then the networks
+         glyph with a generic icon per saved network beneath it. The
+         mid-screen edge button (App) re-expands the sidebar. -->
+    <nav
+      class="rail"
+      aria-label="Conversations (collapsed)"
+      bind:this={railEl}
+      onmouseleave={hideRailTip}
+    >
+      <!-- Top row: a compact hamburger (Settings) with the minimize
+           chevron flipped into an expand chevron sitting to its right.
+           The mid-screen edge tab (App) still expands too. -->
+      <div class="rail-top">
+        <button
+          class="rail-btn rail-ham"
+          onclick={openSettings}
+          onmouseenter={(e) => showRailTip(e, "Settings")}
+          aria-label="Open settings"
+        >
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M3 6h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2zm0 5h18a1 1 0 1 1 0 2H3a1 1 0 1 1 0-2z"
+            />
+          </svg>
+        </button>
+        <button
+          class="rail-btn rail-expand"
+          onclick={onOpen}
+          onmouseenter={(e) => showRailTip(e, "Expand sidebar")}
+          aria-label="Expand sidebar"
+        >
+          <!-- Same chevron as the head's collapse button, mirrored (CSS)
+               so it points outward = expand. -->
+          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M14.7 6.3a1 1 0 0 1 0 1.4L10.4 12l4.3 4.3a1 1 0 1 1-1.4 1.4l-5-5a1 1 0 0 1 0-1.4l5-5a1 1 0 0 1 1.4 0z"
+            />
+          </svg>
+        </button>
+      </div>
+      <button
+        class="rail-btn rail-new"
+        onclick={onNew}
+        onmouseenter={(e) => showRailTip(e, newLabel)}
+        aria-label={newLabel}
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path
+            fill="currentColor"
+            d="M12 5a1 1 0 0 1 1 1v5h5a1 1 0 1 1 0 2h-5v5a1 1 0 1 1-2 0v-5H6a1 1 0 1 1 0-2h5V6a1 1 0 0 1 1-1z"
+          />
+        </svg>
+      </button>
+      <div class="rail-sep" aria-hidden="true"></div>
+      <div class="rail-scroll">
+        {@render railTree(tree, 0)}
+        <button
+          class="rail-net-header"
+          onclick={openMeshStatusSettings}
+          onmouseenter={(e) =>
+            showRailTip(e, pendingApprovalCount > 0 ? pendingApprovalReason : "Networks")}
+          aria-label="Networks settings"
+        >
+          <span class="rail-net-glyph">
+            <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+              <circle cx="12" cy="5" r="2.4" fill="currentColor" />
+              <circle cx="5" cy="18" r="2.4" fill="currentColor" />
+              <circle cx="19" cy="18" r="2.4" fill="currentColor" />
+              <path
+                d="M12 7.2 6.4 16M12 7.2 17.6 16M6.8 18h10.4"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+              />
+            </svg>
+            {#if pendingApprovalCount > 0}
+              <span class="rail-attn"></span>
+            {/if}
+          </span>
+        </button>
+        {#each savedNetworks as net (net.id)}
+          <button
+            class="rail-item rail-net"
+            class:active={net.id === activeNetworkId}
+            onclick={() => switchToNetwork(net.id)}
+            onmouseenter={(e) =>
+              showRailTip(e, net.id === activeNetworkId ? `${net.network_id} (active)` : net.network_id)}
+            aria-label={net.network_id}
+          >
+            <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+              <circle cx="12" cy="12" r="5.5" fill="currentColor" />
+            </svg>
+          </button>
+        {/each}
+      </div>
+    </nav>
+  {/if}
 </aside>
+
+{#if !open && railTip}
+  <!-- Instant rail tooltip: mounts on first hover so it appears at once,
+       then glides between rows (CSS transition on top/left) — it reads as
+       one label sliding down the icons rather than a per-icon hover delay. -->
+  <div
+    class="rail-tip"
+    style="left:{railTip.x}px; top:{railTip.y}px"
+    aria-hidden="true"
+  >
+    {railTip.text}
+  </div>
+{/if}
+
+{#snippet railTree(node: Node, depth: number)}
+  {#each node.items as c (c.id)}
+    <button
+      class="rail-item"
+      class:active={c.id === activeId}
+      style="--rail-depth: {Math.min(depth, 3)};"
+      onclick={() => onSelect(c.id)}
+      onmouseenter={(e) => showRailTip(e, c.title || "Untitled")}
+      aria-label={c.title || "Untitled"}
+    >
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <path
+          fill="currentColor"
+          d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"
+        />
+      </svg>
+    </button>
+  {/each}
+  {#each node.children as child (child.path)}
+    {@const isCol = collapsed.has(child.path)}
+    <button
+      class="rail-folder"
+      class:open={!isCol}
+      style="--rail-depth: {Math.min(depth, 3)};"
+      onclick={() => toggleCollapsed(child.path)}
+      onmouseenter={(e) => showRailTip(e, child.name)}
+      aria-label={`Folder: ${child.name}`}
+      aria-expanded={!isCol}
+    >
+      <span class="rail-caret" aria-hidden="true">{isCol ? "▸" : "▾"}</span>
+      <svg class="rail-folder-icon" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+        <path
+          fill="currentColor"
+          d="M10 4l2 2h6a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h6z"
+        />
+      </svg>
+    </button>
+    {#if !isCol}
+      {@render railTree(child, depth + 1)}
+    {/if}
+  {/each}
+{/snippet}
 
 {#snippet remoteFolder(node: RemoteNode, peer: (typeof peerGroups)[number])}
   {@const key = `${peer.device_pubkey}:${node.path}`}
@@ -2591,21 +2879,227 @@
   .sidebar {
     width: 260px;
     flex-shrink: 0;
+    position: relative;
     background: #0b0b0b;
     border-right: 1px solid #1a1a1a;
     display: flex;
     flex-direction: column;
     height: 100%;
     overflow: hidden;
-    transition: margin-left .18s ease, width .18s ease;
+    transition: width .18s ease;
     /* Sidebar text isn't user content — clicks and right-clicks should
      * never start a selection. Inputs below opt back in. */
     user-select: none;
     -webkit-user-select: none;
   }
+  /* Collapsed: a narrow icon rail rather than fully hidden. Width comes
+     from the shared --rail-width var (set on App's .layout) so the
+     mid-screen reopen tab lines up with the rail's edge. */
   .sidebar:not(.open) {
-    margin-left: -260px;
-    width: 260px;
+    width: var(--rail-width, 52px);
+  }
+  /* No width animation while actively dragging the resize handle — the
+     transition would make the edge lag behind the pointer. */
+  .sidebar.resizing { transition: none; }
+
+  /* Drag-to-resize handle on the inner right edge (expanded only). Thin
+     and transparent until hover; sits above the list so it stays grabbable. */
+  .resize-handle {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 5px;
+    height: 100%;
+    padding: 0;
+    border: none;
+    background: transparent;
+    cursor: col-resize;
+    z-index: 20;
+    touch-action: none;
+  }
+  .resize-handle:hover,
+  .sidebar.resizing .resize-handle {
+    background: #6e6ef7;
+    opacity: .5;
+  }
+
+  /* ---- collapsed icon rail ------------------------------------------- */
+  .rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: .25rem;
+    height: 100%;
+    width: 100%;
+    padding: .45rem .25rem .5rem;
+  }
+  .rail-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 38px;
+    flex-shrink: 0;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: #888;
+    cursor: pointer;
+    transition: background .12s, color .12s, border-color .12s;
+  }
+  .rail-btn:hover { background: #161620; color: #ccc; }
+  .rail-new { border-color: #2a2a2a; color: #ccc; }
+  .rail-new:hover { border-color: #3a3a55; color: #fff; background: #131320; }
+  /* Top row of the rail: a compact hamburger + the flipped expand chevron,
+     side by side and smaller than the prominent New-chat button below. */
+  .rail-top {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    width: 100%;
+  }
+  .rail-ham,
+  .rail-expand {
+    width: 20px;
+    height: 30px;
+    border-color: transparent;
+    color: #888;
+  }
+  .rail-expand svg {
+    /* Mirror the head's collapse chevron so it points outward = expand. */
+    transform: scaleX(-1);
+  }
+  .rail-sep {
+    width: 24px;
+    height: 1px;
+    background: #1c1c1c;
+    margin: .2rem 0;
+    flex-shrink: 0;
+  }
+  .rail-scroll {
+    flex: 1;
+    width: 100%;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: .12rem;
+    scrollbar-width: thin;
+  }
+  .rail-scroll::-webkit-scrollbar { width: 6px; }
+  .rail-item {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 32px;
+    flex-shrink: 0;
+    margin-left: calc(var(--rail-depth, 0) * 6px);
+    background: none;
+    border: none;
+    border-radius: 8px;
+    color: #6f6f6f;
+    cursor: pointer;
+    transition: background .12s, color .12s;
+  }
+  .rail-item:hover { background: #161620; color: #ccc; }
+  .rail-item.active { background: #1a1a2e; color: #b9b9ee; }
+  /* Folder row in the rail: a chevron + folder glyph toggling the same
+     `collapsed` set the expanded tree uses. Its conversations render
+     indented (depth → left margin) beneath it when expanded. */
+  .rail-folder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    height: 30px;
+    flex-shrink: 0;
+    margin-left: calc(var(--rail-depth, 0) * 6px);
+    background: none;
+    border: none;
+    border-radius: 8px;
+    color: #8a8a8a;
+    cursor: pointer;
+    transition: background .12s, color .12s;
+  }
+  .rail-folder:hover { background: #161620; color: #ccc; }
+  .rail-folder.open { color: #aeaec4; }
+  .rail-caret {
+    font-size: 9px;
+    line-height: 1;
+    width: 8px;
+    text-align: center;
+    color: #777;
+    flex-shrink: 0;
+  }
+  .rail-folder:hover .rail-caret { color: #bbb; }
+  .rail-net-header {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 30px;
+    margin-top: .4rem;
+    padding: 0;
+    background: none;
+    border: none;
+    color: #6a7a99;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: color .12s;
+  }
+  .rail-net-header:hover { color: #93a6c8; }
+  .rail-net-header::before {
+    content: "";
+    position: absolute;
+    top: -.35rem;
+    left: 10px;
+    right: 10px;
+    height: 1px;
+    background: #1c1c1c;
+  }
+  .rail-net-glyph {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+  }
+  .rail-attn {
+    position: absolute;
+    top: -3px;
+    right: -5px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #f59e0b;
+    box-shadow: 0 0 5px rgba(245, 158, 11, .7);
+  }
+  .rail-net.active { color: #6cc77f; background: #122212; }
+
+  /* Instant gliding tooltip for the collapsed rail (replaces native
+     `title`, which only shows after a hover delay). Mounts on first hover
+     so it appears at once, then transitions top/left as the pointer slides
+     between rows — like one label sliding down the icons. */
+  .rail-tip {
+    position: fixed;
+    z-index: 80;
+    transform: translateY(-50%);
+    max-width: 280px;
+    padding: .32rem .55rem;
+    border-radius: 6px;
+    background: #1e1e26;
+    border: 1px solid #34343f;
+    color: #e8e8e8;
+    font-size: .76rem;
+    line-height: 1.15;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, .5);
+    transition: top .11s ease, left .11s ease;
   }
   .head {
     display: flex;
@@ -2629,6 +3123,20 @@
     transition: border-color .12s, color .12s, background .12s;
   }
   .new:hover { border-color: #3a3a55; color: #fff; background: #131320; }
+  /* Sidebar hamburger — relocated here from the top bar. Opens Settings;
+     sits top-left of the head, lining up with the rail's top icon. */
+  .hamburger {
+    background: none;
+    border: none;
+    color: #666;
+    cursor: pointer;
+    padding: .25rem .35rem;
+    border-radius: 5px;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+  }
+  .hamburger:hover { background: #1a1a1a; color: #ccc; }
   .folder-btn,
   .select-btn,
   .collapse {
