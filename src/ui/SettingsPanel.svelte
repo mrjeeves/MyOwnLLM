@@ -9,6 +9,7 @@
   import CloudMeshSection from "./settings/CloudMeshSection.svelte";
   import ToolsSection, { type ToolsSubTab } from "./settings/ToolsSection.svelte";
   import PromptsSection from "./settings/PromptsSection.svelte";
+  import VoicesSection from "./settings/VoicesSection.svelte";
   import { updateUi } from "../update-state.svelte";
   import { settingsAttention } from "../settings-attention.svelte";
   import type { CloudMeshSubTab } from "./settings-route.svelte";
@@ -17,6 +18,7 @@
     | "families"
     | "models"
     | "prompts"
+    | "voices"
     | "tools"
     | "hardware"
     | "performance"
@@ -105,6 +107,9 @@
     // per-network policy that used to be its own top-level tab.
     { id: "cloud-mesh", label: "Networks" },
     { id: "prompts", label: "Personas" },
+    // Voices sits right after Personas: the global default voice lives
+    // here, and a persona's Voice section overrides it.
+    { id: "voices", label: "Voices" },
     { id: "tools", label: "Tools" },
     { id: "hardware", label: "Hardware" },
     { id: "performance", label: "Performance" },
@@ -186,6 +191,8 @@
         <CloudMeshSection initialSubTab={initialMeshSubTab} />
       {:else if active === "prompts"}
         <PromptsSection />
+      {:else if active === "voices"}
+        <VoicesSection />
       {:else if active === "tools"}
         <ToolsSection initialSubTab={initialToolsSubTab} />
       {:else if active === "updates"}

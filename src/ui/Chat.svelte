@@ -31,7 +31,8 @@
   } from "./dictation.svelte";
   import { stickToBottom } from "./stick-to-bottom";
   import { renderMarkdown } from "./markdown";
-  import { playWavBase64, stopClip } from "./audio-clip";
+  import { speakText, stopSpeaking } from "./tts";
+  import { loadConfig, resolveVoiceConfig } from "../config";
   import { meshClient } from "../mesh-daemon.svelte";
   import { resolvePeerLlm } from "../mesh-capabilities";
   import { routingPins, setTextPin } from "./routing-pins.svelte";
@@ -58,7 +59,7 @@
   } from "../agent-tools";
   import { agentPrompts } from "../agent-prompts.svelte";
   import { agentToolsConfig } from "../agent-tools-config.svelte";
-  import { PROMPT_ALL_TOOLS, type PromptToolId } from "../types";
+  import { PROMPT_ALL_TOOLS, type PromptToolId, type VoiceConfig } from "../types";
 
   let {
     activeModel,
@@ -1522,8 +1523,9 @@
 
   onDestroy(() => {
     if (isDictating()) void stopDictation();
-    // Don't let a Speak clip keep playing after the chat unmounts.
-    stopClip();
+    // Don't let a Speak clip (WAV or WebSpeech) keep playing after the
+    // chat unmounts.
+    stopSpeaking();
     // Drop any in-flight composer resize so its window listener + body style
     // overrides don't outlive the component.
     window.removeEventListener("pointermove", onComposerResizeMove);
@@ -1700,14 +1702,15 @@
 
   /** Speak (or stop) the assistant reply at `idx`. The active message's
    *  button doubles as Stop; clicking any other Speak button supersedes
-   *  the current clip. Synthesis runs on the backend `tts_speak` command
-   *  (this machine's resolved Kokoro/Piper voice tier) and the returned
-   *  base64 WAV plays in the webview — the same path the Speakers tab uses
-   *  for clip previews. Lets us exercise the real TTS pipeline from chat. */
+   *  the current clip. The voice comes from the active persona's override
+   *  (when it has one) falling back to the global default — so a WebSpeech
+   *  persona reads in an OS voice while another uses on-device Kokoro/Piper.
+   *  `speakText` routes accordingly and gracefully degrades to WebSpeech if
+   *  an on-device engine can't run. */
   async function speakMessage(idx: number, raw: string) {
     // The active button is a Stop toggle.
     if (speakingIdx === idx) {
-      stopClip();
+      stopSpeaking();
       speakToken++;
       speakingIdx = null;
       return;
@@ -1717,35 +1720,50 @@
     if (!text) return;
 
     // Supersede any in-flight / playing clip and claim the loading state.
-    stopClip();
+    stopSpeaking();
     const token = ++speakToken;
     speakingIdx = idx;
     speakPhase = "loading";
     if (speakErrorIdx === idx) speakErrorIdx = null;
 
-    let b64: string;
+    // Resolve the effective voice: the active persona's override, else the
+    // global default.
+    let voice: VoiceConfig;
     try {
-      b64 = await invoke<string>("tts_speak", { text });
+      const cfg = await loadConfig();
+      const persona = activePromptId ? agentPrompts.resolve(activePromptId) : null;
+      voice = resolveVoiceConfig(cfg, persona);
     } catch (e) {
-      console.error("[tts] synthesis failed:", e);
       if (speakToken === token) {
         speakingIdx = null;
         flagSpeakError(idx, String(e));
       }
       return;
     }
-    // A newer Speak/Stop ran while we were synthesizing — drop this clip.
+    // A newer Speak/Stop ran while we were resolving — bail.
     if (speakToken !== token) return;
 
     try {
-      const audio = await playWavBase64(b64);
-      speakPhase = "playing";
-      // Reset the button back to "Speak" when playback finishes on its own.
-      audio.addEventListener("ended", () => {
-        if (speakToken === token && speakingIdx === idx) speakingIdx = null;
+      await speakText(text, voice, {
+        onPlaying: () => {
+          if (speakToken === token) speakPhase = "playing";
+        },
+        onEnded: () => {
+          if (speakToken === token && speakingIdx === idx) speakingIdx = null;
+        },
+        onError: (msg) => {
+          if (speakToken === token) {
+            speakingIdx = null;
+            flagSpeakError(idx, msg);
+          }
+        },
       });
+      // A newer Speak/Stop ran while we were synthesizing — drop this clip.
+      if (speakToken !== token) {
+        stopSpeaking();
+      }
     } catch (e) {
-      console.error("[tts] playback failed:", e);
+      console.error("[tts] speak failed:", e);
       if (speakToken === token) {
         speakingIdx = null;
         flagSpeakError(idx, String(e));

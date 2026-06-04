@@ -202,7 +202,7 @@ impl TtsBackend for KokoroBackend {
         Ok(())
     }
 
-    fn synthesize(&mut self, text: &str, _voice: Option<&str>) -> Result<TtsAudio> {
+    fn synthesize(&mut self, text: &str, _voice: Option<&str>, speed: f32) -> Result<TtsAudio> {
         let ipa = phonemes::phonemize(text, ESPEAK_VOICE)?;
         let (ids, inner_len) = self.token_ids(&ipa);
         if inner_len == 0 {
@@ -220,13 +220,16 @@ impl TtsBackend for KokoroBackend {
             Array2::from_shape_vec((1, len), ids).map_err(|e| anyhow!("shape ids: {e}"))?;
         let style_arr = Array2::from_shape_vec((1, STYLE_DIM), style)
             .map_err(|e| anyhow!("shape style: {e}"))?;
-        let speed = Array1::from_vec(vec![1.0_f32]);
+        // The model's `speed` input scales delivery directly (higher =
+        // faster). Clamp to the same window the Voices UI offers so a
+        // hand-edited config can't feed a degenerate value.
+        let speed_arr = Array1::from_vec(vec![speed.clamp(0.5, 2.0)]);
 
         let outputs = session
             .run(ort::inputs![
                 "input_ids" => Tensor::from_array(input_ids).map_err(|e| anyhow!("tensor input_ids: {e}"))?,
                 "style" => Tensor::from_array(style_arr).map_err(|e| anyhow!("tensor style: {e}"))?,
-                "speed" => Tensor::from_array(speed).map_err(|e| anyhow!("tensor speed: {e}"))?,
+                "speed" => Tensor::from_array(speed_arr).map_err(|e| anyhow!("tensor speed: {e}"))?,
             ])
             .map_err(|e| anyhow!("kokoro ort run: {e}"))?;
 

@@ -119,6 +119,7 @@ class AgentPromptsState {
           tools: [...remote.tools],
           user_prompt: remote.user_prompt,
           updated_at: remote.updated_at,
+          ...(remote.voice ? { voice: { ...remote.voice } } : {}),
         });
         changed = true;
       }
@@ -194,6 +195,7 @@ class AgentPromptsState {
       system_prompt: source.system_prompt,
       tools: [...source.tools],
       user_prompt: source.user_prompt,
+      ...(source.voice ? { voice: { ...source.voice } } : {}),
       // Stamp fresh so peers on the new network treat this as the
       // authoritative copy.
       updated_at: Date.now(),

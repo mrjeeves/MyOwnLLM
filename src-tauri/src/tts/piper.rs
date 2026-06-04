@@ -179,7 +179,7 @@ impl TtsBackend for PiperBackend {
         Ok(())
     }
 
-    fn synthesize(&mut self, text: &str, _voice: Option<&str>) -> Result<TtsAudio> {
+    fn synthesize(&mut self, text: &str, _voice: Option<&str>, speed: f32) -> Result<TtsAudio> {
         let ipa = phonemes::phonemize(text, &self.espeak_voice)?;
         let ids = self.phoneme_ids(&ipa);
         if ids.len() <= 3 {
@@ -195,7 +195,11 @@ impl TtsBackend for PiperBackend {
         let input =
             Array2::from_shape_vec((1, len), ids).map_err(|e| anyhow!("shape input: {e}"))?;
         let input_lengths = Array1::from_vec(vec![len as i64]);
-        let scales = Array1::from_vec(vec![self.noise_scale, self.length_scale, self.noise_w]);
+        // `length_scale` is a duration multiplier (higher = slower), so a
+        // faster speaking rate divides it down. Clamp to the Voices UI
+        // window before inverting so a degenerate rate can't blow it up.
+        let length_scale = self.length_scale / speed.clamp(0.5, 2.0);
+        let scales = Array1::from_vec(vec![self.noise_scale, length_scale, self.noise_w]);
 
         let outputs = session
             .run(ort::inputs![
