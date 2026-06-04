@@ -3,18 +3,18 @@
 //!
 //! Both Kokoro and Piper are trained on espeak-ng IPA phonemes, so this is the
 //! shared front-end: `text → IPA string`. Per the owned-binary policy the
-//! engine never uses a *system* espeak-ng — it resolves only its own copy and
-//! self-heals (fetches) one if missing, exactly like [`crate::ort_install`]
-//! does for the onnxruntime dylib:
+//! engine never uses a *system* espeak-ng — it resolves the copy **bundled
+//! with the app**, built from source during our own build (see
+//! [`crate::espeak_install`] and `build.rs::bundle_espeak`), never downloaded
+//! or compiled on the consumer's machine:
 //!
 //!   1. `$MYOWNLLM_ESPEAK` — an explicit binary override (dev / tests).
-//!   2. The owned install at `~/.myownllm/espeak/`
-//!      ([`crate::espeak_install`]); fetched on demand if absent or stale.
+//!   2. The bundled espeak-ng sidecar + its `espeak-ng-data` resource.
 //!
-//! The owned binary is run with `--path <espeak_dir>` so it loads the bundled
-//! `espeak-ng-data` rather than anything system-wide. If neither the override
-//! nor the owned install is reachable (e.g. the vendor release isn't published
-//! yet, offline), [`phonemize`] errors and the consumer degrades to WebSpeech.
+//! The binary is run with `--path <data_root>` so it loads the bundled
+//! `espeak-ng-data` rather than anything system-wide. If the bundle is absent
+//! (a dev build with `MYOWNLLM_SKIP_ESPEAK` set and no override), [`phonemize`]
+//! errors and the consumer degrades to WebSpeech.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -32,24 +32,27 @@ struct Espeak {
     data_root: Option<PathBuf>,
 }
 
-/// Resolve the owned espeak-ng, fetching it if needed (self-repair). Never
-/// consults the system `PATH`.
+/// Resolve the owned espeak-ng. Never consults the system `PATH`; it's the
+/// copy bundled with the app (see [`crate::espeak_install`]) or an explicit
+/// dev override.
 fn resolve() -> Result<Espeak> {
-    // 1. Explicit override.
+    // 1. Explicit override — a dev / system espeak-ng. It finds its own data
+    //    unless `MYOWNLLM_ESPEAK_DATA_ROOT` also points at an espeak-ng-data.
     if let Ok(p) = std::env::var("MYOWNLLM_ESPEAK") {
         let bin = PathBuf::from(p);
         if bin.is_file() {
-            return Ok(Espeak {
-                bin,
-                data_root: None,
-            });
+            let data_root = std::env::var("MYOWNLLM_ESPEAK_DATA_ROOT")
+                .ok()
+                .map(PathBuf::from);
+            return Ok(Espeak { bin, data_root });
         }
     }
-    // 2. The owned install — fetch on demand (idempotent; no-op once present).
-    let bin = espeak_install::ensure().context("installing the owned espeak-ng")?;
+    // 2. The espeak-ng bundled with the app (built + staged by build.rs),
+    //    run with `--path <data_root>` so it loads the bundled espeak-ng-data.
+    let bin = espeak_install::binary_path().context("locating the bundled espeak-ng")?;
     Ok(Espeak {
         bin,
-        data_root: Some(espeak_install::espeak_dir()?),
+        data_root: Some(espeak_install::data_root()?),
     })
 }
 

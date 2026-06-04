@@ -16,10 +16,11 @@
 //!
 //! Synthesis is real: text → espeak-ng IPA ([`phonemes`]) → phoneme/token ids
 //! → the model's ONNX forward → PCM → WAV ([`pcm_to_wav`]). The espeak-ng
-//! phonemizer is the engine's **own** binary — fetched + cached in
-//! `~/.myownllm/espeak/` and self-repairing, exactly like the onnxruntime
-//! dylib ([`crate::espeak_install`]), never a system package; the voice
-//! models load via the shared `ort_setup`. The format-specific bits —
+//! phonemizer is the engine's **own** binary — built from source during the
+//! app build and **bundled** inside the package (`build.rs::bundle_espeak`,
+//! located at runtime by [`crate::espeak_install`]), never a system package
+//! and never downloaded on the consumer's machine; the voice models load via
+//! the shared `ort_setup`. The format-specific bits —
 //! Piper's `phoneme_id_map`/scales, Kokoro's `vocab`/`voices.bin` — are read
 //! from the downloaded artifacts at runtime and validated, so a mismatch is a
 //! clean error (the consumer degrades to WebSpeech) rather than garbage audio.

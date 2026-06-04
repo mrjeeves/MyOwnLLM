@@ -570,6 +570,92 @@ fn speaker_review_dismiss(stream_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Text-to-speech for the chat UI's "Speak" button: synthesize `text` with
+/// this machine's resolved voice tier and hand back a base64 WAV the webview
+/// plays via `playWavBase64` — the same shape `speaker_profile_clip_wav`
+/// returns for the Speakers tab.
+///
+/// In-process mirror of the headless `POST /v1/audio/speech` route, step for
+/// step: ensure onnxruntime, resolve `(model, runtime)` for the `speak`
+/// surface, fetch the voice model if it's missing, then synthesize on a
+/// blocking worker (ORT inference) so the async runtime stays free. A cold
+/// machine may block while the runtime dylib and the voice model download —
+/// the caller shows a "Speaking…" state and surfaces any error string.
+#[tauri::command]
+async fn tts_speak(text: String, voice: Option<String>) -> Result<String, String> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("nothing to speak — the reply was empty".to_string());
+    }
+    eprintln!("[tts-speak] speak request: {} chars", text.len());
+
+    // 1. onnxruntime must be loaded before any TTS backend builds a session.
+    //    Idempotent + serialized; the first call may download the runtime
+    //    dylib, so keep it off the async worker (mirrors the HTTP route).
+    let ort = tokio::task::spawn_blocking(|| {
+        let never = std::sync::atomic::AtomicBool::new(false);
+        ort_setup::ensure_ready(&|stage| eprintln!("[tts-speak] ort: {stage}"), &never)
+    })
+    .await
+    .map_err(|e| format!("onnxruntime init join error: {e}"))?;
+    if !ort.initialized {
+        let msg = format!(
+            "speech engine (onnxruntime) not ready: {}",
+            ort.error.unwrap_or_else(|| "unknown error".into())
+        );
+        eprintln!("[tts-speak] {msg}");
+        return Err(msg);
+    }
+
+    // 2. Resolve this machine's voice model + the runtime that serves it.
+    let (model, runtime) = resolver::resolve_pair("speak").await.map_err(|e| {
+        let msg = format!("could not resolve a speak model: {e}");
+        eprintln!("[tts-speak] {msg}");
+        msg
+    })?;
+    eprintln!("[tts-speak] resolved speak → runtime={runtime} model={model}");
+
+    // 3. Make sure the voice model is on disk (no-op once installed; first
+    //    call downloads it).
+    match models::fetch_model_quiet(&model, models::ModelKind::Tts).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let msg = format!("voice model '{model}' could not be installed");
+            eprintln!("[tts-speak] {msg}");
+            return Err(msg);
+        }
+        Err(e) => {
+            let msg = format!("fetching voice model '{model}': {e}");
+            eprintln!("[tts-speak] {msg}");
+            return Err(msg);
+        }
+    }
+
+    // 4. Synthesize on a blocking thread (ORT inference), then base64 the WAV
+    //    so the webview can wrap it in a data: URL and play it. Log the full
+    //    error chain to stderr on failure — the synthesis path is where the
+    //    owned espeak-ng install / phonemizer / ONNX forward can fail, and the
+    //    reason (e.g. a missing vendor release) belongs in the engine log, not
+    //    just the webview console the caller writes it to.
+    let audio = tokio::task::spawn_blocking(move || {
+        tts::synthesize_blocking(&runtime, &model, &text, voice.as_deref())
+    })
+    .await
+    .map_err(|e| format!("synthesis join error: {e}"))?
+    .map_err(|e| {
+        let msg = format!("{e:#}");
+        eprintln!("[tts-speak] synthesis failed: {msg}");
+        msg
+    })?;
+
+    eprintln!(
+        "[tts-speak] synthesized {} bytes ({})",
+        audio.wav.len(),
+        audio.mime
+    );
+    Ok(data_encoding::BASE64.encode(&audio.wav))
+}
+
 /// Assign (or clear, with an empty string) a human name for a speaker.
 #[tauri::command]
 fn speaker_registry_rename(id: u32, label: Option<String>) -> Result<bool, String> {
@@ -1324,6 +1410,7 @@ fn main() {
             speaker_review_clip_wav,
             speaker_review_attach,
             speaker_review_dismiss,
+            tts_speak,
             transcribe_session_audio,
             transcribe_start,
             transcribe_stop,
@@ -1454,6 +1541,32 @@ fn main() {
                         let m = monitor.size();
                         if outer.width > m.width || outer.height + 80 > m.height {
                             let _ = window.maximize();
+                        }
+                    }
+                }
+            }
+
+            // Point the TTS phonemizer at the bundled `espeak-ng-data`. The
+            // espeak-ng binary resolves next to the executable on its own (it
+            // ships as an `externalBin` sidecar), but its voice database is a
+            // Tauri *resource* whose location is per-OS — resolve it here,
+            // where we have the resource API, and export the parent dir so the
+            // headless `tts::phonemes` worker can hand it to espeak via
+            // `--path`. Skipped if already set (dev override) or if no real
+            // data is bundled (a `MYOWNLLM_SKIP_ESPEAK` dev build).
+            if std::env::var_os("MYOWNLLM_ESPEAK_DATA_ROOT").is_none() {
+                use tauri::Manager;
+                if let Ok(res_dir) = app.path().resource_dir() {
+                    for cand in [
+                        res_dir.join("espeak-ng-data"),
+                        res_dir.join("binaries").join("espeak-ng-data"),
+                    ] {
+                        if cand.join("phontab").is_file() {
+                            if let Some(parent) = cand.parent() {
+                                std::env::set_var("MYOWNLLM_ESPEAK_DATA_ROOT", parent);
+                                eprintln!("[espeak] bundled voice data: {}", cand.display());
+                            }
+                            break;
                         }
                     }
                 }

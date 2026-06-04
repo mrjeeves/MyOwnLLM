@@ -57,6 +57,24 @@ fn main() {
         }
     }
 
+    // Build + stage the owned espeak-ng phonemizer the TTS backends need,
+    // so it ships *inside* the bundle (no consumer-side download/build).
+    // Same shape as the daemon sidecar: produce `binaries/espeak-ng-<triple>`
+    // + a staged `binaries/espeak-ng-data/`, which tauri.conf.json's
+    // `externalBin` / `resources` carry into the package. On failure (skip
+    // flag, offline, missing toolchain) we stub the slot and the runtime
+    // falls back to the `MYOWNLLM_ESPEAK` override.
+    let espeak_status = bundle_espeak();
+    if let Err(e) = &espeak_status {
+        println!(
+            "cargo:warning=espeak-ng bundle skipped/failed: {e:#} — runtime falls back to \
+             the MYOWNLLM_ESPEAK override / no TTS phonemizer"
+        );
+        if let Err(stub_err) = write_espeak_stub() {
+            println!("cargo:warning=could not write espeak stub: {stub_err:#}");
+        }
+    }
+
     tauri_build::build();
 }
 
@@ -79,6 +97,318 @@ fn write_sidecar_stub() -> std::io::Result<()> {
     if !p.exists() {
         fs::write(&p, b"")?;
         make_executable(&p).ok();
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// espeak-ng phonemizer — built from source during *our* build and bundled
+// into the app (binary + espeak-ng-data), so the TTS backends never download
+// or build it on the consumer's machine. The mirror of the daemon sidecar:
+// `binaries/espeak-ng-<triple>` is a Tauri `externalBin`, and the staged
+// `binaries/espeak-ng-data/` rides along as a bundled `resources` entry.
+// ---------------------------------------------------------------------------
+
+/// Zero-byte espeak binary + placeholder data dir so `tauri_build`'s
+/// `externalBin` / `resources` existence checks pass when the real bundle
+/// was skipped (offline, `MYOWNLLM_SKIP_ESPEAK`, no toolchain). The runtime
+/// ignores zero-byte stubs and falls back to the `MYOWNLLM_ESPEAK` override.
+fn write_espeak_stub() -> std::io::Result<()> {
+    let target_triple = env::var("TARGET").unwrap_or_else(|_| "unknown".into());
+    let exe_suffix = if target_triple.contains("windows") {
+        ".exe"
+    } else {
+        ""
+    };
+    let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let bin_dir = crate_dir.join("binaries");
+    fs::create_dir_all(&bin_dir)?;
+    let bin = bin_dir.join(format!("espeak-ng-{target_triple}{exe_suffix}"));
+    if !bin.exists() {
+        fs::write(&bin, b"")?;
+        make_executable(&bin).ok();
+    }
+    let data_dir = bin_dir.join("espeak-ng-data");
+    fs::create_dir_all(&data_dir)?;
+    // Resources need a non-empty path to copy; a marker keeps the bundler
+    // happy without shipping a real (but absent) voice database.
+    let marker = data_dir.join(".espeak-stub");
+    if !marker.exists() {
+        fs::write(&marker, b"espeak-ng-data not bundled (stub build)\n")?;
+    }
+    Ok(())
+}
+
+/// Build + stage the owned espeak-ng. Resolution order, mirroring the daemon
+/// sidecar: a prebuilt prefix via `MYOWNLLM_ESPEAK_PREBUILT` (CI builds once
+/// and points here), else a cached static build from source.
+fn bundle_espeak() -> Result<(), Box<dyn std::error::Error>> {
+    let target_triple = env::var("TARGET").unwrap_or_else(|_| "unknown".into());
+    // Surface the triple to the runtime so `espeak_install` knows to look for
+    // both `espeak-ng-<triple>` (dev staging) and `espeak-ng` (prod bundle).
+    println!("cargo:rustc-env=ESPEAK_SIDECAR_TRIPLE={target_triple}");
+    let exe_suffix = if target_triple.contains("windows") {
+        ".exe"
+    } else {
+        ""
+    };
+    let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    let bin_dir = crate_dir.join("binaries");
+    fs::create_dir_all(&bin_dir)?;
+    let sidecar_path = bin_dir.join(format!("espeak-ng-{target_triple}{exe_suffix}"));
+    let data_dest = bin_dir.join("espeak-ng-data");
+
+    let version_file = crate_dir.parent().unwrap().join(".espeak-version");
+    println!("cargo:rerun-if-changed={}", version_file.display());
+    println!("cargo:rerun-if-env-changed=MYOWNLLM_ESPEAK_PREBUILT");
+    println!("cargo:rerun-if-env-changed=MYOWNLLM_SKIP_ESPEAK");
+    let version = fs::read_to_string(&version_file)?.trim().to_string();
+    if version.is_empty() {
+        return Err("`.espeak-version` is empty".into());
+    }
+
+    // Idempotency: already staged for this version (real binary + a real
+    // data dir, not the stub) → skip the (slow) build entirely.
+    let sentinel = bin_dir.join(".espeak-bundled-version");
+    let staged_ok = sidecar_path
+        .metadata()
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+        && data_dest.join("phontab").is_file()
+        && fs::read_to_string(&sentinel)
+            .map(|s| s.trim() == version)
+            .unwrap_or(false);
+    if staged_ok {
+        return Ok(());
+    }
+
+    // Escape hatch for fast / offline dev builds: skip the espeak build and
+    // let the runtime use the `MYOWNLLM_ESPEAK` override (or a dev espeak).
+    if env::var_os("MYOWNLLM_SKIP_ESPEAK").is_some() {
+        return Err("skipped via MYOWNLLM_SKIP_ESPEAK".into());
+    }
+
+    // 1. Prebuilt prefix — release/CI can build espeak once and reuse it
+    //    across the matrix instead of rebuilding per cargo invocation.
+    if let Ok(prefix) = env::var("MYOWNLLM_ESPEAK_PREBUILT") {
+        let prefix = PathBuf::from(prefix);
+        let (bin, data) = locate_espeak_install(&prefix, exe_suffix).ok_or_else(|| {
+            format!(
+                "MYOWNLLM_ESPEAK_PREBUILT={} has no espeak-ng + espeak-ng-data",
+                prefix.display()
+            )
+        })?;
+        stage_espeak(&bin, &data, &sidecar_path, &data_dest)?;
+        fs::write(&sentinel, &version)?;
+        println!(
+            "cargo:warning=[espeak] staged {version} from prebuilt {}",
+            prefix.display()
+        );
+        return Ok(());
+    }
+
+    // 2. Build a static espeak-ng from source (cached in OUT_DIR), then stage.
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    let install = build_espeak_from_source(&version, &out_dir, exe_suffix)?;
+    let (bin, data) = locate_espeak_install(&install, exe_suffix)
+        .ok_or("espeak-ng build produced no espeak-ng + espeak-ng-data")?;
+    stage_espeak(&bin, &data, &sidecar_path, &data_dest)?;
+    fs::write(&sentinel, &version)?;
+    println!(
+        "cargo:warning=[espeak] built {version} + staged into {}",
+        bin_dir.display()
+    );
+    Ok(())
+}
+
+/// Find `espeak-ng[.exe]` + the `espeak-ng-data` dir under an install prefix,
+/// covering both the `bin/` + `share/` layout (autotools / cmake `install`)
+/// and a flat prefix.
+fn locate_espeak_install(prefix: &Path, exe_suffix: &str) -> Option<(PathBuf, PathBuf)> {
+    let bin_name = format!("espeak-ng{exe_suffix}");
+    let bin = [prefix.join("bin").join(&bin_name), prefix.join(&bin_name)]
+        .into_iter()
+        .find(|p| p.is_file())?;
+    let data = [
+        prefix.join("share").join("espeak-ng-data"),
+        prefix.join("espeak-ng-data"),
+    ]
+    .into_iter()
+    .find(|p| p.is_dir())?;
+    Some((bin, data))
+}
+
+/// Copy the built binary into the sidecar slot and the `espeak-ng-data` dir
+/// into the staged resource slot (replacing any prior copy).
+fn stage_espeak(
+    bin: &Path,
+    data: &Path,
+    sidecar_path: &Path,
+    data_dest: &Path,
+) -> std::io::Result<()> {
+    fs::copy(bin, sidecar_path)?;
+    make_executable(sidecar_path)?;
+    if data_dest.exists() {
+        fs::remove_dir_all(data_dest)?;
+    }
+    copy_dir_all(data, data_dest)?;
+    Ok(())
+}
+
+/// Recursively copy a directory tree.
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Clone + **statically** build espeak-ng at `version` into a cached install
+/// prefix under `OUT_DIR`. Autotools on unix, CMake on Windows — the same
+/// recipe the retired vendor workflow used, minus the publish. Static
+/// (`--enable-static --disable-shared` / `-DBUILD_SHARED_LIBS=OFF`) so the
+/// binary is self-contained: no `libespeak-ng.{so,dll,dylib}` to bundle or
+/// rpath-wrangle. Returns the install prefix.
+fn build_espeak_from_source(
+    version: &str,
+    out_dir: &Path,
+    exe_suffix: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let src = out_dir.join("espeak-src");
+    let install = out_dir.join("espeak-install");
+    let stamp = install.join(".version");
+
+    // Cache hit: this version already built into this OUT_DIR.
+    if fs::read_to_string(&stamp)
+        .map(|s| s.trim() == version)
+        .unwrap_or(false)
+        && locate_espeak_install(&install, exe_suffix).is_some()
+    {
+        return Ok(install);
+    }
+
+    let _ = fs::remove_dir_all(&src);
+    let _ = fs::remove_dir_all(&install);
+    let src_str = src.to_string_lossy().to_string();
+    run(
+        "git",
+        &[
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            version,
+            "https://github.com/espeak-ng/espeak-ng",
+            &src_str,
+        ],
+        None,
+    )?;
+
+    if exe_suffix == ".exe" {
+        // Windows: CMake static build + install.
+        let prefix_arg = format!("-DCMAKE_INSTALL_PREFIX={}", install.display());
+        run(
+            "cmake",
+            &[
+                "-B",
+                "build",
+                &prefix_arg,
+                "-DUSE_ASYNC=OFF",
+                "-DBUILD_SHARED_LIBS=OFF",
+            ],
+            Some(&src),
+        )?;
+        run(
+            "cmake",
+            &["--build", "build", "--config", "Release"],
+            Some(&src),
+        )?;
+        run(
+            "cmake",
+            &["--install", "build", "--config", "Release"],
+            Some(&src),
+        )?;
+    } else {
+        // unix (Linux/macOS): autotools static build + install. Run as one
+        // shell script so the `./autogen.sh` / `./configure` relative
+        // invocations resolve against the cloned source dir.
+        //
+        // macOS x86_64 is the lone cross case: release.yml builds that slice
+        // on an arm64 runner. Apple clang emits the target arch with `-arch`
+        // (no separate toolchain), so pass it + `--host` when the wanted
+        // slice differs from the build host. The four native targets
+        // (Windows x64, Linux x64/arm64, macOS arm64) take the empty path.
+        let mut extra = String::new();
+        if cfg!(target_os = "macos") {
+            let target = env::var("TARGET").unwrap_or_default();
+            let want = if target.starts_with("x86_64") {
+                Some(("x86_64", "x86_64-apple-darwin"))
+            } else if target.starts_with("aarch64") {
+                Some(("arm64", "aarch64-apple-darwin"))
+            } else {
+                None
+            };
+            let host_arch = if std::env::consts::ARCH == "aarch64" {
+                "arm64"
+            } else {
+                std::env::consts::ARCH
+            };
+            if let Some((arch, host)) = want {
+                if arch != host_arch {
+                    extra = format!(
+                        " --host={host} CFLAGS='-arch {arch}' CXXFLAGS='-arch {arch}' LDFLAGS='-arch {arch}'"
+                    );
+                }
+            }
+        }
+        let script = format!(
+            "cd {src} && ./autogen.sh && ./configure --enable-static --disable-shared --prefix={inst}{extra} && make -j && make install",
+            src = sh_quote(&src),
+            inst = sh_quote(&install),
+        );
+        run("sh", &["-c", &script], None)?;
+    }
+
+    fs::write(&stamp, version)?;
+    Ok(install)
+}
+
+/// Single-quote a path for safe interpolation into the unix build `sh -c`
+/// script (OUT_DIR can contain spaces).
+fn sh_quote(p: &Path) -> String {
+    format!("'{}'", p.display().to_string().replace('\'', "'\\''"))
+}
+
+/// Run a build subcommand, surfacing the tail of stderr on failure so a
+/// missing toolchain (autoconf / cmake) or a build break is legible in the
+/// `cargo:warning` stream.
+fn run(program: &str, args: &[&str], cwd: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if let Some(d) = cwd {
+        cmd.current_dir(d);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("spawn `{program}`: {e} (is it installed?)"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let tail: Vec<&str> = stderr.lines().rev().take(40).collect();
+        let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+        return Err(format!(
+            "`{program} {}` failed ({}):\n{tail}",
+            args.join(" "),
+            out.status
+        )
+        .into());
     }
     Ok(())
 }

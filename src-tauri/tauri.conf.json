@@ -36,7 +36,11 @@
       "icons/icon.ico"
     ],
     "externalBin": [
-      "binaries/myownmesh"
+      "binaries/myownmesh",
+      "binaries/espeak-ng"
+    ],
+    "resources": [
+      "binaries/espeak-ng-data"
     ],
     "macOS": {
       "signingIdentity": "-"
