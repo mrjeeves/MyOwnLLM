@@ -2,19 +2,26 @@
 //! **owned** espeak-ng.
 //!
 //! Both Kokoro and Piper are trained on espeak-ng IPA phonemes, so this is the
-//! shared front-end: `text → IPA string`. Per the owned-binary policy the
-//! engine never uses a *system* espeak-ng — it resolves the copy **bundled
-//! with the app**, built from source during our own build (see
-//! [`crate::espeak_install`] and `build.rs::bundle_espeak`), never downloaded
-//! or compiled on the consumer's machine:
+//! shared front-end: `text → IPA string`. Per the owned-binary policy a
+//! *shipped* build never reaches for an undeclared system espeak-ng — it
+//! resolves the copy **bundled with the app**, built from source during our own
+//! build (see [`crate::espeak_install`] and `build.rs::bundle_espeak`), never
+//! downloaded or compiled on the consumer's machine:
 //!
 //!   1. `$MYOWNLLM_ESPEAK` — an explicit binary override (dev / tests).
 //!   2. The bundled espeak-ng sidecar + its `espeak-ng-data` resource.
+//!   3. *Debug builds only* — a system `espeak-ng` (on `$PATH`, or a Homebrew /
+//!      MacPorts prefix) as a last resort, so `cargo run` / `tauri dev` still
+//!      speak when the espeak toolchain wasn't available to stage the bundle.
+//!      This is just the dev override from (1) auto-discovered; a release build
+//!      skips it and surfaces the missing-bundle error (the webview then
+//!      degrades to WebSpeech).
 //!
-//! The binary is run with `--path <data_root>` so it loads the bundled
-//! `espeak-ng-data` rather than anything system-wide. If the bundle is absent
-//! (a dev build with `MYOWNLLM_SKIP_ESPEAK` set and no override), [`phonemize`]
-//! errors and the consumer degrades to WebSpeech.
+//! The bundled binary is run with `--path <data_root>` so it loads the bundled
+//! `espeak-ng-data` rather than anything system-wide; a debug system fallback
+//! is left to find its own data. If nothing resolves (a release build with
+//! `MYOWNLLM_SKIP_ESPEAK` and no override), [`phonemize`] errors and the
+//! consumer degrades to WebSpeech.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -32,9 +39,11 @@ struct Espeak {
     data_root: Option<PathBuf>,
 }
 
-/// Resolve the owned espeak-ng. Never consults the system `PATH`; it's the
-/// copy bundled with the app (see [`crate::espeak_install`]) or an explicit
-/// dev override.
+/// Resolve the espeak-ng phonemizer. A shipped (release) build only ever uses
+/// the copy bundled with the app (see [`crate::espeak_install`]) or an explicit
+/// `MYOWNLLM_ESPEAK` dev override — never an undeclared system binary. Debug
+/// builds add one last-resort step: a system `espeak-ng`, so dev iteration
+/// (`cargo run` / `tauri dev`) still speaks when the bundle wasn't staged.
 fn resolve() -> Result<Espeak> {
     // 1. Explicit override — a dev / system espeak-ng. It finds its own data
     //    unless `MYOWNLLM_ESPEAK_DATA_ROOT` also points at an espeak-ng-data.
@@ -49,11 +58,70 @@ fn resolve() -> Result<Espeak> {
     }
     // 2. The espeak-ng bundled with the app (built + staged by build.rs),
     //    run with `--path <data_root>` so it loads the bundled espeak-ng-data.
-    let bin = espeak_install::binary_path().context("locating the bundled espeak-ng")?;
-    Ok(Espeak {
-        bin,
-        data_root: Some(espeak_install::data_root()?),
-    })
+    match espeak_install::binary_path().context("locating the bundled espeak-ng") {
+        Ok(bin) => Ok(Espeak {
+            bin,
+            data_root: Some(espeak_install::data_root()?),
+        }),
+        Err(bundled_err) => {
+            // 3. Dev convenience (debug builds only): no bundle was staged —
+            //    typically a local build without the espeak toolchain, the same
+            //    situation `MYOWNLLM_SKIP_ESPEAK` produces. Auto-discover a
+            //    system espeak-ng so the Speak button still works, letting it
+            //    load its own espeak-ng-data (no `--path`). A release build
+            //    never reaches here: it returns the bundle error and the webview
+            //    degrades to WebSpeech.
+            #[cfg(debug_assertions)]
+            if let Some(bin) = system_espeak() {
+                let data_root = std::env::var("MYOWNLLM_ESPEAK_DATA_ROOT")
+                    .ok()
+                    .map(PathBuf::from);
+                eprintln!(
+                    "[espeak] no bundled phonemizer staged; falling back to system \
+                     espeak-ng for this dev build: {}",
+                    bin.display()
+                );
+                return Ok(Espeak { bin, data_root });
+            }
+            Err(bundled_err)
+        }
+    }
+}
+
+/// Locate a *system* `espeak-ng` for the debug-only dev fallback in
+/// [`resolve`]. Searches `$PATH` plus the prefixes package managers use that a
+/// GUI app launched from Finder / the Dock often doesn't inherit (Homebrew on
+/// Apple silicon and Intel, MacPorts, the standard unix bins). Release builds
+/// never call this — owning the phonemizer keeps the IPA stream matched to what
+/// the voice models were trained on.
+#[cfg(debug_assertions)]
+fn system_espeak() -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        "espeak-ng.exe"
+    } else {
+        "espeak-ng"
+    };
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if !cfg!(windows) {
+        for extra in [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/opt/local/bin",
+            "/usr/bin",
+        ] {
+            dirs.push(PathBuf::from(extra));
+        }
+    }
+    first_in_dirs(&dirs, name)
+}
+
+/// First `dir/name` that exists as a file, scanning `dirs` in order. Kept pure
+/// (no environment access) so the lookup order is unit-testable.
+#[cfg(debug_assertions)]
+fn first_in_dirs(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
+    dirs.iter().map(|d| d.join(name)).find(|p| p.is_file())
 }
 
 /// Make sure the owned espeak-ng is installed (fetching if needed). Called from
@@ -158,5 +226,38 @@ mod tests {
             strip_verbatim(Path::new(r"C:\plain")),
             PathBuf::from(r"C:\plain")
         );
+    }
+
+    /// The debug-only system fallback scans its candidate dirs in order and
+    /// returns the first that actually holds an `espeak-ng`.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn system_lookup_returns_first_existing_in_order() {
+        let base = std::env::temp_dir().join("espeak-syslookup-test");
+        let _ = std::fs::remove_dir_all(&base);
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let dirs = vec![first.clone(), second.clone()];
+
+        // Nothing staged in either dir → no hit.
+        assert_eq!(first_in_dirs(&dirs, "espeak-ng"), None);
+
+        // Only the later dir has it → that's the one we pick.
+        std::fs::write(second.join("espeak-ng"), b"#!/bin/sh\n").unwrap();
+        assert_eq!(
+            first_in_dirs(&dirs, "espeak-ng"),
+            Some(second.join("espeak-ng"))
+        );
+
+        // Once the earlier dir also has one, order wins.
+        std::fs::write(first.join("espeak-ng"), b"#!/bin/sh\n").unwrap();
+        assert_eq!(
+            first_in_dirs(&dirs, "espeak-ng"),
+            Some(first.join("espeak-ng"))
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
