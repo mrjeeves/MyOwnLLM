@@ -13,6 +13,12 @@
   import { startupProgress } from "./startup-progress.svelte";
   import PermissionPromptModal from "./PermissionPromptModal.svelte";
   import { loadConfig, updateConfig } from "../config";
+  import {
+    loadSessionState,
+    setSpecialView,
+    flushSessionState,
+    type SpecialView,
+  } from "../session-restore";
   import { getActiveManifest } from "../providers";
   import { resolveModelEx, pickFamily, familyModes } from "../manifest";
   import { runCleanup } from "../model-lifecycle";
@@ -104,6 +110,10 @@
    *  Transcribe / Speakers surface with the mesh node graph; picking a
    *  mode bubble or selecting a conversation clears it. */
   let networksOpen = $state(false);
+  /** Flips true once the persisted UI session state has been read on launch.
+   *  Gates the special-view persist effect so the initial render doesn't
+   *  overwrite the saved view before we've restored it. */
+  let sessionLoaded = $state(false);
   let appVersion = $state("");
   let hardware = $state<HardwareProfile | null>(null);
   let activeModel = $state("");
@@ -232,13 +242,21 @@
     initOrtSetup();
 
     try {
-      const [hw, config] = await Promise.all([
+      const [hw, config, session] = await Promise.all([
         invoke<HardwareProfile>("detect_hardware"),
         loadConfig(),
+        loadSessionState(),
       ]);
       hardware = hw;
       activeMode = config.active_mode;
       activeFamilyName = config.active_family;
+      // Restore whichever non-mode workspace (Speakers / Networks) was open
+      // last, before the workspace paints, so we don't flash the chat surface
+      // first. Done ahead of `view = "chat"` below; the persist effect picks
+      // up subsequent changes once `sessionLoaded` flips.
+      if (session.special_view === "speakers") speakersOpen = true;
+      else if (session.special_view === "networks") networksOpen = true;
+      sessionLoaded = true;
       // Hardware + config are in; the catalog read is next. (The tracker
       // starts on the "hardware" step, so this is the first advance.)
       startupProgress.start("manifest");
@@ -446,7 +464,23 @@
       error = String(e);
       view = "chat"; // Show chat anyway with whatever we have
       startupProgress.done(); // don't leave the tracker dangling mid-step
+      // Even on a partial startup, let later view switches persist.
+      sessionLoaded = true;
     }
+  });
+
+  // Persist which non-mode workspace is open so a relaunch reopens it. Gated
+  // on `sessionLoaded` so the initial render (before the restore above) can't
+  // clobber the saved value; `setSpecialView` is itself a no-op when
+  // unchanged, so restoring the saved view doesn't trigger a redundant write.
+  $effect(() => {
+    const view: SpecialView = networksOpen
+      ? "networks"
+      : speakersOpen
+        ? "speakers"
+        : null;
+    if (!sessionLoaded) return;
+    setSpecialView(view);
   });
 
   onDestroy(() => {
@@ -454,6 +488,9 @@
     unsubRemote?.();
     unsubActiveConv?.();
     if (heartbeatTimer) clearInterval(heartbeatTimer);
+    // Flush any pending debounced session writes (e.g. a view switch right
+    // before close) so they aren't lost to the unmount.
+    flushSessionState();
   });
 
   /**

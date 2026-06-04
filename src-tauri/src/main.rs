@@ -29,6 +29,7 @@ mod usage;
 mod watcher;
 mod wav;
 mod web_search;
+mod window_state;
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -1526,23 +1527,22 @@ fn main() {
                 }
             }
 
-            // If the configured 800x600 window can't fit on this monitor —
-            // e.g. the official 7" Pi DSI screen at 800x480 — start
-            // maximized so the user doesn't lose the bottom of the UI off
-            // the edge of the screen. Compares physical pixels on both
-            // sides; the +80 reserves room for a taskbar / dock the
-            // monitor reports as part of its full size.
+            // Restore the window's last-saved size / position / monitor /
+            // maximized-or-fullscreen state before revealing it, so the app
+            // reopens exactly where the user left it instead of snapping back
+            // to the conf default. With no saved file (first launch) this
+            // falls back to the historical "maximize when the default frame
+            // can't fit this monitor" heuristic — e.g. the 7" Pi DSI panel at
+            // 800x480. The window starts `visible: false` in tauri.conf.json
+            // so this lands before first paint (no jump from 800x600), then
+            // we show it and wire the listener that keeps the saved geometry
+            // current as the user moves / resizes.
             {
                 use tauri::Manager;
                 if let Some(window) = app.get_webview_window("main") {
-                    if let (Ok(outer), Ok(Some(monitor))) =
-                        (window.outer_size(), window.current_monitor())
-                    {
-                        let m = monitor.size();
-                        if outer.width > m.width || outer.height + 80 > m.height {
-                            let _ = window.maximize();
-                        }
-                    }
+                    window_state::restore_or_default(&window);
+                    window_state::watch(&window);
+                    let _ = window.show();
                 }
             }
 
@@ -1764,6 +1764,11 @@ fn main() {
         .expect("error building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // Final flush of the window geometry. `CloseRequested` covers
+                // the click-to-close path; this catches quit paths (macOS
+                // Cmd-Q) that tear the process down without a per-window
+                // close event, so the last frame is never lost.
+                window_state::flush();
                 // Hard-abort any live transcription so a draining meeting
                 // can't hang process teardown waiting for its backlog.
                 transcribe::abort_all();

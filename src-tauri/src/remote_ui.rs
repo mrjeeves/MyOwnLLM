@@ -117,7 +117,11 @@ fn state() -> &'static State_ {
     static S: OnceLock<State_> = OnceLock::new();
     S.get_or_init(|| {
         let (tx, rx) = watch::channel(false);
-        let (ctx, crx) = watch::channel(None);
+        // Seed the active-conversation pointer from disk so a relaunch lands
+        // the user back on the conversation they last had open, instead of an
+        // empty "New chat". `set_active_conversation` writes the file on every
+        // switch; this reads it back on first access this process.
+        let (ctx, crx) = watch::channel(load_persisted_active_conversation());
         State_ {
             tracker: Mutex::new(Tracker::default()),
             active_tx: tx,
@@ -126,6 +130,38 @@ fn state() -> &'static State_ {
             conv_rx: crx,
         }
     })
+}
+
+/// On-disk home of the persisted active-conversation pointer.
+fn active_conversation_path() -> Option<std::path::PathBuf> {
+    crate::myownllm_dir()
+        .ok()
+        .map(|d| d.join("active-conversation.json"))
+}
+
+/// Read the last persisted active-conversation id, or `None` when nothing has
+/// been saved yet / the file is unreadable. The pointer is stored as
+/// `{"id": "<guid>"}` (with `id: null` meaning "no conversation open").
+fn load_persisted_active_conversation() -> Option<String> {
+    let path = active_conversation_path()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    parsed.get("id").and_then(|v| v.as_str()).map(String::from)
+}
+
+/// Persist the active-conversation pointer so it survives a relaunch.
+/// Best-effort: a write failure only forgets the pointer next launch.
+fn persist_active_conversation(id: Option<&str>) {
+    let Some(path) = active_conversation_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = serde_json::json!({ "id": id });
+    if let Ok(json) = serde_json::to_string(&body) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 /// Re-evaluate "is a remote browser using the UI right now?" and notify
@@ -168,7 +204,7 @@ pub fn active_conversation_now() -> Option<String> {
 /// events that the GUI would round-trip back into the same render.
 pub fn set_active_conversation(id: Option<String>) {
     let s = state();
-    let _ = s.conv_tx.send_if_modified(|cur| {
+    let changed = s.conv_tx.send_if_modified(|cur| {
         if *cur != id {
             *cur = id;
             true
@@ -176,6 +212,12 @@ pub fn set_active_conversation(id: Option<String>) {
             false
         }
     });
+    // Mirror the new pointer to disk on every genuine change so the next
+    // launch restores it. Skipped on a no-op set to avoid rewriting the file
+    // for redundant updates the watch channel already collapses.
+    if changed {
+        persist_active_conversation(s.conv_rx.borrow().as_deref());
+    }
 }
 
 /// Subscribe to active-conversation changes. main.rs bridges this to the
