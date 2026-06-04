@@ -794,6 +794,19 @@ fn asr_models_list() -> Vec<models::ModelInfo> {
 }
 
 #[tauri::command]
+fn tts_models_list() -> Vec<models::ModelInfo> {
+    models::list(models::ModelKind::Tts)
+}
+
+#[tauri::command]
+fn tts_model_remove(name: String) -> Result<(), String> {
+    match models::find(&name, models::ModelKind::Tts) {
+        Some(spec) => models::remove(spec).map_err(|e| e.to_string()),
+        None => Err(format!("unknown TTS model: {name}")),
+    }
+}
+
+#[tauri::command]
 async fn asr_model_pull(name: String, window: tauri::WebviewWindow) -> Result<(), String> {
     models::pull_model(name, models::ModelKind::Asr, window)
         .await
@@ -1442,6 +1455,8 @@ fn main() {
             asr_model_pull,
             asr_model_pull_cancel,
             asr_model_remove,
+            tts_models_list,
+            tts_model_remove,
             diarize_model_remove,
             diarize_models_list,
             diarize_model_pull,

@@ -1,6 +1,6 @@
 {
   "name": "MyOwnLLM Default",
-  "version": "25",
+  "version": "26",
   "ttl_minutes": 60,
   "default_family": "gemma4",
   "headroom_gb": {
@@ -65,7 +65,8 @@
           "label": "Text",
           "tiers": [
             { "min_vram_gb": 24, "min_ram_gb": 24, "min_unified_ram_gb": 32, "disk_mb": 19000, "model": "gemma4:31b", "fallback": "gemma4:26b" },
-            { "min_vram_gb": 18, "min_ram_gb": 18, "min_unified_ram_gb": 24, "disk_mb": 17000, "model": "gemma4:26b", "fallback": "gemma4:e4b" },
+            { "min_vram_gb": 18, "min_ram_gb": 18, "min_unified_ram_gb": 24, "disk_mb": 17000, "model": "gemma4:26b", "fallback": "gemma4:12b" },
+            { "min_vram_gb": 12, "min_ram_gb": 14, "min_unified_ram_gb": 16, "disk_mb": 8100,  "model": "gemma4:12b", "fallback": "gemma4:e4b" },
             { "min_vram_gb": 6,  "min_ram_gb": 8,  "min_unified_ram_gb": 12, "disk_mb": 7500,  "model": "gemma4:e4b", "fallback": "gemma4:e2b" },
             { "min_vram_gb": 0,  "min_ram_gb": 0,  "min_unified_ram_gb": 8,  "disk_mb": 5600,  "model": "gemma4:e2b", "fallback": "gemma4:e2b" }
           ]

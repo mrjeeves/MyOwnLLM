@@ -129,8 +129,11 @@ async function fetchOne(url: string): Promise<Manifest> {
  *   - Imports are merged first (depth-first, document order).
  *   - The importing file's own families are merged last and OVERRIDE any
  *     conflicting family key from imports (closer publisher wins).
- *   - Top-level fields (`name`, `version`, `default_family`, `ttl_minutes`)
- *     always come from the importing file.
+ *   - All top-level fields (`name`, `version`, `default_family`, `ttl_minutes`,
+ *     `max_utilization`, `headroom_gb`, `backmap`, …) come from the importing
+ *     file; only `families` and `shared_modes` are the merged result. Dropping
+ *     a top-level field here silently disables it — e.g. losing
+ *     `max_utilization` makes the resolver behave as if utilization were 1.0.
  */
 export async function getManifest(url: string): Promise<Manifest> {
   const visited = new Set<string>();
@@ -170,10 +173,7 @@ async function walk(url: string, visited: Set<string>): Promise<Manifest> {
   }
 
   return {
-    name: raw.name,
-    version: raw.version,
-    ttl_minutes: raw.ttl_minutes,
-    default_family: raw.default_family,
+    ...raw,
     shared_modes: mergedSharedModes,
     families: mergedFamilies,
   };

@@ -322,10 +322,11 @@ interface ModelInfo {
 }
 
 export async function getModelStatusWithMeta(): Promise<ModelMeta[]> {
-  const [pulled, asrList, diarizeList, status, config] = await Promise.all([
+  const [pulled, asrList, diarizeList, ttsList, status, config] = await Promise.all([
     invoke<OllamaModel[]>("ollama_list_models").catch(() => [] as OllamaModel[]),
     invoke<ModelInfo[]>("asr_models_list").catch(() => [] as ModelInfo[]),
     invoke<ModelInfo[]>("diarize_models_list").catch(() => [] as ModelInfo[]),
+    invoke<ModelInfo[]>("tts_models_list").catch(() => [] as ModelInfo[]),
     readStatusCache(),
     loadConfig(),
   ]);
@@ -369,5 +370,5 @@ export async function getModelStatusWithMeta(): Promise<ModelMeta[]> {
         runtime: m.kind, // "asr" / "diarize"
       }));
 
-  return [...ollama, ...asInstalled(asrList), ...asInstalled(diarizeList)];
+  return [...ollama, ...asInstalled(asrList), ...asInstalled(diarizeList), ...asInstalled(ttsList)];
 }

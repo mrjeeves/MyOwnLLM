@@ -713,6 +713,8 @@ fn walk_manifest<'a>(
             "ttl_minutes": raw["ttl_minutes"].clone(),
             "default_family": raw["default_family"].clone(),
             "max_utilization": raw["max_utilization"].clone(),
+            "headroom_gb": raw["headroom_gb"].clone(),
+            "backmap": raw["backmap"].clone(),
             "shared_modes": Value::Object(merged_shared),
             "families": Value::Object(merged_families),
         }))
