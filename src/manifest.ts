@@ -274,6 +274,10 @@ export function defaultRuntimeFor(mode: Mode): ModelRuntime {
       return "moonshine";
     case "diarize":
       return "pyannote-diarize";
+    case "speak":
+      // Top of the speak tier ladder; the lighter rungs promote to piper
+      // via the per-tier `runtime` override.
+      return "kokoro";
     default:
       return "ollama";
   }
@@ -499,6 +503,10 @@ function safeFallbackFor(runtime: ModelRuntime): string {
       return "pyannote-seg-3.0+campp-small";
     case "sortformer":
       return "sortformer-streaming";
+    case "kokoro":
+      return "kokoro-82m";
+    case "piper":
+      return "piper-en-us-lessac-medium";
     default:
       return "tinyllama";
   }

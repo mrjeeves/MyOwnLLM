@@ -32,7 +32,7 @@ export interface LiveSnapshot {
   cpu_count: number | null;
 }
 
-export type Mode = "text" | "vision" | "code" | "transcribe" | "diarize" | "embed";
+export type Mode = "text" | "vision" | "code" | "transcribe" | "diarize" | "embed" | "speak";
 
 /** Runtimes the resolver knows how to dispatch to.
  *
@@ -55,6 +55,10 @@ export type Mode = "text" | "vision" | "code" | "transcribe" | "diarize" | "embe
  *                          it's tracked / recommended / locked like any
  *                          other model. The non-`ollama` value is what keeps
  *                          it off the Ollama pull + cleanup machinery.
+ *  - `kokoro`            — Kokoro-82M TTS via ONNX runtime. The capable-
+ *                          hardware rung of the `speak` ladder.
+ *  - `piper`             — Piper VITS TTS via ONNX runtime. The light /
+ *                          Pi-class rungs of the `speak` ladder.
  */
 export type ModelRuntime =
   | "ollama"
@@ -62,7 +66,9 @@ export type ModelRuntime =
   | "parakeet"
   | "pyannote-diarize"
   | "sortformer"
-  | "silero-vad";
+  | "silero-vad"
+  | "kokoro"
+  | "piper";
 
 export interface ManifestTier {
   /** Discrete-GPU path: matches when `vram_gb >= min_vram_gb`. Includes

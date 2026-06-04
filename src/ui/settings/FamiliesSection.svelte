@@ -58,7 +58,7 @@
   async function load() {
     loading = true;
     try {
-      const [m, provider, config, hw, pulled, asr, diarize] = await Promise.all([
+      const [m, provider, config, hw, pulled, asr, diarize, tts] = await Promise.all([
         getActiveManifest(),
         getActiveProvider(),
         loadConfig(),
@@ -66,6 +66,7 @@
         invoke<OllamaModel[]>("ollama_list_models").catch(() => [] as OllamaModel[]),
         invoke<ModelInfo[]>("asr_models_list").catch(() => [] as ModelInfo[]),
         invoke<ModelInfo[]>("diarize_models_list").catch(() => [] as ModelInfo[]),
+        invoke<ModelInfo[]>("tts_models_list").catch(() => [] as ModelInfo[]),
       ]);
       manifest = m;
       providerName = provider?.name ?? "(none)";
@@ -78,7 +79,7 @@
       for (const p of pulled) sizes[p.name] = p.size;
       pulledSizes = sizes;
       const lsizes: Record<string, number> = {};
-      for (const m of [...asr, ...diarize]) {
+      for (const m of [...asr, ...diarize, ...tts]) {
         if (m.installed && m.installed_size_bytes != null) {
           lsizes[m.name] = m.installed_size_bytes;
         }
@@ -166,9 +167,11 @@
   }
 
   /** Modes the family advertises (its own + manifest.shared_modes), in
-   *  canonical order. */
+   *  canonical order. Includes the interchangeable audio capabilities
+   *  (transcribe / speak) so the list view's per-mode summary matches the
+   *  switchable ladders the detail view (FamilyDetail) draws for them. */
   function modesIn(m: Manifest, family: ManifestFamily): Mode[] {
-    const order: Mode[] = ["text", "vision", "code", "transcribe"];
+    const order: Mode[] = ["text", "vision", "code", "transcribe", "speak"];
     return order.filter((mode) => !!modeFor(m, family, mode));
   }
 

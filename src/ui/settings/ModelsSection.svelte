@@ -186,8 +186,10 @@
       if (hardware && activeEntry) {
         const shared = activeEntry.manifest.shared_modes ?? {};
         // Hardware ladders → lock the current rung. (transcribe / diarize /
-        // embed are all real Modes the resolver understands.)
-        for (const mode of ["transcribe", "diarize", "embed"] as Mode[]) {
+        // embed / speak are all real Modes the resolver understands; speak's
+        // pick — a Kokoro or Piper voice — would otherwise read as a soft
+        // "in Speak" suggestion instead of the recommended model in use.)
+        for (const mode of ["transcribe", "diarize", "embed", "speak"] as Mode[]) {
           if (!shared[mode]) continue;
           const label = shared[mode].label ?? mode;
           try {
