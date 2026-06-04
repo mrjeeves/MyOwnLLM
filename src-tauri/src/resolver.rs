@@ -979,7 +979,8 @@ pub fn default_config_value() -> Value {
             "enabled": true,
             "channel": "stable",
             "auto_apply": "patch",
-            "check_interval_hours": 6
+            "check_interval_hours": 6,
+            "ollama": true
         },
         "auto_cleanup": {
             "models": true,

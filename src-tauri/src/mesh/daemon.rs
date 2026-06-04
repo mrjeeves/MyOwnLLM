@@ -783,6 +783,76 @@ async fn probe(mode: DaemonMode) -> Option<ControlClient> {
     }
 }
 
+/// Stop the bundled `myownmesh` sidecar from self-updating.
+///
+/// The sidecar ships *inside* MyOwnLLM's app bundle (`tauri.conf.json`
+/// `externalBin`), pinned to `.myownmesh-rev` and fetched at build time. It
+/// must ride along with MyOwnLLM's own release, NOT update itself, because:
+///   1. Its on-disk binary lives in a code-signed (macOS) / admin-owned
+///      (Windows Program Files) / read-only bundle dir — a self-update would
+///      break the signature or simply lack permission.
+///   2. The next MyOwnLLM update re-bundles whatever `.myownmesh-rev` pins,
+///      silently reverting any self-update.
+///   3. The control-socket wire protocol is hand-mirrored in this file and
+///      version-locked to the pinned rev (see `build.rs`), so a daemon that
+///      jumped ahead on its own could no longer talk to us.
+///
+/// `myownmesh-updater` is a file-by-file port of MyOwnLLM's `self_update`, so
+/// it honours the same gate: `auto_update.enabled = false` in the daemon's own
+/// `{MYOWNMESH_HOME}/config.json`. We merge that single key at the JSON level
+/// so we don't have to model — or risk dropping — the rest of the daemon's
+/// config. The `MYOWNMESH_AUTOUPDATE=0` env set at spawn is the matching
+/// belt-and-suspenders. Only ever called on the own-spawn path; in shared mode
+/// the MyOwnMesh GUI owns its daemon's config and we leave it untouched.
+///
+/// Best-effort: any failure is logged and ignored — a config we couldn't write
+/// must never block the daemon (and hence the mesh) from coming up.
+fn disable_bundled_daemon_self_update(home: &Path) {
+    let config_path = home.join("config.json");
+    let mut cfg = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // Already disabled? Don't rewrite the daemon's file needlessly.
+    if cfg
+        .get("auto_update")
+        .and_then(|au| au.get("enabled"))
+        .and_then(|e| e.as_bool())
+        == Some(false)
+    {
+        return;
+    }
+
+    let obj = cfg.as_object_mut().expect("cfg is an object");
+    let au = obj
+        .entry("auto_update")
+        .or_insert_with(|| serde_json::json!({}));
+    if !au.is_object() {
+        *au = serde_json::json!({});
+    }
+    au.as_object_mut()
+        .expect("auto_update is an object")
+        .insert("enabled".to_string(), serde_json::Value::Bool(false));
+
+    if let Some(parent) = config_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_string_pretty(&cfg) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(&config_path, s) {
+                eprintln!(
+                    "daemon: couldn't disable bundled daemon self-update at {} ({e}); \
+                     relying on MYOWNMESH_AUTOUPDATE=0 env instead",
+                    config_path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("daemon: serialise daemon config failed ({e}); continuing"),
+    }
+}
+
 /// Detect-and-share daemon resolution. Returns the live
 /// `ControlClient` plus an `Option<DaemonChild>` — the child is
 /// `Some` only when we spawned the daemon ourselves.
@@ -840,6 +910,11 @@ pub async fn ensure_daemon_running() -> Result<(ControlClient, Option<DaemonChil
         .join(".myownllm")
         .join(".myownmesh");
 
+    // We're about to own-spawn the bundled sidecar — make sure it can't try to
+    // self-update itself out of MyOwnLLM's bundle. (Shared mode returned far
+    // above, so we never touch a daemon the MyOwnMesh GUI owns.)
+    disable_bundled_daemon_self_update(&home);
+
     let mut last_err: Option<String> = None;
     for bin in &candidates {
         eprintln!(
@@ -850,6 +925,11 @@ pub async fn ensure_daemon_running() -> Result<(ControlClient, Option<DaemonChil
         let spawn_res = Command::new(bin)
             .arg("serve")
             .env("MYOWNMESH_HOME", &home)
+            // The bundled sidecar must never self-update — see
+            // `disable_bundled_daemon_self_update` for the full rationale. This
+            // env kill-switch mirrors MyOwnLLM's own `MYOWNLLM_AUTOUPDATE`;
+            // belt-and-suspenders with the config flag written below.
+            .env("MYOWNMESH_AUTOUPDATE", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -944,5 +1024,70 @@ impl MeshDaemon {
             client_id,
             child: parking_lot::Mutex::new(child),
         }
+    }
+}
+
+#[cfg(test)]
+mod self_update_disable_tests {
+    use super::*;
+
+    fn read_config(home: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(home.join("config.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn writes_disabled_flag_when_no_config_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        disable_bundled_daemon_self_update(tmp.path());
+        let v = read_config(tmp.path());
+        assert_eq!(v["auto_update"]["enabled"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn preserves_sibling_keys_when_merging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = serde_json::json!({
+            "version": 1,
+            "identity_path": "/x/id.json",
+            "auto_update": { "enabled": true, "channel": "stable" },
+            "networks": [{ "id": "home" }],
+        });
+        std::fs::write(
+            tmp.path().join("config.json"),
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        disable_bundled_daemon_self_update(tmp.path());
+
+        let v = read_config(tmp.path());
+        // Flipped off…
+        assert_eq!(v["auto_update"]["enabled"], serde_json::Value::Bool(false));
+        // …without dropping any sibling keys.
+        assert_eq!(v["auto_update"]["channel"], "stable");
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["identity_path"], "/x/id.json");
+        assert_eq!(v["networks"][0]["id"], "home");
+    }
+
+    #[test]
+    fn idempotent_when_already_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = serde_json::json!({
+            "auto_update": { "enabled": false, "channel": "beta" },
+            "keep": "me",
+        });
+        std::fs::write(
+            tmp.path().join("config.json"),
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        disable_bundled_daemon_self_update(tmp.path());
+
+        let v = read_config(tmp.path());
+        assert_eq!(v["auto_update"]["enabled"], serde_json::Value::Bool(false));
+        assert_eq!(v["auto_update"]["channel"], "beta");
+        assert_eq!(v["keep"], "me");
     }
 }

@@ -79,6 +79,13 @@ async fn tick() -> Result<()> {
     if let Err(e) = crate::self_update::tick().await {
         eprintln!("watcher: self-update tick error: {e}");
     }
+    // Keep the Ollama *runtime* current too (not just models). Gated by
+    // `auto_update.ollama` + a 24h cooldown, so this is cheap on most ticks;
+    // on Linux it can re-run the installer and restart an idle server we own,
+    // on macOS/Windows it defers to Ollama's own desktop auto-updater.
+    if let Err(e) = crate::ollama::update_tick().await {
+        eprintln!("watcher: ollama update tick error: {e}");
+    }
     Ok(())
 }
 

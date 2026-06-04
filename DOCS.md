@@ -1159,6 +1159,7 @@ not your ability to manually pull an update.
   "channel": "stable",          // "stable" | "beta"
   "auto_apply": "patch",        // "patch" | "minor" | "all" | "none"
   "check_interval_hours": 6,
+  "ollama": true,               // also keep the Ollama runtime updated (see below)
   "stable_url": null,           // optional override; falls back to build-time default
   "beta_url": null              // optional override; falls back to build-time default
 }
@@ -1170,6 +1171,42 @@ MYOWNLLM_AUTOUPDATE=0 myownllm serve   # one-shot opt-out
 
 `myownllm update status` shows the current version, install kind, the active
 release-feed URL (with a `(custom)` marker if redirected), and any pending update.
+
+### Keeping the runtime current (Ollama + the mesh sidecar)
+
+Managing the LLM surface means keeping the *runtime* current, not just MyOwnLLM
+itself. The two runtimes are delivered very differently, so they're updated
+differently:
+
+**Ollama** is a separately-installed program with no update API or CLI (there's
+no `ollama update`; the REST API is models + inference only). The watcher keeps
+it current platform-aware, gated by `auto_update.ollama` (default on, and also
+honouring the master `auto_update.enabled` and the `MYOWNLLM_AUTOUPDATE=0`
+kill-switch), checked at most once every 24h:
+
+- **Linux / headless** — nothing else updates Ollama, so MyOwnLLM compares the
+  installed version (`/api/version`, or `ollama --version`) against the latest
+  `ollama/ollama` GitHub release and, when newer, re-runs the official install
+  script (idempotent — it upgrades in place). It then restarts the `ollama
+  serve` process **only if MyOwnLLM spawned it and it's idle** (no model
+  resident, no chat/pull in flight); otherwise the new binary applies on the
+  next idle tick or next launch.
+- **macOS / Windows** — the Ollama desktop app ships its own background
+  auto-updater ("Restart to update" in the tray/menubar). MyOwnLLM defers to it
+  and never runs a second installer; it only restarts a server it spawned
+  itself. A server owned by the desktop app or a systemd unit is never touched.
+
+**MyOwnMesh** ships as a bundled Tauri sidecar (`binaries/myownmesh`, pinned by
+`.myownmesh-rev` and baked in at build time), so — unlike Ollama — it must **not**
+self-update: its binary lives inside MyOwnLLM's code-signed app bundle, the next
+MyOwnLLM update re-bundles the pinned rev, and the control-socket wire protocol
+is version-locked to that rev. The sidecar therefore rides along with MyOwnLLM's
+own release (bump `.myownmesh-rev`, ship a build), and when MyOwnLLM own-spawns
+the daemon it disables the daemon's own updater (`auto_update.enabled = false`
+in the daemon's `config.json`, plus `MYOWNMESH_AUTOUPDATE=0` on the spawn env) so
+it can't fight the bundle or the protocol lock. When MyOwnLLM instead attaches to
+a daemon the MyOwnMesh GUI is already running, that GUI owns its daemon's updates
+and lifecycle — MyOwnLLM leaves it untouched.
 
 ### Pointing at your own release host
 

@@ -1142,6 +1142,331 @@ pub async fn chat_once(
         .to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Runtime self-update — keeping the Ollama binary current.
+//
+// MyOwnLLM's promise is to manage the local LLM surface, which includes the
+// Ollama *runtime*, not just models. Ollama exposes no API or CLI to trigger
+// an update (there's no `ollama update`; the REST API is models + inference
+// only), so we drive it ourselves, platform-aware:
+//
+//   - Linux / headless: nothing else keeps Ollama current. We re-run the
+//     official install script (idempotent — it upgrades in place) and, when we
+//     own the `ollama serve` child and it's idle, restart it to pick up the
+//     new binary.
+//   - macOS / Windows: the desktop app ships its own background auto-updater
+//     ("Restart to update" in the tray/menubar). We defer to it and only
+//     restart a child WE spawned (the headless-CLI case), never one held by
+//     the desktop app or a systemd unit.
+//
+// Gated by `auto_update.enabled` + `auto_update.ollama` in config (and the
+// `MYOWNLLM_AUTOUPDATE` kill-switch) plus a 24h cooldown marker, so the
+// 5-minute watcher tick is cheap and we never hammer GitHub.
+// ---------------------------------------------------------------------------
+
+/// Result of one Ollama runtime update attempt. Mostly for logging/diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+// Some variants are only constructed on certain platforms (e.g. `Updated` on
+// Linux, `DeferredToPlatform` on macOS/Windows); silence per-platform
+// "never constructed" without dropping the variant from the type.
+#[allow(dead_code)]
+pub enum OllamaUpdateOutcome {
+    /// Ollama isn't installed — nothing to update.
+    NotInstalled,
+    /// Already on the newest published version (or we couldn't learn of a
+    /// newer one this tick).
+    UpToDate { version: String },
+    /// We don't drive updates on this platform; deferred to Ollama's own
+    /// desktop auto-updater. We may still have restarted a child we own if the
+    /// desktop updater had already swapped the binary under it.
+    DeferredToPlatform {
+        current: Option<String>,
+        latest: Option<String>,
+    },
+    /// Re-ran the installer for a newer version. `restarted` is true when we
+    /// owned the server and bounced it to pick up the new binary; false means
+    /// the swap applies on the next idle tick or next app launch.
+    Updated {
+        from: Option<String>,
+        to: String,
+        restarted: bool,
+    },
+}
+
+/// Version of the running/installed Ollama, e.g. "0.6.3". Tries the HTTP
+/// `/api/version` endpoint first (works whenever the daemon is up — including
+/// a server we don't own), then falls back to `ollama --version` (works
+/// headless). `None` if neither resolves.
+pub async fn current_version() -> Option<String> {
+    if let Ok(body) = reqwest_get("http://127.0.0.1:11434/api/version").await {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(ver) = v.get("version").and_then(|s| s.as_str()) {
+                if !ver.is_empty() {
+                    return Some(ver.to_string());
+                }
+            }
+        }
+    }
+    // CLI fallback: `ollama --version` → "ollama version is 0.6.3" on stdout
+    // (it also prints a "could not connect" warning to stderr when the server
+    // is down — harmless, we only read stdout).
+    let out = quiet_tokio_command("ollama")
+        .arg("--version")
+        .output()
+        .await
+        .ok()?;
+    parse_cli_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Extract the dotted version from `ollama --version` output. Returns the
+/// first whitespace-separated token shaped like a version (≥2 dot-separated
+/// parts, each starting with a digit), with a leading `v` stripped.
+fn parse_cli_version(text: &str) -> Option<String> {
+    for raw in text.split_whitespace() {
+        let t = raw.trim_start_matches('v');
+        let parts: Vec<&str> = t.split('.').collect();
+        if parts.len() >= 2
+            && parts
+                .iter()
+                .all(|p| p.bytes().next().is_some_and(|b| b.is_ascii_digit()))
+        {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+/// Latest published Ollama version from GitHub releases, e.g. "0.6.3".
+/// Network call; `None` on any failure (offline, rate-limited, parse error).
+async fn latest_release_version() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!(
+            "myownllm-ollama-update/",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let resp = client
+        .get("https://api.github.com/repos/ollama/ollama/releases/latest")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    v.get("tag_name")
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim_start_matches('v').to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// True when `latest` is strictly newer than `current` (major.minor.patch;
+/// any prerelease suffix is ignored). Mirrors `self_update::compare_semver`.
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    fn triple(s: &str) -> (u64, u64, u64) {
+        let core = s.split('-').next().unwrap_or(s);
+        let mut it = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+        (
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+        )
+    }
+    triple(latest) > triple(current)
+}
+
+/// True when MyOwnLLM spawned (and therefore owns) the `ollama serve` process.
+/// When false the server is held by something else — the macOS/Windows desktop
+/// app or a Linux systemd unit — and we must never restart it out from under
+/// its owner.
+async fn we_own_server() -> bool {
+    process_lock().lock().await.is_some()
+}
+
+/// True when no chat/pull stream is in flight and no model is resident, so a
+/// restart won't yank an active request or force a surprise cold reload.
+async fn is_idle() -> bool {
+    if !cancels().lock().await.is_empty() {
+        return false;
+    }
+    if !pull_cancels().lock().await.is_empty() {
+        return false;
+    }
+    !any_model_loaded().await
+}
+
+/// True when Ollama currently holds at least one model in memory (`/api/ps`).
+async fn any_model_loaded() -> bool {
+    let Ok(body) = reqwest_get("http://127.0.0.1:11434/api/ps").await else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("models")
+                .and_then(|m| m.as_array())
+                .map(|a| !a.is_empty())
+        })
+        .unwrap_or(false)
+}
+
+/// Restart the `ollama serve` process we own so it picks up a freshly
+/// installed binary. `stop()` kills our child; `ensure_running()` respawns it
+/// (and is itself a no-op when something is already serving).
+pub async fn restart() -> Result<()> {
+    stop().await?;
+    ensure_running().await
+}
+
+/// Drive one Ollama runtime update if a newer version is published and this is
+/// a platform we update directly. Idempotent and safe to call when nothing is
+/// due. See the section header for the per-platform policy.
+pub async fn update_now() -> Result<OllamaUpdateOutcome> {
+    if !is_installed() {
+        return Ok(OllamaUpdateOutcome::NotInstalled);
+    }
+    let current = current_version().await;
+    run_platform_update(current).await
+}
+
+// macOS / Windows: defer to Ollama's own desktop auto-updater. We don't run
+// the installer (that would race the tray app); we only restart a server WE
+// own, in case the desktop updater already swapped the binary under our
+// long-running child.
+#[cfg(not(target_os = "linux"))]
+async fn run_platform_update(current: Option<String>) -> Result<OllamaUpdateOutcome> {
+    let latest = latest_release_version().await;
+    if we_own_server().await && is_idle().await {
+        if let (Some(cur), Some(lat)) = (current.as_deref(), latest.as_deref()) {
+            if version_is_newer(lat, cur) {
+                if let Err(e) = restart().await {
+                    eprintln!("[ollama] update: restart of owned server failed: {e}");
+                }
+            }
+        }
+    }
+    Ok(OllamaUpdateOutcome::DeferredToPlatform { current, latest })
+}
+
+// Linux / headless: nobody else updates Ollama. Check, re-install, restart.
+#[cfg(target_os = "linux")]
+async fn run_platform_update(current: Option<String>) -> Result<OllamaUpdateOutcome> {
+    let latest = match latest_release_version().await {
+        Some(v) => v,
+        // Couldn't reach GitHub — treat as "nothing to do this tick" rather
+        // than re-running the installer blind.
+        None => {
+            return Ok(OllamaUpdateOutcome::UpToDate {
+                version: current.unwrap_or_default(),
+            })
+        }
+    };
+    let needs = match current.as_deref() {
+        Some(cur) => version_is_newer(&latest, cur),
+        None => true, // version unknown — the installer is idempotent, so safe
+    };
+    if !needs {
+        return Ok(OllamaUpdateOutcome::UpToDate { version: latest });
+    }
+
+    // Re-run the official install script — idempotent, upgrades in place.
+    install()
+        .await
+        .context("re-running ollama install to update the runtime")?;
+
+    // Pick up the new binary only if we own the server and it's idle; otherwise
+    // the next idle tick or next app launch (a fresh `ensure_running` spawn)
+    // applies it.
+    let mut restarted = false;
+    if we_own_server().await && is_idle().await {
+        match restart().await {
+            Ok(()) => restarted = true,
+            Err(e) => eprintln!("[ollama] update: restart after upgrade failed: {e}"),
+        }
+    }
+    Ok(OllamaUpdateOutcome::Updated {
+        from: current,
+        to: latest,
+        restarted,
+    })
+}
+
+/// Watcher entry point. Cheap when nothing is due — gated by config and a 24h
+/// cooldown so we don't hit GitHub on every 5-minute watcher tick.
+pub async fn update_tick() -> Result<()> {
+    if !ollama_autoupdate_enabled() {
+        return Ok(());
+    }
+    if !ollama_update_due(24.0) {
+        return Ok(());
+    }
+    stamp_ollama_check_now();
+    match update_now().await {
+        Ok(outcome) => eprintln!("[ollama] update tick: {outcome:?}"),
+        Err(e) => eprintln!("[ollama] update tick error: {e:#}"),
+    }
+    Ok(())
+}
+
+/// Whether runtime auto-update is permitted: the `MYOWNLLM_AUTOUPDATE=0`
+/// kill-switch disables it wholesale; otherwise both `auto_update.enabled` and
+/// `auto_update.ollama` must be true (both default on, so existing configs opt
+/// in automatically via `merge_defaults`).
+fn ollama_autoupdate_enabled() -> bool {
+    if std::env::var("MYOWNLLM_AUTOUPDATE")
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(cfg) = crate::resolver::load_config_value() else {
+        return true;
+    };
+    let au = &cfg["auto_update"];
+    let master = au.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let ollama = au.get("ollama").and_then(|v| v.as_bool()).unwrap_or(true);
+    master && ollama
+}
+
+fn ollama_check_marker() -> Option<std::path::PathBuf> {
+    crate::myownllm_dir()
+        .ok()
+        .map(|d| d.join("cache/last-ollama-update-check"))
+}
+
+fn ollama_update_due(interval_hours: f64) -> bool {
+    let Some(path) = ollama_check_marker() else {
+        return true;
+    };
+    if !path.exists() {
+        return true;
+    }
+    let prev = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    ((unix_secs_now() - prev) as f64 / 3600.0) >= interval_hours
+}
+
+fn stamp_ollama_check_now() {
+    if let Some(path) = ollama_check_marker() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, format!("{}\n", unix_secs_now()));
+    }
+}
+
+fn unix_secs_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,5 +1508,50 @@ mod tests {
     #[test]
     fn parse_tags_response_handles_empty_models_array() {
         assert!(parse_tags_response(r#"{"models":[]}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_cli_version_extracts_dotted_version() {
+        assert_eq!(
+            parse_cli_version("ollama version is 0.6.3"),
+            Some("0.6.3".to_string())
+        );
+        // Leading `v` stripped.
+        assert_eq!(
+            parse_cli_version("ollama version is v0.10.1"),
+            Some("0.10.1".to_string())
+        );
+        // Two-component versions are accepted.
+        assert_eq!(parse_cli_version("foo 1.2 bar"), Some("1.2".to_string()));
+    }
+
+    #[test]
+    fn parse_cli_version_ignores_warning_noise() {
+        // The real CLI prints a connect warning before the version line; we
+        // read stdout only, but be robust to extra words either way.
+        let out =
+            "Warning: could not connect to a running Ollama instance\nollama version is 0.6.3";
+        assert_eq!(parse_cli_version(out), Some("0.6.3".to_string()));
+    }
+
+    #[test]
+    fn parse_cli_version_none_when_absent() {
+        assert_eq!(parse_cli_version(""), None);
+        assert_eq!(parse_cli_version("no version here"), None);
+    }
+
+    #[test]
+    fn version_is_newer_compares_semver() {
+        assert!(version_is_newer("0.6.4", "0.6.3"));
+        assert!(version_is_newer("0.7.0", "0.6.9"));
+        assert!(version_is_newer("1.0.0", "0.99.99"));
+        assert!(!version_is_newer("0.6.3", "0.6.3"));
+        assert!(!version_is_newer("0.6.2", "0.6.3"));
+    }
+
+    #[test]
+    fn version_is_newer_ignores_prerelease_suffix() {
+        assert!(!version_is_newer("0.6.3-rc1", "0.6.3"));
+        assert!(version_is_newer("0.6.4-rc1", "0.6.3"));
     }
 }
