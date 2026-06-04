@@ -1546,6 +1546,32 @@ fn main() {
                 }
             }
 
+            // Point the TTS phonemizer at the bundled `espeak-ng-data`. The
+            // espeak-ng binary resolves next to the executable on its own (it
+            // ships as an `externalBin` sidecar), but its voice database is a
+            // Tauri *resource* whose location is per-OS — resolve it here,
+            // where we have the resource API, and export the parent dir so the
+            // headless `tts::phonemes` worker can hand it to espeak via
+            // `--path`. Skipped if already set (dev override) or if no real
+            // data is bundled (a `MYOWNLLM_SKIP_ESPEAK` dev build).
+            if std::env::var_os("MYOWNLLM_ESPEAK_DATA_ROOT").is_none() {
+                use tauri::Manager;
+                if let Ok(res_dir) = app.path().resource_dir() {
+                    for cand in [
+                        res_dir.join("espeak-ng-data"),
+                        res_dir.join("binaries").join("espeak-ng-data"),
+                    ] {
+                        if cand.join("phontab").is_file() {
+                            if let Some(parent) = cand.parent() {
+                                std::env::set_var("MYOWNLLM_ESPEAK_DATA_ROOT", parent);
+                                eprintln!("[espeak] bundled voice data: {}", cand.display());
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let _ = ensure_config_dir(&app_handle);

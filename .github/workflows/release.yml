@@ -54,11 +54,20 @@ jobs:
 
       - name: Linux deps
         if: runner.os == 'Linux'
+        # autoconf/automake/libtool/pkg-config build the bundled espeak-ng
+        # phonemizer from source (build.rs::bundle_espeak); cmake is the
+        # Windows path's analogue (preinstalled there).
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libssl-dev xdg-utils libasound2-dev cmake
+            librsvg2-dev libssl-dev xdg-utils libasound2-dev cmake \
+            autoconf automake libtool pkg-config
+
+      - name: macOS espeak build deps
+        if: runner.os == 'macOS'
+        # autotools for build.rs::bundle_espeak's static espeak-ng build.
+        run: brew install autoconf automake libtool
 
       # Same Vulkan SDK install pattern as the CI workflow. Linux uses the
       # official LunarG apt repo (apt's libvulkan-dev is missing glslc);

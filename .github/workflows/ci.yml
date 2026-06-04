@@ -16,6 +16,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
     runs-on: ${{ matrix.os }}
+    # The `check` job validates Rust/TS compilation only — it never builds the
+    # app bundle, so skip the slow, toolchain-heavy espeak-ng source build that
+    # build.rs::bundle_espeak does. build.rs stubs the sidecar slot instead;
+    # the real static espeak build + bundle is exercised by release.yml.
+    env:
+      MYOWNLLM_SKIP_ESPEAK: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -31,9 +37,11 @@ jobs:
             libssl-dev \
             libasound2-dev
         # No `espeak-ng` here on purpose: the TTS phonemizer is an *owned*
-        # binary the engine fetches into `~/.myownllm/espeak/` itself
-        # (src/espeak_install.rs), never a system package. Built + published
-        # by `.github/workflows/espeak-ng-vendor.yml`.
+        # binary built from source + bundled into the app by
+        # build.rs::bundle_espeak — never a system package. This compile-only
+        # `check` job skips that build via MYOWNLLM_SKIP_ESPEAK (set at job
+        # level above); release.yml installs the toolchain and does the real
+        # static build + bundle.
         # `cmake` is no longer in the dep list — whisper-rs was the only
         # consumer (it built whisper.cpp from source) and the new ASR
         # stack uses the `ort` crate with a dynamically-loaded
