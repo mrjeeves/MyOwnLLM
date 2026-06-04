@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { tick, onDestroy, untrack } from "svelte";
+  import { tick, onMount, onDestroy, untrack } from "svelte";
   import TopBar from "./TopBar.svelte";
   import TextBar from "./TextBar.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
@@ -36,6 +36,13 @@
   import { resolvePeerLlm } from "../mesh-capabilities";
   import { routingPins, setTextPin } from "./routing-pins.svelte";
   import { isTranscriptionMemoryTight } from "../model-lifecycle";
+  import {
+    loadSessionState,
+    setDraftText,
+    setDraftAttachments,
+    flushSessionState,
+    type PendingAttachment,
+  } from "../session-restore";
   import {
     noteChatModelResident,
     chatModelLikelyResident,
@@ -373,13 +380,61 @@
    *  model can read" — the user said "general file uploads, as long
    *  as the AI supports it." Best-effort routing: anything image/*
    *  goes as an image; anything else gets inlined as text when it's
-   *  decodable, otherwise we surface a hint and let the user decide. */
-  type PendingAttachment =
-    | { kind: "image"; name: string; mime: string; base64: string; size: number }
-    | { kind: "text"; name: string; mime: string; content: string; size: number };
+   *  decodable, otherwise we surface a hint and let the user decide.
+   *
+   *  The `PendingAttachment` shape lives in `session-restore` because
+   *  that module owns the on-disk form staged files are persisted to
+   *  (so a relaunch restores them into the composer). */
   let pendingAttachments = $state<PendingAttachment[]>([]);
   let attachmentError = $state<string>("");
   let chatFileInput = $state<HTMLInputElement | null>(null);
+
+  // --- Session restore: composer draft (typed text + staged files) ------
+  // Reopening the app should land the user back in front of whatever they
+  // were composing, including files they'd attached but not yet sent. The
+  // draft is global (the composer isn't cleared when switching
+  // conversations), so it's persisted/restored as one unit rather than
+  // per-conversation. Restoring on every mount also means the draft survives
+  // a mode switch (Chat unmounts on Transcribe/Speakers/Networks and
+  // remounts on return).
+  //
+  // `draftRestored` gates the persist effects below so they can't write the
+  // initial empty composer over the saved draft before the async restore
+  // lands.
+  let draftRestored = $state(false);
+  onMount(async () => {
+    try {
+      const s = await loadSessionState();
+      // Only seed an empty composer — never clobber text the user managed to
+      // start typing in the brief window before the async restore resolved.
+      if (!input && pendingAttachments.length === 0) {
+        if (s.draft_text) input = s.draft_text;
+        if (s.draft_attachments.length > 0) {
+          pendingAttachments = s.draft_attachments;
+        }
+      }
+    } catch {
+      // Best-effort: a failed restore just starts with an empty composer.
+    } finally {
+      draftRestored = true;
+    }
+  });
+
+  // Mirror the draft to disk as it changes. Text writes are tiny + debounced;
+  // the attachment payload rides its own (lazier) debounce in the session
+  // module so a large staged file never piggybacks on per-keystroke writes.
+  // Both clear themselves on send / "New chat" (input + pendingAttachments
+  // reset), so a sent draft doesn't reappear next launch.
+  $effect(() => {
+    const text = input;
+    if (!draftRestored) return;
+    setDraftText(text);
+  });
+  $effect(() => {
+    const atts = pendingAttachments;
+    if (!draftRestored) return;
+    setDraftAttachments(atts);
+  });
   /** Soft threshold (~256 KiB) above which staged text earns a
    *  non-blocking "this may overflow the model's context" heads-up.
    *  We no longer *block* large files: the user asked to be able to
@@ -1474,6 +1529,9 @@
     window.removeEventListener("pointermove", onComposerResizeMove);
     document.body.style.userSelect = "";
     document.body.style.cursor = "";
+    // Flush any pending debounced draft writes so a quick mode-switch / close
+    // right after an edit still persists the latest composer contents.
+    flushSessionState();
   });
 
   async function handleModeChange(mode: Mode) {
