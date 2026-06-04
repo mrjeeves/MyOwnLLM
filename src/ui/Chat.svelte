@@ -379,10 +379,13 @@
   let pendingAttachments = $state<PendingAttachment[]>([]);
   let attachmentError = $state<string>("");
   let chatFileInput = $state<HTMLInputElement | null>(null);
-  /** Cap any single text-attachment at ~256 KiB so a stray log dump
-   *  doesn't blow the context window. The user can paste larger
-   *  things explicitly if they want; this is just the file-pick guard. */
-  const MAX_TEXT_ATTACH_BYTES = 256 * 1024;
+  /** Soft threshold (~256 KiB) above which staged text earns a
+   *  non-blocking "this may overflow the model's context" heads-up.
+   *  We no longer *block* large files: the user asked to be able to
+   *  attach big files (e.g. a 50 MB log) and decide for themselves, so
+   *  any size is accepted — we just warn so a silent truncation at send
+   *  time isn't a surprise. See `attachmentWarning`. */
+  const WARN_TEXT_ATTACH_BYTES = 256 * 1024;
   /** Abort controller for the in-flight agent loop, or null when idle.
    *  The TopBar's Stop button (`stop()` below + `forceStopChat()` from
    *  the chat slot) fires it; the agent loop then unwinds at the next
@@ -849,11 +852,6 @@
           });
           continue;
         }
-        if (buf.byteLength > MAX_TEXT_ATTACH_BYTES) {
-          attachmentError =
-            `"${file.name}" is too large (${Math.round(buf.byteLength / 1024)} KB). Files over 256 KB risk overflowing the context — pick a smaller chunk or paste the relevant slice into the message body.`;
-          continue;
-        }
         const text = decodeAsTextIfPlausible(buf, mime);
         if (text === null) {
           attachmentError =
@@ -907,6 +905,30 @@
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
+
+  /** Non-blocking heads-up shown above the composer when the staged
+   *  text attachments are big enough to risk overflowing the model's
+   *  context window. Files of any size are accepted (see
+   *  `WARN_TEXT_ATTACH_BYTES`); this just flags that a large payload may
+   *  be truncated at send time. Empty string = no warning. Derived, so
+   *  it tracks both the staged set and the active model's context window
+   *  and clears itself when the offending files are removed. */
+  const attachmentWarning = $derived.by(() => {
+    let textTokens = 0;
+    let textBytes = 0;
+    for (const att of pendingAttachments) {
+      if (att.kind === "text") {
+        textTokens += approxTokens(att.content);
+        textBytes += att.size;
+      }
+    }
+    if (textBytes <= WARN_TEXT_ATTACH_BYTES) return "";
+    const sizeStr = formatAttachSize(textBytes);
+    if (contextSize > 0 && textTokens > contextSize) {
+      return `Attached text is ~${textTokens.toLocaleString()} tokens (${sizeStr}) — more than this model's ${contextSize.toLocaleString()}-token context window, so it will likely be truncated. You can still send it.`;
+    }
+    return `Attached text is large (${sizeStr}) and may overflow the model's context window and get truncated. You can still send it.`;
+  });
 
   function send() {
     // A live dictation is about to lose its anchor (input gets cleared and
@@ -1773,9 +1795,10 @@
       <!-- Staged-attachments row, mounted above the textarea so the
            user can see what they're about to ship before pressing
            Send. Each chip carries a × to drop the attachment without
-           cancelling the typed prompt. Errors from picks (file too
-           large, undecodable bytes) surface inline here so they sit
-           next to the upload affordance that produced them. -->
+           cancelling the typed prompt. Errors from picks (undecodable
+           binary) and the large-file context-overflow warning surface
+           inline here so they sit next to the upload affordance that
+           produced them. -->
       <div class="attach-row" role="status" aria-live="polite">
         {#each pendingAttachments as att, i (i)}
           <div class="attach-chip" class:image={att.kind === "image"}>
@@ -1797,6 +1820,9 @@
             {attachmentError}
             <button class="attach-error-dismiss" onclick={() => (attachmentError = "")}>✕</button>
           </div>
+        {/if}
+        {#if attachmentWarning}
+          <div class="attach-warn">{attachmentWarning}</div>
         {/if}
       </div>
     {/if}
@@ -2441,6 +2467,15 @@
     opacity: .7;
   }
   .attach-error-dismiss:hover { opacity: 1; }
+  .attach-warn {
+    flex: 1 1 100%;
+    color: #9db4d0;
+    font-size: .72rem;
+    background: #14202e;
+    border: 1px solid #2a3a4f;
+    border-radius: 5px;
+    padding: .3rem .55rem;
+  }
   textarea {
     flex: 1;
     background: #1a1a1a;
