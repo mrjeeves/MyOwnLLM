@@ -726,7 +726,7 @@ The system prompt sent to the model is composed at send time from the active **P
 
 ### Web search backend
 
-`web_search` is **keyless out of the box**: it scrapes DuckDuckGo's HTML endpoint, so search works anywhere with no signup or API key. The fetch happens in the Rust backend (the `agent_web_search` command), not the WebView, so it isn't subject to browser CORS.
+`web_search` is **keyless out of the box**: it scrapes DuckDuckGo's HTML endpoint, so search works anywhere with no signup or API key. The fetch happens in the Rust backend (the `agent_web_search` command), not the WebView, so it isn't subject to browser CORS. When a search comes back empty, the tool explains *why* — DuckDuckGo throttling a new or shared IP (its anti-bot page), a genuine no-match, or a markup change — instead of a bare "no results," so a transient rate-limit doesn't read as a broken tool.
 
 To route searches through a self-hosted [SearXNG](https://docs.searxng.org/) instance instead — cleaner JSON results when you run one — set the top-level `web_search` block in `~/.myownllm/config.json`:
 
