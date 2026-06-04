@@ -167,24 +167,44 @@ jobs:
         shell: bash
         run: |
           set -e
-          BIN=src-tauri/target/${{ matrix.platform.target }}/release/myownllm
-          if [[ "${{ runner.os }}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          TRIPLE="${{ matrix.platform.target }}"
+          BIN=src-tauri/target/$TRIPLE/release/myownllm
+          # build.rs::bundle_espeak staged the owned phonemizer here during the
+          # build above (the release runners install its autotools/cmake deps).
+          ESPEAK=src-tauri/binaries/espeak-ng-$TRIPLE
+          DATA=src-tauri/binaries/espeak-ng-data
+          if [[ "${{ runner.os }}" == "Windows" ]]; then BIN="${BIN}.exe"; ESPEAK="${ESPEAK}.exe"; fi
           if [[ ! -f "$BIN" ]]; then
-            echo "binary not found at $BIN"; exit 1
+            echo "::error::binary not found at $BIN"; exit 1
+          fi
+          # The portable archive must be a *complete* engine: the espeak-ng
+          # phonemizer (sidecar + data) rides along so a consumer that unpacks
+          # just this archive (e.g. Myo bundling the engine) gets a working
+          # voice instead of falling back to WebSpeech. A zero-byte stub or a
+          # data dir without `phontab` means bundle_espeak didn't run — fail
+          # loudly here rather than silently ship a voiceless engine.
+          if [[ ! -s "$ESPEAK" ]]; then
+            echo "::error::staged espeak-ng missing or a stub at $ESPEAK — bundle_espeak did not produce a binary"; exit 1
+          fi
+          if [[ ! -f "$DATA/phontab" ]]; then
+            echo "::error::espeak-ng-data missing or a stub at $DATA"; exit 1
           fi
           mkdir -p dist-bin
           NAME="myownllm-${{ matrix.platform.name }}"
+          cp -R "$DATA" dist-bin/espeak-ng-data
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$BIN" "dist-bin/myownllm.exe"
+            cp "$ESPEAK" "dist-bin/espeak-ng.exe"
             # chdir before hashing so the `.sha256` sidecar records just the
             # basename — matching how the GitHub asset is uploaded. Hashing
             # `dist-bin/<file>` from the repo root would bake `dist-bin/`
             # into the recorded filename and break self-update verification.
-            (cd dist-bin && 7z a "${NAME}.zip" myownllm.exe)
+            (cd dist-bin && 7z a "${NAME}.zip" myownllm.exe espeak-ng.exe espeak-ng-data)
             (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
           else
             cp "$BIN" "dist-bin/myownllm"
-            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin myownllm
+            cp "$ESPEAK" "dist-bin/espeak-ng"
+            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin myownllm espeak-ng espeak-ng-data
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
           fi
 
