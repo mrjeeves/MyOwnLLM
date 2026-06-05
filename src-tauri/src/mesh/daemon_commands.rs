@@ -120,6 +120,14 @@ pub async fn mesh_daemon_network_remove(
 }
 
 #[tauri::command]
+pub async fn mesh_daemon_network_update(
+    state: State<'_, Arc<MeshDaemon>>,
+    config: Value,
+) -> CmdResult<Value> {
+    request_data(&state.inner().clone(), &Request::NetworkUpdate { config }).await
+}
+
+#[tauri::command]
 pub async fn mesh_daemon_topology_set(
     state: State<'_, Arc<MeshDaemon>>,
     network: String,

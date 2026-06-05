@@ -96,6 +96,14 @@ pub enum Request {
     NetworkRemove {
         network: String,
     },
+    /// Update an already-joined network's config in place. The daemon
+    /// hot-applies topology/label/auto_approve changes and rebuilds the
+    /// network for transport changes (signaling / STUN / TURN). This is
+    /// how a STUN/TURN edit reaches a network the daemon joined on a
+    /// previous launch — `NetworkAdd` no-ops on an existing network.
+    NetworkUpdate {
+        config: serde_json::Value,
+    },
     EventsSubscribe,
 
     // ---- governance ------------------------------------------------
