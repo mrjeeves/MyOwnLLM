@@ -68,6 +68,45 @@ fn last_write() -> &'static Mutex<Option<Instant>> {
 
 const WRITE_THROTTLE: Duration = Duration::from_millis(750);
 
+/// On Linux/GTK the `set_size` we issue in `restore_or_default` doesn't take
+/// effect synchronously — GTK dispatches the resulting `configure`/`Resized`
+/// event on the next main-loop turn, which lands *after* `watch()` has wired the
+/// resize listener and the window is shown. That echoed event reports an
+/// `inner_size()` inflated by one title-bar height relative to the value we set
+/// (the inner-vs-outer decoration asymmetry: `set_size` sets the client area but
+/// the post-resize readback includes the chrome). Persisting it re-saves a
+/// slightly taller window, and the next launch restores *that* — so the window
+/// grows by a title bar on every relaunch. We swallow any move/resize that lands
+/// within this settle window after a restore so our own restore can never feed
+/// the saved geometry. Windows/macOS report the value we set verbatim, so this
+/// is a harmless no-op there.
+const RESTORE_SETTLE: Duration = Duration::from_millis(1500);
+
+/// When the last programmatic restore happened. `record` ignores OS-reported
+/// geometry until `RESTORE_SETTLE` past this, to drop the restore's own echo.
+fn restored_at() -> &'static Mutex<Option<Instant>> {
+    static AT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    AT.get_or_init(|| Mutex::new(None))
+}
+
+/// Start (or restart) the post-restore settle window.
+fn mark_restored() {
+    if let Ok(mut g) = restored_at().lock() {
+        *g = Some(Instant::now());
+    }
+}
+
+/// True while we're still inside the settle window after a restore — i.e. any
+/// move/resize event now is the restore's own echo, not a user action.
+fn within_restore_settle() -> bool {
+    restored_at()
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .map(|t| t.elapsed() < RESTORE_SETTLE)
+        .unwrap_or(false)
+}
+
 fn state_path() -> Option<std::path::PathBuf> {
     crate::myownllm_dir()
         .ok()
@@ -105,9 +144,15 @@ fn snapshot() -> Option<WindowState> {
 /// platform can't report size/position (it always can in practice).
 ///
 /// Size is the **inner (client)** size and position the **outer** top-left,
-/// so the values round-trip cleanly through `set_size` (client) +
-/// `set_position` (outer). Using `outer_size` here would grow the window by
-/// the title-bar height on every relaunch on Windows (see `WindowState`).
+/// matching the setters used to restore them — `set_size` resizes the client
+/// area, `set_position` moves the outer frame. Using `outer_size` here would
+/// grow the window by a title-bar height on every relaunch (see `WindowState`).
+///
+/// On Linux the inner getter/setter pair still isn't perfectly symmetric: the
+/// `inner_size()` read back right after our restore's `set_size` is inflated by
+/// the decoration height. That asymmetry is handled at the event layer, not
+/// here — `record` ignores geometry reported inside the post-restore settle
+/// window (see `RESTORE_SETTLE`) so the inflated echo is never persisted.
 fn read_normal_geometry(window: &WebviewWindow) -> Option<WindowState> {
     let size = window.inner_size().ok()?;
     let pos = window.outer_position().ok()?;
@@ -183,6 +228,10 @@ fn apply(window: &WebviewWindow, st: &WindowState) {
 /// move/resize has a normal geometry to preserve. Best-effort throughout:
 /// any failure leaves the window at its conf defaults rather than panicking.
 pub fn restore_or_default(window: &WebviewWindow) {
+    // Open the settle window now: the `set_size`/`set_position` calls in
+    // `apply` (and `maximize` in the seed path) all emit move/resize events
+    // that `watch` must ignore so the restore can't grow the saved geometry.
+    mark_restored();
     if let Some(saved) = load_from_disk() {
         apply(window, &saved);
         if let Ok(mut g) = current().lock() {
@@ -229,6 +278,15 @@ fn persist(st: &WindowState, force: bool) {
 
 /// Update the canonical state from the live window and persist it.
 fn record(window: &WebviewWindow, force: bool) {
+    // Drop the move/resize the restore itself triggers (see `RESTORE_SETTLE`):
+    // on Linux that echo is decoration-inflated and would otherwise grow the
+    // saved window on every relaunch. The canonical state already holds the
+    // geometry we just restored, so ignoring these startup echoes loses nothing
+    // — including on a close that races the settle window, since `flush()`
+    // persists the canonical value on exit either way.
+    if within_restore_settle() {
+        return;
+    }
     let Some(st) = capture(window) else { return };
     if let Ok(mut g) = current().lock() {
         *g = Some(st.clone());
@@ -257,5 +315,22 @@ pub fn watch(window: &WebviewWindow) {
 pub fn flush() {
     if let Some(st) = snapshot() {
         write_to_disk(&st);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_opens_the_settle_window() {
+        // Immediately after a restore, any move/resize the OS reports is the
+        // restore's own (decoration-inflated, on Linux) echo — `record` must
+        // see the settle window as open so it drops that echo instead of
+        // persisting it and growing the saved size on the next launch. The
+        // elapsed time here is microseconds, far inside `RESTORE_SETTLE`, so
+        // this is deterministic even under parallel test execution.
+        mark_restored();
+        assert!(within_restore_settle());
     }
 }
