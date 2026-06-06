@@ -284,6 +284,132 @@ fn try_open_input(
     Ok(())
 }
 
+/// Priority order (as indices into `names`) in which to try capture
+/// devices: the explicitly requested device first (honor the user's
+/// pick), then the system default, then every remaining device in
+/// enumeration order. Deduped, so a device that is both "requested" and
+/// "default" is tried once. Pure index logic — no cpal — so the ordering
+/// is unit-testable without audio hardware.
+fn order_input_candidates(
+    requested: Option<&str>,
+    default_name: Option<&str>,
+    names: &[String],
+) -> Vec<usize> {
+    let mut order: Vec<usize> = Vec::with_capacity(names.len());
+
+    // 1. Honor the user's explicit pick (empty string == "System default").
+    if let Some(req) = requested.filter(|s| !s.is_empty()) {
+        if let Some(i) = names.iter().position(|n| n == req) {
+            order.push(i);
+        }
+    }
+    // 2. The system default — the only device older builds ever tried.
+    if let Some(def) = default_name {
+        if let Some(i) = names.iter().position(|n| n == def) {
+            if !order.contains(&i) {
+                order.push(i);
+            }
+        }
+    }
+    // 3. Everything else the host enumerated, in order. This is the rung
+    //    that rescues a Pi: when the dead ALSA "default" fails, we walk on
+    //    to the USB array sitting right here in the list.
+    for i in 0..names.len() {
+        if !order.contains(&i) {
+            order.push(i);
+        }
+    }
+    order
+}
+
+/// Resolve a working capture device and its config.
+///
+/// `requested` is the user's saved `mic.device_name` (`None` / `""` =
+/// system default). cpal's ALSA "default" PCM is unreliable for capture
+/// on headless Pi-class boxes: it routes to a card with no ADC (a bare Pi
+/// has no onboard capture at all), so it probes empty and opens nothing —
+/// exactly the `default_input_config` / `supported_input_configs` failure
+/// pair seen in the field. Meanwhile the real mic (a ReSpeaker / USB
+/// array) is sitting right there in `input_devices()`, never tried,
+/// because the old code bound to a single device up front.
+///
+/// So we try candidates in priority order — the requested device, then
+/// the system default, then every other enumerated input device — and
+/// keep the first whose [`probe_input_config`] succeeds. On a healthy
+/// desktop the system default wins on the first try (no behavior change);
+/// on the Pi we walk past the unusable "default" to the array that
+/// actually captures.
+fn resolve_input_device(
+    host: &cpal::Host,
+    requested: Option<&str>,
+) -> Result<(cpal::Device, cpal::SampleFormat, cpal::StreamConfig)> {
+    let default_device = host.default_input_device();
+    let default_name = default_device.as_ref().and_then(|d| d.name().ok());
+
+    // cpal pre-filters `input_devices()` to devices that advertise an input
+    // config, which is why the broken ALSA "default" is usually absent from
+    // it. Fold the system default back in if it didn't make the list, or
+    // "System default" would never even get a turn.
+    let mut devices: Vec<cpal::Device> = host
+        .input_devices()
+        .map(|it| it.collect())
+        .unwrap_or_default();
+    if let Some(def) = default_device {
+        let dn = def.name().ok();
+        let already = dn.is_some() && devices.iter().any(|d| d.name().ok() == dn);
+        if !already {
+            devices.push(def);
+        }
+    }
+
+    if devices.is_empty() {
+        return Err(anyhow!(
+            "no input devices: the OS reported no microphones at all"
+        ));
+    }
+
+    let names: Vec<String> = devices
+        .iter()
+        .map(|d| d.name().unwrap_or_else(|_| "<unknown>".to_string()))
+        .collect();
+
+    if let Some(req) = requested.filter(|s| !s.is_empty()) {
+        if !names.iter().any(|n| n == req) {
+            eprintln!(
+                "[transcribe] saved mic {req:?} is not connected — falling back to the system default / another input"
+            );
+        }
+    }
+
+    let order = order_input_candidates(requested, default_name.as_deref(), &names);
+
+    let mut last_err: Option<String> = None;
+    for idx in order {
+        match probe_input_config(&devices[idx]) {
+            Ok((format, cfg)) => {
+                eprintln!("[transcribe] capturing from input device {:?}", names[idx]);
+                let device = devices.swap_remove(idx);
+                return Ok((device, format, cfg));
+            }
+            Err(e) => {
+                eprintln!("[transcribe] input device {:?} unusable: {e}", names[idx]);
+                last_err = Some(format!("{:?}: {e}", names[idx]));
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "no usable microphone: tried {} input device(s) and none accepted a capture stream{}. \
+         If your mic is a multi-channel USB array (ReSpeaker etc.), check the `[transcribe] supported:` \
+         lines logged above for the formats it advertises; otherwise it may be in use by another app, \
+         output-only, or unplugged.",
+        names.len(),
+        last_err
+            .map(|e| format!(" (last error — {e})"))
+            .unwrap_or_default()
+    ))
+}
+
 fn chunk_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
@@ -1504,16 +1630,7 @@ fn run_capture(
     window: &WebviewWindow,
 ) -> Result<()> {
     let host = cpal::default_host();
-    let device = match device_name {
-        Some(name) if !name.is_empty() => host
-            .input_devices()?
-            .find(|d| d.name().map(|n| n == name).unwrap_or(false))
-            .ok_or_else(|| anyhow!("input device '{name}' not found"))?,
-        _ => host
-            .default_input_device()
-            .ok_or_else(|| anyhow!("no default input device"))?,
-    };
-    let (format, stream_cfg) = probe_input_config(&device)?;
+    let (device, format, stream_cfg) = resolve_input_device(&host, device_name)?;
     let sr = stream_cfg.sample_rate.0;
     let channels = stream_cfg.channels as usize;
 
@@ -1952,16 +2069,7 @@ fn run_session(
     write_meta(&buffer_dir, runtime, model_name, diarize_composite);
 
     let host = cpal::default_host();
-    let device = match device_name {
-        Some(name) if !name.is_empty() => host
-            .input_devices()?
-            .find(|d| d.name().map(|n| n == name).unwrap_or(false))
-            .ok_or_else(|| anyhow!("input device '{name}' not found"))?,
-        _ => host
-            .default_input_device()
-            .ok_or_else(|| anyhow!("no default input device"))?,
-    };
-    let (format, stream_cfg) = probe_input_config(&device)?;
+    let (device, format, stream_cfg) = resolve_input_device(&host, device_name)?;
     let sr = stream_cfg.sample_rate.0;
     let channels = stream_cfg.channels as usize;
     eprintln!(
@@ -4388,6 +4496,50 @@ mod tests {
         assert!(config_score(1, 8_000) > config_score(2, 8_000));
         // A rate exactly at the target counts as reaching it.
         assert!(config_score(1, TARGET_SR).0);
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn order_input_candidates_prefers_requested_then_default() {
+        let devs = names(&["default", "plughw:CARD=seeed", "hw:CARD=seeed"]);
+        // Explicit pick comes first, then the system default, then the rest.
+        let order = order_input_candidates(Some("hw:CARD=seeed"), Some("default"), &devs);
+        assert_eq!(order, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn order_input_candidates_default_path_falls_through_to_real_hardware() {
+        let devs = names(&["default", "plughw:CARD=seeed", "hw:CARD=seeed"]);
+        // "System default" (no/empty request) tries "default" first, then the
+        // USB array a dead ALSA "default" must fall through to — the Pi fix.
+        assert_eq!(
+            order_input_candidates(None, Some("default"), &devs),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            order_input_candidates(Some(""), Some("default"), &devs),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn order_input_candidates_dedupes_and_survives_missing_names() {
+        let devs = names(&["a", "b"]);
+        // Requested == default == same device: listed once, then the rest.
+        assert_eq!(
+            order_input_candidates(Some("b"), Some("b"), &devs),
+            vec![1, 0]
+        );
+        // A saved device that's no longer present is skipped, not fatal.
+        assert_eq!(
+            order_input_candidates(Some("gone"), Some("a"), &devs),
+            vec![0, 1]
+        );
+        // No default reported at all: still returns every device, in order.
+        assert_eq!(order_input_candidates(None, None, &devs), vec![0, 1]);
     }
 
     #[test]
