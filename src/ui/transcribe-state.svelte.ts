@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import { meshClient } from "../mesh-daemon.svelte";
+
 /** One unit of decoded speech emitted by the ASR worker. Mirror of
  *  `transcribe::EmittedSegment` in src-tauri. Speaker IDs are
  *  optional — present only when diarization is enabled and the
@@ -172,6 +174,24 @@ let elapsedTimer: ReturnType<typeof setInterval> | null = null;
  *  `final` frame after teardown; we hold the caller in `await` until
  *  that arrives so a follow-up persist() can't race the last delta. */
 let stopResolver: (() => void) | null = null;
+
+// ---- remote (mesh-host) transcription --------------------------------
+// When a peer is pinned as the transcribe host, audio is captured
+// locally — Rust `transcribe_capture_start` (mic) /
+// `transcribe_decode_file_start` (file), both emitting PCM on
+// `myownllm://transcribe-capture/<id>` — and forwarded to the peer via
+// `meshClient.sendTranscribeRequest`; the host runs the ASR and streams
+// segments back through that RPC's `on_segment` callback. These mirror
+// the local session's lifecycle so the StatusBar + TranscribeView don't
+// need to know whether the active session is local or remote.
+//
+// Non-null `remoteCaptureId` is the marker that the active session is
+// remote, so the lifecycle controls (stop/abort/pause/resume) route to
+// the capture commands instead of the local `transcribe_*` ones.
+let remoteCaptureId: string | null = null;
+let remoteMeshCancel: (() => void) | null = null;
+let unlistenCapture: UnlistenFn | null = null;
+let remoteFinished = false;
 
 function clearTimers() {
   if (elapsedTimer) clearInterval(elapsedTimer);
@@ -383,6 +403,15 @@ export async function startUpload(args: {
 }
 
 export async function pauseRecording(): Promise<void> {
+  if (remoteCaptureId) {
+    if (!transcribeUi.active || transcribeUi.paused || transcribeUi.uploadOnly) return;
+    await invoke("transcribe_capture_set_paused", {
+      streamId: remoteCaptureId,
+      paused: true,
+    });
+    transcribeUi.paused = true;
+    return;
+  }
   if (!transcribeUi.active || transcribeUi.paused || transcribeUi.drainOnly) return;
   if (!transcribeUi.streamId) return;
   await invoke("transcribe_pause", { streamId: transcribeUi.streamId });
@@ -390,6 +419,16 @@ export async function pauseRecording(): Promise<void> {
 }
 
 export async function resumeRecording(): Promise<void> {
+  if (remoteCaptureId) {
+    if (!transcribeUi.active || !transcribeUi.paused) return;
+    await invoke("transcribe_capture_set_paused", {
+      streamId: remoteCaptureId,
+      paused: false,
+    });
+    transcribeUi.paused = false;
+    transcribeUi.startedAt = Date.now() - transcribeUi.elapsed * 1000;
+    return;
+  }
   if (!transcribeUi.active || !transcribeUi.paused) return;
   if (!transcribeUi.streamId) return;
   await invoke("transcribe_resume", { streamId: transcribeUi.streamId });
@@ -402,6 +441,26 @@ export async function resumeRecording(): Promise<void> {
  *  worker has emitted its final frame (after the drain completes), so
  *  callers can safely persist the transcript right after `await`. */
 export async function stopRecording(): Promise<void> {
+  if (remoteCaptureId) {
+    // Stop capturing; the Rust loop flushes its trailing audio and emits
+    // a final PCM frame, which we forward to the host as the end-of-audio
+    // marker. The host drains its ASR backlog, streams the last segments,
+    // and ends the RPC — `on_done` then resolves this promise via
+    // `finalizeRemote`.
+    transcribeUi.draining = true;
+    const done = new Promise<void>((resolve) => {
+      stopResolver = resolve;
+    });
+    try {
+      await invoke("transcribe_capture_stop", { streamId: remoteCaptureId });
+    } catch (e) {
+      console.warn("transcribe_capture_stop failed:", e);
+      finalizeRemote(null);
+      return;
+    }
+    await done;
+    return;
+  }
   const id = transcribeUi.streamId;
   if (!id) return;
   // Capture has stopped; the session is now draining its backlog until the
@@ -429,6 +488,18 @@ export async function stopRecording(): Promise<void> {
  *  frame, like `stopRecording`. Safe to call whether or not a graceful
  *  stop is already in flight. */
 export async function abortRecording(): Promise<void> {
+  if (remoteCaptureId) {
+    // Cut off now: stop the local capture, then tear down (which drops the
+    // RPC so we don't wait on the host's backlog). Whatever segments
+    // already streamed back are kept — the caller persists them.
+    try {
+      await invoke("transcribe_capture_stop", { streamId: remoteCaptureId });
+    } catch (e) {
+      console.warn("transcribe_capture_stop failed:", e);
+    }
+    finalizeRemote(null);
+    return;
+  }
   const id = transcribeUi.streamId;
   if (!id) return;
   // If no graceful stop preceded this, make sure the awaited `done` promise
@@ -489,6 +560,235 @@ export async function startDrain(args: {
   transcribeUi.pendingChunks = 0;
   transcribeUi.liveSegments = [];
   transcribeUi.liveDelta = "";
+}
+
+/** One transcript segment streamed back from the host peer. Mirror of
+ *  `SegmentPayload` in `mesh-transcribe.ts`. */
+interface RemoteSegment {
+  text: string;
+  speaker?: number;
+  overlap?: boolean;
+  start_ms?: number;
+  end_ms?: number;
+}
+
+/** One PCM frame the Rust capture / decode loop emits for us to forward
+ *  to the host. Mirror of `CapturePcm` in `src-tauri/src/transcribe.rs`:
+ *  `bytes_b64` is i16-LE PCM at 16 kHz mono, empty on the terminal frame;
+ *  `error` is set instead of audio when the mic / decoder failed. */
+interface CapturePcm {
+  index: number;
+  bytes_b64: string;
+  is_final: boolean;
+  error?: string | null;
+}
+
+function bytesFromBase64(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/** Tear a remote session down exactly once: drop the capture listener,
+ *  surface any error, flip the UI back to idle, and resolve a pending
+ *  stop()/abort(). The local-session equivalent is the `final`-frame
+ *  branch in `attachListener`. */
+function finalizeRemote(error: string | null): void {
+  if (remoteFinished) return;
+  remoteFinished = true;
+  clearTimers();
+  unlistenCapture?.();
+  unlistenCapture = null;
+  // Release the RPC. On a clean host finish this stream is already ended
+  // (cancel is then a harmless no-op); on an abort or a local-capture
+  // failure it's what stops the host waiting for audio that won't come.
+  remoteMeshCancel?.();
+  remoteMeshCancel = null;
+  // Stop the local mic / decoder if it's still running. Idempotent: on the
+  // graceful-stop path the capture already ended; this is the backstop for
+  // the error / peer-dropped paths so the microphone doesn't stay open.
+  const id = remoteCaptureId;
+  remoteCaptureId = null;
+  if (id) void invoke("transcribe_capture_stop", { streamId: id }).catch(() => {});
+  if (error) transcribeUi.error = error;
+  transcribeUi.active = false;
+  transcribeUi.draining = false;
+  const r = stopResolver;
+  stopResolver = null;
+  r?.();
+}
+
+interface RemoteCommon {
+  targetPeerId: string;
+  runtime: string;
+  model: string;
+  diarizeModel: string | null;
+  conversationId: string | null;
+}
+
+/** Shared driver for remote Record + remote Upload. Opens the
+ *  `transcribe` RPC on the host (segments stream back via `on_segment`),
+ *  wires the local capture/decode PCM events through to the host, brings
+ *  up the transcribe UI state, then kicks off the local audio source via
+ *  `startCapture`. */
+async function runRemoteSession(
+  common: RemoteCommon,
+  uploadOnly: boolean,
+  startCapture: (captureId: string) => Promise<unknown>,
+): Promise<void> {
+  if (transcribeUi.active) return;
+  transcribeUi.error = "";
+  remoteFinished = false;
+  const captureId = crypto.randomUUID();
+
+  // 1. Open the remote ASR session. Segments arrive on `on_segment`; the
+  //    terminal state on `on_done` (clean) / `on_error`.
+  let handle: {
+    id: string;
+    sendAudioChunk: (pcm: Uint8Array, isFinal: boolean) => void;
+    cancel: () => void;
+  };
+  try {
+    handle = await meshClient.sendTranscribeRequest({
+      target_peer_id: common.targetPeerId,
+      runtime: common.runtime,
+      model: common.model,
+      diarize_model: common.diarizeModel,
+      on_segment: (seg: RemoteSegment) => {
+        if (remoteFinished) return;
+        const e: EmittedSegment = {
+          start_ms: seg.start_ms ?? 0,
+          end_ms: seg.end_ms ?? 0,
+          text: seg.text,
+          speaker: seg.speaker,
+          overlap: seg.overlap,
+        };
+        transcribeUi.liveSegments = [...transcribeUi.liveSegments, e];
+        transcribeUi.liveDelta = transcribeUi.liveDelta + e.text + " ";
+        transcribeUi.framePulse++;
+      },
+      on_done: () => finalizeRemote(null),
+      on_error: (m: string) => finalizeRemote(m),
+    });
+  } catch (e) {
+    transcribeUi.error = `Couldn't start remote transcription: ${e}`;
+    throw e;
+  }
+  remoteMeshCancel = handle.cancel;
+
+  // 2. Forward captured PCM → host. Listen before starting the capture so
+  //    the first frame can't be missed.
+  let sentFinal = false;
+  const sendFinalOnce = () => {
+    if (sentFinal) return;
+    sentFinal = true;
+    handle.sendAudioChunk(new Uint8Array(0), true);
+  };
+  unlistenCapture = await listen<CapturePcm>(
+    `myownllm://transcribe-capture/${captureId}`,
+    (ev) => {
+      if (remoteFinished) return;
+      const f = ev.payload;
+      if (f.error) {
+        // Local mic / decoder failed mid-stream. Close out the host
+        // session, then tear down with the error surfaced inline.
+        sendFinalOnce();
+        finalizeRemote(f.error);
+        return;
+      }
+      if (f.bytes_b64) {
+        handle.sendAudioChunk(bytesFromBase64(f.bytes_b64), false);
+      }
+      // The terminal frame (flush complete) carries no audio — signal
+      // end-of-stream to the host so it drains and finalizes.
+      if (f.is_final) sendFinalOnce();
+    },
+  );
+
+  // 3. Bring up the UI state, mirroring startRecording / startUpload.
+  transcribeUi.active = true;
+  transcribeUi.paused = false;
+  transcribeUi.drainOnly = false;
+  transcribeUi.uploadOnly = uploadOnly;
+  transcribeUi.streamId = captureId;
+  transcribeUi.runtime = common.runtime;
+  transcribeUi.model = common.model;
+  transcribeUi.conversationId = common.conversationId;
+  transcribeUi.startedAt = Date.now();
+  transcribeUi.elapsed = 0;
+  transcribeUi.pendingChunks = 0;
+  transcribeUi.liveSegments = [];
+  transcribeUi.liveDelta = "";
+  remoteCaptureId = captureId;
+  if (uploadOnly) {
+    transcribeUi.uploadProgress = { total_ms: null, decoded_ms: 0, processed_ms: 0 };
+  } else {
+    elapsedTimer = setInterval(() => {
+      if (transcribeUi.paused) return;
+      transcribeUi.elapsed = Math.floor((Date.now() - transcribeUi.startedAt) / 1000);
+    }, 250);
+  }
+
+  // 4. Start the local audio source. On failure, tear everything down.
+  try {
+    await startCapture(captureId);
+  } catch (e) {
+    finalizeRemote(String(e));
+    throw e;
+  }
+}
+
+/** Remote Record: capture the local mic, transcribe on `targetPeerId`. */
+export async function startRemoteRecording(args: {
+  targetPeerId: string;
+  runtime: string;
+  model: string;
+  diarizeModel: string | null;
+  device: string | null;
+  conversationId: string | null;
+}): Promise<void> {
+  await runRemoteSession(
+    {
+      targetPeerId: args.targetPeerId,
+      runtime: args.runtime,
+      model: args.model,
+      diarizeModel: args.diarizeModel,
+      conversationId: args.conversationId,
+    },
+    false,
+    (captureId) =>
+      invoke("transcribe_capture_start", {
+        streamId: captureId,
+        device: args.device,
+      }),
+  );
+}
+
+/** Remote Upload: decode a local file, transcribe it on `targetPeerId`. */
+export async function startRemoteUpload(args: {
+  targetPeerId: string;
+  runtime: string;
+  model: string;
+  diarizeModel: string | null;
+  filePath: string;
+  conversationId: string | null;
+}): Promise<void> {
+  await runRemoteSession(
+    {
+      targetPeerId: args.targetPeerId,
+      runtime: args.runtime,
+      model: args.model,
+      diarizeModel: args.diarizeModel,
+      conversationId: args.conversationId,
+    },
+    true,
+    (captureId) =>
+      invoke("transcribe_decode_file_start", {
+        streamId: captureId,
+        filePath: args.filePath,
+      }),
+  );
 }
 
 /** Hand back whatever segments have streamed in since the last flush,
