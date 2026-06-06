@@ -110,6 +110,10 @@
    *  Transcribe / Speakers surface with the mesh node graph; picking a
    *  mode bubble or selecting a conversation clears it. */
   let networksOpen = $state(false);
+  /** Set by the approval toast when it opens the Networks workspace, so
+   *  NetworksView lands straight on the waiting request. Cleared whenever
+   *  Networks closes (see the reset effect alongside the toast state). */
+  let reviewPendingOnOpen = $state(false);
   /** Flips true once the persisted UI session state has been read on launch.
    *  Gates the special-view persist effect so the initial render doesn't
    *  overwrite the saved view before we've restored it. */
@@ -687,9 +691,13 @@
    *  chat streams, same as Speakers — leaving the Chat surface
    *  mid-stream would orphan the in-flight generation (the TopBar's
    *  Networks bubble is disabled then too, so this is belt-and-braces). */
-  function openNetworks() {
+  function openNetworks(opts?: { reviewPending?: boolean }) {
     if (chatStreamLock) return;
     speakersOpen = false;
+    // Only the approval toast passes `reviewPending`; the top-bar bubble
+    // and session-restore call this bare, so a normal open never auto-
+    // selects a request.
+    reviewPendingOnOpen = opts?.reviewPending === true;
     networksOpen = true;
   }
 
@@ -740,9 +748,10 @@
    *  Networks mode bubble shows its own dot from the same source. This
    *  is the one mesh signal worth interrupting for: a new device can't
    *  finish joining until the user acts. */
-  const meshPendingCount = $derived(
-    meshClient.peers.filter((p) => p.status === "pending_approval").length,
+  const meshPendingPeers = $derived(
+    meshClient.peers.filter((p) => p.status === "pending_approval"),
   );
+  const meshPendingCount = $derived(meshPendingPeers.length);
   $effect(() => {
     settingsAttention.set(
       "cloud-mesh",
@@ -752,6 +761,38 @@
           }
         : null,
     );
+  });
+
+  // --- Global approval toast -------------------------------------------
+  // A waiting join request can't finish until the user acts, and the
+  // Networks banner only shows once you're already on that tab — so we
+  // float a dismissible toast over every view. Clicking it opens the
+  // Networks workspace and lands on the request.
+  let approvalToastDismissed = $state(false);
+  // Key the dismissal to the set of waiting peer ids: a new knock (or
+  // the list clearing) brings the toast back, but while the same
+  // requests sit there a dismiss stays dismissed.
+  const pendingPeerKey = $derived(
+    meshPendingPeers
+      .map((p) => p.peer_id)
+      .sort()
+      .join(","),
+  );
+  $effect(() => {
+    pendingPeerKey; // re-run only when the waiting set changes
+    approvalToastDismissed = false;
+  });
+  const showApprovalToast = $derived(
+    meshPendingPeers.length > 0 &&
+      !networksOpen &&
+      !approvalToastDismissed &&
+      !remoteActive,
+  );
+  // Drop the "review on open" hint whenever Networks closes, so a later
+  // normal open (top-bar bubble, restored session) doesn't auto-select a
+  // request the user never clicked the toast for.
+  $effect(() => {
+    if (!networksOpen) reviewPendingOnOpen = false;
   });
 
   function onSelectConversation(id: string) {
@@ -1277,6 +1318,7 @@
           onRequestStopTranscribe={requestStopTranscribe}
           onRequestStopChat={requestStopChat}
           onOpenSpeakers={openSpeakers}
+          focusPendingOnOpen={reviewPendingOnOpen}
         />
       {:else if speakersOpen}
         <SpeakersView
@@ -1355,6 +1397,38 @@
       onConfirm={confirmConflict}
       onCancel={dismissConflict}
     />
+  {/if}
+
+  {#if showApprovalToast}
+    <!--
+      Global approval toast. Floats over any view when a device is
+      waiting to join; clicking the body opens the Networks workspace and
+      lands on the request. Suppressed while the Networks tab is open
+      (the in-tab banner takes over) and while a remote session curtains
+      the app.
+    -->
+    <div class="approval-toast" role="status" aria-live="polite">
+      <button
+        class="approval-main"
+        onclick={() => openNetworks({ reviewPending: true })}
+        title="Open Networks and review the request"
+      >
+        <span class="approval-bell" aria-hidden="true">🔔</span>
+        <span class="approval-body">
+          <span class="approval-title">
+            {meshPendingPeers.length === 1
+              ? `${meshPendingPeers[0].label || "A device"} wants to join your mesh`
+              : `${meshPendingPeers.length} devices want to join your mesh`}
+          </span>
+          <span class="approval-sub">Click to review and approve</span>
+        </span>
+      </button>
+      <button
+        class="approval-dismiss"
+        aria-label="Dismiss"
+        onclick={() => (approvalToastDismissed = true)}
+      >✕</button>
+    </div>
   {/if}
 
   {#if remoteActive}
@@ -1607,6 +1681,83 @@
     to {
       transform: rotate(360deg);
     }
+  }
+
+  /* Global approval toast — bottom-right, above app chrome. Purple
+     accent matches the Networks graph's "pending" node and the
+     Connections pending rows so a join request reads the same
+     everywhere. Suppressed while the remote curtain (z 9999) is up. */
+  .approval-toast {
+    position: fixed;
+    right: 1.1rem;
+    bottom: 1.1rem;
+    z-index: 200;
+    display: flex;
+    align-items: stretch;
+    background: #15121d;
+    border: 1px solid #3a3157;
+    border-left: 3px solid #a78bfa;
+    border-radius: 10px;
+    box-shadow: 0 12px 34px rgba(0, 0, 0, 0.5);
+    overflow: hidden;
+    max-width: 22rem;
+    animation: approval-in 0.18s ease-out;
+  }
+  @keyframes approval-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .approval-main {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    padding: 0.7rem 0.55rem 0.7rem 0.85rem;
+    background: none;
+    border: none;
+    color: #e8e8e8;
+    text-align: left;
+    cursor: pointer;
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+  }
+  .approval-main:hover { background: #1b1727; }
+  .approval-bell {
+    font-size: 1.1rem;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .approval-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 0;
+  }
+  .approval-title {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: #f0ebff;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .approval-sub {
+    font-size: 0.7rem;
+    color: #9a92b8;
+  }
+  .approval-dismiss {
+    background: none;
+    border: none;
+    border-left: 1px solid #2a2440;
+    color: #6a6480;
+    padding: 0 0.7rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .approval-dismiss:hover {
+    color: #c9b8f5;
+    background: #1b1727;
   }
 
   .remote-curtain {

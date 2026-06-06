@@ -70,6 +70,16 @@
     ),
   );
 
+  /** Authenticated peers waiting on the local user to approve them —
+   *  the actionable join requests. They sit in `pending_approval` until
+   *  the user acts; a peer we've already approved and are waiting on
+   *  shows as `pending_remote` and stays in the Indirect list. Surfaced
+   *  as their own prominent block at the top so a request can never hide
+   *  among the parked/offline rows. */
+  let pendingApprovalPeers = $derived(
+    meshClient.peers.filter((p) => p.status === "pending_approval"),
+  );
+
   function indirectReason(p: (typeof meshClient.peers)[number]): string {
     if (p.status === "offline") return "offline";
     if (p.status === "reconnecting") return "reconnecting";
@@ -141,6 +151,56 @@
       main sidebar under <strong>Network</strong>.
     </div>
   {:else}
+    <!-- Pending approval — actionable join requests, on top so they're
+         never buried under the ring / indirect lists. -->
+    {#if pendingApprovalPeers.length > 0}
+      <section class="block">
+        <div class="block-head">
+          <h3>Pending approval</h3>
+          <span class="block-meta">
+            {pendingApprovalPeers.length} waiting · approve to connect
+          </span>
+        </div>
+        <div class="peer-list">
+          {#each pendingApprovalPeers as p (p.peer_id)}
+            <div class="peer-row pending">
+              <div class="peer-main">
+                <div class="peer-label">
+                  <span class="peer-name">{p.label || "Unnamed device"}</span>
+                  {#if p.device_suffix}
+                    <span class="peer-suffix">-{p.device_suffix}</span>
+                  {/if}
+                  <span class="badge pending">wants to connect</span>
+                </div>
+                <code class="peer-pubkey" title={p.device_pubkey}>{shortPubkeyBody(p.device_pubkey)}</code>
+                {#if p.verification_code}
+                  <div class="verify-line">
+                    verification code
+                    <code class="verify-code">{p.verification_code}</code>
+                    <span class="verify-hint">— confirm it matches the other device before approving</span>
+                  </div>
+                {/if}
+              </div>
+              <button
+                class="btn-small primary"
+                onclick={() => meshClient.approveRequest(p.peer_id)}
+                title="Approve this device and let it join the mesh"
+              >
+                Approve
+              </button>
+              <button
+                class="btn-small ghost"
+                onclick={() => meshClient.denyRequest(p.peer_id)}
+                title="Reject this join request"
+              >
+                Deny
+              </button>
+            </div>
+          {/each}
+        </div>
+      </section>
+    {/if}
+
     <!-- Ring -->
     <section class="block">
       <div class="block-head">
@@ -390,6 +450,40 @@
     border-left: 3px solid #2c8e4e;
     background: #0f1812;
   }
+  /* Pending-approval rows borrow the graph's purple "pending" accent
+     so a join request reads as the same thing across the Networks
+     graph, the toast, and here. */
+  .peer-row.pending {
+    border-left: 3px solid #a78bfa;
+    background: #15121d;
+    border-color: #2a2440;
+  }
+  .verify-line {
+    font-size: 0.7rem;
+    color: #8a83a8;
+    margin-top: 0.25rem;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+  }
+  .verify-code {
+    font-family: monospace;
+    font-size: 0.74rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: #c9b8f5;
+    background: #1d1730;
+    padding: 0.05rem 0.4rem;
+    border-radius: 3px;
+    user-select: all;
+  }
+  .verify-hint { color: #6a6480; }
+  .badge.pending {
+    color: #c9b8f5;
+    background: #241d38;
+    border: 1px solid #3a3157;
+  }
   .peer-row.indirect {
     background: #0f0f0f;
     border-color: #1a1a1a;
@@ -530,6 +624,12 @@
     color: #888;
   }
   .btn-small.ghost:hover { background: #1c1c1c; color: #ccc; }
+  .btn-small.primary {
+    background: #5b46a8;
+    border-color: #6b54c4;
+    color: #f0ebff;
+  }
+  .btn-small.primary:hover:not(:disabled) { background: #6b54c4; }
 
   /* Resource list */
   .resource-list {

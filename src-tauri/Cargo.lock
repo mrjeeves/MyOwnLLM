@@ -2995,8 +2995,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-core"
-version = "0.1.7"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.1.7#19fd577f92a3d1426ce6d4867a5ed9a659404519"
+version = "0.1.8"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.1.8#560d3b723f4eee72392921a4c359fe31a7aee849"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3026,8 +3026,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-signaling"
-version = "0.1.7"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.1.7#19fd577f92a3d1426ce6d4867a5ed9a659404519"
+version = "0.1.8"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.1.8#560d3b723f4eee72392921a4c359fe31a7aee849"
 dependencies = [
  "async-trait",
  "bytes",
