@@ -31,7 +31,7 @@
     {
       value: "io",
       label: "Balanced (recommended)",
-      hint: "Lowers the model's priority a notch so the system — display, networking — keeps enough CPU to stay responsive during a load, while inference still gets the bulk of the cores.",
+      hint: "Nudges the model's CPU and disk priority down a single notch — just enough to leave the system (display, networking) a sliver of headroom so a load can't lock the machine up. It's a light touch: when nothing else needs the machine, inference still runs at full speed.",
     },
     {
       value: "aggressive",
@@ -129,11 +129,10 @@
       <div class="card">
         <div class="card-title">Load throttle</div>
         <p class="card-meta">
-          Loading a model reads gigabytes from disk, which can freeze a
-          laptop. This throttles those reads so the machine stays usable.
-          Loading is disk-bound and inference is compute-bound, so the
-          balanced default eases disk only and leaves token generation at
-          full speed.
+          Loading a model reads gigabytes from disk and can peg every core,
+          which may briefly lock up the machine. The balanced default leaves
+          the OS a little headroom during a load so it stays responsive — a
+          light touch that doesn't slow token generation.
         </p>
         <dl class="info">
           <div class="full">

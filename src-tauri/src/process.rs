@@ -59,15 +59,16 @@ fn apply_quiet_flags_tokio(_cmd: &mut tokio::process::Command) {}
 /// `taskpolicy`) exec their target, so the resulting child PID is still
 /// ollama and our kill-on-exit handling is unaffected.
 ///
-/// - `"io"` (default, "balanced"): a moderate `nice` (CPU) — plus a low
-///   disk-IO class on Linux. `nice` only makes the server yield when
-///   something else (the display server, networking, the WebView) wants
-///   the CPU, so the machine stays responsive during a heavy load while
-///   inference still gets the bulk of the cores when nothing competes.
-///   Crucially it does NOT leave the CPU wide open to the server — which
-///   is what starved the desktop and froze the machine — nor force it
-///   onto efficiency cores like background QoS, so inference isn't
-///   crippled.
+/// - `"io"` (default, "balanced"): a *light* `nice` (CPU) plus a one-notch
+///   best-effort disk-IO ease on Linux. The goal is deliberately narrow —
+///   leave the OS a sliver of headroom so a model load can't lock the
+///   machine up for long stretches — not to slow the server down. `nice`
+///   only makes inference yield when something else (the display server,
+///   networking, the WebView) actually wants the CPU, so when nothing
+///   competes it still runs at full speed. The earlier, much heavier
+///   `nice 10` / lowest-IO-class settings overshot this and crippled
+///   few-core hosts (a Pi 5 fell from ~7.5 to 2-3 tok/s with minute-long
+///   loads), so keep this gentle.
 /// - `"aggressive"`: deep `nice` / background QoS — most responsive
 ///   desktop during a load, but noticeably slower inference.
 ///
@@ -85,11 +86,16 @@ pub fn throttle_launch_prefix(mode: &str) -> Option<Vec<&'static str>> {
             // else wants CPU or disk. Snappiest desktop, slowest model.
             vec!["nice", "-n", "19", "ionice", "-c", "3"]
         } else {
-            // Moderate nice so the system keeps headroom, plus low
-            // best-effort IO so disk reads yield under contention. The
-            // server still gets most of the CPU when it's the only thing
-            // running, so inference stays fast.
-            vec!["nice", "-n", "10", "ionice", "-c", "2", "-n", "7"]
+            // A light touch: barely lower the server's CPU priority and
+            // nudge its disk priority down a single notch — just enough
+            // that the OS keeps a sliver of headroom and stays responsive
+            // during a load, not enough to slow inference. `nice -n 2`
+            // still lets the server take the cores whenever nothing else
+            // wants them; `ionice -c 2 -n 5` is one step below the default
+            // best-effort priority (4), so the model read only yields a
+            // little under contention instead of being starved by the old
+            // lowest-priority `-n 7`.
+            vec!["nice", "-n", "2", "ionice", "-c", "2", "-n", "5"]
         })
     }
     #[cfg(target_os = "macos")]
@@ -99,11 +105,11 @@ pub fn throttle_launch_prefix(mode: &str) -> Option<Vec<&'static str>> {
             // Frees the machine most, but slows inference.
             vec!["taskpolicy", "-b"]
         } else {
-            // Moderate nice only — reserves CPU headroom for the system
-            // (display, networking) while leaving the server on the
+            // A light nice only — leaves a sliver of CPU headroom for the
+            // system (display, networking) while keeping the server on the
             // performance cores, so inference isn't kneecapped. `nice` is
             // POSIX and always present, so this can't fail the launch.
-            vec!["nice", "-n", "10"]
+            vec!["nice", "-n", "2"]
         })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -130,4 +136,46 @@ pub async fn set_priority_windows(pid: u32, mode: &str) {
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .status()
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn off_never_throttles() {
+        assert!(throttle_launch_prefix("off").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_io_is_a_light_touch() {
+        // The balanced default leaves the OS a little headroom without
+        // crippling inference: a light nice + a one-notch IO ease, never the
+        // old nice 10 / lowest-IO-class that tanked few-core hosts.
+        assert_eq!(
+            throttle_launch_prefix("io").expect("io throttles on linux"),
+            vec!["nice", "-n", "2", "ionice", "-c", "2", "-n", "5"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_aggressive_is_heavier_than_io() {
+        // Aggressive is the deliberately heavy option for users who want
+        // maximum desktop responsiveness during a load.
+        assert_eq!(
+            throttle_launch_prefix("aggressive").expect("aggressive throttles on linux"),
+            vec!["nice", "-n", "19", "ionice", "-c", "3"]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_io_is_a_light_nice() {
+        assert_eq!(
+            throttle_launch_prefix("io").expect("io throttles on macos"),
+            vec!["nice", "-n", "2"]
+        );
+    }
 }
