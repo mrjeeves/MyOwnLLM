@@ -20,38 +20,56 @@ use super::daemon::{MeshDaemon, Request};
 /// the daemon's error message verbatim.
 type CmdResult<T> = Result<T, String>;
 
+/// Returned to the frontend when a `mesh_daemon_*` command is invoked
+/// before the background bring-up has attached to a daemon — or after a
+/// daemon we were using went away and we're mid-reconnect. The frontend
+/// already treats daemon errors as "daemon down" and keeps polling
+/// `mesh_daemon_status` (which the reconnect loop in `main.rs` eventually
+/// satisfies), so this reads far better than Tauri's internal "state not
+/// managed for field 'state' … You must call '.manage()' before using
+/// this command", which is what surfaced here before the state was
+/// managed synchronously at setup.
+const DAEMON_NOT_CONNECTED: &str =
+    "mesh daemon not connected — it's still starting up or currently unavailable";
+
 /// Convenience: unwrap a daemon response, returning the `data`
-/// field on `ok` or the error string otherwise.
+/// field on `ok` or the error string otherwise. Errors with
+/// [`DAEMON_NOT_CONNECTED`] when no live connection is installed yet.
 async fn request_data(state: &Arc<MeshDaemon>, req: &Request) -> CmdResult<Value> {
-    state
-        .client
-        .request_ok(req)
-        .await
-        .map_err(|e| e.to_string())
+    let client = state
+        .client()
+        .ok_or_else(|| DAEMON_NOT_CONNECTED.to_string())?;
+    client.request_ok(req).await.map_err(|e| e.to_string())
 }
 
 // ---- daemon meta -----------------------------------------------------
 
 #[tauri::command]
 pub async fn mesh_daemon_status(state: State<'_, Arc<MeshDaemon>>) -> CmdResult<Value> {
-    let daemon = state.inner().clone();
-    let mut data = request_data(&daemon, &Request::Status).await?;
+    // Snapshot the live connection up front. When the background
+    // bring-up hasn't attached yet (or is mid-reconnect) there's nothing
+    // to query — return the clean "not connected" error the frontend's
+    // status poll already knows how to wait out.
+    let Some((client, client_id)) = state.client_and_id() else {
+        return Err(DAEMON_NOT_CONNECTED.to_string());
+    };
+    let mut data = client
+        .request_ok(&Request::Status)
+        .await
+        .map_err(|e| e.to_string())?;
     // Surface the IPC client_id our event-subscription owns so the
     // frontend can pass it back on RpcRegister / ChannelSubscribe /
     // RpcCallStream ops. The daemon's `Status` payload doesn't
     // include this — it's local to our connection state.
     if let Some(obj) = data.as_object_mut() {
-        obj.insert(
-            "ipc_client_id".to_string(),
-            Value::String(daemon.client_id.clone()),
-        );
+        obj.insert("ipc_client_id".to_string(), Value::String(client_id));
         obj.insert(
             "daemon_socket".to_string(),
-            Value::String(daemon.client.socket_display()),
+            Value::String(client.socket_display()),
         );
         obj.insert(
             "daemon_mode".to_string(),
-            Value::String(daemon.client.mode_str().to_string()),
+            Value::String(client.mode_str().to_string()),
         );
         // Daemon-version gate. Surface the rev this build was pinned to
         // and whether the live daemon meets it, so the frontend can show
@@ -82,7 +100,14 @@ pub async fn mesh_daemon_status(state: State<'_, Arc<MeshDaemon>>) -> CmdResult<
 #[tauri::command]
 pub async fn mesh_daemon_update_to_pin(state: State<'_, Arc<MeshDaemon>>) -> CmdResult<Value> {
     let daemon = state.inner().clone();
-    let own = daemon.client.mode_str() == "own_llm";
+    // Default to own-LLM semantics when not yet connected: the staged
+    // binary applies to the daemon we'd spawn ourselves. (In practice
+    // the version-gate UI that triggers this only renders after a
+    // successful status, so we're connected here.)
+    let own = daemon
+        .client()
+        .map(|c| c.mode_str() == "own_llm")
+        .unwrap_or(true);
     match tauri::async_runtime::spawn_blocking(move || super::daemon::drive_daemon_update(own))
         .await
     {
@@ -360,7 +385,9 @@ pub async fn mesh_daemon_rpc_register(
     streaming: bool,
 ) -> CmdResult<Value> {
     let daemon = state.inner().clone();
-    let client_id = daemon.client_id.clone();
+    let client_id = daemon
+        .client_id()
+        .ok_or_else(|| DAEMON_NOT_CONNECTED.to_string())?;
     request_data(
         &daemon,
         &Request::RpcRegister {
@@ -380,7 +407,9 @@ pub async fn mesh_daemon_rpc_unregister(
     method: String,
 ) -> CmdResult<Value> {
     let daemon = state.inner().clone();
-    let client_id = daemon.client_id.clone();
+    let client_id = daemon
+        .client_id()
+        .ok_or_else(|| DAEMON_NOT_CONNECTED.to_string())?;
     request_data(
         &daemon,
         &Request::RpcUnregister {
@@ -468,7 +497,9 @@ pub async fn mesh_daemon_rpc_call_stream(
     payload: Value,
 ) -> CmdResult<Value> {
     let daemon = state.inner().clone();
-    let client_id = daemon.client_id.clone();
+    let client_id = daemon
+        .client_id()
+        .ok_or_else(|| DAEMON_NOT_CONNECTED.to_string())?;
     request_data(
         &daemon,
         &Request::RpcCallStream {
@@ -491,7 +522,9 @@ pub async fn mesh_daemon_channel_subscribe(
     channel: String,
 ) -> CmdResult<Value> {
     let daemon = state.inner().clone();
-    let client_id = daemon.client_id.clone();
+    let client_id = daemon
+        .client_id()
+        .ok_or_else(|| DAEMON_NOT_CONNECTED.to_string())?;
     request_data(
         &daemon,
         &Request::ChannelSubscribe {
@@ -510,7 +543,9 @@ pub async fn mesh_daemon_channel_unsubscribe(
     channel: String,
 ) -> CmdResult<Value> {
     let daemon = state.inner().clone();
-    let client_id = daemon.client_id.clone();
+    let client_id = daemon
+        .client_id()
+        .ok_or_else(|| DAEMON_NOT_CONNECTED.to_string())?;
     request_data(
         &daemon,
         &Request::ChannelUnsubscribe {

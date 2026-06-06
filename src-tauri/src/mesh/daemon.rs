@@ -1023,28 +1023,119 @@ pub async fn ensure_daemon_running() -> Result<(ControlClient, Option<DaemonChil
 
 // ---- Tauri state ----------------------------------------------------
 
-/// State managed by Tauri for the duration of the app. The
-/// `child` slot keeps the spawned daemon alive (or `None` if we
-/// attached to one we didn't spawn); the `client` is what every
-/// Tauri command uses; the `client_id` is what RPC/channel ops
-/// pass back to the daemon so it routes inbound events to our
-/// event socket.
+/// State managed by Tauri for the duration of the app.
+///
+/// Registered **synchronously** during `setup` (see `main.rs`) in a
+/// disconnected state, so the `State<Arc<MeshDaemon>>` extractor every
+/// `mesh_daemon_*` command depends on always resolves — even before the
+/// background bring-up task has attached to a daemon, and even if that
+/// bring-up fails outright. Commands invoked before a live connection is
+/// installed get a clean "daemon not connected" error (see
+/// [`super::daemon_commands`]) instead of Tauri's internal "state not
+/// managed for field 'state' … You must call '.manage()'…".
+///
+/// Managing up front — rather than inside the spawn, only on success —
+/// is what fixes the fresh-install failure mode: previously a daemon
+/// that was slow to bind its control socket (a cold Windows boot with
+/// the sidecar still being virus-scanned) or that failed to start at all
+/// meant `.manage()` never ran, so *every* mesh command rejected with
+/// that cryptic internal error.
+///
+/// The connected half lives behind a lock so the background task can
+/// install it after the state is already managed, and swap it out / back
+/// in as the daemon restarts.
 pub struct MeshDaemon {
-    pub client: ControlClient,
-    pub client_id: String,
-    /// Held purely for lifetime — drop kills the daemon child.
-    /// `Mutex<Option<_>>` so we can take ownership at app exit
-    /// to wait the child cleanly rather than racing the OS to
-    /// reclaim it.
-    pub child: parking_lot::Mutex<Option<DaemonChild>>,
+    conn: parking_lot::RwLock<Option<DaemonConn>>,
+    /// Set once at app exit so the background reconnect loop stops
+    /// instead of racing process teardown to spawn a fresh daemon it
+    /// would immediately orphan. See `main.rs`'s `RunEvent::Exit` arm.
+    shutting_down: std::sync::atomic::AtomicBool,
+}
+
+/// Everything that only exists once we've attached to (or spawned) a
+/// live daemon: the `client` every command sends requests on, the
+/// `client_id` the event-subscribe handshake issued (passed back on
+/// RPC/channel ops so the daemon routes inbound frames to our event
+/// socket), and — when we spawned the daemon ourselves — the owned
+/// `child` whose `Drop` kills it.
+struct DaemonConn {
+    client: ControlClient,
+    client_id: String,
+    child: Option<DaemonChild>,
 }
 
 impl MeshDaemon {
-    pub fn new(client: ControlClient, client_id: String, child: Option<DaemonChild>) -> Self {
+    /// A managed-but-not-yet-connected daemon. Installed synchronously
+    /// during setup; [`Self::set_connected`] fills in the live
+    /// connection once bring-up succeeds.
+    pub fn disconnected() -> Self {
         Self {
+            conn: parking_lot::RwLock::new(None),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Signal the background reconnect loop to stop (called at app exit,
+    /// before the owned child is taken for an orderly wait).
+    pub fn begin_shutdown(&self) {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether app exit has begun — the reconnect loop checks this before
+    /// spawning so it never leaves a daemon orphaned past our own exit.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Install (or replace) the live connection. Replacing drops the
+    /// previous [`DaemonConn`] — including any owned child, whose `Drop`
+    /// kills it — which is what we want when reconnecting after the old
+    /// daemon went away.
+    pub fn set_connected(
+        &self,
+        client: ControlClient,
+        client_id: String,
+        child: Option<DaemonChild>,
+    ) {
+        *self.conn.write() = Some(DaemonConn {
             client,
             client_id,
-            child: parking_lot::Mutex::new(child),
-        }
+            child,
+        });
+    }
+
+    /// Drop the current connection (e.g. after the daemon's event stream
+    /// ended). Kills an owned child via [`DaemonConn`]'s drop.
+    pub fn set_disconnected(&self) {
+        *self.conn.write() = None;
+    }
+
+    /// The control client, if connected. Cheap to clone — it's just the
+    /// socket address + mode; the actual socket connect happens lazily
+    /// per request.
+    pub fn client(&self) -> Option<ControlClient> {
+        self.conn.read().as_ref().map(|c| c.client.clone())
+    }
+
+    /// Our daemon-issued IPC client_id, if connected.
+    pub fn client_id(&self) -> Option<String> {
+        self.conn.read().as_ref().map(|c| c.client_id.clone())
+    }
+
+    /// Snapshot the client + client_id together so `mesh_daemon_status`
+    /// reads a consistent pair under one lock acquisition.
+    pub fn client_and_id(&self) -> Option<(ControlClient, String)> {
+        self.conn
+            .read()
+            .as_ref()
+            .map(|c| (c.client.clone(), c.client_id.clone()))
+    }
+
+    /// Take the spawned child out for an orderly wait at app exit. The
+    /// connection otherwise stays intact (the client is unaffected);
+    /// only the lifetime guard moves to the caller.
+    pub fn take_child(&self) -> Option<DaemonChild> {
+        self.conn.write().as_mut().and_then(|c| c.child.take())
     }
 }

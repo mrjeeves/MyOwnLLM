@@ -971,8 +971,18 @@ class MeshDaemonClient {
   }
 
   private async fetchDaemonStatusWithRetry(): Promise<DaemonStatus> {
+    // The backend registers the mesh-daemon state synchronously at
+    // startup and keeps a reconnect loop running, so `mesh_daemon_status`
+    // no longer fails with Tauri's "state not managed" error — it returns
+    // a clean "daemon not connected" until the daemon is actually up.
+    // Wait that out: attaching to (shared probe + own probe + spawn +
+    // control-socket bind) can take ~10s on a cold boot, and longer when
+    // the OS is still virus-scanning a freshly-installed sidecar, so the
+    // budget here has to comfortably exceed that or a healthy-but-slow
+    // first launch gets reported as a failure. ~20s; the reconnect loop
+    // covers a daemon that only comes up after we give up.
     let lastErr: unknown = null;
-    for (let attempt = 0; attempt < 30; attempt++) {
+    for (let attempt = 0; attempt < 100; attempt++) {
       try {
         return (await invoke("mesh_daemon_status")) as DaemonStatus;
       } catch (e) {
