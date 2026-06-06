@@ -892,10 +892,13 @@ fn chat_keep_alive() -> serde_json::Value {
 }
 
 /// Resolve the user's configured throttle mode for the Ollama server we
-/// spawn — how hard we ease its priority so model loading doesn't starve
-/// the desktop: "off" (no throttle), "io" (disk-IO only; keeps inference
-/// full speed — the default), or "aggressive" (also demote CPU/QoS; most
-/// responsive machine but slower inference). Falls back to "io".
+/// spawn — how hard we ease its priority so a model load can't lock the
+/// machine up: "off" (no throttle), "io" (a light nudge to CPU + disk
+/// priority that leaves the OS a sliver of headroom without slowing
+/// inference — the default), or "aggressive" (deeply demote CPU/IO/QoS;
+/// most responsive machine but slower inference). Falls back to "io". The
+/// actual `nice`/`ionice` values for each mode live in
+/// [`crate::process::throttle_launch_prefix`].
 fn throttle_mode() -> String {
     crate::resolver::load_config_value()
         .ok()
