@@ -1276,6 +1276,427 @@ pub fn end_remote_audio(stream_id: &str) {
     }
 }
 
+// ----------------------------------------------------------------------
+// Sender-side capture for *remote* transcription.
+//
+// The inverse of `start_remote_session`: when the user pins a peer as
+// the transcribe host, the audio is captured *here* (mic or decoded
+// file) and shipped to that peer, which runs the ASR and streams
+// segments back (`mesh-transcribe.ts`). These functions produce the
+// receiver's wire format — 16 kHz mono i16-LE PCM — and emit it to the
+// frontend as `myownllm://transcribe-capture/<stream_id>` frames; the
+// TS layer forwards each one over the `transcribe_audio/<id>` channel.
+// No ASR runs locally: this side is just a microphone (or file
+// decoder) with a resampler.
+// ----------------------------------------------------------------------
+
+/// One PCM frame emitted to the frontend by the sender-side capture /
+/// decode loops. `bytes_b64` is base64 i16-LE PCM at [`TARGET_SR`]
+/// (16 kHz mono) — empty on the terminal frame. `is_final` marks the
+/// last frame of the stream; `error` is set instead of audio when the
+/// mic / decoder failed.
+#[derive(Debug, Clone, Serialize)]
+struct CapturePcm {
+    index: u64,
+    bytes_b64: String,
+    is_final: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Per-stream control for an in-flight sender capture (mic or file).
+/// Separate from `sessions()` — these never run ASR, so they don't need
+/// the full `Session` shape; just cancel + pause flags.
+struct CaptureCtl {
+    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+}
+
+fn capture_sessions() -> &'static DashMap<String, CaptureCtl> {
+    static MAP: OnceLock<DashMap<String, CaptureCtl>> = OnceLock::new();
+    MAP.get_or_init(DashMap::new)
+}
+
+/// ~250 ms of audio per emitted frame at 16 kHz — small enough that the
+/// peer's ASR starts almost immediately, large enough that the
+/// per-frame base64 + IPC overhead stays negligible (~8 KB/frame).
+const CAPTURE_FRAME_SAMPLES: usize = TARGET_SR as usize / 4;
+
+/// f32 mono samples → base64 of i16-LE PCM, the receiver's wire shape.
+fn pcm_f32_to_i16_b64(samples: &[f32]) -> String {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for &s in samples {
+        let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    data_encoding::BASE64.encode(&bytes)
+}
+
+/// Drain `pending` into [`CAPTURE_FRAME_SAMPLES`]-sized PCM frames and
+/// emit each to the frontend. In the steady state (`flush == false`)
+/// only whole frames go out, leaving a partial behind to coalesce with
+/// the next batch; on `flush` everything is sent so the last word isn't
+/// dropped.
+fn emit_pcm_frames(
+    pending: &mut Vec<f32>,
+    index: &mut u64,
+    window: &WebviewWindow,
+    event: &str,
+    flush: bool,
+) {
+    use tauri::Emitter;
+    let min = if flush { 1 } else { CAPTURE_FRAME_SAMPLES };
+    while pending.len() >= min {
+        let take = pending.len().min(CAPTURE_FRAME_SAMPLES);
+        let chunk: Vec<f32> = pending.drain(..take).collect();
+        let _ = window.emit(
+            event,
+            CapturePcm {
+                index: *index,
+                bytes_b64: pcm_f32_to_i16_b64(&chunk),
+                is_final: false,
+                error: None,
+            },
+        );
+        *index += 1;
+    }
+}
+
+fn emit_capture_final(window: &WebviewWindow, event: &str, error: Option<String>) {
+    use tauri::Emitter;
+    let _ = window.emit(
+        event,
+        CapturePcm {
+            index: u64::MAX,
+            bytes_b64: String::new(),
+            is_final: true,
+            error,
+        },
+    );
+}
+
+/// Start capturing the local mic and forwarding 16 kHz mono PCM to the
+/// frontend for a remote transcribe session. Frames land on
+/// `myownllm://transcribe-capture/<stream_id>`. Stop with
+/// [`stop_capture`]; pause/resume with [`set_capture_paused`].
+pub fn start_capture(
+    stream_id: String,
+    device_name: Option<String>,
+    window: WebviewWindow,
+) -> Result<()> {
+    if capture_sessions().contains_key(&stream_id) {
+        return Err(anyhow!("capture {stream_id} is already running"));
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    capture_sessions().insert(
+        stream_id.clone(),
+        CaptureCtl {
+            cancel: cancel.clone(),
+            paused: paused.clone(),
+        },
+    );
+    thread::spawn(move || {
+        let event = format!("myownllm://transcribe-capture/{stream_id}");
+        let res = run_capture(&event, device_name.as_deref(), &cancel, &paused, &window);
+        capture_sessions().remove(&stream_id);
+        emit_capture_final(&window, &event, res.err().map(|e| format!("{e:#}")));
+    });
+    Ok(())
+}
+
+/// Start decoding a local audio/video file into 16 kHz mono PCM for a
+/// remote transcribe session — the file-upload analogue of
+/// [`start_capture`], emitting on the same channel and stopped the same
+/// way.
+pub fn start_decode_file(
+    stream_id: String,
+    file_path: PathBuf,
+    window: WebviewWindow,
+) -> Result<()> {
+    if capture_sessions().contains_key(&stream_id) {
+        return Err(anyhow!("capture {stream_id} is already running"));
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    capture_sessions().insert(
+        stream_id.clone(),
+        CaptureCtl {
+            cancel: cancel.clone(),
+            paused: paused.clone(),
+        },
+    );
+    thread::spawn(move || {
+        let event = format!("myownllm://transcribe-capture/{stream_id}");
+        let res = run_decode_file(&event, &file_path, &cancel, &paused, &window);
+        capture_sessions().remove(&stream_id);
+        emit_capture_final(&window, &event, res.err().map(|e| format!("{e:#}")));
+    });
+    Ok(())
+}
+
+/// Stop a sender capture / decode (mic or file). The loop flushes its
+/// pending samples, then the worker emits the terminal frame. Idempotent.
+pub fn stop_capture(stream_id: &str) {
+    if let Some(c) = capture_sessions().get(stream_id) {
+        c.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Pause / resume a sender capture. While paused, mic frames are dropped
+/// (the remote ASR session stays open, just starved of audio) and a file
+/// decode holds at the current packet. No-op for an unknown id.
+pub fn set_capture_paused(stream_id: &str, paused: bool) {
+    if let Some(c) = capture_sessions().get(stream_id) {
+        c.paused.store(paused, Ordering::SeqCst);
+    }
+}
+
+/// Mic-capture forward loop. cpal pushes native-rate mono f32 over a
+/// channel; we resample to 16 kHz, slice into [`CAPTURE_FRAME_SAMPLES`]
+/// frames, and emit each as base64 i16 PCM. Returns when cancelled
+/// (Stop) or on an unrecoverable audio error. The terminal frame is
+/// emitted by the caller.
+fn run_capture(
+    event: &str,
+    device_name: Option<&str>,
+    cancel: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
+    window: &WebviewWindow,
+) -> Result<()> {
+    let host = cpal::default_host();
+    let device = match device_name {
+        Some(name) if !name.is_empty() => host
+            .input_devices()?
+            .find(|d| d.name().map(|n| n == name).unwrap_or(false))
+            .ok_or_else(|| anyhow!("input device '{name}' not found"))?,
+        _ => host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("no default input device"))?,
+    };
+    let (format, stream_cfg) = probe_input_config(&device)?;
+    let sr = stream_cfg.sample_rate.0;
+    let channels = stream_cfg.channels as usize;
+
+    let (tx, rx) = bounded::<Vec<f32>>(256);
+    let stream_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // The realtime audio callback does the bare minimum — downmix +
+    // one non-blocking send — and bails while paused/cancelled.
+    let stream = match format {
+        cpal::SampleFormat::F32 => {
+            let tx = tx.clone();
+            let cancel = cancel.clone();
+            let paused = paused.clone();
+            device.build_input_stream(
+                &stream_cfg,
+                move |data: &[f32], _| {
+                    if cancel.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let _ = tx.try_send(downmix_f32(data, channels));
+                },
+                stream_err_fn(stream_err.clone()),
+                None,
+            )?
+        }
+        cpal::SampleFormat::I16 => {
+            let tx = tx.clone();
+            let cancel = cancel.clone();
+            let paused = paused.clone();
+            device.build_input_stream(
+                &stream_cfg,
+                move |data: &[i16], _| {
+                    if cancel.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let f: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                    let _ = tx.try_send(downmix_f32(&f, channels));
+                },
+                stream_err_fn(stream_err.clone()),
+                None,
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            let tx = tx.clone();
+            let cancel = cancel.clone();
+            let paused = paused.clone();
+            device.build_input_stream(
+                &stream_cfg,
+                move |data: &[u16], _| {
+                    if cancel.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let f: Vec<f32> = data
+                        .iter()
+                        .map(|&s| (s as f32 - 32768.0) / 32768.0)
+                        .collect();
+                    let _ = tx.try_send(downmix_f32(&f, channels));
+                },
+                stream_err_fn(stream_err.clone()),
+                None,
+            )?
+        }
+        other => return Err(anyhow!("unsupported sample format {other:?}")),
+    };
+    stream.play()?;
+
+    let mut pending: Vec<f32> = Vec::with_capacity(CAPTURE_FRAME_SAMPLES * 2);
+    let mut index: u64 = 0;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(mono_native) => {
+                let mut mono16 = resample_linear(&mono_native, sr, TARGET_SR);
+                pending.append(&mut mono16);
+                emit_pcm_frames(&mut pending, &mut index, window, event, false);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if let Some(err) = stream_err.lock().ok().and_then(|mut s| s.take()) {
+            return Err(anyhow!("microphone error: {err}"));
+        }
+    }
+    emit_pcm_frames(&mut pending, &mut index, window, event, true);
+    drop(stream);
+    Ok(())
+}
+
+/// File-decode forward loop. Mirrors `run_upload`'s decoder stage but
+/// ships PCM to the peer instead of running ASR locally: decode →
+/// downmix → resample to 16 kHz → emit base64 i16 frames. The terminal
+/// frame is emitted by the caller.
+fn run_decode_file(
+    event: &str,
+    file_path: &Path,
+    cancel: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
+    window: &WebviewWindow,
+) -> Result<()> {
+    use std::fs::File;
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+    use symphonia::core::errors::Error as SymError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let file = File::open(file_path).map_err(|e| anyhow!("open audio file: {e}"))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| anyhow!("probe audio: {e}"))?;
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| {
+            anyhow!(
+                "no audio track in {} — pick an audio file, or a video that has audio.",
+                file_path.display()
+            )
+        })?;
+    let track_id = track.id;
+    let codec_params = track.codec_params.clone();
+    let src_rate = codec_params
+        .sample_rate
+        .ok_or_else(|| anyhow!("audio file has no declared sample rate"))?;
+    let src_channels = codec_params.channels.map(|c| c.count()).unwrap_or(1);
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&codec_params, &DecoderOptions::default())
+        .map_err(|e| anyhow!("make decoder: {e}"))?;
+
+    // Resample in ~0.5 s source batches: bounds the linear resampler's
+    // per-call boundary error without holding the whole file in RAM.
+    let batch_at_src_rate = (src_rate as usize / 2).max(1);
+    let mut buf: Vec<f32> = Vec::with_capacity(batch_at_src_rate * 2);
+    let mut pending: Vec<f32> = Vec::with_capacity(CAPTURE_FRAME_SAMPLES * 2);
+    let mut sb: Option<SampleBuffer<f32>> = None;
+    let mut index: u64 = 0;
+
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        while paused.load(Ordering::SeqCst) {
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(SymError::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(anyhow!("symphonia read packet: {e}")),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(SymError::IoError(_)) => continue,
+            Err(SymError::DecodeError(_)) => continue,
+            Err(e) => return Err(anyhow!("symphonia decode: {e}")),
+        };
+        let frames = decoded.frames();
+        let spec = *decoded.spec();
+        let sb_ref = match sb.as_mut() {
+            Some(b) => {
+                if b.capacity() < decoded.capacity() {
+                    sb = Some(SampleBuffer::new(decoded.capacity() as u64, spec));
+                    sb.as_mut().unwrap()
+                } else {
+                    b
+                }
+            }
+            None => {
+                sb = Some(SampleBuffer::new(decoded.capacity() as u64, spec));
+                sb.as_mut().unwrap()
+            }
+        };
+        sb_ref.copy_interleaved_ref(decoded);
+        let samples = sb_ref.samples();
+        if src_channels == 1 {
+            buf.extend_from_slice(samples);
+        } else {
+            for f in 0..frames {
+                let base = f * src_channels;
+                let mut sum = 0.0f32;
+                for c in 0..src_channels {
+                    sum += samples[base + c];
+                }
+                buf.push(sum / src_channels as f32);
+            }
+        }
+        while buf.len() >= batch_at_src_rate {
+            let chunk: Vec<f32> = buf.drain(..batch_at_src_rate).collect();
+            let mut r = resample_linear(&chunk, src_rate, TARGET_SR);
+            pending.append(&mut r);
+            emit_pcm_frames(&mut pending, &mut index, window, event, false);
+        }
+    }
+    // Flush the decoder remainder + the trailing partial frame.
+    if !buf.is_empty() {
+        let mut r = resample_linear(&buf, src_rate, TARGET_SR);
+        pending.append(&mut r);
+    }
+    emit_pcm_frames(&mut pending, &mut index, window, event, true);
+    Ok(())
+}
+
 /// Mesh-flavour run_session: same backend setup + ingest_loop +
 /// decode loop as `run_session`, with the cpal capture replaced
 /// by an externally-fed `Receiver<Vec<f32>>`. The receiver lives

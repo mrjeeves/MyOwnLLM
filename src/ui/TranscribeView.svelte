@@ -16,6 +16,8 @@
     transcribeUi,
     startRecording,
     startUpload,
+    startRemoteRecording,
+    startRemoteUpload,
     stopRecording,
     abortRecording,
     pauseRecording,
@@ -568,21 +570,32 @@
       return;
     }
     if (transcribeViaDevicePubkey) {
-      // Routing pin is set. Distinguish the two failure modes the
-      // user might be in: peer-offline (pin valid but host away) vs
-      // receiver-not-yet-wired (Rust audio-chunk pipeline lands in
-      // a follow-up). Either way: pause-or-error, never silently
-      // run locally — the user picked a host and deserves to know
-      // why their pick isn't being used.
-      if (transcribePinUnavailable) {
+      // Routing pin is set: capture the mic locally and stream it to the
+      // pinned host, which runs the ASR (see `startRemoteRecording`). If
+      // the host is offline, pause-or-error rather than silently running
+      // locally — the user picked a host and deserves to know why their
+      // pick isn't being used.
+      if (transcribePinUnavailable || !transcribeRoutedPeer) {
         transcribeError =
           "Pinned peer is offline. Pick another host or 'this device' " +
           "in the bar under this pane to record.";
-      } else {
-        transcribeError =
-          "Remote transcribe is wired on the sender but the receiver " +
-          "pipeline lands in a follow-up. Pick 'this device' in the " +
-          "bar under this pane to record locally.";
+        return;
+      }
+      const conv = await persist({ force: true });
+      try {
+        await startRemoteRecording({
+          targetPeerId: transcribeRoutedPeer.peer_id,
+          runtime,
+          model,
+          // The host resolves its own model + diarize; we send our pick
+          // as a hint and the composite name when "Identify speakers" is
+          // on (the host drops it if it lacks the diarize model).
+          diarizeModel: diarizeEnabled ? defaultDiarizeModel : null,
+          device: mic.device_name || null,
+          conversationId: conv?.id ?? null,
+        });
+      } catch (e) {
+        transcribeError = String(e);
       }
       return;
     }
@@ -699,15 +712,26 @@
       return;
     }
     if (transcribeViaDevicePubkey) {
-      if (transcribePinUnavailable) {
+      // Routing pin is set: decode the file locally and stream its audio
+      // to the pinned host, which runs the ASR (see `startRemoteUpload`).
+      if (transcribePinUnavailable || !transcribeRoutedPeer) {
         transcribeError =
           "Pinned peer is offline. Pick another host or 'this device' " +
           "in the bar under this pane to upload.";
-      } else {
-        transcribeError =
-          "Remote transcribe is wired on the sender but the receiver " +
-          "pipeline lands in a follow-up. Pick 'this device' in the " +
-          "bar under this pane to upload locally.";
+        return;
+      }
+      const conv = await persist({ force: true });
+      try {
+        await startRemoteUpload({
+          targetPeerId: transcribeRoutedPeer.peer_id,
+          runtime,
+          model,
+          diarizeModel: diarizeEnabled ? defaultDiarizeModel : null,
+          filePath,
+          conversationId: conv?.id ?? null,
+        });
+      } catch (e) {
+        transcribeError = String(e);
       }
       return;
     }

@@ -739,8 +739,16 @@ fn transcribe_upload_start(
 /// `transcribe_start` shape minus the device picker. Audio chunks
 /// are pushed via `transcribe_feed_remote_audio`; end-of-stream is
 /// signaled by the same command's `is_final` flag.
+///
+/// Host-side model resolution: the requesting peer sends the model
+/// *it* would use locally, but this host may not have that exact tag
+/// installed. Mirror remote inference ("the peer's resolver picks the
+/// actual tag") — honour the requested model when it's present here,
+/// otherwise fall back to this machine's resolved transcribe pair.
+/// Diarization is likewise the host's call: drop it if the requested
+/// composite isn't installed rather than failing the whole session.
 #[tauri::command]
-fn transcribe_start_remote_session(
+async fn transcribe_start_remote_session(
     session_id: String,
     runtime: String,
     model: String,
@@ -748,6 +756,21 @@ fn transcribe_start_remote_session(
     sample_rate: u32,
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
+    let (runtime, model) = if models::find(&model, models::ModelKind::Asr)
+        .map(models::is_installed)
+        .unwrap_or(false)
+    {
+        (runtime, model)
+    } else {
+        match resolver::resolve_pair("transcribe").await {
+            Ok((resolved_model, resolved_runtime)) => (resolved_runtime, resolved_model),
+            Err(e) => return Err(format!("no transcribe model available on host: {e:#}")),
+        }
+    };
+    let diarize_model = match diarize_model {
+        Some(d) if models::composite_installed(&d, models::ModelKind::Diarize) => Some(d),
+        _ => None,
+    };
     transcribe::start_remote_session(
         session_id,
         runtime,
@@ -757,6 +780,47 @@ fn transcribe_start_remote_session(
         window,
     )
     .map_err(|e| e.to_string())
+}
+
+/// Capture the local mic for a *remote* transcribe session: 16 kHz mono
+/// i16 PCM is emitted on `myownllm://transcribe-capture/<stream_id>` for
+/// the frontend to forward to the host peer, which runs the ASR (see
+/// `transcribe_start_remote_session`). Stop with `transcribe_capture_stop`.
+#[tauri::command]
+fn transcribe_capture_start(
+    stream_id: String,
+    device: Option<String>,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    transcribe::start_capture(stream_id, device, window).map_err(|e| e.to_string())
+}
+
+/// Decode a local audio/video file into 16 kHz mono PCM for a remote
+/// transcribe session, emitted on the same channel as
+/// `transcribe_capture_start` — the file-upload path's sender half.
+#[tauri::command]
+fn transcribe_decode_file_start(
+    stream_id: String,
+    file_path: String,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    transcribe::start_decode_file(stream_id, std::path::PathBuf::from(file_path), window)
+        .map_err(|e| e.to_string())
+}
+
+/// Stop a sender capture / decode started by `transcribe_capture_start`
+/// or `transcribe_decode_file_start`. Flushes the trailing audio, then
+/// the worker emits its terminal `is_final` frame.
+#[tauri::command]
+fn transcribe_capture_stop(stream_id: String) {
+    transcribe::stop_capture(&stream_id);
+}
+
+/// Pause / resume a sender capture. Mic frames are dropped while paused;
+/// the remote ASR session stays open.
+#[tauri::command]
+fn transcribe_capture_set_paused(stream_id: String, paused: bool) {
+    transcribe::set_capture_paused(&stream_id, paused);
 }
 
 /// Push a single PCM chunk into a running remote session. `bytes_b64`
@@ -1500,6 +1564,10 @@ fn main() {
             transcribe_upload_start,
             transcribe_start_remote_session,
             transcribe_feed_remote_audio,
+            transcribe_capture_start,
+            transcribe_decode_file_start,
+            transcribe_capture_stop,
+            transcribe_capture_set_paused,
             asr_models_list,
             asr_model_pull,
             asr_model_pull_cancel,
