@@ -1868,42 +1868,99 @@ fn main() {
             // rather than a re-derivation of the protocol.
             {
                 use std::sync::Arc;
+                use std::time::Duration;
                 use tauri::{Emitter, Manager};
+
+                // Register the mesh-daemon state *synchronously*, before any
+                // window can invoke a command, so `State<Arc<MeshDaemon>>`
+                // always resolves. It starts disconnected; the background
+                // task below attaches to (or spawns) the daemon and installs
+                // the live connection once it's up. Managing here — rather
+                // than inside the spawn, only on the bring-up success path as
+                // before — is what fixes the fresh-install failure: a daemon
+                // slow to bind its control socket (a cold Windows boot with
+                // the sidecar still being virus-scanned), or one that failed
+                // to start at all, previously meant `.manage()` never ran and
+                // every mesh command rejected with Tauri's cryptic "state not
+                // managed for field 'state' … You must call '.manage()'…".
+                // See `mesh::daemon::MeshDaemon`.
+                let daemon = Arc::new(mesh::daemon::MeshDaemon::disconnected());
+                app.manage(daemon.clone());
+
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    match mesh::daemon::ensure_daemon_running().await {
-                        Ok((client, child)) => {
-                            // Subscribe events first — gives us the
-                            // ipc client_id needed for handler claims.
-                            let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(256);
-                            let client_id = match client.subscribe_events(tx).await {
-                                Ok(id) => id,
-                                Err(e) => {
-                                    eprintln!("daemon: event subscribe failed: {e}");
-                                    // Daemon's up but events failed — keep going
-                                    // with a placeholder id so RPC/channel ops
-                                    // produce useful errors instead of panicking.
-                                    String::from("c-unbound")
+                    // Reconnect loop: attach to (or spawn) the daemon, install
+                    // the live connection, then pump its event stream to the
+                    // frontend. If bring-up fails, or a daemon we were using
+                    // later dies, back off and try again rather than wedging
+                    // the mesh UI until the app restarts. Commands return a
+                    // clean "daemon not connected" error meanwhile (see
+                    // `mesh::daemon_commands`).
+                    let mut backoff = Duration::from_secs(1);
+                    while !daemon.is_shutting_down() {
+                        match mesh::daemon::ensure_daemon_running().await {
+                            Ok((client, child)) => {
+                                // Raced into app exit while bringing up? Drop
+                                // the freshly spawned child (its `Drop` kills
+                                // it) instead of orphaning it past our exit.
+                                if daemon.is_shutting_down() {
+                                    drop(child);
+                                    break;
                                 }
-                            };
-                            let state =
-                                Arc::new(mesh::daemon::MeshDaemon::new(client, client_id, child));
-                            app_handle.manage(state);
-                            // Pump events into the frontend.
-                            let emit_handle = app_handle.clone();
-                            tauri::async_runtime::spawn(async move {
-                                while let Some(frame) = rx.recv().await {
-                                    let _ = emit_handle.emit("mesh://event", frame);
+                                // Subscribe to the event stream first — its
+                                // ack carries the ipc client_id RPC/channel
+                                // claims need.
+                                let (tx, mut rx) =
+                                    tokio::sync::mpsc::channel::<serde_json::Value>(256);
+                                match client.subscribe_events(tx).await {
+                                    Ok(client_id) => {
+                                        backoff = Duration::from_secs(1);
+                                        daemon.set_connected(client, client_id, child);
+                                        // Pump events into the frontend until
+                                        // the stream ends (daemon gone), then
+                                        // drop the connection and reconnect.
+                                        while let Some(frame) = rx.recv().await {
+                                            let _ = app_handle.emit("mesh://event", frame);
+                                        }
+                                        eprintln!("daemon: event stream ended — reconnecting");
+                                        daemon.set_disconnected();
+                                    }
+                                    Err(e) => {
+                                        // Daemon's reachable but the event
+                                        // subscribe failed. Keep a command-
+                                        // capable connection (placeholder id,
+                                        // no live events) and stop reconnecting:
+                                        // with no event stream there's nothing
+                                        // to drive a reconnect on, and retrying
+                                        // would risk repeatedly killing and
+                                        // respawning a daemon we own. Matches
+                                        // the original pre-reconnect behavior.
+                                        eprintln!(
+                                            "daemon: event subscribe failed: {e} — \
+                                             continuing without live events"
+                                        );
+                                        daemon.set_connected(
+                                            client,
+                                            String::from("c-unbound"),
+                                            child,
+                                        );
+                                        break;
+                                    }
                                 }
-                            });
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "daemon: ensure_daemon_running failed: {e} — \
+                                     retrying in {}s",
+                                    backoff.as_secs()
+                                );
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("daemon: ensure_daemon_running failed: {e}");
-                            // Still register an empty placeholder so commands
-                            // that take `State<Arc<MeshDaemon>>` panic with a
-                            // clear message ("state not found") rather than
-                            // silently dispatching against a half-built one.
+                        if daemon.is_shutting_down() {
+                            break;
                         }
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
                     }
                 });
             }
@@ -1935,7 +1992,12 @@ fn main() {
                 use std::sync::Arc;
                 use tauri::Manager;
                 if let Some(state) = app.try_state::<Arc<mesh::daemon::MeshDaemon>>() {
-                    let _ = state.child.lock().take();
+                    // Stop the reconnect loop, then take the spawned child so
+                    // its `Drop` (SIGKILL / TerminateProcess + wait) runs here
+                    // — before teardown — rather than the loop respawning a
+                    // daemon we'd orphan, or the OS racing to reclaim it.
+                    state.begin_shutdown();
+                    let _ = state.take_child();
                 }
             }
         });
