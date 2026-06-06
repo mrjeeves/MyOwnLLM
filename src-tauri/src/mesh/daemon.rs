@@ -453,6 +453,100 @@ impl ControlClient {
     }
 }
 
+// ---- daemon version gate ---------------------------------------------
+
+/// The MyOwnMesh release this build was pinned to (`.myownmesh-rev`,
+/// surfaced by `build.rs`). `None` for dev builds with no pin. May be a
+/// `vMAJOR.MINOR.PATCH` tag or a raw SHA; comparisons go through
+/// [`version_meets`], which ignores anything not parseable as semver.
+pub fn pinned_mesh_version() -> Option<&'static str> {
+    option_env!("MYOWNMESH_PIN")
+}
+
+/// True when daemon version `have` satisfies requirement `want`
+/// (`have >= want`). Both accept an optional leading `v` and ignore any
+/// `-pre` / `+build` suffix. Returns `true` ("don't nag") when either
+/// side isn't a parseable `MAJOR.MINOR.PATCH` — e.g. a SHA pin in dev —
+/// since no meaningful claim can be made then.
+pub fn version_meets(have: &str, want: &str) -> bool {
+    fn parse(s: &str) -> Option<(u64, u64, u64)> {
+        let s = s.trim();
+        let s = s.strip_prefix('v').unwrap_or(s);
+        let core = s.split(|c| c == '-' || c == '+').next().unwrap_or(s);
+        let mut parts = core.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        Some((major, minor, patch))
+    }
+    match (parse(have), parse(want)) {
+        (Some(h), Some(w)) => h >= w,
+        _ => true,
+    }
+}
+
+/// Best-effort: nudge the live `myownmesh` daemon toward (at least) the
+/// pinned version. Advisory only — mismatched revs still peer, since the
+/// wire protocol negotiates features per-peer — so this never blocks.
+///
+/// `own` = MyOwnLLM spawned this daemon, so it runs against our isolated
+/// `MYOWNMESH_HOME` and it's safe to `apply` the staged binary (which
+/// takes effect on the daemon's next start). For a shared daemon we only
+/// `enable` + `check` (stage); its own process applies on its restart —
+/// we never swap another app's binary out from under it.
+///
+/// Returns a small JSON summary. Every step is fail-soft, so a missing
+/// binary, a read-only install, or an offline box degrades quietly
+/// rather than surfacing an error to the user.
+pub fn drive_daemon_update(own: bool) -> serde_json::Value {
+    let Some(bin) = daemon_binary_candidates().into_iter().find(|p| p.is_file()) else {
+        return serde_json::json!({ "ok": false, "error": "no myownmesh binary found" });
+    };
+    // Own-LLM daemon lives under our isolated home; a shared daemon uses
+    // its own default `MYOWNMESH_HOME` (don't override it).
+    let home = if own {
+        dirs::home_dir().map(|h| h.join(".myownllm").join(".myownmesh"))
+    } else {
+        None
+    };
+    let run = |args: &[&str]| -> Result<String, String> {
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.args(args);
+        if let Some(h) = &home {
+            cmd.env("MYOWNMESH_HOME", h);
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => {
+                Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            }
+            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    // 1. Make sure the daemon's own background updater is on ("let it").
+    let _ = run(&["update", "enable"]);
+    // 2. Force a check now so we don't wait out the 6h interval; stages
+    //    the latest release when the daemon's apply policy allows.
+    let check = run(&["update", "check", "--json"]);
+    // 3. For a daemon we own, apply the staged binary (effective on its
+    //    next start). Leave a shared daemon's binary alone.
+    let apply = if own {
+        Some(run(&["update", "apply"]))
+    } else {
+        None
+    };
+    serde_json::json!({
+        "ok": true,
+        "own": own,
+        "binary": bin.display().to_string(),
+        "check": check.as_ref().ok(),
+        "check_error": check.as_ref().err(),
+        "applied": apply.as_ref().map(|r| r.is_ok()),
+        "apply": apply.as_ref().and_then(|r| r.as_ref().ok().cloned()),
+        "apply_error": apply.as_ref().and_then(|r| r.as_ref().err().cloned()),
+    })
+}
+
 // ---- daemon child lifecycle ------------------------------------------
 
 /// Owned wrapper around a spawned `myownmesh serve` child.

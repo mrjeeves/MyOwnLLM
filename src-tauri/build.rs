@@ -448,6 +448,15 @@ fn bundle_myownmesh_sidecar() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.trim().to_string())
         .ok()
         .filter(|s| !s.is_empty());
+    // Surface the pinned rev to the runtime so the daemon-version gate
+    // (`mesh::daemon_commands::mesh_daemon_status`) can tell when the
+    // live `myownmesh` daemon is older than the rev this build was
+    // tested against, and nudge it to update. Raw pin
+    // (`vMAJOR.MINOR.PATCH`, or a SHA in dev); the runtime strips the
+    // `v` and ignores anything that isn't semver.
+    if let Some(want) = &want_rev {
+        println!("cargo:rustc-env=MYOWNMESH_PIN={want}");
+    }
     if let Some(want) = &want_rev {
         let bundled = fs::read_to_string(&bundled_rev_sentinel)
             .map(|s| s.trim().to_string())

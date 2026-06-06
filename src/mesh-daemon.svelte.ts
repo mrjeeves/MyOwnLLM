@@ -258,6 +258,11 @@ interface DaemonStatus {
   ipc_client_id: string;
   daemon_socket: string;
   daemon_mode: "shared" | "own_llm";
+  /** The `.myownmesh-rev` version this build was tested against, and
+   *  whether the live daemon meets it. Both absent on older backends —
+   *  treated as "fine". See `noteDaemonVersion`. */
+  pinned_version?: string;
+  meets_pin?: boolean;
 }
 
 // ----------------------------------------------------------------------
@@ -445,6 +450,18 @@ class MeshDaemonClient {
   diag_quiet = $state<boolean>(false);
   /** Peer roster + per-peer state, hydrated from `mesh://event`. */
   peers = $state<PeerEntry[]>([]);
+  /** Daemon-version gate vs the `.myownmesh-rev` pin (surfaced by the
+   *  backend in `mesh_daemon_status`). `meets_pin` false means the live
+   *  daemon is older than the rev this build was tested against — it
+   *  still peers, but newer mesh features may be unavailable until it
+   *  catches up, so we auto-nudge it to update (see `noteDaemonVersion`). */
+  daemon_version = $state<string>("");
+  pinned_version = $state<string | null>(null);
+  meets_pin = $state<boolean>(true);
+  daemon_update = $state<{
+    state: "idle" | "updating" | "done" | "failed";
+    detail?: string;
+  }>({ state: "idle" });
   /** True while a forced `stop → start` cycle is mid-flight. */
   is_rediscovering = $state<boolean>(false);
   /** Wall-clock ms of the most recent ICE failure observed across any
@@ -586,6 +603,9 @@ class MeshDaemonClient {
       // later (the retry budget bounded so it's not unbounded).
       const status = await this.fetchDaemonStatusWithRetry();
       this.clientId = status.ipc_client_id;
+      // Check the live daemon against this build's pin and, if it's
+      // older, help it update in the background (non-blocking).
+      this.noteDaemonVersion(status);
 
       // Bridge the frontend's saved-network catalog into the
       // daemon. The daemon's own config is empty on first launch
@@ -903,6 +923,53 @@ class MeshDaemonClient {
    *  surfacing a confusing "state not managed" error. Aborts after
    *  ~6s so a daemon that genuinely failed to start still bubbles
    *  the error up. */
+  /** Latched so the auto-update is attempted at most once per app run. */
+  private daemonUpdateTried = false;
+
+  /** Record the daemon's version against the build's pin and, if it's
+   *  behind, kick off a best-effort background update. Advisory only —
+   *  the mesh keeps working meanwhile (mismatched revs still peer), so
+   *  this never blocks startup. Surfaces progress in the activity log
+   *  and via the reactive `meets_pin` / `daemon_update` fields. */
+  private noteDaemonVersion(status: DaemonStatus): void {
+    this.daemon_version = status.version ?? "";
+    this.pinned_version = status.pinned_version ?? null;
+    // Absent (older backend or non-semver pin) is treated as "fine".
+    this.meets_pin = status.meets_pin !== false;
+    if (this.meets_pin || this.daemonUpdateTried) return;
+    this.daemonUpdateTried = true;
+    this.daemon_update = { state: "updating" };
+    this.appendDiag(
+      "warn",
+      `mesh daemon ${this.daemon_version || "?"} is older than the pinned ${this.pinned_version ?? "?"} — updating in the background`,
+    );
+    void invoke("mesh_daemon_update_to_pin")
+      .then((r) => {
+        const res = (r ?? {}) as {
+          ok?: boolean;
+          applied?: boolean | null;
+          check?: string | null;
+          check_error?: string | null;
+          apply_error?: string | null;
+        };
+        // `applied` is null for a shared daemon (we only stage, never
+        // apply someone else's binary) — that's still success here.
+        const ok = res.ok !== false && res.applied !== false;
+        const detail = res.apply_error ?? res.check_error ?? res.check ?? undefined;
+        this.daemon_update = { state: ok ? "done" : "failed", detail };
+        this.appendDiag(
+          ok ? "info" : "warn",
+          ok
+            ? `mesh daemon update staged — restart to finish updating to ${this.pinned_version ?? "the pinned version"}`
+            : `mesh daemon auto-update couldn't complete${detail ? `: ${detail}` : ""} — update MyOwnMesh manually to ${this.pinned_version ?? "the pinned version"}`,
+        );
+      })
+      .catch((e) => {
+        this.daemon_update = { state: "failed", detail: String(e) };
+        this.appendDiag("warn", `mesh daemon auto-update failed: ${String(e)}`);
+      });
+  }
+
   private async fetchDaemonStatusWithRetry(): Promise<DaemonStatus> {
     let lastErr: unknown = null;
     for (let attempt = 0; attempt < 30; attempt++) {
