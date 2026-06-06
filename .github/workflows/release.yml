@@ -153,6 +153,26 @@ jobs:
           echo "dist/ OK:"
           ls -la dist/ dist/assets/
 
+      # onnxruntime.dll (fetched on first run) links the MSVC runtime
+      # (vcruntime140 / msvcp140). Stage the redistributable CRT DLLs from
+      # the runner so the Windows installer ships them — see the
+      # `vcredist/*` resource in tauri.windows.conf.json. Consumer PCs
+      # without the VC++ redistributable then load the speech engine
+      # instead of erroring. Best-effort: a missing DLL warns, not fails.
+      - name: Stage MSVC runtime for the Windows bundle
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p src-tauri/vcredist
+          for dll in vcruntime140.dll vcruntime140_1.dll msvcp140.dll; do
+            if cp "/c/Windows/System32/$dll" "src-tauri/vcredist/$dll"; then
+              echo "staged $dll"
+            else
+              echo "::warning::couldn't stage $dll from System32"
+            fi
+          done
+          ls -la src-tauri/vcredist || true
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -202,6 +222,16 @@ jobs:
             if [[ "$have_espeak" == 1 ]]; then
               cp "$ESPEAK" "dist-bin/espeak-ng.exe"; payload+=(espeak-ng.exe)
             fi
+            # Ship the MSVC CRT next to the exe so the fetched onnxruntime.dll
+            # loads on a PC without the VC++ redistributable — the exe's own
+            # directory is always searched for a DLL's dependencies.
+            for dll in vcruntime140.dll vcruntime140_1.dll msvcp140.dll; do
+              if cp "/c/Windows/System32/$dll" "dist-bin/$dll"; then
+                payload+=("$dll")
+              else
+                echo "::warning::couldn't stage $dll for the portable zip"
+              fi
+            done
             # chdir before hashing so the `.sha256` sidecar records just the
             # basename — matching how the GitHub asset is uploaded. Hashing
             # `dist-bin/<file>` from the repo root would bake `dist-bin/`
