@@ -153,25 +153,11 @@ jobs:
           echo "dist/ OK:"
           ls -la dist/ dist/assets/
 
-      # onnxruntime.dll (fetched on first run) links the MSVC runtime
-      # (vcruntime140 / msvcp140). Stage the redistributable CRT DLLs from
-      # the runner so the Windows installer ships them — see the
-      # `vcredist/*` resource in tauri.windows.conf.json. Consumer PCs
-      # without the VC++ redistributable then load the speech engine
-      # instead of erroring. Best-effort: a missing DLL warns, not fails.
-      - name: Stage MSVC runtime for the Windows bundle
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          mkdir -p src-tauri/vcredist
-          for dll in vcruntime140.dll vcruntime140_1.dll msvcp140.dll; do
-            if cp "/c/Windows/System32/$dll" "src-tauri/vcredist/$dll"; then
-              echo "staged $dll"
-            else
-              echo "::warning::couldn't stage $dll from System32"
-            fi
-          done
-          ls -la src-tauri/vcredist || true
+      # NOTE: the MSVC CRT for the *installer* bundle is staged by
+      # build.rs (stage_vcredist) into src-tauri/vcredist/ and shipped via
+      # tauri.windows.conf.json's `vcredist` resource — so no staging step
+      # is needed here. The portable .zip gets its own copy next to the
+      # exe in the "Package portable binary" step below.
 
       - uses: tauri-apps/tauri-action@v0
         env:

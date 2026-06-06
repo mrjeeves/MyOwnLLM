@@ -3,7 +3,7 @@
   "bundle": {
     "resources": [
       "binaries/espeak-ng-data",
-      "vcredist/*"
+      "vcredist"
     ]
   }
 }
