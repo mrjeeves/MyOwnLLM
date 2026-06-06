@@ -75,6 +75,19 @@ fn main() {
         }
     }
 
+    // Windows: stage the MSVC CRT the fetched onnxruntime.dll links
+    // against (vcruntime140 / msvcp140), so the bundle ships it via
+    // tauri.windows.conf.json's `vcredist` resource — a PC without the
+    // VC++ redistributable then still loads the speech engine. Runs for
+    // every Windows build (CI, `tauri dev`, release) so the bundler's
+    // resource check always sees a populated dir.
+    let target_triple = env::var("TARGET").unwrap_or_default();
+    if target_triple.contains("windows") {
+        if let Err(e) = stage_vcredist() {
+            println!("cargo:warning=could not stage vcredist MSVC runtime: {e:#}");
+        }
+    }
+
     tauri_build::build();
 }
 
@@ -135,6 +148,54 @@ fn write_espeak_stub() -> std::io::Result<()> {
     let marker = data_dir.join(".espeak-stub");
     if !marker.exists() {
         fs::write(&marker, b"espeak-ng-data not bundled (stub build)\n")?;
+    }
+    Ok(())
+}
+
+/// Stage the redistributable MSVC runtime DLLs into `vcredist/` so the
+/// Windows bundle ships them as a `resources` entry (see
+/// tauri.windows.conf.json). The fetched `onnxruntime.dll` links these,
+/// so shipping them lets a PC without the Visual C++ redistributable
+/// load the speech engine instead of failing.
+///
+/// Best-effort: copies whatever the host's System32 holds and, if none
+/// were staged (e.g. a cross-build host), drops a marker so the resource
+/// dir is non-empty and `tauri_build`'s check still passes — mirroring
+/// [`write_espeak_stub`]. With no bundled CRT the runtime simply falls
+/// back to a system-installed one.
+fn stage_vcredist() -> std::io::Result<()> {
+    let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let dir = crate_dir.join("vcredist");
+    fs::create_dir_all(&dir)?;
+
+    let system32 = env::var("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows"))
+        .join("System32");
+
+    let mut staged = 0;
+    for dll in ["vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll"] {
+        let dst = dir.join(dll);
+        if dst.exists() {
+            staged += 1;
+            continue;
+        }
+        let src = system32.join(dll);
+        if src.exists() {
+            match fs::copy(&src, &dst) {
+                Ok(_) => staged += 1,
+                Err(e) => println!("cargo:warning=couldn't stage {dll} into vcredist/: {e}"),
+            }
+        }
+    }
+
+    if staged == 0 {
+        // Keep the resource dir non-empty so the bundler's existence
+        // check passes even when no CRT could be sourced.
+        fs::write(
+            dir.join(".vcredist-stub"),
+            b"MSVC CRT not staged (no System32 source); runtime uses the system VC++ redistributable\n",
+        )?;
     }
     Ok(())
 }

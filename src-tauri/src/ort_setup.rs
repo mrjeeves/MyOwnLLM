@@ -261,6 +261,13 @@ fn run_init() -> (OrtStatus, String) {
         "[ort_setup] loading onnxruntime from {}…",
         existing.display()
     );
+    // On Windows, onnxruntime.dll links the MSVC runtime
+    // (vcruntime140 / msvcp140). Make any CRT we ship with the app
+    // discoverable so the load doesn't fail/hang on a consumer PC that
+    // lacks the VC++ redistributable — the failure this function would
+    // otherwise report below.
+    #[cfg(windows)]
+    prepare_msvc_runtime(existing.parent().unwrap_or_else(|| Path::new(".")));
     let load_path = existing.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -315,6 +322,81 @@ fn run_init() -> (OrtStatus, String) {
                 err,
             )
         }
+    }
+}
+
+/// Candidate directories that may hold the MSVC CRT DLLs we bundle with
+/// the app (`vcruntime140.dll` & friends), most-specific first. The
+/// portable zip ships them next to the exe; the Windows installer ships
+/// them as Tauri resources (a `vcredist/` subdir). Kept pure so the
+/// directory list is unit-testable on any OS — only the search-path
+/// mutation in [`prepare_msvc_runtime`] is Windows-specific.
+///
+/// Gated to where it's actually referenced (the Windows caller or the
+/// tests) so a Linux release build doesn't flag it dead.
+#[cfg(any(windows, test))]
+fn msvc_runtime_search_dirs(runtime_dir: &Path, exe_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = vec![runtime_dir.to_path_buf()];
+    if let Some(d) = exe_dir {
+        dirs.push(d.to_path_buf()); // portable: next to the exe
+        dirs.push(d.join("resources")); // tauri resource root (NSIS)
+        dirs.push(d.join("vcredist")); // resources mapped to vcredist/
+        dirs.push(d.join("resources").join("vcredist"));
+    }
+    dirs
+}
+
+/// Windows: ensure onnxruntime.dll's MSVC-runtime dependency resolves
+/// from a CRT we ship with the app, so a PC without the VC++
+/// redistributable can still load the speech engine. Finds the dir
+/// holding the bundled CRT and prepends it to the DLL search path —
+/// which also governs dependency resolution for the subsequent
+/// `ort::init_from`. A no-op (leaving the existing "install the VC++
+/// runtime" guidance to fire) if we didn't bundle one.
+#[cfg(windows)]
+fn prepare_msvc_runtime(runtime_dir: &Path) {
+    const PROBE: &str = "vcruntime140.dll";
+    let exe = std::env::current_exe().ok();
+    let exe_dir = exe.as_deref().and_then(Path::parent);
+    for dir in msvc_runtime_search_dirs(runtime_dir, exe_dir) {
+        if dir.join(PROBE).exists() {
+            if win::set_dll_directory(&dir) {
+                eprintln!(
+                    "[ort_setup] bundled MSVC runtime found; added to DLL search path: {}",
+                    dir.display()
+                );
+            } else {
+                eprintln!("[ort_setup] SetDllDirectory failed for {}", dir.display());
+            }
+            return;
+        }
+    }
+    eprintln!(
+        "[ort_setup] no bundled MSVC runtime DLLs found near the app; \
+         relying on a system-installed VC++ redistributable"
+    );
+}
+
+#[cfg(windows)]
+mod win {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    #[allow(non_snake_case)]
+    extern "system" {
+        fn SetDllDirectoryW(path: *const u16) -> i32;
+    }
+
+    /// Prepend `dir` to the process DLL search path (and thus the
+    /// dependency search for DLLs loaded afterwards). Returns false on
+    /// failure. `SetDllDirectoryW` is exported by kernel32, which the
+    /// MSVC target links by default.
+    pub fn set_dll_directory(dir: &Path) -> bool {
+        let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+        wide.push(0);
+        // SAFETY: `wide` is a valid NUL-terminated UTF-16 buffer that
+        // outlives the call; SetDllDirectoryW only reads from it.
+        unsafe { SetDllDirectoryW(wide.as_ptr()) != 0 }
     }
 }
 
@@ -503,6 +585,26 @@ mod tests {
             "expected ~/.myownllm/runtime/ in candidate list, got: {:?}",
             paths
         );
+    }
+
+    #[test]
+    fn msvc_search_dirs_lists_runtime_and_bundle_locations() {
+        let rt = Path::new("/home/user/.myownllm/runtime");
+        let exe_dir = Path::new("/opt/app");
+        let dirs = msvc_runtime_search_dirs(rt, Some(exe_dir));
+        // The onnxruntime dir is checked first (DLLs next to the dylib).
+        assert_eq!(dirs.first().map(|p| p.as_path()), Some(rt));
+        // Portable layout: CRT next to the exe.
+        assert!(dirs.iter().any(|p| p == Path::new("/opt/app")));
+        // Installer layouts: a vcredist/ resource dir and the resource root.
+        assert!(dirs.iter().any(|p| p.ends_with("vcredist")));
+        assert!(dirs.iter().any(|p| p.ends_with("resources")));
+    }
+
+    #[test]
+    fn msvc_search_dirs_without_exe_is_just_runtime() {
+        let rt = Path::new("/tmp/rt");
+        assert_eq!(msvc_runtime_search_dirs(rt, None), vec![rt.to_path_buf()]);
     }
 
     #[test]

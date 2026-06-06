@@ -153,6 +153,12 @@ jobs:
           echo "dist/ OK:"
           ls -la dist/ dist/assets/
 
+      # NOTE: the MSVC CRT for the *installer* bundle is staged by
+      # build.rs (stage_vcredist) into src-tauri/vcredist/ and shipped via
+      # tauri.windows.conf.json's `vcredist` resource — so no staging step
+      # is needed here. The portable .zip gets its own copy next to the
+      # exe in the "Package portable binary" step below.
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -202,6 +208,16 @@ jobs:
             if [[ "$have_espeak" == 1 ]]; then
               cp "$ESPEAK" "dist-bin/espeak-ng.exe"; payload+=(espeak-ng.exe)
             fi
+            # Ship the MSVC CRT next to the exe so the fetched onnxruntime.dll
+            # loads on a PC without the VC++ redistributable — the exe's own
+            # directory is always searched for a DLL's dependencies.
+            for dll in vcruntime140.dll vcruntime140_1.dll msvcp140.dll; do
+              if cp "/c/Windows/System32/$dll" "dist-bin/$dll"; then
+                payload+=("$dll")
+              else
+                echo "::warning::couldn't stage $dll for the portable zip"
+              fi
+            done
             # chdir before hashing so the `.sha256` sidecar records just the
             # basename — matching how the GitHub asset is uploaded. Hashing
             # `dist-bin/<file>` from the repo root would bake `dist-bin/`

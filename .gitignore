@@ -10,6 +10,10 @@ src-tauri/gen/schemas/*-schema.json
 # bundler can ship it as a sidecar (see tauri.conf.json::externalBin).
 # Build artefact; the pinned source rev lives in `.myownmesh-rev`.
 src-tauri/binaries/
+# release.yml stages the redistributable MSVC CRT DLLs here on Windows
+# (from the runner's System32) so the bundler ships them as resources;
+# they're build artefacts pulled in at release time, never source.
+src-tauri/vcredist/
 .env
 .env.local
 .DS_Store

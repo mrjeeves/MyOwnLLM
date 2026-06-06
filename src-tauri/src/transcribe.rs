@@ -132,9 +132,19 @@ fn stream_err_fn(
 fn probe_input_config(device: &cpal::Device) -> Result<(cpal::SampleFormat, cpal::StreamConfig)> {
     use cpal::SampleFormat;
 
-    // The three sample formats the capture callback knows how to decode.
-    let decodable =
-        |f: SampleFormat| matches!(f, SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16);
+    let dev_name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+    eprintln!("[transcribe] probing capture config for input device {dev_name:?}");
+
+    // Sample formats the capture callback knows how to decode. I32 covers
+    // the S32_LE that XMOS-based USB mic arrays (ReSpeaker et al.) almost
+    // always expose — and frequently *only* expose, which is exactly what
+    // makes a working array look like "no usable capture format".
+    let decodable = |f: SampleFormat| {
+        matches!(
+            f,
+            SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16 | SampleFormat::I32
+        )
+    };
 
     // 1. Happy path.
     match device.default_input_config() {
@@ -155,39 +165,65 @@ fn probe_input_config(device: &cpal::Device) -> Result<(cpal::SampleFormat, cpal
     // 2. Enumerate whatever the backend admits and take the best decodable
     //    range. Prefer a range that can reach TARGET_SR (downsampling
     //    beats upsampling) and the fewest channels (less to downmix).
-    if let Ok(ranges) = device.supported_input_configs() {
-        let mut best: Option<cpal::SupportedStreamConfigRange> = None;
-        for r in ranges.filter(|r| decodable(r.sample_format())) {
-            best = Some(match best {
-                Some(cur)
-                    if config_score(cur.channels(), cur.max_sample_rate().0)
-                        >= config_score(r.channels(), r.max_sample_rate().0) =>
-                {
-                    cur
-                }
-                _ => r,
-            });
+    match device.supported_input_configs() {
+        Ok(ranges) => {
+            // Log *every* advertised config first — the single most useful
+            // breadcrumb if the device still won't open (e.g. it only
+            // offers a format cpal can't represent at all, like S24_3LE).
+            let all: Vec<cpal::SupportedStreamConfigRange> = ranges.collect();
+            if all.is_empty() {
+                eprintln!("[transcribe] supported_input_configs: device advertised none");
+            }
+            for r in &all {
+                eprintln!(
+                    "[transcribe]   supported: format={:?} ch={} rate={}..{}",
+                    r.sample_format(),
+                    r.channels(),
+                    r.min_sample_rate().0,
+                    r.max_sample_rate().0
+                );
+            }
+            let mut best: Option<cpal::SupportedStreamConfigRange> = None;
+            for r in all.into_iter().filter(|r| decodable(r.sample_format())) {
+                best = Some(match best {
+                    Some(cur)
+                        if config_score(cur.channels(), cur.max_sample_rate().0)
+                            >= config_score(r.channels(), r.max_sample_rate().0) =>
+                    {
+                        cur
+                    }
+                    _ => r,
+                });
+            }
+            if let Some(r) = best {
+                // Clamp to a sane rate inside the range: TARGET_SR if it fits
+                // (then no resampling at all), otherwise the nearest end.
+                let rate = TARGET_SR.clamp(r.min_sample_rate().0, r.max_sample_rate().0);
+                let cfg = r.with_sample_rate(cpal::SampleRate(rate));
+                let format = cfg.sample_format();
+                eprintln!(
+                    "[transcribe] using enumerated input config: sr={rate} ch={} format={format:?}",
+                    cfg.channels()
+                );
+                return Ok((format, cfg.into()));
+            }
         }
-        if let Some(r) = best {
-            // Clamp to a sane rate inside the range: TARGET_SR if it fits
-            // (then no resampling at all), otherwise the nearest end.
-            let rate = TARGET_SR.clamp(r.min_sample_rate().0, r.max_sample_rate().0);
-            let cfg = r.with_sample_rate(cpal::SampleRate(rate));
-            let format = cfg.sample_format();
-            eprintln!(
-                "[transcribe] using enumerated input config: sr={rate} ch={} format={format:?}",
-                cfg.channels()
-            );
-            return Ok((format, cfg.into()));
-        }
+        Err(e) => eprintln!("[transcribe] supported_input_configs failed: {e}"),
     }
 
     // 3. Brute force: try to open the device with concrete configs,
     //    ordered by ALSA compatibility — S16_LE mono is the most
     //    universally accepted capture format on Pi-class hardware.
-    let formats = [SampleFormat::I16, SampleFormat::F32, SampleFormat::U16];
+    let formats = [
+        SampleFormat::I16,
+        SampleFormat::I32,
+        SampleFormat::F32,
+        SampleFormat::U16,
+    ];
     let rates = [TARGET_SR, 48_000, 44_100, 32_000, 8_000];
-    let channels_opts = [1u16, 2];
+    // Include the 4/6/8-channel layouts USB mic arrays use — many reject a
+    // mono or stereo request outright and only accept their native count.
+    let channels_opts = [1u16, 2, 4, 6, 8];
     for &format in &formats {
         for &rate in &rates {
             for &channels in &channels_opts {
@@ -207,7 +243,7 @@ fn probe_input_config(device: &cpal::Device) -> Result<(cpal::SampleFormat, cpal
     }
 
     Err(anyhow!(
-        "input config: device accepted no usable capture format (tried the default config plus {} fallback combinations). The microphone may be in use by another app, output-only, or unplugged.",
+        "input config: device {dev_name:?} accepted no usable capture format (tried the default config plus {} fallback combinations). Check the `[transcribe] supported:` lines logged above for what it advertises — if its only formats are 24-bit (e.g. S24_3LE) we can't decode them yet; otherwise the mic may be in use by another app, output-only, or unplugged.",
         formats.len() * rates.len() * channels_opts.len()
     ))
 }
@@ -238,6 +274,9 @@ fn try_open_input(
         }
         cpal::SampleFormat::U16 => {
             device.build_input_stream(cfg, |_: &[u16], _| {}, err_fn, None)?
+        }
+        cpal::SampleFormat::I32 => {
+            device.build_input_stream(cfg, |_: &[i32], _| {}, err_fn, None)?
         }
         _ => return Err(cpal::BuildStreamError::StreamConfigNotSupported),
     };
@@ -1536,6 +1575,25 @@ fn run_capture(
                 None,
             )?
         }
+        cpal::SampleFormat::I32 => {
+            let tx = tx.clone();
+            let cancel = cancel.clone();
+            let paused = paused.clone();
+            device.build_input_stream(
+                &stream_cfg,
+                move |data: &[i32], _| {
+                    if cancel.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // S32_LE from XMOS USB mic arrays; normalize by the
+                    // full i32 range (also right for 24-bit-left-justified).
+                    let f: Vec<f32> = data.iter().map(|&s| s as f32 / i32::MAX as f32).collect();
+                    let _ = tx.try_send(downmix_f32(&f, channels));
+                },
+                stream_err_fn(stream_err.clone()),
+                None,
+            )?
+        }
         other => return Err(anyhow!("unsupported sample format {other:?}")),
     };
     stream.play()?;
@@ -2031,6 +2089,38 @@ fn run_session(
                             .iter()
                             .map(|&s| (s as f32 - 32768.0) / 32768.0)
                             .collect();
+                        let mono = downmix_f32(&f, channels);
+                        if let Some(rec) = &recorder {
+                            rec.write(mono.clone());
+                        }
+                        let _ = tx.try_send(mono);
+                    }
+                },
+                stream_err_fn(stream_err.clone()),
+                None,
+            )?
+        }
+        cpal::SampleFormat::I32 => {
+            let tx = tx.clone();
+            let cancel = cancel_audio.clone();
+            let draining = draining_audio.clone();
+            let recorder = recorder_cb.clone();
+            device.build_input_stream(
+                &stream_cfg,
+                {
+                    let paused = paused.clone();
+                    move |data: &[i32], _| {
+                        if cancel.load(Ordering::Relaxed)
+                            || paused.load(Ordering::Relaxed)
+                            || draining.load(Ordering::Relaxed)
+                        {
+                            return;
+                        }
+                        // S32_LE — what XMOS USB mic arrays emit. Normalize
+                        // by the full i32 range; 24-bit-left-justified data
+                        // (low byte zero) lands at the right amplitude too.
+                        let f: Vec<f32> =
+                            data.iter().map(|&s| s as f32 / i32::MAX as f32).collect();
                         let mono = downmix_f32(&f, channels);
                         if let Some(rec) = &recorder {
                             rec.write(mono.clone());
