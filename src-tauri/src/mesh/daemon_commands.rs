@@ -53,8 +53,41 @@ pub async fn mesh_daemon_status(state: State<'_, Arc<MeshDaemon>>) -> CmdResult<
             "daemon_mode".to_string(),
             Value::String(daemon.client.mode_str().to_string()),
         );
+        // Daemon-version gate. Surface the rev this build was pinned to
+        // and whether the live daemon meets it, so the frontend can show
+        // a non-blocking "update your mesh" notice and kick off
+        // `mesh_daemon_update_to_pin`. Mismatched revs still peer (the
+        // wire protocol negotiates features per-peer), so this is
+        // advisory only — never a hard gate.
+        if let Some(pin) = super::daemon::pinned_mesh_version() {
+            // Compute the comparison before mutating `obj` so `have`'s
+            // borrow of it ends before the inserts below.
+            let meets = {
+                let have = obj.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                super::daemon::version_meets(have, pin)
+            };
+            obj.insert("pinned_version".to_string(), Value::String(pin.to_string()));
+            obj.insert("meets_pin".to_string(), Value::Bool(meets));
+        }
     }
     Ok(data)
+}
+
+/// Best-effort nudge the live `myownmesh` daemon toward at least the
+/// pinned version: enable its background updater, force a check, and —
+/// for a daemon we spawned ourselves — apply the staged binary so it
+/// lands on the daemon's next start. Advisory and non-blocking; see
+/// [`super::daemon::drive_daemon_update`]. Runs on a blocking thread
+/// since it shells out to the daemon CLI. Returns a small status object.
+#[tauri::command]
+pub async fn mesh_daemon_update_to_pin(state: State<'_, Arc<MeshDaemon>>) -> CmdResult<Value> {
+    let daemon = state.inner().clone();
+    let own = daemon.client.mode_str() == "own_llm";
+    match tauri::async_runtime::spawn_blocking(move || super::daemon::drive_daemon_update(own)).await
+    {
+        Ok(v) => Ok(v),
+        Err(_) => Err("daemon update task did not complete".to_string()),
+    }
 }
 
 // ---- identity --------------------------------------------------------

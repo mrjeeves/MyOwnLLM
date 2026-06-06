@@ -335,6 +335,34 @@ import { APP_VERSION } from "../../mesh-capabilities";
       </div>
     </section>
 
+    <!-- Daemon-version gate: non-blocking notice when the live myownmesh
+         daemon is older than the rev this build was tested against. The
+         mesh still connects; this just flags that newer features may be
+         unavailable until it updates (auto-nudged in the background). -->
+    {#if meshClient.pinned_version && !meshClient.meets_pin}
+      <section class="block">
+        <div class="daemon-stale" role="status" aria-live="polite">
+          <span class="daemon-stale-icon" aria-hidden="true">⬆</span>
+          <div class="daemon-stale-text">
+            <strong>
+              {meshClient.daemon_update.state === "updating"
+                ? "Updating mesh engine…"
+                : meshClient.daemon_update.state === "done"
+                  ? "Mesh engine update ready"
+                  : "Mesh engine is out of date"}
+            </strong>
+            <span>
+              The myownmesh daemon is {meshClient.daemon_version || "older"} but
+              this app expects {meshClient.pinned_version}. It still connects —
+              newer mesh features may be unavailable until it updates.{#if meshClient.daemon_update.state === "done"}
+                Restart to finish.{/if}{#if meshClient.daemon_update.state === "failed" && meshClient.daemon_update.detail}
+                ({meshClient.daemon_update.detail}){/if}
+            </span>
+          </div>
+        </div>
+      </section>
+    {/if}
+
     <!-- 2. Status pill + accepting policy. One row: the live mesh
          state on the left, the per-network accepting dropdown on
          the right. Accepting is disabled when no network is
@@ -1109,4 +1137,36 @@ import { APP_VERSION } from "../../mesh-capabilities";
     border-color: #3a4a6a;
   }
   .modal-actions .primary:hover { background: #344566; }
+  /* Daemon-version gate notice — purple "needs attention" accent,
+     matching the pending-approval surfaces. */
+  .daemon-stale {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    padding: 0.6rem 0.75rem;
+    background: #1a1626;
+    border: 1px solid #3a3157;
+    border-left: 3px solid #a78bfa;
+    border-radius: 7px;
+  }
+  .daemon-stale-icon {
+    font-size: 0.95rem;
+    line-height: 1.3;
+    color: #c9b8f5;
+  }
+  .daemon-stale-text {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 0;
+  }
+  .daemon-stale-text strong {
+    font-size: 0.8rem;
+    color: #e9e3ff;
+  }
+  .daemon-stale-text span {
+    font-size: 0.72rem;
+    color: #9a92b8;
+    line-height: 1.5;
+  }
 </style>

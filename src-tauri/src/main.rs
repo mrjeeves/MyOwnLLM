@@ -1535,6 +1535,7 @@ fn main() {
             web_search::agent_web_search,
             // ---- daemon-backed mesh commands (PR migrating off Trystero)
             mesh::daemon_commands::mesh_daemon_status,
+            mesh::daemon_commands::mesh_daemon_update_to_pin,
             mesh::daemon_commands::mesh_daemon_identity_show,
             mesh::daemon_commands::mesh_daemon_identity_set_label,
             mesh::daemon_commands::mesh_daemon_network_id_generate,
