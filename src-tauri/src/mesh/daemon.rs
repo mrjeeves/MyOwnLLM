@@ -516,7 +516,9 @@ pub fn drive_daemon_update(own: bool) -> serde_json::Value {
             cmd.env("MYOWNMESH_HOME", h);
         }
         match cmd.output() {
-            Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()),
+            Ok(o) if o.status.success() => {
+                Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            }
             Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
             Err(e) => Err(e.to_string()),
         }
@@ -528,7 +530,11 @@ pub fn drive_daemon_update(own: bool) -> serde_json::Value {
     let check = run(&["update", "check", "--json"]);
     // 3. For a daemon we own, apply the staged binary (effective on its
     //    next start). Leave a shared daemon's binary alone.
-    let apply = if own { Some(run(&["update", "apply"])) } else { None };
+    let apply = if own {
+        Some(run(&["update", "apply"]))
+    } else {
+        None
+    };
     serde_json::json!({
         "ok": true,
         "own": own,

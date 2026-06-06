@@ -83,7 +83,8 @@ pub async fn mesh_daemon_status(state: State<'_, Arc<MeshDaemon>>) -> CmdResult<
 pub async fn mesh_daemon_update_to_pin(state: State<'_, Arc<MeshDaemon>>) -> CmdResult<Value> {
     let daemon = state.inner().clone();
     let own = daemon.client.mode_str() == "own_llm";
-    match tauri::async_runtime::spawn_blocking(move || super::daemon::drive_daemon_update(own)).await
+    match tauri::async_runtime::spawn_blocking(move || super::daemon::drive_daemon_update(own))
+        .await
     {
         Ok(v) => Ok(v),
         Err(_) => Err("daemon update task did not complete".to_string()),
