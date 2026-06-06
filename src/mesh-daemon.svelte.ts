@@ -310,15 +310,30 @@ function daemonPeerToEntry(info: DaemonPeerInfo): PeerEntry {
 
 function mapPeerStatus(info: DaemonPeerInfo): PeerStatus {
   // myownmesh-core's PeerStatus enum (engine/connection.rs) is the
-  // source of truth: Sighted | Authenticated | Approved | Shelved |
-  // Dropped. We coerce into the legacy frontend's wider PeerStatus
-  // because the UI cards have already-written labels for each.
+  // source of truth, serialized snake_case:
+  //   sighted | handshaking | pending_approval | active | shelved |
+  //   reconnecting | offline | error
+  // We coerce into the legacy frontend's wider PeerStatus because the
+  // UI cards have already-written labels for each.
+  //
+  // NB: the daemon signals "auth verified, awaiting the user's
+  // approval" with `pending_approval`. An earlier version of this map
+  // switched on an "authenticated"/"approved"/"dropped" status the
+  // daemon never emits, so every join request fell through to the
+  // default and surfaced as `handshaking` — which made approvals
+  // invisible everywhere they're keyed off `pending_approval` (the
+  // Networks banner + graph node, the Connections list, the top-bar /
+  // sidebar attention dots, and the approval toast).
   switch (info.status) {
-    case "approved":
     case "active":
       if (info.local_shelved && info.remote_shelved) return "shelved";
       return "active";
-    case "authenticated":
+    case "pending_approval":
+      // The engine holds a peer in `pending_approval` for the whole
+      // bilateral exchange. Once we've sent our approve and are only
+      // waiting on theirs, it's no longer actionable here — surface it
+      // as `pending_remote` ("awaiting peer") so it drops off the
+      // "needs your approval" surfaces while still showing on its node.
       if (info.local_approve_sent && !info.remote_approve_seen)
         return "pending_remote";
       return "pending_approval";
@@ -327,9 +342,12 @@ function mapPeerStatus(info: DaemonPeerInfo): PeerStatus {
       return "handshaking";
     case "shelved":
       return "shelved";
-    case "dropped":
+    case "reconnecting":
+      return "reconnecting";
     case "offline":
       return "offline";
+    case "error":
+      return "failed";
     default:
       return "handshaking";
   }

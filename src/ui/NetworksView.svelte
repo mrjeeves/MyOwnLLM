@@ -35,6 +35,7 @@
     onRequestStopTranscribe,
     onRequestStopChat,
     onOpenSpeakers,
+    focusPendingOnOpen = false,
   } = $props<{
     activeMode: Mode;
     supportedModes: Set<Mode>;
@@ -43,6 +44,11 @@
     onRequestStopTranscribe: () => void;
     onRequestStopChat: () => void;
     onOpenSpeakers: () => void;
+    /** Set when the workspace is opened from the approval toast — auto-
+     *  select the first waiting request so the user lands straight on it.
+     *  The view remounts on each open, so this fires at most once per
+     *  toast-triggered open. */
+    focusPendingOnOpen?: boolean;
   }>();
 
   let cfg = $state<Config | null>(null);
@@ -141,6 +147,19 @@
     if (pendingPeers.length === 0) return;
     selectedPeerId = pendingPeers[0].peer_id;
   }
+
+  /** When opened from the approval toast, land on the first waiting
+   *  request as soon as the peer snapshot has it. Latched so it only
+   *  selects once per open (the view remounts each time, resetting it),
+   *  and the `pendingPeers.length` guard rides out any reconcile race
+   *  where the snapshot hasn't populated yet on first paint. */
+  let focusedPending = $state(false);
+  $effect(() => {
+    if (focusPendingOnOpen && !focusedPending && pendingPeers.length > 0) {
+      focusedPending = true;
+      reviewPending();
+    }
+  });
 
   // Settings deep-link channel — same pattern as Chat / Speakers.
   $effect(() => {
