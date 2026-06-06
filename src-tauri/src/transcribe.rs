@@ -107,6 +107,144 @@ fn stream_err_fn(
     }
 }
 
+/// Negotiate a capture config for `device`.
+///
+/// cpal's `default_input_config()` is brittle on ALSA: on a lot of
+/// Raspberry Pi / USB-mic setups it returns `StreamTypeNotSupported`
+/// ("The requested stream type is not supported by the device") even
+/// though the device opens fine with a concrete config. That variant
+/// specifically means cpal's hw-param probe enumerated *zero* configs,
+/// so `supported_input_configs()` comes back empty too — falling back
+/// to it alone wouldn't help.
+///
+/// So we degrade in three stages:
+///   1. `default_input_config()` — the happy path (CoreAudio / WASAPI /
+///      most ALSA).
+///   2. enumerate `supported_input_configs()` and take the best range we
+///      can actually decode (covers other negotiation hiccups, e.g. a
+///      default config in a sample format we don't handle).
+///   3. brute force: try to *open* the device with a prioritized list of
+///      plain configs and keep the first that builds. A successful build
+///      is ground truth — if ALSA accepts the hw params, capture works.
+///
+/// Everything downstream resamples to `TARGET_SR`, so any rate the
+/// device accepts is fine; we only need a stream that builds.
+fn probe_input_config(device: &cpal::Device) -> Result<(cpal::SampleFormat, cpal::StreamConfig)> {
+    use cpal::SampleFormat;
+
+    // The three sample formats the capture callback knows how to decode.
+    let decodable =
+        |f: SampleFormat| matches!(f, SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16);
+
+    // 1. Happy path.
+    match device.default_input_config() {
+        Ok(cfg) => {
+            let format = cfg.sample_format();
+            if decodable(format) {
+                return Ok((format, cfg.into()));
+            }
+            eprintln!(
+                "[transcribe] default input config is sample format {format:?} (not decodable); probing alternatives"
+            );
+        }
+        Err(e) => {
+            eprintln!("[transcribe] default_input_config failed ({e}); probing supported configs");
+        }
+    }
+
+    // 2. Enumerate whatever the backend admits and take the best decodable
+    //    range. Prefer a range that can reach TARGET_SR (downsampling
+    //    beats upsampling) and the fewest channels (less to downmix).
+    if let Ok(ranges) = device.supported_input_configs() {
+        let mut best: Option<cpal::SupportedStreamConfigRange> = None;
+        for r in ranges.filter(|r| decodable(r.sample_format())) {
+            best = Some(match best {
+                Some(cur)
+                    if config_score(cur.channels(), cur.max_sample_rate().0)
+                        >= config_score(r.channels(), r.max_sample_rate().0) =>
+                {
+                    cur
+                }
+                _ => r,
+            });
+        }
+        if let Some(r) = best {
+            // Clamp to a sane rate inside the range: TARGET_SR if it fits
+            // (then no resampling at all), otherwise the nearest end.
+            let rate = TARGET_SR.clamp(r.min_sample_rate().0, r.max_sample_rate().0);
+            let cfg = r.with_sample_rate(cpal::SampleRate(rate));
+            let format = cfg.sample_format();
+            eprintln!(
+                "[transcribe] using enumerated input config: sr={rate} ch={} format={format:?}",
+                cfg.channels()
+            );
+            return Ok((format, cfg.into()));
+        }
+    }
+
+    // 3. Brute force: try to open the device with concrete configs,
+    //    ordered by ALSA compatibility — S16_LE mono is the most
+    //    universally accepted capture format on Pi-class hardware.
+    let formats = [SampleFormat::I16, SampleFormat::F32, SampleFormat::U16];
+    let rates = [TARGET_SR, 48_000, 44_100, 32_000, 8_000];
+    let channels_opts = [1u16, 2];
+    for &format in &formats {
+        for &rate in &rates {
+            for &channels in &channels_opts {
+                let cfg = cpal::StreamConfig {
+                    channels,
+                    sample_rate: cpal::SampleRate(rate),
+                    buffer_size: cpal::BufferSize::Default,
+                };
+                if try_open_input(device, format, &cfg).is_ok() {
+                    eprintln!(
+                        "[transcribe] opened input via fallback probe: sr={rate} ch={channels} format={format:?}"
+                    );
+                    return Ok((format, cfg));
+                }
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "input config: device accepted no usable capture format (tried the default config plus {} fallback combinations). The microphone may be in use by another app, output-only, or unplugged.",
+        formats.len() * rates.len() * channels_opts.len()
+    ))
+}
+
+/// Rank a capture config for [`probe_input_config`]: reaching
+/// `TARGET_SR` wins first, then fewer channels. Pure so it can be
+/// unit-tested without real hardware.
+fn config_score(channels: u16, max_sample_rate: u32) -> (bool, std::cmp::Reverse<u16>) {
+    (max_sample_rate >= TARGET_SR, std::cmp::Reverse(channels))
+}
+
+/// Build a throwaway input stream just to confirm the device accepts
+/// `cfg`. cpal applies the hw params at build time, so a successful
+/// build (then immediate drop) proves capture will work. Callbacks are
+/// no-ops and we never call `play()`.
+fn try_open_input(
+    device: &cpal::Device,
+    format: cpal::SampleFormat,
+    cfg: &cpal::StreamConfig,
+) -> Result<(), cpal::BuildStreamError> {
+    let err_fn = |_e: cpal::StreamError| {};
+    let stream = match format {
+        cpal::SampleFormat::F32 => {
+            device.build_input_stream(cfg, |_: &[f32], _| {}, err_fn, None)?
+        }
+        cpal::SampleFormat::I16 => {
+            device.build_input_stream(cfg, |_: &[i16], _| {}, err_fn, None)?
+        }
+        cpal::SampleFormat::U16 => {
+            device.build_input_stream(cfg, |_: &[u16], _| {}, err_fn, None)?
+        }
+        _ => return Err(cpal::BuildStreamError::StreamConfigNotSupported),
+    };
+    drop(stream);
+    Ok(())
+}
+
 fn chunk_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
@@ -1344,13 +1482,9 @@ fn run_session(
             .default_input_device()
             .ok_or_else(|| anyhow!("no default input device"))?,
     };
-    let cfg = device
-        .default_input_config()
-        .map_err(|e| anyhow!("input config: {e}"))?;
-    let sr = cfg.sample_rate().0;
-    let channels = cfg.channels() as usize;
-    let format = cfg.sample_format();
-    let stream_cfg: cpal::StreamConfig = cfg.into();
+    let (format, stream_cfg) = probe_input_config(&device)?;
+    let sr = stream_cfg.sample_rate.0;
+    let channels = stream_cfg.channels as usize;
     eprintln!(
         "[transcribe] mic config: sr={sr} channels={channels} format={format:?} keep_audio={keep_audio}"
     );
@@ -3730,6 +3864,19 @@ mod tests {
             text: text.to_string(),
             t_ms,
         }
+    }
+
+    #[test]
+    fn config_score_prefers_target_then_fewer_channels() {
+        // Reaching TARGET_SR beats not reaching it, whatever the channels.
+        assert!(config_score(1, TARGET_SR) > config_score(1, 8_000));
+        assert!(config_score(2, 48_000) > config_score(1, 8_000));
+        // Among target-reaching ranges, fewer channels wins.
+        assert!(config_score(1, 48_000) > config_score(2, 48_000));
+        // Among non-reaching ranges, fewer channels still wins.
+        assert!(config_score(1, 8_000) > config_score(2, 8_000));
+        // A rate exactly at the target counts as reaching it.
+        assert!(config_score(1, TARGET_SR).0);
     }
 
     #[test]
