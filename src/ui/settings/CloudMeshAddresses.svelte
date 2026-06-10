@@ -357,13 +357,14 @@
         {#if editing}<span class="scope-tag" title="These signaling relays apply to '{editing.network_id}' only.">for {editing.network_id}</span>{/if}
       </h3>
       <div class="block-hint">
-        Networks use <a href="https://trystero.dev" target="_blank" rel="noopener">Trystero</a>
-        for peer discovery — currently over Nostr relays. By default
-        Trystero picks from a built-in pool of public relays
-        maintained by the Nostr community, so MyOwnLLM operates no
-        signaling infrastructure of its own. Add your own relay
-        URLs below to use specific or self-hosted relays instead;
-        leave the list empty to keep the defaults.
+        Peers rendezvous over Nostr relays. By default a network uses
+        the project's reference relay
+        <code>wss://myownmesh.com</code> (standard <code>wss://</code>
+        on 443, so it clears restrictive firewalls), with a reactive
+        fallback to a pool of public community relays only while the
+        default can't be reached. Add your own relay URLs below to pin
+        specific or self-hosted relays instead; leave the list empty to
+        keep the default.
       </div>
       <div class="list">
         {#each signalingRelays as _, i (i)}
@@ -396,10 +397,10 @@
         <div class="self-host">
           <p>
             A Nostr relay is a tiny WebSocket service that proxies
-            signed messages between subscribed clients — Trystero
-            piggybacks on this to relay WebRTC offers/answers
-            between MyOwnLLM peers. The relay never sees mesh
-            content, only the small offer/answer envelopes during
+            signed messages between subscribed clients — the mesh
+            signaling driver piggybacks on this to relay WebRTC
+            offers/answers between MyOwnLLM peers. The relay never sees
+            mesh content, only the small offer/answer envelopes during
             connection setup.
           </p>
 
@@ -426,7 +427,7 @@
             </div>
             <p>
               More featureful, persists messages across restarts
-              (which Trystero doesn't need but doesn't hurt).
+              (which the signaling driver doesn't need but doesn't hurt).
             </p>
             <code class="self-host-cmd">
               docker run -d -p 8080:8080 scsibug/nostr-rs-relay
@@ -453,8 +454,10 @@
         {#if editing}<span class="scope-tag" title="These STUN servers apply to '{editing.network_id}' only.">for {editing.network_id}</span>{/if}
       </h3>
       <div class="block-hint">
-        Public NAT-traversal helpers. Defaults to Google's public STUN
-        pool, which works for the majority of home networks.
+        Public NAT-traversal helpers. Defaults to the project's
+        reference STUN, <code>stun:stun.myownmesh.com:3478</code>,
+        which works for the majority of home networks. Leave the list
+        empty to skip STUN.
       </div>
       <div class="list">
         {#each stunServers as _, i (i)}
@@ -483,11 +486,13 @@
       </h3>
       <div class="block-hint">
         Relay servers used when direct peer connections can't be
-        established. Required for peers behind symmetric NAT (phone
+        established — required for peers behind symmetric NAT (phone
         hotspots, carrier-grade NAT, restrictive corporate or guest
-        Wi-Fi) because STUN-only hole-punching can't traverse those.
-        TURN consumes real bandwidth, so there's no free
-        no-signup public service that reliably stays up. Use one of:
+        Wi-Fi), where STUN-only hole-punching can't traverse. New
+        networks default to the project's shared-guest relay
+        <code>turn:turn.myownmesh.com:3478</code> so this works out of
+        the box. That relay is bandwidth-capped per connection, so for
+        sustained throughput point at your own:
       </div>
       <ul class="turn-options">
         <li>

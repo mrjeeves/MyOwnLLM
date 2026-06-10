@@ -275,9 +275,13 @@ export interface NetworkConfig {
   auto_approve?: boolean;
   /** Per-network signaling / NAT settings. Each network can point
    *  at a different relay pool — home / office / public mesh all
-   *  configurable independently. Empty signaling = Trystero's
-   *  built-in Nostr default pool at redundancy 8; empty stun = no
-   *  NAT helpers; empty turn = no relay fallback. */
+   *  configurable independently. New networks are seeded with the
+   *  MyOwnMesh defaults (signaling `wss://myownmesh.com`, STUN
+   *  `stun.myownmesh.com:3478`, TURN `turn.myownmesh.com:3478` with
+   *  the shared guest credential) so they connect out of the box;
+   *  each list is overridable from the Addresses tab. An empty
+   *  signaling list still resolves to `wss://myownmesh.com` in the
+   *  daemon; an empty stun / turn list opts out of that helper. */
   signaling_servers: string[];
   stun_servers: string[];
   turn_servers: TurnServer[];
