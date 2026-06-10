@@ -28,7 +28,9 @@
   import { onMount } from "svelte";
   import {
     addNetwork,
+    DEFAULT_NETWORK_SIGNALING,
     DEFAULT_NETWORK_STUN,
+    DEFAULT_NETWORK_TURN,
     importNetworkSettings,
     tryParseNetworkSettings,
     type NetworkSettingsExport,
@@ -55,9 +57,9 @@
   // (which carries transport fields end-to-end) instead of the
   // simple `addNetwork` path.
   let advancedExpanded = $state(false);
-  let signalingDraft = $state<string[]>([]);
+  let signalingDraft = $state<string[]>([...DEFAULT_NETWORK_SIGNALING]);
   let stunDraft = $state<string[]>([...DEFAULT_NETWORK_STUN]);
-  let turnDraft = $state<TurnServer[]>([]);
+  let turnDraft = $state<TurnServer[]>(DEFAULT_NETWORK_TURN.map((t) => ({ ...t })));
   let turnEntry = $state<TurnServer>({ url: "", username: "", credential: "" });
 
   // Import flow state. Either a parsed blob ready to apply or null
@@ -71,10 +73,10 @@
   // a plain new network or applying transport overrides.
   let hasOverrides = $derived(
     importDraft !== null ||
-      signalingDraft.some((s) => s.trim() !== "") ||
-      // Custom STUN list = different from defaults.
+      // Any edit away from the seeded MyOwnMesh defaults.
+      JSON.stringify(signalingDraft) !== JSON.stringify(DEFAULT_NETWORK_SIGNALING) ||
       JSON.stringify(stunDraft) !== JSON.stringify(DEFAULT_NETWORK_STUN) ||
-      turnDraft.length > 0,
+      JSON.stringify(turnDraft) !== JSON.stringify(DEFAULT_NETWORK_TURN),
   );
 
   onMount(() => {
@@ -274,10 +276,13 @@
     {#if advancedExpanded}
       <div class="advanced">
         <p class="advanced-hint">
-          Optional. Leave blank to use Trystero's public Nostr relays
-          and Google's STUN pool. Override here when you want a
-          private relay, a custom STUN, or TURN for symmetric-NAT
-          peers (phone hotspot / CGNAT).
+          Optional. These are seeded with the MyOwnMesh defaults —
+          signaling <code>wss://myownmesh.com</code>, STUN
+          <code>stun.myownmesh.com</code>, and the shared-guest TURN
+          relay <code>turn.myownmesh.com</code> — so a fresh network
+          connects out of the box, even for symmetric-NAT peers (phone
+          hotspot / CGNAT). Override here to point at a private relay,
+          your own STUN, or your own TURN server.
         </p>
 
         <div class="adv-block">
@@ -379,7 +384,7 @@
               <dt>signaling</dt>
               <dd>
                 {importDraft.signaling_servers.length === 0
-                  ? "(default pool)"
+                  ? "(default · wss://myownmesh.com)"
                   : importDraft.signaling_servers.join(", ")}
               </dd>
               <dt>STUN</dt>

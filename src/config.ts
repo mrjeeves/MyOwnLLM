@@ -56,18 +56,30 @@ const DEFAULT_REMOTE_UI: RemoteUiConfig = {
   port: 1474,
 };
 
-// Signaling is handled by Trystero over Nostr relays. The default
-// per-network `signaling_servers` list is empty so the mesh client
-// uses Trystero's built-in 52-relay public pool, bumped to
-// redundancy 8 at connect time (see `DEFAULT_SIGNALING_REDUNDANCY`
-// in mesh-client.svelte.ts). Anyone who wants to point at a
-// self-hosted Nostr relay (or a private one for office/LAN use)
-// adds entries from the Cloud Mesh → Addresses tab and those
-// replace the default pool entirely. STUN servers default to
-// Google's public pool, which is the de-facto baseline.
+// Per-network transport defaults. The frontend bridges each saved
+// network into the bundled `myownmesh serve` daemon (see
+// `networkConfigToDaemonShape`), which owns signaling / ICE. Every
+// new network is seeded with the project's semi-public MyOwnMesh
+// defaults so a fresh install connects out of the box AND the user
+// can see what it's using in Settings → Cloud Mesh → Addresses
+// rather than staring at an empty list:
+//
+//   - signaling → wss://myownmesh.com — the reference Nostr relay,
+//     reached over standard wss:// (443) so it sails through
+//     restrictive firewalls. The daemon resolves an empty list to
+//     this same relay, so seeding it explicitly is purely so the
+//     value is visible and editable in the UI.
+//   - STUN → stun.myownmesh.com:3478 — server-reflexive discovery.
+//   - TURN → turn.myownmesh.com:3478 with the shared guest
+//     credential, so symmetric-NAT / CGNAT peers (phone hotspots)
+//     relay out of the box. Bandwidth-capped and the credential is
+//     deliberately not a secret; point at your own server for
+//     sustained throughput.
+//
+// All three are overridable per-network from the Addresses tab.
 //
 // Legacy entries from earlier PeerJS-based commits get stripped
-// on load so testers don't end up pointing Trystero at a
+// on load so testers don't end up pointing the relay layer at a
 // peerjs-server URL it can't speak to.
 const LEGACY_PEERJS_SIGNALING_URLS = [
   "wss://0.peerjs.com:443/",
@@ -75,15 +87,34 @@ const LEGACY_PEERJS_SIGNALING_URLS = [
   "wss://mesh.myownllm.net/signal",
 ];
 
-/** Defaults for newly-added networks. Empty signaling = Trystero's
- *  public Nostr relays; Google's STUN pool for NAT helpers; empty
- *  per-network TURN by default. Applied by `createNetwork` and by
- *  the legacy-config migration so a pre-multi-network install
- *  lands with sane per-network defaults. */
-export const DEFAULT_NETWORK_SIGNALING: string[] = [];
-export const DEFAULT_NETWORK_STUN: string[] = [
+/** The pre-MyOwnMesh STUN default (Google's public pool). A network
+ *  still carrying exactly this list never made a deliberate STUN
+ *  choice — it's just the old baseline — so it's upgraded to the
+ *  current default on load. A customised list (anything added or
+ *  removed) won't match and is left untouched. */
+const LEGACY_GOOGLE_STUN: string[] = [
   "stun:stun.l.google.com:19302",
   "stun:stun1.l.google.com:19302",
+];
+
+/** Default signaling relay for newly-added networks: the project's
+ *  reference relay over standard wss:// (443). The daemon resolves an
+ *  empty list to the same relay, so this exists mainly so the value
+ *  is visible in the UI. */
+export const DEFAULT_NETWORK_SIGNALING: string[] = ["wss://myownmesh.com"];
+/** Default STUN servers for newly-added networks — the project's
+ *  reference STUN for server-reflexive NAT discovery. */
+export const DEFAULT_NETWORK_STUN: string[] = ["stun:stun.myownmesh.com:3478"];
+/** Default TURN servers for newly-added networks — the project's
+ *  reference TURN with its shared semi-public guest credential, so
+ *  symmetric-NAT / CGNAT peers relay out of the box. Bandwidth-capped;
+ *  point at your own server for sustained throughput. */
+export const DEFAULT_NETWORK_TURN: TurnServer[] = [
+  {
+    url: "turn:turn.myownmesh.com:3478",
+    username: "guest",
+    credential: "theguestpassword",
+  },
 ];
 
 const DEFAULT_CLOUD_MESH: CloudMeshConfig = {
@@ -515,9 +546,24 @@ function coerceAccepting(raw: unknown): NetworkConfig["accepting"] {
 }
 
 /** Strip legacy PeerJS signaling URLs that may linger in old
- *  configs from a pre-Trystero branch commit. */
+ *  configs from a pre-daemon branch commit. */
 function cleanSignaling(raw: string[] | undefined): string[] {
   return (raw ?? []).filter((s) => !LEGACY_PEERJS_SIGNALING_URLS.includes(s));
+}
+
+/** STUN list for a saved/added network. Fills the MyOwnMesh default
+ *  when the field is absent (a fresh network) and upgrades the exact
+ *  legacy Google default to the current one. Any other explicit list
+ *  — including a deliberately-empty opt-out (`[]`) — is preserved. */
+function defaultedStun(raw: string[] | undefined): string[] {
+  if (raw === undefined) return [...DEFAULT_NETWORK_STUN];
+  if (
+    raw.length === LEGACY_GOOGLE_STUN.length &&
+    raw.every((u, i) => u === LEGACY_GOOGLE_STUN[i])
+  ) {
+    return [...DEFAULT_NETWORK_STUN];
+  }
+  return raw;
 }
 
 /** Build a `NetworkConfig` from a partial saved entry, filling
@@ -544,9 +590,18 @@ function mergeNetwork(
   const net: NetworkConfig = {
     id: raw.id || newNetworkInternalId(),
     network_id: raw.network_id || "",
-    signaling_servers: cleanSignaling(raw.signaling_servers),
-    stun_servers: raw.stun_servers ?? [...DEFAULT_NETWORK_STUN],
-    turn_servers: raw.turn_servers ?? [],
+    // Absent transport fields seed the MyOwnMesh defaults (a fresh
+    // network); an explicit list on disk — including an empty
+    // opt-out — is preserved. Signaling is left empty when the saved
+    // value is empty (the daemon resolves that to wss://myownmesh.com
+    // anyway), but a brand-new network gets it spelled out so it's
+    // visible in the Addresses tab.
+    signaling_servers:
+      raw.signaling_servers === undefined
+        ? [...DEFAULT_NETWORK_SIGNALING]
+        : cleanSignaling(raw.signaling_servers),
+    stun_servers: defaultedStun(raw.stun_servers),
+    turn_servers: raw.turn_servers ?? [...DEFAULT_NETWORK_TURN],
     accepting: coerceAccepting(raw.accepting),
     // Default to enabled so existing networks (saved before this
     // field existed) keep their pre-toggle "auto-sync everywhere"

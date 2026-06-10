@@ -626,7 +626,9 @@ export const NETWORKS_TOOL: Tool = {
             description:
               "For set_signaling_servers / set_stun_servers: array of URL strings. " +
               "For set_turn_servers: array of {url, username?, credential?} objects. " +
-              "Empty array clears the list (Trystero / Google defaults will be used).",
+              "Empty array clears the list — an empty signaling list still falls back " +
+              "to the default wss://myownmesh.com relay; empty STUN/TURN opts out of " +
+              "that helper.",
           },
         },
         required: ["action"],
@@ -1054,8 +1056,9 @@ const NETWORKS_TOOL_SNIPPET: string =
   "(status, peers, saved networks, accepting policy, diagnostic log, " +
   "signaling/STUN/TURN servers, import/export of portable settings).\n\n" +
   "How the mesh works:\n" +
-  "- Devices that share a Network ID find each other through public Nostr relays " +
-  "(or a self-hosted one) and connect peer-to-peer over WebRTC.\n" +
+  "- Devices that share a Network ID find each other through the default " +
+  "wss://myownmesh.com relay (or your own) over Nostr, then connect " +
+  "peer-to-peer over WebRTC.\n" +
   "- Joining still requires explicit approval per device, gated by a 6-char " +
   "verification code that both sides should read out and confirm.\n" +
   "- The user can save multiple networks; exactly one is active at a time.\n" +
@@ -1080,8 +1083,11 @@ const NETWORKS_TOOL_SNIPPET: string =
   "- `action='export_settings'` returns the same envelope for the active (or " +
   "named) network, ready to share to another device.\n" +
   "- `action='set_signaling_servers' / 'set_stun_servers' / 'set_turn_servers'` " +
-  "replace the respective list on a network. Empty array restores defaults " +
-  "(Trystero public Nostr relays / Google STUN / no TURN).";
+  "replace the respective list on a network. New networks ship the MyOwnMesh " +
+  "defaults (signaling wss://myownmesh.com, STUN stun.myownmesh.com:3478, TURN " +
+  "turn.myownmesh.com:3478 with the shared guest credential). Passing an empty " +
+  "array clears that list — an empty signaling list still falls back to " +
+  "wss://myownmesh.com; empty STUN/TURN opts out of that helper.";
 
 const WEB_SEARCH_TOOL_SNIPPET: string =
   "## `web_search` tool — search the web\n\n" +
